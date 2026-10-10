@@ -137,7 +137,7 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | 配置项 | 说明 |
 |---|---|
 | `cache.dll_dir` | libmpv-2.dll 搜索目录，`auto` = exe 同目录 |
-| `cache.dir` | 7Z/RAR 解压缓存目录，`auto` = `%TEMP%\archview_cache`；可指向 RAM Disk 提速 |
+| `cache.dir` | 7Z/RAR 解压缓存目录，`auto` = `%TEMP%\archview_cache`；可指向 RAM Disk 提速（见下文"进阶：RAM Disk 缓存"） |
 | `cache.max_size_mb` | 缓存总量上限，超出按 LRU（最久未访问）驱逐 |
 | `cache.clean_on_exit` | 退出时是否自动清空缓存（默认 false） |
 | `cache.clean_on_switch` | 切换压缩包时是否清理上一个包的缓存（默认 false，保留以便切回时命中） |
@@ -147,6 +147,40 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | `ui.slideshow_secs` | 图片自动播放（PPT 式翻页）间隔秒数 |
 | `ui.wheel_switch_secs` | 视频区滚轮切换媒体的最小间隔秒数 |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
+
+### 路径写法（cache.dir 等所有路径项）
+
+标准 JSON 字符串，双引号包裹。Windows 下正斜杠、反斜杠都认，但反斜杠必须**双写**（JSON 转义）：
+
+```json
+"dir": "D:/my_cache"       // 推荐：正斜杠，无需转义
+"dir": "D:\\my_cache"      // 反斜杠必须双写，单个 \ 会解析报错
+"dir": "auto"              // 特殊值：自动探测
+```
+
+常见错误：单引号 `'D:/cache'` 不合法（JSON 只认双引号）；`"C:\cache"` 因 `\c` 非法转义导致整个 config.json 解析失败。相对路径相对的是 exe 启动时的工作目录，建议写绝对路径。目录不存在会自动创建。
+
+### 进阶：RAM Disk 缓存（可选推荐）
+
+7Z/RAR 走"后台解压到磁盘缓存再播放"的慢路径，缓存落在机械盘上时首次播放等待明显。把 `cache.dir` 指向 RAM Disk 可以显著加速，且**断电/重启即自动清空**，无需维护：
+
+1. 用 [ImDisk Toolkit](http://www.ltr-data.se/opencode.htm/)、OSFMount 或 [Primo Ramdisk](https://www.romexsoft.com/zh/primo-ramdisk/) 等工具划出一块 RAM Disk（建议 2~4GB，盘符如 `R:`）
+2. 修改 config.json：
+
+```json
+{
+  "cache": {
+    "dir": "R:/archview_cache",
+    "max_size_mb": 3072,
+    "clean_on_exit": false,
+    "clean_on_switch": false
+  }
+}
+```
+
+3. `max_size_mb` 建议设为 RAM Disk 容量的 70%~80%，留出余量；超出上限时按 LRU 自动驱逐最久未访问的缓存
+
+> RAM Disk 容量有限：单条目超过剩余空间时（如蓝光原盘），解压前会预检磁盘余量并**直接报错提示**（不再发起注定失败的解压）——此时需手动把 `cache.dir` 改回磁盘目录并重启程序。`clean_on_exit` / `clean_on_switch` 保持 false 即可：RAM Disk 生命周期与系统一致，重启自动归零。
 
 ### 缓存清理时机
 

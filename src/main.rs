@@ -15,7 +15,17 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    let cfg = config::Config::load_or_create().expect("配置加载失败");
+    let cfg = match config::Config::load_or_create() {
+        Ok(c) => c,
+        // 解析失败即 panic（用户要求）：但先打明确原因——
+        // serde 错误带行列号（如 "invalid escape at line 5 column 12"），
+        // 常见于 cache.dir 反斜杠没双写等 JSON 转义问题
+        Err(e) => {
+            tracing::error!("config.json 加载失败: {e}");
+            eprintln!("config.json 加载失败: {e}");
+            panic!("配置加载失败: {e}");
+        }
+    };
     if let Err(e) = player::mpv_ffi::init(&cfg.dll_path()) {
         // mpv 不可用时仍可浏览列表，播放功能在 UI 内提示错误
         tracing::error!("{e}");

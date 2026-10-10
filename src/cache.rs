@@ -16,6 +16,23 @@ pub fn cache_dir(cfg: &Config) -> PathBuf {
     dir
 }
 
+/// 目录所在磁盘的剩余字节数（Windows GetDiskFreeSpaceExW，微秒级；
+/// 目录不可达/查询失败返回 None，调用方按"无法判断"处理）
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut avail: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(avail)
+}
+
 /// 计划写入 incoming_bytes 前，确保总量在上限内：超出则按 mtime 从旧到新删除
 pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {

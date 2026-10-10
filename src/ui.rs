@@ -397,6 +397,24 @@ impl App {
             }
         }
 
+        // 磁盘余量预检：缓存目录所在盘放不下本条目（留 64MB 余量）则直接报错，
+        // 不发起到注定失败的解压。查不到余量（目录不可达等）跳过，让解压错误自己暴露。
+        if let Some(free) = cache::free_bytes(&dir) {
+            let need = entry.size.saturating_add(64 * 1024 * 1024);
+            if free < need {
+                let msg = format!(
+                    "缓存目录所在磁盘空间不足：剩余 {:.1}GB，条目 [{}] 需要 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.json 的 cache.dir）",
+                    free as f64 / (1024.0 * 1024.0 * 1024.0),
+                    entry.name,
+                    need as f64 / (1024.0 * 1024.0 * 1024.0),
+                    dir.display()
+                );
+                tracing::error!("{msg}");
+                self.error = Some(msg);
+                return;
+            }
+        }
+
         cache::evict_if_needed(
             &dir,
             self.cfg.cache.max_size_mb * 1024 * 1024,
