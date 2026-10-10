@@ -101,6 +101,8 @@ pub struct UiConfig {
     pub slideshow_secs: f64,
     /// 视频区滚轮切换最小间隔秒数（防惯性/触控板连跳）
     pub wheel_switch_secs: f64,
+    /// 翻到本包最后一个媒体项再往后导航时，是否询问打开同目录下一个压缩包
+    pub ask_next_archive: bool,
 }
 
 impl Default for UiConfig {
@@ -109,6 +111,7 @@ impl Default for UiConfig {
             font_path: "auto".into(),
             slideshow_secs: 1.0,
             wheel_switch_secs: 0.3,
+            ask_next_archive: true,
         }
     }
 }

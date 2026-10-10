@@ -179,6 +179,80 @@ pub fn open_archive(
     }
 }
 
+/// 解析分卷 RAR 文件名的族前缀：`X.part1.rar` → `Some("x")`（统一小写）。
+/// 仅匹配 `.partN.rar`（N 为纯数字）；普通 rar / 其它命名返回 None。
+fn split_rar_family(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".rar")?;
+    let idx = stem.rfind(".part")?;
+    let (prefix, tail) = stem.split_at(idx);
+    let num = tail.strip_prefix(".part")?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
+/// 同目录所有压缩包（zip/7z/rar，与 open_archive 支持集一致），按文件名升序。
+/// 分卷 RAR（`X.partN.rar`）每族只保留排序最前的一卷（通常为 part1）作为可打开条目，
+/// 避免列表里出现同一包的多卷。目录不可读返回空。
+pub fn archives_in_dir(cur: &Path) -> Vec<PathBuf> {
+    let Some(dir) = cur.parent() else { return Vec::new() };
+    let mut items: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| {
+            let path = e.path();
+            let ext = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "zip" | "7z" | "rar") {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy().to_lowercase();
+            Some((name, path))
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    // 同族分卷只保留排序最前的一卷（part1 < part10 < part2 的字典序保证 part1 在前）
+    let mut family_seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|(name, _)| match split_rar_family(name) {
+            Some(f) => family_seen.insert(f),
+            None => true,
+        })
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// 同目录中按文件名排序的下一个压缩包，已是最后一个时循环回第一个
+/// （目录内只有当前一个包 / 目录不可读 / 当前包不在候选中返回 None）。
+/// 当前包属于分卷族时按族的首卷定位，"下一个"不会是同包的其它分卷。
+pub fn next_archive_in_dir(cur: &Path) -> Option<PathBuf> {
+    let list = archives_in_dir(cur);
+    if list.len() < 2 {
+        return None;
+    }
+    let cur_name = cur.file_name()?.to_string_lossy().to_lowercase();
+    let cur_family = split_rar_family(&cur_name);
+    let pos = list.iter().position(|p| {
+        let n = p
+            .file_name()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        n == cur_name
+            || cur_family
+                .as_ref()
+                .is_some_and(|f| split_rar_family(&n).as_deref() == Some(f.as_str()))
+    })?;
+    Some(list[(pos + 1) % list.len()].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +363,57 @@ mod tests {
         // 环境清理：只删本测试的缓存文件与测试目录，不动共享缓存目录其它内容
         std::fs::remove_file(&dest_a).ok();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// next_archive_in_dir / archives_in_dir：同目录按文件名排序取下一个，
+    /// 末包循环回第一个；非压缩包/子目录不参与；同族分卷在列表中合并为首卷。
+    #[test]
+    fn next_archive_in_dir_order_and_skip() {
+        let dir = std::env::temp_dir().join(format!("next_arch_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 干扰项：非压缩包、子目录
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("subdir.zip")).unwrap();
+        for name in [
+            "a.zip", "b.7z", "c.rar", "x.part1.rar", "x.part2.rar", "y.rar",
+        ] {
+            std::fs::write(dir.join(name), [0u8; 8]).unwrap();
+        }
+
+        // 列表：分卷族合并（只剩 x.part1.rar），按文件名升序
+        let list = archives_in_dir(&dir.join("a.zip"));
+        let names: Vec<String> = list
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.zip", "b.7z", "c.rar", "x.part1.rar", "y.rar"]);
+
+        // 基本顺序：a → b → c → x.part1 →（跳过同族 x.part2）→ y →（循环）a
+        let n = |f: &str| next_archive_in_dir(&dir.join(f));
+        assert_eq!(n("a.zip"), Some(dir.join("b.7z")));
+        assert_eq!(n("b.7z"), Some(dir.join("c.rar")));
+        assert_eq!(n("c.rar"), Some(dir.join("x.part1.rar")));
+        assert_eq!(n("x.part1.rar"), Some(dir.join("y.rar")), "应跳过同族分卷 x.part2");
+        assert_eq!(n("x.part2.rar"), Some(dir.join("y.rar")), "从分卷族任意一卷定位结果一致");
+        assert_eq!(n("y.rar"), Some(dir.join("a.zip")), "末包应循环回第一个");
+        // 当前包不在目录中
+        assert_eq!(n("zz.zip"), None);
+        // 大小写不敏感：扩展名大写也能参与排序定位
+        std::fs::write(dir.join("B2.ZIP"), [0u8; 8]).unwrap();
+        assert_eq!(n("a.zip"), Some(dir.join("b.7z")));
+        assert_eq!(n("b2.zip"), Some(dir.join("c.rar")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 目录内只有当前一个包：没有"下一个"
+        let solo = std::env::temp_dir().join(format!("next_arch_solo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&solo);
+        std::fs::create_dir_all(&solo).unwrap();
+        std::fs::write(solo.join("only.zip"), [0u8; 8]).unwrap();
+        assert_eq!(next_archive_in_dir(&solo.join("only.zip")), None);
+        assert_eq!(archives_in_dir(&solo.join("only.zip")).len(), 1);
+        let _ = std::fs::remove_dir_all(&solo);
     }
 }

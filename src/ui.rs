@@ -4,7 +4,10 @@ use crate::cache;
 use crate::config::Config;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
-use crate::vfs::{open_archive, AccessMode, ArchiveVFS, VirtualEntry, VfsError};
+use crate::vfs::{
+    archives_in_dir, next_archive_in_dir, open_archive, AccessMode, ArchiveVFS, VirtualEntry,
+    VfsError,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -49,6 +52,13 @@ enum PwKind {
     Open(PathBuf),
     /// 播放加密条目需要密码，提交成功后重建 VFS 并重试播放
     Play(usize),
+}
+
+/// 末项后询问打开下一个压缩包的弹窗状态：
+/// 同目录压缩包列表（分卷族已合并为首卷）+ 选中项下标（默认=循环意义上的下一个）
+struct NextArchivePrompt {
+    archives: Vec<PathBuf>,
+    sel: usize,
 }
 
 /// 后台解压任务（7z/RAR）
@@ -115,6 +125,10 @@ pub struct App {
     pw_prompt: Option<PwPrompt>,
     // 会话内密码记忆：压缩包路径 → 密码（内存中，退出即丢；切包回来不用重输）
     pw_memory: std::collections::HashMap<PathBuf, String>,
+    // 末项后询问打开下一个压缩包：弹窗状态（目录内可选包列表 + 选中项）
+    next_archive_prompt: Option<NextArchivePrompt>,
+    // 本会话打开过的压缩包路径（切包弹窗中灰色标记"看过"）
+    seen_archives: std::collections::HashSet<PathBuf>,
 }
 
 impl App {
@@ -148,6 +162,8 @@ impl App {
             next_gen: 0,
             pw_prompt: None,
             pw_memory: std::collections::HashMap::new(),
+            next_archive_prompt: None,
+            seen_archives: std::collections::HashSet::new(),
         }
     }
 
@@ -235,6 +251,8 @@ impl App {
                 if let Some(pw) = password {
                     self.pw_memory.insert(path.clone(), pw.to_string());
                 }
+                // 会话内"看过"标记（切包弹窗中灰色显示）
+                self.seen_archives.insert(path.clone());
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -568,11 +586,11 @@ impl App {
     }
 
     /// 密码输入弹窗（加密头=打开阶段 / 加密条目=播放阶段）。
-    /// mpv 原生子窗口永远盖在 egui 绘制之上，窗口固定在左侧文件列表区避开视频区
+    /// 弹窗期间隐藏 mpv 子窗口，窗口视口居中
     fn password_dialog(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let Some(p) = self.pw_prompt.as_mut() else { return };
         // 密码框显示期间隐藏 mpv 子窗口（与帮助弹窗同机制，帧末统一同步）；
-        // 原先 fixed_pos 避让方案在窗口缩放/高 DPI 下仍可能被视频挡住
+        // anchor 视口居中：egui 逻辑坐标下 125%/150% 缩放均保持居中
         self.overlay_open = true;
         let mut submitted = false;
         let mut cancelled = false;
@@ -581,7 +599,7 @@ impl App {
             PwKind::Play(_) => "文件已加密",
         };
         egui::Window::new(title)
-            .fixed_pos((60.0, 140.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
@@ -603,13 +621,18 @@ impl App {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submitted = true;
                 }
+                ui.add_space(4.0);
+                // 按钮行右对齐（主按钮在最右）。先包一层 horizontal 限定单行高度，
+                // 否则 right_to_left 会占满剩余区域并把按钮垂直居中"悬浮"在框中部
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
-                        submitted = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        cancelled = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("确定").clicked() {
+                            submitted = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancelled = true;
+                        }
+                    });
                 });
             });
         if submitted {
@@ -620,6 +643,78 @@ impl App {
             }
         } else if cancelled {
             self.pw_prompt = None;
+        }
+    }
+
+    /// 末项后询问打开下一个压缩包的确认弹窗（与密码框同机制：
+    /// overlay_open 置位隐藏 mpv 子窗口，帧末统一同步显隐）。
+    /// 列出同目录全部压缩包（分卷族合并为首卷），默认选中循环意义上的
+    /// 下一个（末包绕回第一个），点选任意包可直接打开；
+    /// 本会话打开过的包灰色显示，帮助绕圈时分辨看过的。
+    fn next_archive_dialog(&mut self, ctx: &egui::Context) {
+        // 先取当前包路径（"当前"标记）与已看集合（灰色标记），避免与 prompt 可变借用冲突
+        let cur_name = self
+            .archive
+            .as_ref()
+            .and_then(|a| a.path.file_name())
+            .map(|n| n.to_string_lossy().to_lowercase());
+        let seen = self.seen_archives.clone();
+        let Some(prompt) = self.next_archive_prompt.as_mut() else { return };
+        self.overlay_open = true;
+        let mut open = false;
+        let mut cancelled = false;
+        egui::Window::new("打开下一个压缩包？")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.label("已到本压缩包的最后一项，选择要打开的压缩包：");
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, path) in prompt.archives.iter().enumerate() {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let is_cur = cur_name
+                                .as_deref()
+                                .is_some_and(|c| name.to_lowercase() == c);
+                            let label = if is_cur { format!("{name}（当前）") } else { name };
+                            // 本会话看过的包灰色弱化，未看的正常色
+                            let text = if seen.contains(path) {
+                                egui::RichText::new(label).weak()
+                            } else {
+                                egui::RichText::new(label)
+                            };
+                            if ui.selectable_label(prompt.sel == i, text).clicked() {
+                                prompt.sel = i;
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                // 按钮行右对齐（主按钮在最右）。先包一层 horizontal 限定单行高度，
+                // 否则 right_to_left 会占满剩余区域并把按钮垂直居中"悬浮"在框中部
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("打开").clicked() {
+                            open = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            });
+        if open {
+            let prompt = self.next_archive_prompt.take().unwrap();
+            let path = prompt.archives[prompt.sel].clone();
+            // 复用完整打开链路：pw_memory 密码记忆 / clean_on_switch 缓存清理 / 加密头弹密码框
+            self.open_path(path);
+        } else if cancelled {
+            self.next_archive_prompt = None;
         }
     }
 
@@ -803,7 +898,7 @@ impl App {
             }
         }
         if step_entry != 0 {
-            self.play_adjacent(frame, step_entry);
+            self.play_adjacent(frame, step_entry, step_entry > 0);
         }
         if fs_toggle {
             self.set_fullscreen(!self.fullscreen, frame);
@@ -825,7 +920,9 @@ impl App {
     /// 播放列表中的上一个/下一个媒体（offset = -1/+1）。
     /// 只在当前条目同类型内导航（视频↔视频，图片↔图片），避免视频播着切到图片。
     /// 未播放时：按当前标签页类型从第一项（下一个）/最后一项（上一个）开始。
-    fn play_adjacent(&mut self, frame: &mut eframe::Frame, offset: i32) {
+    /// ask_next = 用户显式的"下一个"操作（快捷键/滚轮/按钮）：已在本包最后一项
+    /// 再往后翻时，询问是否打开同目录下一个压缩包（config: ui.ask_next_archive）。
+    fn play_adjacent(&mut self, frame: &mut eframe::Frame, offset: i32, ask_next: bool) {
         let Some(a) = &self.archive else { return };
         // 未播放：类型由当前标签页决定
         let (cur, want_video) = match self.playing {
@@ -854,7 +951,24 @@ impl App {
                 return;
             };
             let np = pos as i32 + offset;
-            if np < 0 || (np as usize) >= same_kind.len() {
+            if np < 0 {
+                return;
+            }
+            if (np as usize) >= same_kind.len() {
+                // 已在最后一项再往后翻：弹窗选择打开同目录下一个压缩包
+                // （仅用户显式操作触发；图片自动翻页传 false，防每帧重复弹窗）
+                if ask_next && self.cfg.ui.ask_next_archive && self.next_archive_prompt.is_none() {
+                    let list = archives_in_dir(&a.path);
+                    if list.len() < 2 {
+                        self.notice = Some("此目录没有其它压缩包".into());
+                    } else {
+                        // 默认选中循环意义上的下一个（末包绕回第一个）
+                        let sel = next_archive_in_dir(&a.path)
+                            .and_then(|p| list.iter().position(|q| *q == p))
+                            .unwrap_or(0);
+                        self.next_archive_prompt = Some(NextArchivePrompt { archives: list, sel });
+                    }
+                }
                 return;
             }
             same_kind[np as usize]
@@ -875,7 +989,8 @@ impl App {
             return;
         }
         if now - self.slideshow_anchor >= self.cfg.ui.slideshow_secs {
-            self.play_adjacent(frame, 1);
+            // 自动翻页不触发"打开下一个压缩包"询问（到最后一张停住）
+            self.play_adjacent(frame, 1, false);
         }
     }
 
@@ -1096,7 +1211,7 @@ impl App {
                 if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
                     self.wheel_last = now;
                     let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
-                    self.play_adjacent(frame, dir);
+                    self.play_adjacent(frame, dir, dir > 0);
                 }
             }
         }
@@ -1195,7 +1310,7 @@ impl App {
 
         // 闭包外应用动作（避免嵌套借用 self）
         if act.step != 0 {
-            self.play_adjacent(frame, act.step);
+            self.play_adjacent(frame, act.step, act.step > 0);
         }
         if act.toggle {
             if let Some(p) = &self.player {
@@ -1322,6 +1437,8 @@ impl eframe::App for App {
         self.slideshow_tick(&ctx, frame);
         // 密码输入弹窗（加密压缩包：加密头=打开阶段 / 加密条目=播放阶段）
         self.password_dialog(&ctx, frame);
+        // 末项后询问打开同目录下一个压缩包
+        self.next_archive_dialog(&ctx);
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条

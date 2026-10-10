@@ -11,6 +11,7 @@
 | 后台解压 | 7Z / RAR 自动后台解压到缓存目录，完成后无缝播放 |
 | 加密支持 | 加密头（7Z/RAR）打开时输密码；内容加密（ZIP AES 等）播放时输密码；多编码候选兼容汉字密码；会话内密码记忆（切换包后切回不用重输） |
 | 文件列表 | 视频 / 图片两个标签页，序号 `[当前/总数]` 显示，支持搜索过滤，多级子目录平铺展示 |
+| 连续看包 | 翻到本包最后一项再往后翻（PgDn / 滚轮 / ">" 按钮）时，弹出同目录压缩包列表（默认选中下一个，末包循环回第一个；分卷 RAR 只列首卷），点选任意包打开；本会话看过的包灰色显示；`ui.ask_next_archive` 可关 |
 | 播放控制 | mpv 风格快捷键、底部全宽进度条拖动 seek、音量调节、静音提示 |
 | 图片自动播放 | PPT 式自动翻页（控制栏播放/暂停按钮或空格切换） |
 | 全屏 | 双击画面或回车进入，Esc 退出，全屏内快捷键照常可用 |
@@ -128,7 +129,8 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
   "ui": {
     "font_path": "auto",
     "slideshow_secs": 1.0,
-    "wheel_switch_secs": 0.3
+    "wheel_switch_secs": 0.3,
+    "ask_next_archive": true
   },
   "password_codepage": "gbk"
 }
@@ -146,6 +148,7 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | `ui.font_path` | CJK 字体路径，`auto` 依次尝试系统 msyh / simhei / simsun |
 | `ui.slideshow_secs` | 图片自动播放（PPT 式翻页）间隔秒数 |
 | `ui.wheel_switch_secs` | 视频区滚轮切换媒体的最小间隔秒数 |
+| `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
 
 ### 路径写法（cache.dir 等所有路径项）
