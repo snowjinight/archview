@@ -1,0 +1,28 @@
+[package]
+name = "archview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
+rfd = "0.17"
+libloading = "0.8"
+raw-window-handle = "0.6"
+winit = { version = "0.30", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sevenz-rust = { version = "0.6.1", features = ["aes256"] }
+unrar = "0.5.8"
+encoding_rs = "0.8"
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+]

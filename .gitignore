@@ -1,0 +1,19 @@
+# 构建产物
+/target
+
+# 第三方 mpv 开发包（120MB dll 超过 GitHub 限制；见 README 下载指引）
+/deps
+
+# 发布产物与临时文件
+/dist
+/dist.zip
+check_output.log
+
+# 本地测试媒体（体积大，不入库；测试脚本会自动生成或跳过）
+/test_media
+
+# 个人配置（首次运行自动生成）
+config.json
+
+# 内部交接文档（不开源）
+HANDOFF.md
