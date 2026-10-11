@@ -28,7 +28,12 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
         .collect();
     let mut avail: u64 = 0;
     let ok = unsafe {
-        GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut())
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut avail,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
     };
     (ok != 0).then_some(avail)
 }
@@ -52,7 +57,9 @@ pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
     files.sort_by_key(|(_, _, t)| *t); // 旧在前
 
     let total: u64 = files.iter().map(|(_, s, _)| s).sum();
-    let mut over = total.saturating_add(incoming_bytes).saturating_sub(max_bytes);
+    let mut over = total
+        .saturating_add(incoming_bytes)
+        .saturating_sub(max_bytes);
     if over == 0 {
         return;
     }
@@ -72,7 +79,13 @@ pub fn dest_path(dir: &Path, archive_id: u64, entry_idx: usize, entry_name: &str
     let base = entry_name.rsplit('/').next().unwrap_or(entry_name);
     let safe: String = base
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     dir.join(format!("{archive_id}_{entry_idx}_{safe}"))
 }

@@ -1,7 +1,7 @@
 //! RarVFS：RAR 格式（固态慢路径，unrar crate 内嵌编译 UnRAR 源码，支持 RAR4/5、分卷）。
 //! 与 7z 同理：后台解压到缓存目录 → 播放本地文件。
 
-use super::{AccessMode, ArchiveVFS, VirtualEntry, VirtualFile, VfsError};
+use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
 use std::path::{Path, PathBuf};
 use unrar::Archive;
 
@@ -47,7 +47,10 @@ impl RarVFS {
                 if candidates.is_empty() {
                     return Err(VfsError::Password);
                 }
-                match candidates.iter().find(|c| try_list(Some(c.as_slice())).is_ok()) {
+                match candidates
+                    .iter()
+                    .find(|c| try_list(Some(c.as_slice())).is_ok())
+                {
                     Some(pw) => candidates = vec![pw.clone()],
                     None => return Err(VfsError::Password),
                 }
@@ -68,13 +71,18 @@ impl RarVFS {
         }
     }
 
-    /// 单个密码候选的解压尝试：定位条目 + extract_to 临时文件（不改名）
-    fn try_extract(
+    /// 单个密码候选的批量解压：一次 processing 遍历顺带解出全部目标
+    /// （solid RAR 定位目标需逐条 skip，一次遍历解一批摊薄固定成本）；
+    /// 目标之间的条目 skip 并按条目数 + 字节数上报进度
+    fn try_batch(
         &self,
         pw: Option<&[u8]>,
-        entry: &VirtualEntry,
-        tmp: &Path,
+        targets: &[(&VirtualEntry, &Path)],
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize),
     ) -> Result<(), VfsError> {
+        use std::collections::HashMap;
         let arch = match pw {
             Some(p) => Archive::with_password(&self.path, p),
             None => Archive::new(&self.path),
@@ -82,48 +90,99 @@ impl RarVFS {
         let mut open = arch.open_for_processing().map_err(|e| {
             VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display()))
         })?;
+        let mut remaining: HashMap<String, usize> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, (e, _))| (e.name.clone(), i))
+            .collect();
+        let mut skipped: usize = 0;
+        let mut skipped_bytes: u64 = 0;
         loop {
-            match open
-                .read_header()
-                .map_err(|e| VfsError::Archive(format!("读 RAR 头失败 [{}]: {e}", self.path.display())))?
-            {
+            // 逐条目定位期间检查取消（大包 / NAS 上定位耗时分钟级）
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(VfsError::Cancelled);
+            }
+            match open.read_header().map_err(|e| {
+                VfsError::Archive(format!("读 RAR 头失败 [{}]: {e}", self.path.display()))
+            })? {
                 Some(head) => {
-                    let name = head
-                        .entry()
-                        .filename
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    if name == entry.name {
-                        if head.entry().is_encrypted() && pw.is_none() {
+                    let name = head.entry().filename.to_string_lossy().replace('\\', "/");
+                    // extract_to/skip 消费 head：先取需要的字段
+                    let encrypted = head.entry().is_encrypted();
+                    let size = head.entry().unpacked_size;
+                    if let Some(&ti) = remaining.get(&name) {
+                        if encrypted && pw.is_none() {
                             return Err(VfsError::Password);
                         }
-                        head.extract_to(tmp).map_err(|e| {
+                        let dest = targets[ti].1;
+                        // 缓存已存在且尺寸一致：跳过解压（幂等，密码候选重试时已解出的不重做）
+                        if std::fs::metadata(dest)
+                            .map(|m| m.len() == size)
+                            .unwrap_or(false)
+                        {
+                            remaining.remove(&name);
+                            file_done(ti);
+                            if remaining.is_empty() {
+                                return Ok(());
+                            }
+                            open = head.skip().map_err(|e| {
+                                VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
+                            })?;
+                            continue;
+                        }
+                        // 解压到临时文件再改名：中断不留半截文件被当成有效缓存；
+                        // 临时文件名带序号防并发踩踏。
+                        // unrar 的 extract_to 无逐字节回调：写文件前发 0、完成后发
+                        // 全量，UI 能区分"跳过阶段 → 写文件阶段"（字节数不串台）
+                        progress(0, "");
+                        let tmp = super::tmp_path(dest);
+                        open = head.extract_to(&tmp).map_err(|e| {
+                            std::fs::remove_file(&tmp).ok();
                             if is_password_err(&e) {
                                 VfsError::Password
                             } else {
                                 VfsError::Archive(format!(
                                     "RAR 解压失败: 压缩包 [{}] 条目 [{}] 解压到 [{}] 失败: {e}",
                                     self.path.display(),
-                                    entry.name,
+                                    name,
                                     tmp.display()
                                 ))
                             }
                         })?;
-                        return Ok(());
+                        std::fs::rename(&tmp, dest).map_err(|e| {
+                            std::fs::remove_file(&tmp).ok();
+                            VfsError::Archive(format!(
+                                "重命名临时文件失败: [{}] → [{}]: {e}",
+                                tmp.display(),
+                                dest.display()
+                            ))
+                        })?;
+                        remaining.remove(&name);
+                        progress(size, "");
+                        file_done(ti);
+                        if remaining.is_empty() {
+                            return Ok(());
+                        }
                     } else {
                         open = head.skip().map_err(|e| {
                             VfsError::Archive(format!(
-                                "RAR 跳过条目 [{}] 失败（正在定位目标 [{}]）: {e}",
-                                name, entry.name
+                                "RAR 跳过条目 [{}] 失败（正在定位目标）: {e}",
+                                name
                             ))
                         })?;
+                        skipped += 1;
+                        skipped_bytes += size;
+                        if skipped % 64 == 0 {
+                            progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                        }
                     }
                 }
                 None => {
+                    let names: Vec<String> = remaining.keys().cloned().collect();
                     return Err(VfsError::Archive(format!(
                         "entry 不存在: {}",
-                        entry.name
-                    )))
+                        names.join(", ")
+                    )));
                 }
             }
         }
@@ -176,13 +235,21 @@ impl ArchiveVFS for RarVFS {
         &self,
         entry: &VirtualEntry,
         dest: &Path,
-        progress: &dyn Fn(u64),
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
     ) -> Result<(), VfsError> {
-        // 先解压到同目录临时文件再改名，避免中断留下半截文件被当成有效缓存；
-        // 临时文件名带序号：同一条目被并发解压时不会互相抢同一个 .part（Windows 独占打开冲突）
-        let tmp = super::tmp_path(dest);
+        self.extract_batch(&[(entry, dest)], cancel, progress, &|_| {})
+    }
+
+    fn extract_batch(
+        &self,
+        targets: &[(&VirtualEntry, &Path)],
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize),
+    ) -> Result<(), VfsError> {
         // 尝试序列：有密码 → 各编码候选，最后兜底无密码（条目实际未加密时直接成功）；
-        // 无密码 → 仅无密码（加密条目在 try_extract 内报 Password，UI 弹密码框）
+        // 无密码 → 仅无密码（加密条目在 try_batch 内报 Password，UI 弹密码框）
         let mut attempts: Vec<Option<Vec<u8>>> = Vec::new();
         if self.password.is_empty() {
             attempts.push(None);
@@ -194,23 +261,15 @@ impl ArchiveVFS for RarVFS {
         }
         let mut last_err = VfsError::Password;
         for pw in &attempts {
-            match self.try_extract(pw.as_deref(), entry, &tmp) {
-                Ok(()) => {
-                    std::fs::rename(&tmp, dest).map_err(|e| {
-                        VfsError::Archive(format!(
-                            "重命名临时文件失败: [{}] → [{}]: {e}",
-                            tmp.display(),
-                            dest.display()
-                        ))
-                    })?;
-                    progress(entry.size);
-                    return Ok(());
-                }
-                // 密码/编码不匹配（RAR4 无密码哈希，错密码可能只报 CRC 失败）：换下一候选
-                Err(e) if is_pwd_or_crc(&e) => {
-                    std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件
-                    last_err = e;
-                }
+            // 多候选/大包定位期间检查取消（unrar 逐条目 skip 定位，大包耗时）
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(VfsError::Cancelled);
+            }
+            match self.try_batch(pw.as_deref(), targets, cancel, progress, file_done) {
+                Ok(()) => return Ok(()),
+                // 密码/编码不匹配（RAR4 无密码哈希，错密码可能只报 CRC 失败）：换下一候选。
+                // 已解出的目标已落地（try_batch 幂等跳过），重试只补漏
+                Err(e) if is_pwd_or_crc(&e) => last_err = e,
                 Err(e) => return Err(e),
             }
         }
@@ -280,7 +339,13 @@ mod tests {
         assert_eq!(entries[0].size, 50_000);
 
         let dest = dir.join("out.bin");
-        vfs.extract_entry(&entries[0], &dest, &|_| {}).unwrap();
+        vfs.extract_entry(
+            &entries[0],
+            &dest,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap();
         let data = std::fs::read(&dest).unwrap();
         assert_eq!(data.len(), 50_000);
         assert!(data.iter().all(|&b| b == 9));

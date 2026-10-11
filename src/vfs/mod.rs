@@ -1,9 +1,9 @@
 //! VFS 层：统一压缩包读取接口。
 //! Phase 1 只实现 ZipVFS；7z/RAR 是后续 Phase，接口不变。
 
+pub mod rar_vfs;
 pub mod sevenz_vfs;
 pub mod zip_vfs;
-pub mod rar_vfs;
 
 use std::fmt;
 use std::io::{Read, Seek};
@@ -109,6 +109,8 @@ pub enum VfsError {
     Archive(String),
     Unsupported(String),
     Password,
+    /// 解压被取消（用户切换了目标条目）：调用方静默丢弃，不报错
+    Cancelled,
 }
 
 impl fmt::Display for VfsError {
@@ -118,6 +120,7 @@ impl fmt::Display for VfsError {
             VfsError::Archive(s) => write!(f, "压缩包错误: {s}"),
             VfsError::Unsupported(s) => write!(f, "不支持: {s}"),
             VfsError::Password => write!(f, "需要密码或密码错误"),
+            VfsError::Cancelled => write!(f, "已取消"),
         }
     }
 }
@@ -134,47 +137,76 @@ impl From<std::io::Error> for VfsError {
 pub trait ArchiveVFS: Send + Sync {
     /// 列出所有 entry
     fn list(&self) -> Vec<VirtualEntry>;
+    /// 带进度的列表（后台打开期间向 UI 报告进度）。
+    /// 回调参数：(进度比例 0.0~1.0（None = 不定进度阶段）， 阶段说明文字)。
+    /// 默认实现忽略进度直接 list——7z/RAR 的头解析在 crate 内部，
+    /// 无法细分进度；ZipVFS 覆写为 CD 顺序遍历的真实条目百分比。
+    fn list_with_progress(&self, progress: &dyn Fn(Option<f32>, &str)) -> Vec<VirtualEntry> {
+        let _ = progress;
+        self.list()
+    }
     /// 打开单个文件，返回可读可 seek 的虚拟文件（仅 FastSeek 格式支持）
     fn open_entry(&self, entry: &VirtualEntry) -> Result<Box<dyn VirtualFile>, VfsError>;
     /// 决定播放策略
     fn access_mode(&self) -> AccessMode;
-    /// 解压单个文件到目标路径（固态格式的慢路径；progress 回调报告已写出字节数）。
+    /// 解压单个文件到目标路径（固态格式的慢路径）。
+    /// - `cancel`：置位后实现应尽快返回 `VfsError::Cancelled`（用户切换了目标条目，
+    ///   旧任务不再需要——solid 包跳过前置文件的阶段耗时可达分钟级，不取消会
+    ///   与新任务并行抢占网络盘带宽）
+    /// - `progress`：(字节数, 阶段文字)。阶段为空串 = 正在写目标文件（字节数
+    ///   = 已写出）；非空 = 定位/跳过前置文件阶段（字节数 = 已顺序解压的字节数，
+    ///   此阶段可能占总耗时 99%，必须上报让人看到进展，否则像卡死）。
     /// 默认不支持；ZipVFS/SevenzVFS/RarVFS 各自实现。
     fn extract_entry(
         &self,
         entry: &VirtualEntry,
         dest: &Path,
-        progress: &dyn Fn(u64),
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
     ) -> Result<(), VfsError> {
-        let _ = (entry, dest, progress);
+        let _ = (entry, dest, cancel, progress);
         Err(VfsError::Unsupported("此格式不支持解压".into()))
+    }
+
+    /// 批量解压：solid 包定位目标需顺序解压前置数据（folder 内不可 seek），
+    /// 一次解压流顺带解出一批条目可摊薄该固定成本（UI 用于预取后续文件，
+    /// 翻页直接命中缓存）。
+    /// - `targets`：(条目, 目标路径) 列表；`file_done`：第 i 个条目落地
+    ///   （临时文件改名完成）时回调 i——UI 据此在目标就绪时立即播放，
+    ///   不必等整批完成
+    /// - 其余参数语义同 `extract_entry`
+    /// 默认实现逐条调用 extract_entry（zip 等无跳过成本的格式）；
+    /// 7z/RAR 覆写为单次遍历批量解出。
+    fn extract_batch(
+        &self,
+        targets: &[(&VirtualEntry, &Path)],
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize),
+    ) -> Result<(), VfsError> {
+        for (i, (entry, dest)) in targets.iter().enumerate() {
+            self.extract_entry(entry, dest, cancel, progress)?;
+            file_done(i);
+        }
+        Ok(())
     }
 }
 
 /// 按扩展名打开压缩包（7z/RAR 走固态慢路径，ZIP 走流式快路径）。
 /// 加密头（7z/RAR 加密文件名）在打开阶段就会返回 Password，由 UI 弹密码框后带密码重开；
 /// 只加密内容（文件名明文）的包 open 成功，播放加密条目时再返回 Password。
-pub fn open_archive(
-    path: &Path,
-    password: Option<&str>,
-) -> Result<Box<dyn ArchiveVFS>, VfsError> {
+pub fn open_archive(path: &Path, password: Option<&str>) -> Result<Box<dyn ArchiveVFS>, VfsError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "zip" => {
-            zip_vfs::ZipVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>)
-        }
+        "zip" => zip_vfs::ZipVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>),
         "7z" => {
-            sevenz_vfs::SevenzVFS::open(path, password)
-                .map(|v| Box::new(v) as Box<dyn ArchiveVFS>)
+            sevenz_vfs::SevenzVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>)
         }
-        "rar" => {
-            rar_vfs::RarVFS::open(path, password)
-                .map(|v| Box::new(v) as Box<dyn ArchiveVFS>)
-        }
+        "rar" => rar_vfs::RarVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>),
         _ => Err(VfsError::Unsupported(format!("暂不支持的格式: .{ext}"))),
     }
 }
@@ -197,7 +229,9 @@ fn split_rar_family(name: &str) -> Option<String> {
 /// 分卷 RAR（`X.partN.rar`）每族只保留排序最前的一卷（通常为 part1）作为可打开条目，
 /// 避免列表里出现同一包的多卷。目录不可读返回空。
 pub fn archives_in_dir(cur: &Path) -> Vec<PathBuf> {
-    let Some(dir) = cur.parent() else { return Vec::new() };
+    let Some(dir) = cur.parent() else {
+        return Vec::new();
+    };
     let mut items: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -281,7 +315,10 @@ mod tests {
             use sevenz_rust::Password;
             let mut w = sevenz_rust::SevenZWriter::create(&arch_a).unwrap();
             w.set_encrypt_header(false);
-            w.set_content_methods(vec![sevenz_rust::AesEncoderOptions::new(Password::from("pw123")).into()]);
+            w.set_content_methods(vec![sevenz_rust::AesEncoderOptions::new(Password::from(
+                "pw123",
+            ))
+            .into()]);
             let e = sevenz_rust::SevenZArchiveEntry::from_path(&payload_a, "enc/pa.bin".into());
             w.push_archive_entry(e, Some(std::fs::File::open(&payload_a).unwrap()))
                 .unwrap();
@@ -308,18 +345,35 @@ mod tests {
         let cfg = Config::default();
         let cdir = cache::cache_dir(&cfg);
         assert!(
-            matches!(vfs.extract_entry(&entries[0], &cache::dest_path(&cdir, 0, 0, &entries[0].name), &|_| {}), Err(VfsError::Password)),
+            matches!(
+                vfs.extract_entry(
+                    &entries[0],
+                    &cache::dest_path(&cdir, 0, 0, &entries[0].name),
+                    &std::sync::atomic::AtomicBool::new(false),
+                    &|_, _| {}
+                ),
+                Err(VfsError::Password)
+            ),
             "无密码解压应报 Password"
         );
-        let (id_a1, _) = stream_cb::register(std::sync::Arc::from(vfs), &arch_a);
+        let (id_a1, _) =
+            stream_cb::register_with_progress(std::sync::Arc::from(vfs), &arch_a, &|_, _| {});
         let dest_a = cache::dest_path(&cdir, id_a1, 0, &entries[0].name);
 
         // ---- 阶段 2：用户输入密码后带密码重开 A，解压成功（缓存落盘）----
         let arc_a2: std::sync::Arc<dyn ArchiveVFS> =
             open_archive(&arch_a, Some("pw123")).unwrap().into();
-        let (id_a2, entries2) = stream_cb::register(arc_a2.clone(), &arch_a);
+        let (id_a2, entries2) =
+            stream_cb::register_with_progress(arc_a2.clone(), &arch_a, &|_, _| {});
         assert_eq!(id_a1, id_a2, "同一路径重开 register 应返回相同稳定 id");
-        arc_a2.extract_entry(&entries2[0], &dest_a, &|_| {}).unwrap();
+        arc_a2
+            .extract_entry(
+                &entries2[0],
+                &dest_a,
+                &std::sync::atomic::AtomicBool::new(false),
+                &|_, _| {},
+            )
+            .unwrap();
         assert_eq!(
             std::fs::metadata(&dest_a).unwrap().len(),
             entries2[0].size,
@@ -328,19 +382,15 @@ mod tests {
 
         // ---- 阶段 3：切到 B ----
         let vfs_b = open_archive(&arch_b, None).unwrap();
-        let (id_b, entries_b) = stream_cb::register(
-            std::sync::Arc::from(vfs_b),
-            &arch_b,
-        );
+        let (id_b, entries_b) =
+            stream_cb::register_with_progress(std::sync::Arc::from(vfs_b), &arch_b, &|_, _| {});
         assert_ne!(id_a1, id_b, "不同包的 id 不应相同");
         assert_eq!(entries_b.len(), 1);
 
         // ---- 阶段 4：切回 A（模拟 pw_memory 命中：直接带记忆密码重开）----
         let vfs = open_archive(&arch_a, Some("pw123")).unwrap(); // 密码命中：不弹框直接打开
-        let (id_a3, entries3) = stream_cb::register(
-            std::sync::Arc::from(vfs),
-            &arch_a,
-        );
+        let (id_a3, entries3) =
+            stream_cb::register_with_progress(std::sync::Arc::from(vfs), &arch_a, &|_, _| {});
         assert_eq!(id_a1, id_a3, "切回 A 时 id 应保持稳定");
         // 缓存命中判定（App::start_extract 的同款逻辑）
         let dest_a3 = cache::dest_path(&cdir, id_a3, 0, &entries3[0].name);
@@ -356,7 +406,12 @@ mod tests {
         let arc_bad: std::sync::Arc<dyn ArchiveVFS> =
             open_archive(&arch_a, Some("wrongpw")).unwrap().into();
         assert!(matches!(
-            arc_bad.extract_entry(&entries3[0], &dest_a, &|_| {}),
+            arc_bad.extract_entry(
+                &entries3[0],
+                &dest_a,
+                &std::sync::atomic::AtomicBool::new(false),
+                &|_, _| {}
+            ),
             Err(VfsError::Password)
         ));
 
@@ -377,7 +432,12 @@ mod tests {
         std::fs::write(dir.join("note.txt"), b"x").unwrap();
         std::fs::create_dir_all(dir.join("subdir.zip")).unwrap();
         for name in [
-            "a.zip", "b.7z", "c.rar", "x.part1.rar", "x.part2.rar", "y.rar",
+            "a.zip",
+            "b.7z",
+            "c.rar",
+            "x.part1.rar",
+            "x.part2.rar",
+            "y.rar",
         ] {
             std::fs::write(dir.join(name), [0u8; 8]).unwrap();
         }
@@ -395,8 +455,16 @@ mod tests {
         assert_eq!(n("a.zip"), Some(dir.join("b.7z")));
         assert_eq!(n("b.7z"), Some(dir.join("c.rar")));
         assert_eq!(n("c.rar"), Some(dir.join("x.part1.rar")));
-        assert_eq!(n("x.part1.rar"), Some(dir.join("y.rar")), "应跳过同族分卷 x.part2");
-        assert_eq!(n("x.part2.rar"), Some(dir.join("y.rar")), "从分卷族任意一卷定位结果一致");
+        assert_eq!(
+            n("x.part1.rar"),
+            Some(dir.join("y.rar")),
+            "应跳过同族分卷 x.part2"
+        );
+        assert_eq!(
+            n("x.part2.rar"),
+            Some(dir.join("y.rar")),
+            "从分卷族任意一卷定位结果一致"
+        );
         assert_eq!(n("y.rar"), Some(dir.join("a.zip")), "末包应循环回第一个");
         // 当前包不在目录中
         assert_eq!(n("zz.zip"), None);

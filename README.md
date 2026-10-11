@@ -39,7 +39,7 @@
 
 1. 解压发布包（archview.exe + libmpv-2.dll + config.json），双击 `archview.exe`。
 2. 点击左上角 **Open Archive…** 选择压缩包，或直接把压缩包文件拖入窗口。
-3. 左侧标签页切换 **视频 / 图片**，顶部搜索框可过滤文件名；点击文件即开始播放。
+3. 左侧标签页切换 **视频 / 图片**，顶部搜索框可过滤文件名；点击文件即开始播放，悬停行的完整文件名显示在列表底部状态行。
 4. 右侧播放区底部为进度条，拖动到目标位置松手即跳转。
 
 > 首次启动若 exe 同目录没有 config.json，会自动生成一份默认配置。
@@ -130,7 +130,8 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
     "font_path": "auto",
     "slideshow_secs": 1.0,
     "wheel_switch_secs": 0.3,
-    "ask_next_archive": true
+    "ask_next_archive": true,
+    "sort_files": true
   },
   "password_codepage": "gbk"
 }
@@ -145,10 +146,11 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | `cache.clean_on_switch` | 切换压缩包时是否清理上一个包的缓存（默认 false，保留以便切回时命中） |
 | `media.*_extensions` | 视频 / 图片的文件扩展名识别列表 |
 | `player.hwdec` | 硬件解码（`auto` / `no` / `d3d11va` 等 mpv 取值） |
-| `ui.font_path` | CJK 字体路径，`auto` 依次尝试系统 msyh / simhei / simsun |
+| `ui.font_path` | CJK 字体路径，`auto` 加载系统中/日/韩候选字体链（msyh / simhei / simsun + YuGoth / Meiryo / MS Gothic + Malgun，同族按序补字形，支持中日韩文件名显示）；也可指定单个字体文件的绝对路径 |
 | `ui.slideshow_secs` | 图片自动播放（PPT 式翻页）间隔秒数 |
 | `ui.wheel_switch_secs` | 视频区滚轮切换媒体的最小间隔秒数 |
 | `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
+| `ui.sort_files` | 文件列表是否按文件名排序（不区分大小写字典序，默认 true）。设为 false 保持压缩包内部顺序——漫画包通常打包时已按自然顺序排列，而字典序会把 `1/2/10` 排成 `1/10/2` |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
 
 ### 路径写法（cache.dir 等所有路径项）
@@ -270,11 +272,20 @@ trait ArchiveVFS {
 - `pause` / `mute` / `eof-reached` 是 flag(bool) 属性，必须用 `MPV_FORMAT_FLAG` 读；用 INT64 读恒失败。
 - egui 0.36 无 `allocate_ui_at_rect`，用 `allocate_rect` 顺序布局实现「视频矩形 + 底部进度条」。
 
+**9. 大压缩包性能设计。** 针对万级条目、数十 GB 的包（尤其存放于网络盘/NAS）做了多层优化：
+
+- **打开后台化**：打开压缩包（解析头 + 列目录 + 密码预校验）在后台线程执行，顶栏与视频区显示阶段进度（zip 的目录遍历为真实百分比进度条；crate 内部解析阶段为旋转动画），窗口不再冻结。
+- **列表虚拟化**：文件列表用 `ScrollArea::show_viewport` 按可视区渲染（上下各 3 行余量），行标签与计数在排序后一次性缓存，万级条目下滚动保持流畅；超长文件名截断显示，完整文件名在悬停时显示于面板底部状态行（不用悬浮气泡——气泡会被 mpv 原生子窗口遮挡），行高均匀保证虚拟化数学成立。
+- **I/O 降次**：ZIP 的 central directory 打开时只解析一次并缓存元数据（`unsafe_new_with_metadata` 复用）；列表通过顺序遍历 CD 生成（一次几 MB 顺序读），避免逐条目 `by_index_raw` 引发的上万次本地文件头随机读（NAS 上是分钟级开销）。CD 遍历与 crate 条目数不一致时自动回退逐条模式。7z 头同样在打开时缓存，`list()` 不再重复解析。
+- **7z folder 直达**：7z 的 folder（固态块）彼此独立，pack 流偏移记录在头里。解压用 `BlockDecoder` 按目标所在 folder 直接 seek 定位，只顺序解压目标 folder 内目标之前的少量数据——不再像 crate 的 `for_each_entries` 那样从 folder 0 开始解压全部前置 folder（56G solid 包里目标排第 400 位时会无谓解压几十 GB 无关数据，约 10 分钟级、CPU 持续满载）。
+- **批量预取**：solid 包定位目标本就需顺序解压一段数据，一次解压流顺带解出目标之后的若干条目（`extract.prefetch_mb` 控制预取总量，默认 512MB，0 关闭）。连续翻页直接命中缓存无需再等；批内切换目标不取消不重启任务。
+
 ### 线程模型
 
 - **UI 线程**：egui 渲染、快捷键、mpv 命令（mpv handle 线程安全，但仅 UI 线程持有）。
+- **打开线程**：每个 OpenJob 一条线程，负责解析压缩包头与生成文件清单，完成后经 mpsc channel 交 UI 线程应用；与 ExtractJob 同样带代际号（gen），快速连续切换时旧结果丢弃。
 - **mpv 内部线程**：demux/decode，经 stream_cb 回调读压缩包数据，与 UI 仅通过 REGISTRY（Arc<dyn VirtualFile>）共享。
-- **解压线程**：每个 ExtractJob 一条线程，通过 mpsc channel 报告进度/结果，UI 每帧轮询；带代际号（gen），用户快速连续切换时旧任务结果直接丢弃。
+- **解压线程**：每个 ExtractJob 一条线程，通过 mpsc channel 报告进度/结果/单文件完成（FileDone），UI 每帧轮询；任务以「目标 + 顺序后续条目」组成一批（受 `extract.prefetch_mb` 限制），批内切换目标不取消不重启，切到批外条目时旧任务经 `AtomicBool` 取消标志真正中止（solid 包定位目标需顺序跳过前置文件，旧任务不取消会与新任务并行抢 NAS 带宽），取消的结果静默丢弃。进度分两阶段上报：跳过前置文件阶段显示阶段文字与已解压字节数（媒体区居中覆盖层，含旋转动画），写出目标文件阶段显示字节进度条。
 
 ## 已知限制与规划
 

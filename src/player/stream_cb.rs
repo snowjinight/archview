@@ -30,9 +30,14 @@ fn archive_stable_id(path: &std::path::Path) -> u64 {
 /// 注册压缩包，返回 (archive_id, entries)。entries 由 VFS 列出并缓存于注册表。
 /// id = 路径哈希（稳定，缓存按路径命中）；同路径重开复用原 id 覆盖旧注册项；
 /// 极小概率哈希碰撞（不同路径同 id）时线性探测换 id，避免两包共抢注册项/缓存前缀。
-pub fn register(vfs: Arc<dyn ArchiveVFS>, path: &std::path::Path) -> (u64, Vec<VirtualEntry>) {
+/// list 期间的进度经 progress 回调上报（后台打开线程转发给 UI；不关心进度传空回调）
+pub fn register_with_progress(
+    vfs: Arc<dyn ArchiveVFS>,
+    path: &std::path::Path,
+    progress: &dyn Fn(Option<f32>, &str),
+) -> (u64, Vec<VirtualEntry>) {
     let base = archive_stable_id(path);
-    let entries = vfs.list();
+    let entries = vfs.list_with_progress(progress);
     let mut g = REGISTRY.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     let mut id = base;
@@ -143,6 +148,8 @@ unsafe extern "C" fn size_cb(cookie: *mut c_void) -> i64 {
 
 unsafe extern "C" fn close_cb(cookie: *mut c_void) {
     if !cookie.is_null() {
-        drop(Box::from_raw(cookie as *mut Box<dyn crate::vfs::VirtualFile>));
+        drop(Box::from_raw(
+            cookie as *mut Box<dyn crate::vfs::VirtualFile>,
+        ));
     }
 }

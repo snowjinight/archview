@@ -17,9 +17,13 @@ pub const MPV_FORMAT_DOUBLE: c_int = 5;
 pub type MpvHandle = c_void;
 
 // 回调类型签名（stream_cb.h）
-pub type StreamCbOpenRoFn =
-    unsafe extern "C" fn(user_data: *mut c_void, uri: *mut c_char, info: *mut StreamCbInfo) -> c_int;
-pub type StreamCbReadFn = unsafe extern "C" fn(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64;
+pub type StreamCbOpenRoFn = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    uri: *mut c_char,
+    info: *mut StreamCbInfo,
+) -> c_int;
+pub type StreamCbReadFn =
+    unsafe extern "C" fn(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64;
 pub type StreamCbSeekFn = unsafe extern "C" fn(cookie: *mut c_void, offset: i64) -> i64;
 pub type StreamCbSizeFn = unsafe extern "C" fn(cookie: *mut c_void) -> i64;
 pub type StreamCbCloseFn = unsafe extern "C" fn(cookie: *mut c_void);
@@ -39,14 +43,33 @@ struct MpvApi {
     create: unsafe extern "C" fn() -> *mut MpvHandle,
     initialize: unsafe extern "C" fn(ctx: *mut MpvHandle) -> c_int,
     terminate_destroy: unsafe extern "C" fn(ctx: *mut MpvHandle),
-    set_option_string: unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char, data: *const c_char) -> c_int,
+    set_option_string: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int,
     command_string: unsafe extern "C" fn(ctx: *mut MpvHandle, args: *const c_char) -> c_int,
-    set_property_string: unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char, data: *const c_char) -> c_int,
-    get_property: unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char, format: c_int, out: *mut c_void) -> c_int,
-    get_property_string: unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char) -> *mut c_char,
+    set_property_string: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int,
+    get_property: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        name: *const c_char,
+        format: c_int,
+        out: *mut c_void,
+    ) -> c_int,
+    get_property_string:
+        unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char) -> *mut c_char,
     free: unsafe extern "C" fn(data: *mut c_void),
     error_string: unsafe extern "C" fn(err: c_int) -> *const c_char,
-    stream_cb_add_ro: unsafe extern "C" fn(ctx: *mut MpvHandle, protocol: *const c_char, user_data: *mut c_void, open_fn: StreamCbOpenRoFn) -> c_int,
+    stream_cb_add_ro: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        protocol: *const c_char,
+        user_data: *mut c_void,
+        open_fn: StreamCbOpenRoFn,
+    ) -> c_int,
 }
 
 static API: OnceLock<MpvApi> = OnceLock::new();
@@ -96,7 +119,9 @@ fn api() -> Result<&'static MpvApi, String> {
 pub fn err_str(err: c_int) -> String {
     match api() {
         Ok(a) => unsafe {
-            CStr::from_ptr((a.error_string)(err)).to_string_lossy().into_owned()
+            CStr::from_ptr((a.error_string)(err))
+                .to_string_lossy()
+                .into_owned()
         },
         Err(_) => format!("mpv 错误 {err}"),
     }
@@ -132,14 +157,22 @@ pub fn set_option_string(ctx: *mut MpvHandle, name: &str, data: &str) -> Result<
     let name = CString::new(name).map_err(|e| e.to_string())?;
     let data = CString::new(data).map_err(|e| e.to_string())?;
     let r = unsafe { (a.set_option_string)(ctx, name.as_ptr(), data.as_ptr()) };
-    if r < 0 { Err(err_str(r)) } else { Ok(()) }
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn command_string(ctx: *mut MpvHandle, args: &str) -> Result<(), String> {
     let a = api()?;
     let args = CString::new(args).map_err(|e| e.to_string())?;
     let r = unsafe { (a.command_string)(ctx, args.as_ptr()) };
-    if r < 0 { Err(err_str(r)) } else { Ok(()) }
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn set_property_string(ctx: *mut MpvHandle, name: &str, data: &str) -> Result<(), String> {
@@ -147,7 +180,11 @@ pub fn set_property_string(ctx: *mut MpvHandle, name: &str, data: &str) -> Resul
     let name = CString::new(name).map_err(|e| e.to_string())?;
     let data = CString::new(data).map_err(|e| e.to_string())?;
     let r = unsafe { (a.set_property_string)(ctx, name.as_ptr(), data.as_ptr()) };
-    if r < 0 { Err(err_str(r)) } else { Ok(()) }
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
 }
 
 /// 读 f64 属性（time-pos / duration 等），属性不存在返回 None
@@ -155,7 +192,14 @@ pub fn get_property_f64(ctx: *mut MpvHandle, name: &str) -> Result<Option<f64>, 
     let a = api()?;
     let name = CString::new(name).map_err(|e| e.to_string())?;
     let mut out: f64 = 0.0;
-    let r = unsafe { (a.get_property)(ctx, name.as_ptr(), MPV_FORMAT_DOUBLE, &mut out as *mut f64 as *mut c_void) };
+    let r = unsafe {
+        (a.get_property)(
+            ctx,
+            name.as_ptr(),
+            MPV_FORMAT_DOUBLE,
+            &mut out as *mut f64 as *mut c_void,
+        )
+    };
     if r == MPV_ERROR_SUCCESS {
         Ok(Some(out))
     } else {
@@ -168,8 +212,19 @@ pub fn get_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<Option<bool>
     let a = api()?;
     let name = CString::new(name).map_err(|e| e.to_string())?;
     let mut out: c_int = 0;
-    let r = unsafe { (a.get_property)(ctx, name.as_ptr(), MPV_FORMAT_FLAG, &mut out as *mut c_int as *mut c_void) };
-    if r == MPV_ERROR_SUCCESS { Ok(Some(out != 0)) } else { Ok(None) }
+    let r = unsafe {
+        (a.get_property)(
+            ctx,
+            name.as_ptr(),
+            MPV_FORMAT_FLAG,
+            &mut out as *mut c_int as *mut c_void,
+        )
+    };
+    if r == MPV_ERROR_SUCCESS {
+        Ok(Some(out != 0))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn get_property_string(ctx: *mut MpvHandle, name: &str) -> Option<String> {
@@ -196,5 +251,9 @@ pub fn stream_cb_add_ro(
     let a = api()?;
     let protocol = CString::new(protocol).map_err(|e| e.to_string())?;
     let r = unsafe { (a.stream_cb_add_ro)(ctx, protocol.as_ptr(), user_data, open_fn) };
-    if r < 0 { Err(err_str(r)) } else { Ok(()) }
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
 }

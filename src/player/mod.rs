@@ -91,7 +91,8 @@ impl PlayerService {
 
     /// 相对 seek（秒，可为负），mpv 默认关键帧级（快）
     pub fn seek_relative(&self, sec: f64) {
-        if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("no-osd seek {sec:+} relative")) {
+        if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("no-osd seek {sec:+} relative"))
+        {
             tracing::error!("seek 相对跳转失败: {e}");
         }
     }
@@ -120,11 +121,15 @@ impl PlayerService {
     }
 
     pub fn time_pos(&self) -> Option<f64> {
-        mpv_ffi::get_property_f64(self.ctx, "time-pos").ok().flatten()
+        mpv_ffi::get_property_f64(self.ctx, "time-pos")
+            .ok()
+            .flatten()
     }
 
     pub fn duration(&self) -> Option<f64> {
-        mpv_ffi::get_property_f64(self.ctx, "duration").ok().flatten()
+        mpv_ffi::get_property_f64(self.ctx, "duration")
+            .ok()
+            .flatten()
     }
 
     pub fn paused(&self) -> bool {
@@ -172,8 +177,8 @@ mod tests {
     //! 前置：libmpv-2.dll（build.rs 已复制到 target）+ ffmpeg 生成测试视频，缺任一则跳过。
 
     use super::*;
-    use crate::vfs::ArchiveVFS;
     use crate::vfs::zip_vfs::ZipVFS;
+    use crate::vfs::ArchiveVFS;
     use std::path::PathBuf;
 
     /// 查找 libmpv-2.dll 所在目录：test exe 在 target\{debug,release}\deps\ 下，
@@ -193,8 +198,7 @@ mod tests {
                 cands.push(PathBuf::from(&m).join("target").join(prof));
             }
         }
-        cands.into_iter()
-            .find(|d| d.join("libmpv-2.dll").exists())
+        cands.into_iter().find(|d| d.join("libmpv-2.dll").exists())
     }
 
     /// ffmpeg 是否可用
@@ -237,8 +241,8 @@ mod tests {
         let zip_path = dir.join("test.zip");
         let f = std::fs::File::create(&zip_path).ok()?;
         let mut w = zip::ZipWriter::new(f);
-        let opts: zip::write::SimpleFileOptions =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         w.start_file("clip.mp4", opts).ok()?;
         std::io::Write::write_all(&mut w, &data).ok()?;
         // 第二个 entry：用于"播完后切换视频"场景
@@ -249,7 +253,12 @@ mod tests {
     }
 
     /// 轮询直到属性满足条件，超时返回 None
-    fn wait_prop(ctx: *mut mpv_ffi::MpvHandle, name: &str, pred: impl Fn(f64) -> bool, secs: u64) -> Option<f64> {
+    fn wait_prop(
+        ctx: *mut mpv_ffi::MpvHandle,
+        name: &str,
+        pred: impl Fn(f64) -> bool,
+        secs: u64,
+    ) -> Option<f64> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
         loop {
             if let Ok(Some(v)) = mpv_ffi::get_property_f64(ctx, name) {
@@ -285,7 +294,7 @@ mod tests {
         // 注册 VFS
         let vfs = ZipVFS::open(&zip_path, None).unwrap();
         let arc: std::sync::Arc<dyn crate::vfs::ArchiveVFS> = std::sync::Arc::new(vfs);
-        let (archive_id, entries) = stream_cb::register(arc, &zip_path);
+        let (archive_id, entries) = stream_cb::register_with_progress(arc, &zip_path, &|_, _| {});
         let entry_idx = entries
             .iter()
             .position(|e| e.name == "clip.mp4")
@@ -305,12 +314,14 @@ mod tests {
 
         // 播放
         let uri = stream_cb::entry_uri(archive_id, entry_idx);
-        mpv_ffi::command_string(ctx, &format!("loadfile {uri}"))
-            .expect("loadfile 失败");
+        mpv_ffi::command_string(ctx, &format!("loadfile {uri}")).expect("loadfile 失败");
 
         // 1) 起播：time-pos > 0.5s（vo=null 全速解码，瞬间到达）
         let started = wait_prop(ctx, "time-pos", |t| t > 0.5, 30);
-        assert!(started.is_some(), "30 秒内未起播（stream_cb 链路可能崩溃/挂起）");
+        assert!(
+            started.is_some(),
+            "30 秒内未起播（stream_cb 链路可能崩溃/挂起）"
+        );
 
         // 1.1) pause 属性必须用 flag 格式读：toggle_pause/paused 依赖它。
         // 此前用 INT64 读恒失败 → toggle_pause 永远认为"未暂停" → 空格/暂停按钮无法恢复播放
@@ -370,7 +381,9 @@ mod tests {
         mpv_ffi::set_property_string(ctx, "pause", "no").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let eof = mpv_ffi::get_property_flag(ctx, "eof-reached").ok().flatten();
+            let eof = mpv_ffi::get_property_flag(ctx, "eof-reached")
+                .ok()
+                .flatten();
             if eof == Some(true) {
                 break;
             }
@@ -391,15 +404,12 @@ mod tests {
             .position(|e| e.name == "clip2.mp4")
             .expect("zip 内应有 clip2.mp4");
         let uri2 = stream_cb::entry_uri(archive_id, entry_idx2);
-        mpv_ffi::command_string(ctx, &format!("loadfile {uri2} replace"))
-            .expect("loadfile 失败");
+        mpv_ffi::command_string(ctx, &format!("loadfile {uri2} replace")).expect("loadfile 失败");
         // 修复验证：loadfile 后显式取消暂停（PlayerService::load 的行为）
         mpv_ffi::set_property_string(ctx, "pause", "no").unwrap();
         let started2 = wait_prop(ctx, "time-pos", |t| t > 0.5, 15);
         let pause_after_load = mpv_ffi::get_property_flag(ctx, "pause").ok().flatten();
-        eprintln!(
-            "切换后 time-pos = {started2:?}, pause = {pause_after_load:?}"
-        );
+        eprintln!("切换后 time-pos = {started2:?}, pause = {pause_after_load:?}");
         assert!(
             started2.is_some(),
             "播完 EOF 后切换第二个视频未起播（pause={pause_after_load:?}：keep-open EOF 暂停跨 loadfile 粘滞，需显式 pause=no）"
@@ -460,8 +470,17 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "movies/clip.mp4");
         let extracted = dir.join("extracted.mp4");
-        vfs.extract_entry(&entries[0], &extracted, &|_| {}).unwrap();
-        assert_eq!(std::fs::metadata(&extracted).unwrap().len(), entries[0].size);
+        vfs.extract_entry(
+            &entries[0],
+            &extracted,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&extracted).unwrap().len(),
+            entries[0].size
+        );
 
         // headless mpv 播放解压后的本地文件
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");

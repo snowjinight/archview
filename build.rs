@@ -18,7 +18,10 @@ fn main() {
     if src.exists() {
         let dst = target_dir.join("libmpv-2.dll");
         match std::fs::copy(&src, &dst) {
-            Ok(n) => println!("cargo:warning=已复制 libmpv-2.dll ({n} 字节) 到 {}", dst.display()),
+            Ok(n) => println!(
+                "cargo:warning=已复制 libmpv-2.dll ({n} 字节) 到 {}",
+                dst.display()
+            ),
             Err(e) => println!("cargo:warning=复制 libmpv-2.dll 失败: {e}"),
         }
     } else {

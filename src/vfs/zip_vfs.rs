@@ -4,15 +4,24 @@
 //! deflate 等压缩条目的 seek 由本模块实现：前向 seek = 继续解压丢弃输出；
 //! 后向 seek = 重开 entry 从头解压丢弃到目标偏移（O(target)，架构文档"解码块 LRU"的未加缓存版本）。
 
-use super::{AccessMode, ArchiveVFS, VirtualEntry, VirtualFile, VfsError};
+use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct ZipVFS {
     path: PathBuf,
     /// 解密密码候选（UTF-8/GBK 等，见 vfs::password_candidates）；空 = 未提供密码
     password: Vec<Vec<u8>>,
+    /// 打开时解析一次的 central directory 元数据。open_entry/list 用
+    /// `unsafe_new_with_metadata` 免重复解析——27GB 大包在网络盘上
+    /// 重复解析 CD（seek 到文件尾 + 读几 MB）代价显著
+    metadata: Arc<zip::read::ZipArchiveMetadata>,
+    /// CD 起始的绝对偏移（crate 已处理 ZIP64 定位与前置数据偏移）
+    cd_start: u64,
+    /// crate 解码的条目名快照（CD 顺序，与 by_index 下标一致）
+    names: Vec<String>,
 }
 
 /// zip crate 错误 → VfsError（密码缺失/错误统一映射为 Password，UI 据此弹密码框）
@@ -25,21 +34,51 @@ fn map_zip_err(e: zip::result::ZipError) -> VfsError {
     }
 }
 
+/// 从 extra field 解析 ZIP64(0x0001) 的未压缩尺寸。
+/// ZIP64 extra 的字段按 [未压缩尺寸, 压缩尺寸, 本地头偏移, 起始盘号] 顺序出现，
+/// 且仅在对应固定字段为 0xFFFFFFFF 时存在（APPNOTE 4.5.3）——
+/// 本函数只在该条件下被调用，故首 8 字节即未压缩尺寸。
+fn zip64_uncompressed_size(extra: &[u8]) -> Option<u64> {
+    let mut i = 0usize;
+    while i + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[i], extra[i + 1]]);
+        let sz = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
+        if id == 0x0001 {
+            let b = extra.get(i + 4..i + 12)?;
+            return Some(u64::from_le_bytes(b.try_into().unwrap()));
+        }
+        i += 4 + sz;
+    }
+    None
+}
+
 impl ZipVFS {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, VfsError> {
         let file = File::open(path).map_err(VfsError::Io)?;
-        zip::read::ZipArchive::new(file)
+        let archive = zip::read::ZipArchive::new(file)
             .map_err(|e| VfsError::Archive(format!("打开 zip 失败: {e}")))?;
+        // CD 只解析这一次：元数据/CD 偏移/条目名缓存到 self，
+        // 之后 open_entry 与 list 均不再重复解析（旧实现每次操作都重开重解析）
+        let metadata = archive.metadata();
+        let cd_start = archive.central_directory_start();
+        let names = archive.file_names().map(str::to_string).collect();
         Ok(Self {
             path: path.to_path_buf(),
             password: password.map(super::password_candidates).unwrap_or_default(),
+            metadata,
+            cd_start,
+            names,
         })
     }
 
-    fn reopen(&self) -> Result<zip::read::ZipArchive<File>, VfsError> {
+    /// 从缓存的 CD 元数据重建 reader（不再重复解析 central directory）。
+    ///
+    /// # Safety
+    /// metadata 解析自同一路径的同一文件（open 时）；仅当文件此后被外部改写
+    /// 才会错位——压缩包在本程序的使用场景下视为不可变对象。
+    fn archive(&self) -> Result<zip::read::ZipArchive<File>, VfsError> {
         let file = File::open(&self.path).map_err(VfsError::Io)?;
-        zip::read::ZipArchive::new(file)
-            .map_err(|e| VfsError::Archive(format!("重开 zip 失败: {e}")))
+        Ok(unsafe { zip::read::ZipArchive::unsafe_new_with_metadata(file, self.metadata.clone()) })
     }
 
     /// 带（可选）密码候选按序号打开 entry（借用 archive，调用侧 transmute 延长生命周期）。
@@ -75,17 +114,78 @@ impl ZipVFS {
         };
         // 第二遍：命中的候选正式打开
         let opts = zip::read::ZipReadOptions::new().password(Some(pw));
-        archive.by_index_with_options(index, opts).map_err(map_zip_err)
+        archive
+            .by_index_with_options(index, opts)
+            .map_err(map_zip_err)
     }
-}
 
-impl ArchiveVFS for ZipVFS {
-    fn list(&self) -> Vec<VirtualEntry> {
-        let Ok(mut zip) = self.reopen() else {
+    /// 顺序解析 central directory：每条目只取 46 字节固定头里的
+    /// flags(bit0=加密) 与未压缩尺寸（ZIP64 时查 extra field），
+    /// 名字以 crate 解码的 `names` 按下标对齐（避免复制其编码逻辑）。
+    /// 返回 None = 与 crate 条目数不一致/解析错位，调用方走 fallback。
+    /// progress 按已遍历条目/总数上报（0.0~1.0）。
+    fn list_from_central_directory(&self, progress: &dyn Fn(f32)) -> Option<Vec<VirtualEntry>> {
+        let mut f = File::open(&self.path).ok()?;
+        f.seek(SeekFrom::Start(self.cd_start)).ok()?;
+        let total = self.names.len().max(1);
+        let mut out = Vec::with_capacity(self.names.len());
+        for (i, name) in self.names.iter().enumerate() {
+            if i % 256 == 0 {
+                progress(i as f32 / total as f32);
+            }
+            let mut hdr = [0u8; 46]; // central directory 头固定部分
+            f.read_exact(&mut hdr).ok()?;
+            if &hdr[..4] != b"PK\x01\x02" {
+                return None; // 错位/损坏：交给 fallback
+            }
+            let flags = u16::from_le_bytes([hdr[8], hdr[9]]);
+            // APPNOTE 4.3.7：20-23 压缩尺寸、24-27 未压缩尺寸、
+            // 28-29 名长、30-31 extra 长、32-33 注释长
+            let fixed_size = u32::from_le_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]) as u64;
+            let name_len = u16::from_le_bytes([hdr[28], hdr[29]]) as i64;
+            let extra_len = u16::from_le_bytes([hdr[30], hdr[31]]) as usize;
+            let cmt_len = u16::from_le_bytes([hdr[32], hdr[33]]) as i64;
+            // 跳过条目名（名字用 crate 的解码结果，见上）
+            f.seek(SeekFrom::Current(name_len)).ok()?;
+            let mut extra = vec![0u8; extra_len];
+            f.read_exact(&mut extra).ok()?;
+            let size = if fixed_size == 0xFFFF_FFFF {
+                zip64_uncompressed_size(&extra)?
+            } else {
+                fixed_size
+            };
+            f.seek(SeekFrom::Current(cmt_len)).ok()?;
+            out.push(VirtualEntry {
+                name: name.clone(),
+                size,
+                is_dir: name.ends_with('/'),
+                encrypted: flags & 0b1 != 0,
+            });
+        }
+        // 数量一致性：crate 的索引表会折叠重名条目而 CD 不会——
+        // 消费完 names.len() 条后若还有 CD 头剩下，说明两者错位，走 fallback
+        let mut peek = [0u8; 4];
+        match f.read(&mut peek) {
+            Ok(4) if &peek == b"PK\x01\x02" => None,
+            _ => {
+                progress(1.0);
+                Some(out)
+            }
+        }
+    }
+
+    /// 兜底：逐条 by_index_raw（每条目一次本地文件头读；仅 CD 遍历失配的边缘包走这里）。
+    /// progress 同样按条目数上报。
+    fn list_by_index_raw(&self, progress: &dyn Fn(f32)) -> Vec<VirtualEntry> {
+        let Ok(mut zip) = self.archive() else {
             return vec![];
         };
-        (0..zip.len())
+        let total = zip.len().max(1);
+        let out: Vec<VirtualEntry> = (0..zip.len())
             .filter_map(|i| {
+                if i % 256 == 0 {
+                    progress(i as f32 / total as f32);
+                }
                 // by_index_raw 不解密不解压：加密条目也能拿到元数据（文件名明文）
                 zip.by_index_raw(i).ok().map(|e| VirtualEntry {
                     name: e.name().to_string(),
@@ -94,11 +194,34 @@ impl ArchiveVFS for ZipVFS {
                     encrypted: e.encrypted(),
                 })
             })
-            .collect()
+            .collect();
+        progress(1.0);
+        out
+    }
+}
+
+impl ArchiveVFS for ZipVFS {
+    fn list(&self) -> Vec<VirtualEntry> {
+        self.list_with_progress(&|_, _| {})
+    }
+
+    /// CD 遍历/fallback 的真实条目百分比进度（打开期间的 UI 进度条数据源）
+    fn list_with_progress(&self, progress: &dyn Fn(Option<f32>, &str)) -> Vec<VirtualEntry> {
+        const STAGE: &str = "正在构建文件列表";
+        let cb = |f: f32| progress(Some(f), STAGE);
+        // 快路径：顺序遍历 central directory（一次几 MB 的顺序读）。
+        // 不能走 by_index_raw：它会为每个条目 seek 到本地文件头读一次，
+        // 万级条目在网络盘/HDD 上即上万次随机读——27GB 包实测可拖到分钟级
+        match self.list_from_central_directory(&cb) {
+            Some(entries) => entries,
+            // CD 遍历与 crate 条目数不一致（重名条目被 crate 折叠等边缘情况）：
+            // 退回逐条 by_index_raw，保证与 open_entry 的下标语义一致
+            None => self.list_by_index_raw(&cb),
+        }
     }
 
     fn open_entry(&self, entry: &VirtualEntry) -> Result<Box<dyn VirtualFile>, VfsError> {
-        let mut archive = Box::new(self.reopen()?);
+        let mut archive = Box::new(self.archive()?);
         let index = archive
             .index_for_name(&entry.name)
             .ok_or_else(|| VfsError::Archive(format!("entry 不存在: {}", entry.name)))?;
@@ -124,7 +247,8 @@ impl ArchiveVFS for ZipVFS {
         &self,
         entry: &VirtualEntry,
         dest: &std::path::Path,
-        progress: &dyn Fn(u64),
+        _cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
     ) -> Result<(), VfsError> {
         let mut src = self.open_entry(entry)?;
         // 写临时文件 + 改名（与 7z/RAR 一致）：并发解压同一 dest 时不互相覆盖写坏缓存
@@ -136,17 +260,22 @@ impl ArchiveVFS for ZipVFS {
                 entry.name
             ))
         })?;
-        super::sevenz_vfs::copy_with_progress(&mut src, &mut out, entry.size, progress).map_err(
-            |e| {
-                std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件
-                VfsError::Archive(format!(
-                    "zip 解压失败: 压缩包 [{}] 条目 [{}] → [{}]: {e}",
-                    self.path.display(),
-                    entry.name,
-                    dest.display()
-                ))
-            },
-        )?;
+        // zip 非固态：无跳过阶段，进度直接映射（阶段恒为空 = 写目标文件）
+        super::sevenz_vfs::copy_with_progress(&mut src, &mut out, entry.size, &|done| {
+            progress(done, "")
+        })
+        .map_err(|e| {
+            std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件
+            let e = match e {
+                super::sevenz_vfs::CopyErr::Read(e) | super::sevenz_vfs::CopyErr::Write(e) => e,
+            };
+            VfsError::Archive(format!(
+                "zip 解压失败: 压缩包 [{}] 条目 [{}] → [{}]: {e}",
+                self.path.display(),
+                entry.name,
+                dest.display()
+            ))
+        })?;
         use std::io::Write;
         out.flush().map_err(VfsError::Io)?;
         std::fs::rename(&tmp, dest).map_err(|e| {
@@ -251,10 +380,15 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// 建一个含 stored 与 deflate 条目的测试 zip（临时目录，路径不硬编码）
+    /// 建一个含 stored 与 deflate 条目的测试 zip（临时目录，路径不硬编码）。
+    /// 路径带原子序号：多个测试并行调用时互不截断/删除对方的包
+    /// （曾用固定 {pid} 路径，并行测试偶发读到被另一测试截断的半截包）
     fn make_test_zip() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("zipvfs_test_{}.zip", std::process::id()));
+        let path = dir.join(format!("zipvfs_test_{}_{n}.zip", std::process::id()));
         let file = File::create(&path).unwrap();
         let mut w = zip::write::ZipWriter::new(file);
         let stored = zip::write::SimpleFileOptions::default()
@@ -262,7 +396,8 @@ mod tests {
         let deflated = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         w.start_file("dir/a.txt", deflated).unwrap();
-        w.write_all(b"hello zip vfs, this is a deflate payload!").unwrap();
+        w.write_all(b"hello zip vfs, this is a deflate payload!")
+            .unwrap();
         w.start_file("dir/sub/b.mp4", stored).unwrap();
         w.write_all(&vec![7u8; 4096]).unwrap();
         w.finish().unwrap();
@@ -275,11 +410,9 @@ mod tests {
         let vfs = ZipVFS::open(&path, None).unwrap();
         let entries = vfs.list();
         assert_eq!(entries.len(), 2);
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.name == "dir/sub/b.mp4" && e.size == 4096)
-        );
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "dir/sub/b.mp4" && e.size == 4096));
         assert!(entries.iter().all(|e| !e.encrypted));
 
         // deflate 条目：读 + seek 往返（前向/后向）
@@ -321,7 +454,8 @@ mod tests {
             .compression_method(zip::CompressionMethod::Deflated)
             .with_aes_encryption(zip::AesMode::Aes256, "pw123");
         w.start_file("secret/v.txt", opts).unwrap();
-        w.write_all(b"encrypted payload for seek test, 0123456789").unwrap();
+        w.write_all(b"encrypted payload for seek test, 0123456789")
+            .unwrap();
         w.finish().unwrap();
 
         // 1) 无密码打开：列表可见且 encrypted=true
@@ -379,7 +513,77 @@ mod tests {
         assert_eq!(&b, b"ascii");
         // 错密码（编码正确但内容错误）：两个候选都失败 → Password
         let vfs_bad = ZipVFS::open(&path, Some("错误密码测试")).unwrap();
-        assert!(matches!(vfs_bad.open_entry(&entries[0]), Err(VfsError::Password)));
+        assert!(matches!(
+            vfs_bad.open_entry(&entries[0]),
+            Err(VfsError::Password)
+        ));
         std::fs::remove_file(&path).ok();
+    }
+
+    /// CD 顺序遍历（list 快路径）与逐条 by_index_raw（fallback）结果一致：
+    /// 名字/尺寸/目录标记/加密标记逐字段对齐，保证快路径没有静默漂移
+    #[test]
+    fn cd_walk_matches_by_index_raw() {
+        let path = make_test_zip();
+        let vfs = ZipVFS::open(&path, None).unwrap();
+        // 快路径确实可用（没悄悄落回 fallback）
+        let fast = vfs
+            .list_from_central_directory(&|_| {})
+            .expect("CD 遍历应成功");
+        let slow = vfs.list_by_index_raw(&|_| {});
+        assert_eq!(fast.len(), slow.len());
+        for (f, s) in fast.iter().zip(slow.iter()) {
+            assert_eq!(f.name, s.name);
+            assert_eq!(f.size, s.size);
+            assert_eq!(f.is_dir, s.is_dir);
+            assert_eq!(f.encrypted, s.encrypted);
+        }
+        // list() 走的就是快路径结果（长度一致；字段已在上面与 fallback 对齐校验）
+        assert_eq!(vfs.list().len(), fast.len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// list_with_progress：进度单调递增、以 1.0 收尾，结果与 list() 一致
+    #[test]
+    fn list_with_progress_reports() {
+        let path = make_test_zip();
+        let vfs = ZipVFS::open(&path, None).unwrap();
+        // &dyn Fn 回调不能捕获可变状态，用 Cell 记录
+        let (last, saw_done) = (std::cell::Cell::new(0.0f32), std::cell::Cell::new(false));
+        let entries = vfs.list_with_progress(&|f, stage| {
+            let f = f.expect("ZipVFS 的 list_with_progress 应上报真实百分比");
+            assert_eq!(stage, "正在构建文件列表");
+            assert!(f >= last.get(), "进度应单调递增");
+            last.set(f);
+            if f >= 1.0 {
+                saw_done.set(true);
+            }
+        });
+        assert!(saw_done.get(), "应以 1.0 收尾");
+        assert_eq!(entries.len(), vfs.list().len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// ZIP64 extra(0x0001) 未压缩尺寸解析：字段顺序 [usize, csize, offset, disk]
+    #[test]
+    fn zip64_extra_size_parse() {
+        let mk = |id: u16, data: &[u8]| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&id.to_le_bytes());
+            v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            v.extend_from_slice(data);
+            v
+        };
+        // 前面放一个无关 extra（如 NTFS 时间戳 0x000a），后面 ZIP64
+        let mut extra = mk(0x000a, &[0u8; 32]);
+        let mut z64 = 0xDEAD_BEEFu64.to_le_bytes().to_vec();
+        z64.extend_from_slice(&0xABCD_EF01u64.to_le_bytes()); // csize（顺序跳过）
+        z64.extend_from_slice(&0x1234_5678u64.to_le_bytes()); // 本地头偏移（顺序跳过）
+        extra.extend_from_slice(&mk(0x0001, &z64));
+        assert_eq!(zip64_uncompressed_size(&extra), Some(0xDEAD_BEEF));
+        // 无 ZIP64 extra
+        assert_eq!(zip64_uncompressed_size(&mk(0x000a, &[1, 2, 3])), None);
+        // ZIP64 数据不足 8 字节（损坏包）
+        assert_eq!(zip64_uncompressed_size(&mk(0x0001, &[1, 2, 3])), None);
     }
 }
