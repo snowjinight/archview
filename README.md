@@ -218,7 +218,7 @@ report_dir = "auto"
 | `ui.slideshow_secs` | 图片自动播放（PPT 式翻页）间隔秒数 |
 | `ui.wheel_switch_secs` | 视频区滚轮切换媒体的最小间隔秒数 |
 | `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
-| `ui.sort_files` | 文件列表是否按文件名排序（不区分大小写字典序，默认 true）。设为 false 保持压缩包内部顺序——漫画包通常打包时已按自然顺序排列，而字典序会把 `1/2/10` 排成 `1/10/2` |
+| `ui.sort_files` | 文件列表是否按自然序排序（数字段按数值比较、不区分大小写，默认 false）。false = 保持压缩包内部顺序——7z/RAR 固态包下内部顺序即物理码流顺序，预取直接命中相邻文件（性能最优）；注意 7-Zip 工具打的包内部本来就是字典序，关排序对这类包显示无变化。true = 自然序（`1/2/10`，而非字典序 `1/10/2`），看漫画/图集时开启 |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
 | `passwords` | 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）：打开阶段自动探测（无密码优先 → 列表依次），全不匹配播放器才弹密码框、CLI 才记失败 |
 | `vartidy.repo_dir` | VarTidy（`archview.exe tidy` CLI 子命令）的 var 仓库目录；详见 ARCHITECTURE.md 第 12 章 |

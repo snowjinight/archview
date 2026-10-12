@@ -208,7 +208,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume
-[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files / extract_overlay_delay_ms
+[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms
 [extract] # prefetch_mb（solid 包批量预取上限）
 [vartidy] # repo_dir / report_dir（CLI 整理子命令）
 ```
@@ -257,6 +257,7 @@ archive/rar : unrar (UnRAR.dll)
 image       : 无独立解码库（mpv 统一渲染）
 config      : serde + toml (config.toml)
 logging     : tracing
+sort        : alphanumeric-sort (file list natural order, optional mode for comic/image collections)
 ```
 
 ---
@@ -324,7 +325,7 @@ logging     : tracing
 | **usize 下溢** | 手动向后翻列表再切歌 → 列表直接跳到底部。目标行在渲染范围之前时 `pos - range.start` 下溢，debug 下 panic，**release 下 wrap 成 2^64 级天文数字** → 滚动目标被钳到 max_offset | 一切虚拟化下标换算用 `isize` |
 | **行高不均匀** | 长文件名自动换行把行撑成 2 行高，首行实测高度被钉在 2 行值上 → 渲染范围按虚高缩水 → 底部空隙 + 翻页时行高双稳态翻转 | 所有列表行 `.truncate()` 强制单行；全名放视频区上方状态行 |
 | **scroll_to_rect 坐标系** | 高亮追踪滚动跳到错误位置。`scroll_to_rect` 接收**屏幕坐标**，而虚拟化闭包内 `max_rect().top()` = 内容顶 + min_row×step，需按此换算目标行 y | 换算公式 `(pos - range.start) × step + 闭包 max_rect().top()` |
-| **每帧重算** | 万级条目每帧过滤/排序/clone，UI 帧率跌到个位数 | 行缓存一次性构建；排序用 `sort_by_cached_key`（预生成小写键，避免比较器内每次 2 次 to_lowercase 分配） |
+| **每帧重算** | 万级条目每帧过滤/排序/clone，UI 帧率跌到个位数 | 行缓存一次性构建；排序预生成小写键再按自然序比较（避免比较器内每次 2 次 to_lowercase 分配）；实测 7-Zip 打包时无视添加顺序强制按字典序写入，故 `ui.sort_files` 默认 false（包内顺序 = 固态包物理码流顺序，预取最优），true = 自然序（数字段按数值 1/2/10）供漫画/图集场景 |
 
 **多帧测试方法论**：虚拟化 bug 大多是跨帧时序问题（滚轮惯性、动画收敛、行高反馈延迟），
 单帧单 pass 的 egui 测试 (`__run_test_ui`) 复现不了。用 `ctx.run_ui(RawInput)` 手动喂

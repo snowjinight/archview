@@ -517,7 +517,8 @@ impl App {
     }
 
     /// 重新计算过滤视图：搜索框子串匹配 + 只显示媒体文件（视频/图片按 config 分类），
-    /// 按文件名不区分大小写排序（保证序号/上一个下一个顺序稳定，与归档内部顺序无关）。
+    /// 按文件名自然序排序（数字段按数值比较：1/2/10，而非字典序的 1/10/2；
+    /// 保证序号/上一个下一个顺序稳定，与归档内部顺序无关）。
     /// 同时重建列表行缓存（虚拟化渲染的显示数据）：只在打开/搜索/切标签时执行，
     /// 不再每帧重算——万级条目时每帧 clone/format 是 UI 卡顿的主因
     fn rebuild_view(&mut self) {
@@ -538,14 +539,23 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        // 排序（config: ui.sort_files，默认开）：不区分大小写字典序，
-        // 保证序号/上一个下一个顺序稳定。关闭时保持压缩包内部顺序——
-        // 漫画包通常打包时已按自然顺序排列，字典序反而把 1/2/10 排成 1/10/2
+        // 排序（config: ui.sort_files，默认关）：自然序（alphanumeric-sort），
+        // 数字段按数值比较（1/2/10），非数字段不区分大小写——看漫画/图集时开启。
+        // 默认关闭 = 保持压缩包内部顺序：7z/RAR 固态包下内部顺序 == 物理码流顺序，
+        // 预取批恰好是物理相邻的后续文件，翻页直接命中缓存（性能最优）。
+        // 注意 7-Zip 工具打的包内部本来就是字典序（实验验证：无视添加顺序强制重排），
+        // 关闭排序对这类包的显示无变化，属正常现象。
         if self.cfg.ui.sort_files {
-            // cached_key 预生成小写键（每条一次分配），
-            // 旧比较器每次比较做 2 次 to_lowercase（万级条目 ≈ 34 万次分配）
-            a.view
-                .sort_by_cached_key(|&i| a.entries[i].name.to_lowercase());
+            // 预生成小写键（每条一次分配），比较器内不再重复 to_lowercase
+            // （旧比较器每次比较做 2 次 to_lowercase，万级条目 ≈ 34 万次分配）。
+            // 用 (idx, key) 对排序再取回 idx：键与位置绑定，排序中不会错位
+            let mut keyed: Vec<(usize, String)> = a
+                .view
+                .iter()
+                .map(|&i| (i, a.entries[i].name.to_lowercase()))
+                .collect();
+            keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.1, &y.1));
+            a.view = keyed.into_iter().map(|(i, _)| i).collect();
         }
 
         // 自动切标签页：当前标签页为空而另一类非空时跳过去。
@@ -2111,6 +2121,36 @@ impl Drop for App {
 #[cfg(test)]
 mod tests {
     use egui::Widget as _;
+
+    /// 自然序排序管线（rebuild_view 同款：小写键 + alphanumeric_sort::compare_str）。
+    /// 钉死语义：数字段按数值（1/2/10 而非字典序 1/10/2）、大小写不敏感、
+    /// 同值前导零 tie-break（少零在前）、CJK+数字混合名按数值排。
+    /// 只在同脚本组内断言相对顺序，不依赖 crate 的跨脚本比较规则
+    #[test]
+    fn natural_sort_pipeline_semantics() {
+        fn sort(mut v: Vec<&str>) -> Vec<&str> {
+            v.sort_by(|a, b| alphanumeric_sort::compare_str(&a.to_lowercase(), &b.to_lowercase()));
+            v
+        }
+        // 纯编号：1/2/9/10/12（字典序会给出 1/10/12/2/9）
+        assert_eq!(
+            sort(vec!["10.jpg", "2.jpg", "1.jpg", "12.jpg", "9.jpg"]),
+            vec!["1.jpg", "2.jpg", "9.jpg", "10.jpg", "12.jpg"]
+        );
+        // 字符+数字混合 + 大小写不敏感：IMG_2 在 img_10 前
+        assert_eq!(
+            sort(vec!["img_10.jpg", "IMG_2.jpg"]),
+            vec!["IMG_2.jpg", "img_10.jpg"]
+        );
+        // CJK+数字：第2话 在 第10话 前
+        assert_eq!(
+            sort(vec!["第10话.jpg", "第2话.jpg"]),
+            vec!["第2话.jpg", "第10话.jpg"]
+        );
+        // 同值前导零 tie-break：2.jpg 在 02.jpg 前（少零在前，结果稳定）
+        assert_eq!(sort(vec!["02.jpg", "2.jpg"]), vec!["2.jpg", "02.jpg"]);
+    }
+
     /// 虚拟化列表（show_viewport 手动行范围）关键行为的回归测试。
     ///
     /// 注意：__run_test_ui 默认装的是空字体（文本不换行、行高全被钳成 18），
