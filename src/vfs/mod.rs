@@ -13,14 +13,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 解压临时文件名自增序号：同一 dest 被并发解压（双击/孤儿线程）时互不踩踏
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 密码候选代码页（启动时由 config.toml 的 password_codepage 初始化；
-/// 未初始化时默认 GBK，便于单元测试直接跑）
+/// 非 UTF-8 字节兜底代码页（启动时由 config.toml 的 codepage 初始化）。
+/// 消费方：zip 老包文件名解码（无 UTF-8 标志且非合法 UTF-8 的名字字节）+
+/// 密码候选（老工具同按系统 ANSI 编码密码）。
+/// 未初始化时默认 GBK，便于单元测试直接跑
 static CODEPAGE: std::sync::OnceLock<Option<&'static encoding_rs::Encoding>> =
     std::sync::OnceLock::new();
 
-/// 设置密码候选代码页（WHATWG 标签："gbk"/"big5"/"shift_jis"/"euc-kr"…；
-/// "none"/空 = 只试 UTF-8；utf-8 本身是默认候选无需追加；未知标签告警并保持默认）
-pub fn set_password_codepage(name: &str) {
+/// 设置兜底代码页（WHATWG 标签："gbk"/"big5"/"shift_jis"/"euc-kr"…；
+/// "none"/空 = 不追加；utf-8 本身是默认候选无需设置；未知标签告警并保持默认）
+pub fn set_codepage(name: &str) {
     let enc = if name.is_empty() || name.eq_ignore_ascii_case("none") {
         None
     } else {
@@ -28,7 +30,7 @@ pub fn set_password_codepage(name: &str) {
             Some(e) if e != encoding_rs::UTF_8 => Some(e),
             Some(_) => None, // utf-8：默认候选已有，无需追加
             None => {
-                tracing::warn!("未知密码代码页 [{name}]，保持默认 GBK");
+                tracing::warn!("未知兜底代码页 [{name}]，保持默认 GBK");
                 return;
             }
         }

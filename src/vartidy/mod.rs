@@ -922,7 +922,7 @@ pub fn cli_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    crate::vfs::set_password_codepage(&cfg.password_codepage);
+    crate::vfs::set_codepage(&cfg.codepage);
 
     // 仓库目录：-o 优先，缺省 config.toml vartidy.repo_dir
     let repo = match parsed.repo.clone().or_else(|| {

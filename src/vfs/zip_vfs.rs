@@ -22,6 +22,15 @@ pub struct ZipVFS {
     cd_start: u64,
     /// crate 解码的条目名快照（CD 顺序，与 by_index 下标一致）
     names: Vec<String>,
+    /// 自行解码的条目名（同 CD 顺序）。crate 对无 UTF-8 标志的条目恒按
+    /// CP437 解码——老工具（简中 Windows）打的 GBK 名包即乱码，且其
+    /// `index_for_name` 按名字字节查内部表也必然失配（"entry 不存在"）。
+    /// 故扫 CD 原始字节自行解码；None = 扫描失败/条目数与 crate 不一致
+    /// （重名被折叠等边缘包），整体回退 crate 旧行为
+    display_names: Option<Vec<String>>,
+    /// 显示名 → crate 下标（open_entry/verify_password 查找用；
+    /// 仅 display_names 为 Some 时存在）
+    name_table: Option<std::collections::HashMap<String, usize>>,
 }
 
 /// zip crate 错误 → VfsError（密码缺失/错误统一映射为 Password，UI 据此弹密码框）
@@ -52,6 +61,55 @@ fn zip64_uncompressed_size(extra: &[u8]) -> Option<u64> {
     None
 }
 
+/// CD 条目名解码链（老包兼容）：
+/// 1. flags bit11（UTF-8 标志）置位，或字节本身是合法 UTF-8（部分工具不设
+///    标志但实际 UTF-8）→ 按 UTF-8
+/// 2. 配置码页（config codepage，默认 GBK）——老 WinRAR/好压按系统 ANSI
+///    打包，简中即 GBK；GBK 汉字首字节多为 UTF-8 非法形态，与 1 不冲突
+/// 3. 码页解出替换符（非法序列）→ lossy（极端角案：码页也解不了的西文
+///    老包字节；crate 的 CP437 表未公开导出，lossy 展示 � 即可）
+fn decode_cd_name(raw: &[u8], flags: u16) -> String {
+    if flags & 0x800 != 0 || std::str::from_utf8(raw).is_ok() {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    if let Some(enc) = super::extra_encoding() {
+        let (cow, _, had_errors) = enc.decode(raw);
+        if !had_errors {
+            return cow.into_owned();
+        }
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+/// 顺序扫一遍 CD，收集每条目的原始名字节与 flags（一次顺序读，无逐条 seek）。
+/// None = 解析失败或 CD 头比 crate 条目多（重名被 crate 折叠等），
+/// 对齐检查与 list_from_central_directory 同款
+fn scan_cd_raw(cd_start: u64, path: &Path, expect: usize) -> Option<Vec<(Vec<u8>, u16)>> {
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(cd_start)).ok()?;
+    let mut out = Vec::with_capacity(expect);
+    for _ in 0..expect {
+        let mut hdr = [0u8; 46];
+        f.read_exact(&mut hdr).ok()?;
+        if &hdr[..4] != b"PK\x01\x02" {
+            return None;
+        }
+        let flags = u16::from_le_bytes([hdr[8], hdr[9]]);
+        let name_len = u16::from_le_bytes([hdr[28], hdr[29]]) as usize;
+        let extra_len = u16::from_le_bytes([hdr[30], hdr[31]]) as i64;
+        let cmt_len = u16::from_le_bytes([hdr[32], hdr[33]]) as i64;
+        let mut raw = vec![0u8; name_len];
+        f.read_exact(&mut raw).ok()?;
+        f.seek(SeekFrom::Current(extra_len + cmt_len)).ok()?;
+        out.push((raw, flags));
+    }
+    let mut peek = [0u8; 4];
+    match f.read(&mut peek) {
+        Ok(4) if &peek == b"PK\x01\x02" => None,
+        _ => Some(out),
+    }
+}
+
 impl ZipVFS {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, VfsError> {
         let file = File::open(path).map_err(VfsError::Io)?;
@@ -61,14 +119,42 @@ impl ZipVFS {
         // 之后 open_entry 与 list 均不再重复解析（旧实现每次操作都重开重解析）
         let metadata = archive.metadata();
         let cd_start = archive.central_directory_start();
-        let names = archive.file_names().map(str::to_string).collect();
+        let names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+        // 扫 CD 原始名字节自行解码（见 display_names 字段注释）；
+        // 失败/条目数不一致 → 整体 None，走 crate 旧行为
+        let (display_names, name_table) = match scan_cd_raw(cd_start, path, names.len()) {
+            Some(items) => {
+                let disp: Vec<String> =
+                    items.iter().map(|(r, fl)| decode_cd_name(r, *fl)).collect();
+                // 显示名 → crate 下标（CD 顺序 = 插入顺序 = by_index 下标）；
+                // 解码后重名（罕见）后者覆盖前者，与 crate 折叠语义近似
+                let table: std::collections::HashMap<String, usize> = disp
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.clone(), i))
+                    .collect();
+                (Some(disp), Some(table))
+            }
+            None => (None, None),
+        };
         Ok(Self {
             path: path.to_path_buf(),
             password: password.map(super::password_candidates).unwrap_or_default(),
             metadata,
             cd_start,
             names,
+            display_names,
+            name_table,
         })
+    }
+
+    /// 显示名 → crate 下标。优先自建表（GBK 等非 UTF-8 名包 crate 查不到）；
+    /// 表缺失或未命中再走 crate 的 index_for_name（UTF-8 名两条路等价）
+    fn index_of(&self, archive: &zip::read::ZipArchive<File>, name: &str) -> Option<usize> {
+        self.name_table
+            .as_ref()
+            .and_then(|t| t.get(name).copied())
+            .or_else(|| archive.index_for_name(name))
     }
 
     /// 从缓存的 CD 元数据重建 reader（不再重复解析 central directory）。
@@ -157,10 +243,15 @@ impl ZipVFS {
             f.seek(SeekFrom::Current(cmt_len)).ok()?;
             // APPNOTE 4.3.7：16-19 CRC32（VarTidy 包内去重判据，元数据自带零解压成本）
             let crc = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+            // 名字：自解码名（GBK 等老包）优先，缺失时用 crate 解码名（同 CD 顺序对齐）
+            let dname: String = match &self.display_names {
+                Some(d) => d[i].clone(),
+                None => name.clone(),
+            };
             out.push(VirtualEntry {
-                name: name.clone(),
+                name: dname.clone(),
                 size,
-                is_dir: name.ends_with('/'),
+                is_dir: dname.ends_with('/'),
                 encrypted: flags & 0b1 != 0,
                 crc: Some(crc),
             });
@@ -226,8 +317,8 @@ impl ArchiveVFS for ZipVFS {
 
     fn open_entry(&self, entry: &VirtualEntry) -> Result<Box<dyn VirtualFile>, VfsError> {
         let mut archive = Box::new(self.archive()?);
-        let index = archive
-            .index_for_name(&entry.name)
+        let index = self
+            .index_of(&archive, &entry.name)
             .ok_or_else(|| VfsError::Archive(format!("entry 不存在: {}", entry.name)))?;
         let file = Self::by_index(&mut archive, index, &self.password)?;
 
@@ -297,8 +388,8 @@ impl ArchiveVFS for ZipVFS {
     /// 全部失败报 Password；条目未加密时任何密码都通过
     fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
         let mut archive = self.archive()?;
-        let index = archive
-            .index_for_name(&entry.name)
+        let index = self
+            .index_of(&archive, &entry.name)
             .ok_or_else(|| VfsError::Archive(format!("entry 不存在: {}", entry.name)))?;
         let candidates = password.map(super::password_candidates).unwrap_or_default();
         Self::by_index(&mut archive, index, &candidates).map(|_| ())
@@ -418,6 +509,92 @@ mod tests {
         w.write_all(&vec![7u8; 4096]).unwrap();
         w.finish().unwrap();
         path
+    }
+
+    /// 手工构造单条目 store zip：文件名按 GBK 编码且不设 UTF-8 标志，
+    /// 模拟老 WinRAR/好压在简中 Windows 上打的包（zip crate 的 writer
+    /// 无法产出这种形态——它恒设 UTF-8 标志）
+    fn make_gbk_zip() -> PathBuf {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        let (name_gbk, _, had_errors) = encoding_rs::GBK.encode("荒木经惟/测试 (1).jpg");
+        assert!(!had_errors);
+        let content = b"jpeg-data-here";
+        let crc = crc32(content);
+        let mut z: Vec<u8> = Vec::new();
+        // local file header（flags=0：无 UTF-8 标志 = 老工具形态）
+        z.extend_from_slice(b"PK\x03\x04");
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u16.to_le_bytes()); // flags
+        z.extend_from_slice(&0u16.to_le_bytes()); // method = store
+        z.extend_from_slice(&0u16.to_le_bytes()); // dostime
+        z.extend_from_slice(&0x21u16.to_le_bytes()); // dosdate = 1980-01-01
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&(content.len() as u32).to_le_bytes()); // csize
+        z.extend_from_slice(&(content.len() as u32).to_le_bytes()); // usize
+        z.extend_from_slice(&(name_gbk.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(&name_gbk);
+        z.extend_from_slice(content);
+        // central directory
+        let cd_offset = z.len() as u32;
+        z.extend_from_slice(b"PK\x01\x02");
+        z.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u16.to_le_bytes()); // flags
+        z.extend_from_slice(&0u16.to_le_bytes()); // method
+        z.extend_from_slice(&0u16.to_le_bytes()); // dostime
+        z.extend_from_slice(&0x21u16.to_le_bytes()); // dosdate
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        z.extend_from_slice(&(name_gbk.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk
+        z.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        z.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        z.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        z.extend_from_slice(&name_gbk);
+        let cd_size = z.len() as u32 - cd_offset;
+        // EOCD
+        z.extend_from_slice(b"PK\x05\x06");
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z.extend_from_slice(&1u16.to_le_bytes());
+        z.extend_from_slice(&1u16.to_le_bytes());
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_offset.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("zipvfs_gbk_{}.zip", std::process::id()));
+        std::fs::write(&path, &z).unwrap();
+        path
+    }
+
+    /// 老 GBK 名包：名字正确解码（非 CP437 乱码）+ open_entry 可读
+    /// （旧 bug：crate CP437 乱码名 index_for_name 查不到 → "entry 不存在"）
+    #[test]
+    fn gbk_filename_decoded_and_openable() {
+        let path = make_gbk_zip();
+        let vfs = ZipVFS::open(&path, None).unwrap();
+        let entries = vfs.list();
+        let e = entries
+            .iter()
+            .find(|e| e.name == "荒木经惟/测试 (1).jpg")
+            .expect("GBK 文件名应按 codepage 正确解码");
+        let mut f = vfs.open_entry(e).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"jpeg-data-here");
     }
 
     #[test]

@@ -212,8 +212,9 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config, cc: &eframe::CreationContext, initial: Option<PathBuf>) -> Self {
         Self::install_cjk_font(&cfg, &cc.egui_ctx);
-        // 密码候选代码页（config: password_codepage，默认 gbk）
-        crate::vfs::set_password_codepage(&cfg.password_codepage);
+        // 非 UTF-8 字节兜底代码页（config: codepage，默认 gbk）：
+        // zip 老包文件名解码 + 密码候选
+        crate::vfs::set_codepage(&cfg.codepage);
         // 清理上次中断解压留下的 .part 半截文件
         cache::cleanup_partial(&cache::cache_dir(&cfg));
         Self {

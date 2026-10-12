@@ -16,10 +16,12 @@ pub struct Config {
     pub player: PlayerConfig,
     pub ui: UiConfig,
     pub extract: ExtractConfig,
-    /// 密码候选代码页（WHATWG 标签，如 "gbk"/"big5"/"shift_jis"/"euc-kr"）：
-    /// zip/RAR4 老工具按系统 ANSI 代码页编码密码，解压时在 UTF-8 之外追加此编码候选。
-    /// "none" 或空 = 只试 UTF-8。默认 "gbk"（简中 Windows）。
-    pub password_codepage: String,
+    /// 非 UTF-8 字节兜底代码页（WHATWG 标签，如 "gbk"/"big5"/"shift_jis"/"euc-kr"）：
+    /// 老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，密码与 zip 文件名同源编码。
+    /// 此编码用于：密码候选追加（UTF-8 之外再试）+ zip 文件名解码兜底
+    /// （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
+    /// "none" 或空 = 只用 UTF-8。默认 "gbk"（简中 Windows）。
+    pub codepage: String,
     /// 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
     /// 打开压缩包阶段即自动探测（无密码优先 → 此列表依次），全不匹配播放器才弹
     /// 密码框、VarTidy 记失败；CLI 的 -p 密码排在此列表之前。
@@ -185,7 +187,7 @@ impl Default for Config {
             player: PlayerConfig::default(),
             ui: UiConfig::default(),
             extract: ExtractConfig::default(),
-            password_codepage: "gbk".into(),
+            codepage: "gbk".into(),
             passwords: Vec::new(),
             vartidy: VarTidyConfig::default(),
         }
@@ -294,9 +296,11 @@ const DEFAULT_TOML: &str = r#"# ================================================
 #   * "auto" 表示自动探测；相对路径相对启动时工作目录，建议绝对路径
 # =============================================================
 
-# 加密包密码候选代码页（zip/RAR4 老工具按系统 ANSI 代码页编码密码）。
-# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只试 UTF-8
-password_codepage = "gbk"
+# 非 UTF-8 字节兜底代码页：老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，
+# 密码与 zip 文件名同源编码。用于密码候选追加 + zip 文件名解码兜底
+# （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
+# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只用 UTF-8
+codepage = "gbk"
 
 # 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
 # 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
@@ -394,7 +398,7 @@ mod tests {
     #[test]
     fn toml_special_char_passwords() {
         let text = r#"
-password_codepage = "gbk"
+codepage = "gbk"
 passwords = ["p@ss #1", "中文密码 2026", "特!@#$%^&*()殊"]
 [vartidy]
 repo_dir = ""

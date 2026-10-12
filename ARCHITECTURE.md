@@ -124,6 +124,21 @@ trait VirtualFile: Read + Seek {
 播放侧注册 mpv 自定义协议（`zvf://archive_idx/entry_idx`），open/read/seek 三个回调
 直接转发给 `VirtualFile` —— **mpv 的 seek 就是 VirtualFile 的 seek**，快/慢两条通路对播放器完全透明。
 
+### 4.1 zip 老包文件名编码（GBK 等）
+
+ZIP 规范（APPNOTE）：文件名无 bit11 UTF-8 标志时按 CP437 解释。老工具（老 WinRAR/好压）
+在简中 Windows 上实际按系统 ANSI（GBK）存名字字节——按规范解即乱码，且 zip crate 的
+`index_for_name` 以原始字节为 key 查内部表，CP437 解出的字符串 UTF-8 字节必然与原始
+GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开必失败）。
+
+解法（zip_vfs.rs）：`open()` 时顺序扫一遍 CD 收集原始名字节与 flags（一次顺序读，
+无逐条 seek；条目数与 crate 不一致的重名折叠等边缘包整体放弃，回退 crate 旧行为），
+按链解码：**UTF-8 标志置位或字节为合法 UTF-8 → UTF-8；否则配置码页（config `codepage`，
+默认 GBK）；码页解出替换符 → lossy**。解码结果两处消费：`list` 的显示名 +
+自建「显示名 → crate 下标」表（`open_entry`/`verify_password` 查找，替代按名字节
+查 crate 内部表的 `index_for_name`）。密码与文件名共用同一 `codepage`——老工具
+打包时两者同按系统 ANSI 编码，本就同源。VarTidy 同链受益：GBK 名 var 入库不再乱码。
+
 ---
 
 ## 5. Seek（拖动进度条）详细设计
@@ -202,7 +217,7 @@ PSD/HEIC 等专用格式（mpv 不支持，需引入解码库走纹理路径）�
 ## 7. 配置文件设计（config.toml，单文件集中）
 
 ```toml
-password_codepage = "gbk"   # 加密包密码候选代码页
+codepage = "gbk"            # 非 UTF-8 字节兜底代码页（密码候选追加 + zip 老包文件名解码）
 passwords = []              # 加密包密码候选列表（播放器与 VarTidy 公用，打开阶段自动探测）
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
