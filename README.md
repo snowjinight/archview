@@ -1,4 +1,4 @@
-# Archview — 压缩包媒体播放器
+﻿# Archview — 压缩包媒体播放器
 
 直接预览播放压缩包内媒体的桌面工具：无需完整解压，打开 ZIP / 7Z / RAR 压缩包即可浏览和播放其中的视频与图片，支持加密压缩包（密码输入 + 会话内记忆）。
 
@@ -16,7 +16,8 @@
 | 图片自动播放 | PPT 式自动翻页（控制栏播放/暂停按钮或空格切换） |
 | 全屏 | 双击画面或回车进入，Esc 退出，全屏内快捷键照常可用 |
 | 缓存管理 | 手动清理/打开目录按钮 + 可配置的退出/切换清理 + LRU 容量上限；缓存按包路径稳定命名，切回重开均可命中 |
-| 配置集中 | 所有可变项集中在 config.json，代码零硬编码路径 |
+| VarTidy 整理 | `archview.exe tidy` CLI 子命令：var 资源包分类后增量合入 var 仓库（零全量解压、包内/仓库两级去重、仓库只读绝不覆盖；详见下文「VarTidy」小节） |
+| 配置集中 | 所有可变项集中在 config.toml，代码零硬编码路径 |
 
 ## 快捷键
 
@@ -37,12 +38,40 @@
 
 ### 直接运行（推荐用户）
 
-1. 解压发布包（archview.exe + libmpv-2.dll + config.json），双击 `archview.exe`。
+1. 解压发布包（archview.exe + libmpv-2.dll + config.toml），双击 `archview.exe`。
 2. 点击左上角 **Open Archive…** 选择压缩包，或直接把压缩包文件拖入窗口。
 3. 左侧标签页切换 **视频 / 图片**，顶部搜索框可过滤文件名；点击文件即开始播放，悬停行的完整文件名显示在列表底部状态行。
 4. 右侧播放区底部为进度条，拖动到目标位置松手即跳转。
 
-> 首次启动若 exe 同目录没有 config.json，会自动生成一份默认配置。
+> 首次启动若 exe 同目录没有 config.toml，会自动生成一份默认配置。
+
+### VarTidy：var 资源包增量整理（CLI 子命令）
+
+`archview.exe` 无参数启动 = 播放器 GUI（行为不变）；带 `tidy` 参数 = var 资源包整理。var 文件不可播放，整理与播放器 UI 无交集，因此走 CLI 而非塞进 GUI——替代手动流程「解压 → class_var.py → deal 脚本 → 删空目录 → 手动并入仓库 → 去重」，实现零全量临时落盘的原地整理（50G 包手动流程需额外 ~100G 磁盘，新流程磁盘增量 ≈ 仓库确实缺少的 var 体积）。
+
+```bat
+archview.exe tidy <压缩包或目录> [更多输入...] [选项]
+```
+
+| 选项 | 说明 |
+|---|---|
+| `-o, --repo <dir>` | var 仓库目录（缺省用 config.toml 的 `vartidy.repo_dir`） |
+| `-n, --dry-run` | 预演：只做分类与两级去重检查并输出报告，不写任何文件 |
+| `-p, --password <pw>` | 加密包密码（可多次指定按序尝试；config.toml 的 `vartidy.passwords` 列表兜底） |
+| `-q, --quiet` | 静默：无控制台时结束不弹结果窗（脚本/计划任务防阻塞） |
+| `--report <dir>` | 报告输出目录（缺省为首个输入所在目录，不写入仓库） |
+
+行为要点：
+
+- **仓库只读红线**：仓库已有文件/文件夹绝不被修改、移动、删除、覆盖；仅创建新作者子目录并写入仓库没有的新 var；同名冲突一律仓库版胜出。
+- **两级去重**：包内（多级目录同名 var 按 CRC32 元数据判重，同名不同内容记警告交人工确认）+ 仓库（目标存在即跳过）。
+- **无效文件不落盘**：非 var / 命名非法（版本号非数字、作者/内容缺失等）只进报告，仓库零垃圾。
+- 支持中文、空格、特殊字符的作者名与压缩包名；加密包（含中文密码）；分卷 RAR（同族只整理首卷）。
+- 退出码：0 = 完成；1 = 有失败项（见报告）；2 = 用法/配置错误。
+
+**「发送到」快捷方式**：新建快捷方式，目标填 `"<archview.exe 完整路径>" tidy "%1"`，仓库目录在 config.toml 的 `vartidy.repo_dir` 配好后，右键任意压缩包 → 发送 → 即完成整理。
+
+架构与设计原则详见 `ARCHITECTURE.md` 第 12 章。
 
 ### 从源码构建
 
@@ -69,7 +98,7 @@ Archview 的视频播放基于 libmpv，**仓库不含该 dll**（约 120MB，�
 package.bat
 ```
 
-产物：`dist\`（exe + libmpv-2.dll + config.json）及 `dist.zip`。可用环境变量覆盖路径（不硬编码）：
+产物：`dist\`（exe + libmpv-2.dll + config.toml）及 `dist.zip`。可用环境变量覆盖路径（不硬编码）：
 
 - `ARCHVIEW_MPV_DIR`：libmpv-2.dll 所在目录（默认 `deps\mpv-dev`）
 - `ARCHVIEW_DIST`：输出目录（默认 `dist`）
@@ -96,45 +125,77 @@ cargo test -- --nocapture
 | e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证前向 / 后向 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归） |
 | e2e 解压播放 | 构造 7Z 包 → 后台解压 → headless mpv 播放本地文件全链路 |
 | flag 属性循环 | pause / mute 属性经 flag 格式读 → 翻转 → 写 → 读，覆盖空格暂停、静音按钮的行为路径 |
+| VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
+| config | TOML 默认模板与代码默认值防漂移、序列化往返、特殊字符密码（`#`/空格/中文）引号保留 |
 
 e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time-pos` / `pause` / `eof-reached` 等属性断言播放状态，`cache=no` 强制 seek 请求打到 VFS 层，能真实暴露流实现缺陷。
 
 RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或 Program Files 常见路径，找不到自动跳过，不算失败）。
 
-## 配置文件 config.json
+VarTidy 另有本地冒烟环境：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包（明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run → 实际整理（含密码候选重试）→ 幂等重跑。
 
-启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则写入默认值。所有路径均可为绝对路径，`"auto"` 表示自动探测。
+## 配置文件 config.toml
 
-```json
-{
-  "cache": {
-    "dll_dir": "auto",
-    "dir": "auto",
-    "max_size_mb": 8192,
-    "chunk_size_mb": 4,
-    "chunk_cache_blocks": 64,
-    "clean_on_exit": false,
-    "clean_on_switch": false
-  },
-  "media": {
-    "video_extensions": ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"],
-    "image_extensions": ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
-  },
-  "player": {
-    "hwdec": "auto",
-    "cache_secs": 30,
-    "demuxer_max_mb": 512,
-    "volume": 100
-  },
-  "ui": {
-    "font_path": "auto",
-    "slideshow_secs": 1.0,
-    "wheel_switch_secs": 0.3,
-    "ask_next_archive": true,
-    "sort_files": true
-  },
-  "password_codepage": "gbk"
-}
+启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则生成一份**带中文注释**的默认配置。所有路径均可为绝对路径，`"auto"` 表示自动探测。
+
+```toml
+# 加密包密码候选代码页（zip/RAR4 老工具按系统 ANSI 代码页编码密码）
+password_codepage = "gbk"
+
+[cache]
+# libmpv-2.dll 搜索目录；"auto" = exe 同目录
+dll_dir = "auto"
+# 7Z/RAR 解压缓存目录；"auto" = %TEMP%\archview_cache（可指向 RAM Disk 提速）
+dir = "auto"
+# 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
+max_size_mb = 8192
+# 解码块大小（MB）与解码块 LRU 缓存块数
+chunk_size_mb = 4
+chunk_cache_blocks = 64
+# 退出程序时自动清空解压缓存
+clean_on_exit = false
+# 切换压缩包时自动清理上一个包的解压缓存（false = 保留以便切回命中）
+clean_on_switch = false
+
+[media]
+# 视频 / 图片的文件扩展名识别列表（不区分大小写）
+video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
+image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
+
+[player]
+# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
+hwdec = "auto"
+# mpv 缓存秒数与 demuxer 最大缓存（MB）
+cache_secs = 30
+demuxer_max_mb = 512
+# 初始音量（0-100）
+volume = 100
+
+[ui]
+# CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
+font_path = "auto"
+# 图片自动播放（PPT 式翻页）间隔秒数
+slideshow_secs = 1.0
+# 视频区滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+wheel_switch_secs = 0.3
+# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
+ask_next_archive = true
+# 文件列表是否按文件名排序（false = 保持压缩包内部顺序，漫画包场景用）
+sort_files = true
+# 解压进度覆盖层显示前的宽限期（毫秒）：快速解压全程不打扰播放
+extract_overlay_delay_ms = 500
+
+[extract]
+# solid 包解压时顺带预取后续文件的总大小上限（MB），0 = 关闭
+prefetch_mb = 512
+
+[vartidy]
+# var 仓库根目录（archview.exe tidy 用；整理器绝不修改仓库已有内容，仅增量合入）
+repo_dir = ""
+# 报告输出目录；"auto" = 首个输入压缩包所在目录
+report_dir = "auto"
+# 加密包密码候选列表（按序尝试）；密码始终用双引号包裹
+passwords = []
 ```
 
 | 配置项 | 说明 |
@@ -152,35 +213,34 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
 | `ui.sort_files` | 文件列表是否按文件名排序（不区分大小写字典序，默认 true）。设为 false 保持压缩包内部顺序——漫画包通常打包时已按自然顺序排列，而字典序会把 `1/2/10` 排成 `1/10/2` |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
+| `vartidy.repo_dir` | VarTidy（`archview.exe tidy` CLI 子命令）的 var 仓库目录；详见 ARCHITECTURE.md 第 12 章 |
+| `vartidy.passwords` | 加密包密码候选列表（按序尝试），CLI/SendTo 模式无交互输入的密码方案 |
 
 ### 路径写法（cache.dir 等所有路径项）
 
-标准 JSON 字符串，双引号包裹。Windows 下正斜杠、反斜杠都认，但反斜杠必须**双写**（JSON 转义）：
+TOML 字符串，双引号包裹。Windows 下正斜杠、反斜杠都认，但反斜杠必须**双写**（TOML 转义）：
 
-```json
-"dir": "D:/my_cache"       // 推荐：正斜杠，无需转义
-"dir": "D:\\my_cache"      // 反斜杠必须双写，单个 \ 会解析报错
-"dir": "auto"              // 特殊值：自动探测
+```toml
+dir = "D:/my_cache"       # 推荐：正斜杠，无需转义
+dir = "D:\\my_cache"      # 反斜杠必须双写，单个 \ 会解析报错
+dir = "auto"              # 特殊值：自动探测
 ```
 
-常见错误：单引号 `'D:/cache'` 不合法（JSON 只认双引号）；`"C:\cache"` 因 `\c` 非法转义导致整个 config.json 解析失败。相对路径相对的是 exe 启动时的工作目录，建议写绝对路径。目录不存在会自动创建。
+常见错误：`#` 前有空格会被当注释起点（值里含 `#`、空格等特殊字符——尤其密码——必须双引号包裹，引号内一切字符原样）；`dir = D:/cache` 缺引号不是合法 TOML。相对路径相对的是 exe 启动时的工作目录，建议写绝对路径。目录不存在会自动创建。
 
 ### 进阶：RAM Disk 缓存（可选推荐）
 
 7Z/RAR 走"后台解压到磁盘缓存再播放"的慢路径，缓存落在机械盘上时首次播放等待明显。把 `cache.dir` 指向 RAM Disk 可以显著加速，且**断电/重启即自动清空**，无需维护：
 
 1. 用 [ImDisk Toolkit](http://www.ltr-data.se/opencode.htm/)、OSFMount 或 [Primo Ramdisk](https://www.romexsoft.com/zh/primo-ramdisk/) 等工具划出一块 RAM Disk（建议 2~4GB，盘符如 `R:`）
-2. 修改 config.json：
+2. 修改 config.toml：
 
-```json
-{
-  "cache": {
-    "dir": "R:/archview_cache",
-    "max_size_mb": 3072,
-    "clean_on_exit": false,
-    "clean_on_switch": false
-  }
-}
+```toml
+[cache]
+dir = "R:/archview_cache"
+max_size_mb = 3072
+clean_on_exit = false
+clean_on_switch = false
 ```
 
 3. `max_size_mb` 建议设为 RAM Disk 容量的 70%~80%，留出余量；超出上限时按 LRU 自动驱逐最久未访问的缓存
@@ -223,7 +283,7 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 |---|---|
 | `src/main.rs` | 入口：日志初始化、配置加载、libmpv 动态库初始化、启动 eframe |
 | `src/ui.rs` | 全部 UI：顶栏（打开/清理缓存）、文件列表标签页、播放区（mpv 子窗口嵌入 + 底部全宽进度条）、控制栏、快捷键分发、全屏管理、后台解压任务轮询 |
-| `src/config.rs` | config.json 的加载 / 默认值生成 / 扩展名与路径探测（唯一配置来源） |
+| `src/config.rs` | config.toml 的加载 / 默认值生成 / 扩展名与路径探测（唯一配置来源） |
 | `src/cache.rs` | 缓存目录管理：LRU 驱逐、部分解压清理、全量 / 按包清理 |
 | `src/player/mod.rs` | mpv 播放服务：加载、seek、暂停、音量等命令封装；headless e2e 测试 |
 | `src/player/mpv_ffi.rs` | mpv 最小 FFI 绑定：libloading 运行时动态加载 libmpv-2.dll |
@@ -232,6 +292,9 @@ RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
 | `src/vfs/zip_vfs.rs` | ZIP 实现：自研 deflate 流式 seek（前向跳读、后向重开） |
 | `src/vfs/sevenz_vfs.rs` | 7Z 实现：sevenz-rust 纯 Rust 解压（无外部 exe 依赖） |
 | `src/vfs/rar_vfs.rs` | RAR 实现：unrar crate（内嵌编译 UnRAR 源码），分卷支持 |
+| `src/vartidy/mod.rs` | VarTidy CLI：输入展开 → 规划（分类+两级去重）→ 批量抽取直写仓库 → 报告；`tidy` 子命令参数解析 |
+| `src/vartidy/classify.rs` | var 文件名分类规则（class_var.py 移植：作者.内容.版本.var 四段校验） |
+| `examples/make_smoke_fixtures.rs` | VarTidy 冒烟测试源生成器（构造明文/加密 zip/7z 测试包与既有仓库） |
 
 ### 核心设计决策
 

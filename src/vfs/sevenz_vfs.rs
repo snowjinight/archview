@@ -42,6 +42,8 @@ impl SevenzVFS {
                 // sevenz-rust 未公开条目加密检测（content_methods 私有），
                 // 内容加密条目在解压时报 Password，由 UI 弹密码框重试
                 encrypted: false,
+                // CRC 来自 7z 头（个别条目无 CRC 时 None，VarTidy 去重退化为尺寸判同）
+                crc: if e.has_crc { Some(e.crc as u32) } else { None },
             })
             .collect();
         Ok(Self {

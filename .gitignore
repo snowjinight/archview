@@ -12,8 +12,20 @@ check_output.log
 # 本地测试媒体（体积大，不入库；测试脚本会自动生成或跳过）
 /test_media
 
+# VarTidy 冒烟测试源（本地构造的压缩包与仓库，不入库）
+/test_tidy
+
 # 个人配置（首次运行自动生成）
+config.toml
 config.json
+
+# IDE 本地目录
+.trae/
+.idea/
+.vscode/
+
+# 临时文件
+old_ui_tmp.txt
 
 # 内部交接文档（不开源）
 HANDOFF.md

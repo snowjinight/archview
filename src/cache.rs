@@ -1,5 +1,5 @@
 //! 缓存管理：7z/RAR 后台解压的目标目录 + 总量上限（LRU 按 mtime 驱逐）。
-//! 目录来自 config.json（"auto" = 系统临时目录），代码零硬编码路径。
+//! 目录来自 config.toml（"auto" = 系统临时目录），代码零硬编码路径。
 
 use crate::config::Config;
 use std::path::{Path, PathBuf};

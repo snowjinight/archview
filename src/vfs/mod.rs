@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 解压临时文件名自增序号：同一 dest 被并发解压（双击/孤儿线程）时互不踩踏
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 密码候选代码页（启动时由 config.json 的 password_codepage 初始化；
+/// 密码候选代码页（启动时由 config.toml 的 password_codepage 初始化；
 /// 未初始化时默认 GBK，便于单元测试直接跑）
 static CODEPAGE: std::sync::OnceLock<Option<&'static encoding_rs::Encoding>> =
     std::sync::OnceLock::new();
@@ -87,6 +87,9 @@ pub struct VirtualEntry {
     pub is_dir: bool,
     /// 条目内容是否加密（文件名仍明文可见；加密头的包在 open 阶段就要密码）
     pub encrypted: bool,
+    /// 内容 CRC32（来自压缩包元数据，零解压成本；VarTidy 包内去重判据。
+    /// 7z 个别条目无 CRC 时为 None）
+    pub crc: Option<u32>,
 }
 
 /// 可读可 seek 的虚拟文件 —— mpv stream_cb 与（未来的）图片查看器共用。
@@ -213,7 +216,8 @@ pub fn open_archive(path: &Path, password: Option<&str>) -> Result<Box<dyn Archi
 
 /// 解析分卷 RAR 文件名的族前缀：`X.part1.rar` → `Some("x")`（统一小写）。
 /// 仅匹配 `.partN.rar`（N 为纯数字）；普通 rar / 其它命名返回 None。
-fn split_rar_family(name: &str) -> Option<String> {
+/// VarTidy 的目录递归扫描复用（同族只整理首卷）。
+pub(crate) fn split_rar_family(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".rar")?;
     let idx = stem.rfind(".part")?;

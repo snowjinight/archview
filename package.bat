@@ -27,7 +27,12 @@ if exist "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" (
     echo WARNING: libmpv-2.dll not found in "%ARCHVIEW_MPV_DIR%" - package will not play video!
 )
 
-if exist config.json copy /y config.json "%ARCHVIEW_DIST%\" >nul
+rem copy config: config.toml preferred; legacy config.json also packed (auto-migrates on first run)
+if exist config.toml (
+    copy /y config.toml "%ARCHVIEW_DIST%\" >nul
+) else (
+    if exist config.json copy /y config.json "%ARCHVIEW_DIST%\" >nul
+)
 
 if exist "%ARCHVIEW_DIST%.zip" del /q "%ARCHVIEW_DIST%.zip"
 powershell -NoProfile -Command "Compress-Archive -Path '%ARCHVIEW_DIST%\*' -DestinationPath '%ARCHVIEW_DIST%.zip'"

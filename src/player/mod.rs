@@ -17,7 +17,7 @@ impl PlayerService {
     pub fn new(cfg: &Config) -> Result<Self, String> {
         let ctx = mpv_ffi::create()?;
         let s = Self { ctx };
-        // 播放器参数全部来自 config.json
+        // 播放器参数全部来自 config.toml
         s.opt("hwdec", &cfg.player.hwdec);
         s.opt("cache-secs", &cfg.player.cache_secs.to_string());
         s.opt(

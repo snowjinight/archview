@@ -253,7 +253,7 @@ impl App {
         let paths = cfg.cjk_font_paths();
         if paths.is_empty() {
             tracing::warn!(
-                "未找到 CJK 字体，非拉丁字符将显示为方块（可在 config.json 配 ui.font_path）"
+                "未找到 CJK 字体，非拉丁字符将显示为方块（可在 config.toml 配 ui.font_path）"
             );
             return;
         }
@@ -780,7 +780,7 @@ impl App {
             let need = batch_bytes.saturating_add(64 * 1024 * 1024);
             if free < need {
                 let msg = format!(
-                    "缓存目录所在磁盘空间不足：剩余 {:.1}GB，本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.json 的 cache.dir / extract.prefetch_mb）",
+                    "缓存目录所在磁盘空间不足：剩余 {:.1}GB，本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.toml 的 cache.dir / extract.prefetch_mb）",
                     free as f64 / (1024.0 * 1024.0 * 1024.0),
                     batch.len(),
                     need as f64 / (1024.0 * 1024.0 * 1024.0),

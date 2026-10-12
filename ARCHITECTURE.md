@@ -1,4 +1,4 @@
-# 压缩包媒体预览播放器 — 架构设计
+﻿# 压缩包媒体预览播放器 — 架构设计
 
 > 目标：打开一个压缩包（RAR / 7Z / ZIP），浏览其中分散在各子目录的视频与图片文件，
 > 视频可直接播放（支持拖动进度条 seek），图片可预览（类 HoneyView 体验），无需完整解压。
@@ -26,10 +26,11 @@
 |---|---|---|
 | UI | `egui` / `eframe` | 纯 Rust，即时模式，单二进制分发 |
 | ZIP 读取 | `zip` | 纯 Rust，支持按 entry 随机访问 |
-| 7Z 读取 | `sevenz-rust` | 纯 Rust，支持非固态单文件解压 |
+| 7Z 读取 | `sevenz-rust` | 纯 Rust；`BlockDecoder` 支持固态 folder 直达解压（见 11.1） |
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
-| 视频播放 | `libmpv-rs` | 绑定 libmpv，含 stream_cb 自定义流回调 |
-| 图片解码 | `image` | JPEG/PNG/GIF/WebP/BMP + AnimationDecoder 动图 |
+| 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 15 符号，含 stream_cb）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
+| 图片渲染 | —— | 无独立解码库：图片（含 GIF/WebP 动图）与视频统一经 mpv `loadfile` 渲染，VFS/缓存/翻页链路完全复用 |
+| 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
 ### 2.2 播放方案：内嵌 libmpv（而非外部播放器 / 裸 FFmpeg）
 
@@ -61,44 +62,41 @@
 ```
 ┌─────────────────────────────────────────────────────┐
 │  UI 层 (egui)                                       │
-│  左侧：文件树/列表（视频+图片，类型图标）+ 搜索    │
-│  右侧：媒体区 —— 按选中文件类型切换                │
-│         ├─ VideoPlayerView（libmpv 子窗口嵌入）     │
-│         └─ ImageViewerView（纹理渲染/缩放/平移）    │
-│  顶栏：密码输入、包信息；状态栏：加载/解压/缓冲     │
+│  左侧：文件列表（视频/图片标签页）+ 搜索            │
+│  右侧：媒体区 —— mpv 原生子窗口统一渲染             │
+│         （视频与图片/动图同一条 loadfile 链路）      │
+│  顶栏：打开/缓存管理；状态行：文件名/进度           │
 └──────────────────┬──────────────────────────────────┘
                    │ 命令/事件
 ┌──────────────────▼──────────────────────────────────┐
-│  应用核心 (状态机：浏览/加载/播放/解压中/看图中)   │
-│  MediaDispatcher：按文件类型路由到 Player/Viewer    │
+│  应用核心 (状态机：浏览/打开中/播放/解压中)        │
 └────┬───────────────────┬────────────────────────────┘
      │                   │
 ┌────▼───────────┐  ┌────▼──────────────────────┐
-│  播放服务       │  │  图片查看服务              │
-│  libmpv 实例   │  │  image 解码（后台线程）    │
-│  stream_cb     │  │  纹理 LRU 缓存            │
-│  拉取数据      │  │  ←/→ 翻页 / 缩放平移      │
+│  播放服务       │  │  VarTidy 整理器（CLI）     │
+│  mpv_ffi       │  │  分类 + 去重 + 批量抽取    │
+│  stream_cb     │  │  → 直写 var 仓库（只增）   │
 └────┬───────────┘  └────┬──────────────────────┘
-     │                   │ open_entry + read
+     │                   │ open_entry / extract_batch
      │ Read + Seek       │
 ┌────▼───────────────────▼─────────────────────────────┐
-│  VFS 层（核心抽象，两种消费者共用）                  │
+│  VFS 层（核心抽象，播放与整理共用）                 │
 │  trait ArchiveVFS { list(); open_entry() }           │
 │  trait VirtualFile: Read + Seek { size() }           │
 │  ├─ ZipVFS    （随机访问）                           │
-│  ├─ SevenzVFS （探测固态；非固态随机访问）           │
+│  ├─ SevenzVFS （BlockDecoder 固态 folder 直达）      │
 │  └─ RarVFS    （探测固态；分卷合并处理）             │
 └────┬─────────────────────────────────────────────────┘
      │ 固态回退：后台解压
 ┌────▼──────────────────┐   ┌──────────────────────────┐
 │  缓存管理器            │   │  配置服务                │
-│  · 解压文件缓存（慢路径）│   │  config.json 单文件：   │
+│  · 解压文件缓存（慢路径）│   │  config.toml 单文件：   │
 │  · 解码块 LRU（快路径） │   │  缓存/扩展名/播放器参数/ │
-│  · LRU 淘汰 + 上限控制  │   │  看图器参数              │
+│  · LRU 淘汰 + 上限控制  │   │  看图参数/VarTidy       │
 └───────────────────────┘   └──────────────────────────┘
 ```
 
-**架构不变量**：播放器与图片查看器是 VFS 层的两个并列消费者，互不感知。
+**架构不变量**：播放器与 VarTidy 整理器是 VFS 层的两个并列消费者，互不感知。
 未来扩展（音频播放、文本预览等）只需新增消费者，VFS 不动 —— 这是本设计的核心扩展点。
 
 ---
@@ -150,7 +148,7 @@ trait VirtualFile: Read + Seek {
 
 ### 5.3 缓解措施（四层）
 
-1. **mpv demuxer 缓存**：调大 `demuxer-max-bytes` / `cache-secs`（config.json 可配）。
+1. **mpv demuxer 缓存**：调大 `demuxer-max-bytes` / `cache-secs`（config.toml 可配）。
    小幅回跳（刚看过的地方）命中缓存，零成本 —— 覆盖最常见的拖拽场景。
 2. **解码块 LRU 缓存（快路径）**：解压后的数据按块（默认 4MB/块，可配）进 LRU；
    后向 seek 落在缓存内则 O(1)。播放为顺序读，"拖回刚才看过的地方"命中率极高。
@@ -167,72 +165,57 @@ trait VirtualFile: Read + Seek {
 
 ---
 
-## 6. 图片预览模块（类 HoneyView）
+## 6. 图片预览模块
 
-### 6.1 定位
+### 6.1 定位与实现决策
 
-与视频播放并列的 VFS 消费者。扫描阶段按扩展名将 entry 分为视频/图片两类
-（分类规则集中在 config.json），列表以图标区分，双击/回车打开。
+与视频播放并列的 VFS 消费者。**图片不经独立解码库，统一走 mpv 渲染**
+（早期设计稿的 image crate + egui 纹理方案已放弃）：mpv 原生支持 JPEG/PNG/GIF/WebP/BMP
+等常见格式（含 GIF/WebP 动图逐帧播放），复用 loadfile 一条链路后，VFS 快慢路径、
+缓存、翻页导航、全屏、解压进度覆盖层全部零成本复用，也避免了
+"mpv 子窗口永远盖在 egui 之上"（见 11.3）与纹理渲染的窗口叠放冲突。
 
 ### 6.2 数据流
 
 ```
-选中图片 → open_entry() → 后台线程全量读入 + image 解码
-        → 上传 egui 纹理（后台完成后通知 UI）
-        → 纹理进入 LRU 缓存（上限可配，默认 32 张）→ ←/→ 翻页秒切
+选中图片 → 与视频完全同路：ZipVFS 流式（zvf://）或固态包后台解压 → 缓存文件
+        → mpv loadfile 统一渲染（静态图 / GIF/WebP 动图）
+        → PPT 式自动翻页（ui.slideshow_secs 间隔，空格/播放按钮开关）
 ```
 
 ### 6.3 功能与交互
 
 | 功能 | 说明 |
 |---|---|
-| 缩放 | 滚轮缩放；模式：适应窗口 / 1:1 / 自由倍率（可配默认值） |
-| 平移 | 放大后拖拽平移 |
-| 翻页 | ←/→ 或 PgUp/PgDn 在当前文件列表内切换；预解码相邻 1~2 张 |
-| 动图 | GIF / WebP 动画通过 image 的 AnimationDecoder 帧动画渲染 |
-| 大图 | 后台解码 + loading 占位，不阻塞 UI |
-| 记忆 | 记住同包内上次浏览位置与缩放模式 |
+| 翻页 | PgUp/PgDn 或滚轮在当前文件列表内切换（`ui.wheel_switch_secs` 节流） |
+| 动图 | GIF / WebP 动画由 mpv 逐帧渲染 |
+| 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
+| 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
 
-### 6.4 格式支持
+### 6.4 预留扩展
 
-- 一期（`image` crate 原生）：JPEG / PNG / GIF / WebP / BMP / TIFF
-- 二期（按需）：PSD、HEIC 等引入专用解码库；不影响 VFS 层
-
-### 6.5 预留扩展
-
-同一消费者模式可继续接入：音频播放、视频缩略图（mpv 截首帧）、文本/字幕预览等。
+缩放/平移交互、浏览位置记忆（需在 mpv 子窗口之上叠加 egui 交互层或改纹理渲染方案）、
+PSD/HEIC 等专用格式（mpv 不支持，需引入解码库走纹理路径）——均不影响 VFS 层。
 
 ---
 
-## 7. 配置文件设计（config.json，单文件集中）
+## 7. 配置文件设计（config.toml，单文件集中）
 
-```json
-{
-  "cache": {
-    "dir": "auto",
-    "max_size_mb": 2048,
-    "chunk_size_mb": 4,
-    "chunk_cache_blocks": 64,
-    "texture_cache_count": 32
-  },
-  "media": {
-    "video_extensions": ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"],
-    "image_extensions": ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"],
-    "player": {
-      "hwdec": "auto",
-      "cache_secs": 30,
-      "demuxer_max_mb": 512
-    }
-  },
-  "viewer": {
-    "background": "#1e1e1e",
-    "default_zoom": "fit",
-    "preload_neighbors": 2
-  }
-}
+```toml
+password_codepage = "gbk"   # 加密包密码候选代码页
+
+[cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
+[media]   # video_extensions / image_extensions
+[player]  # hwdec / cache_secs / demuxer_max_mb / volume
+[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files / extract_overlay_delay_ms
+[extract] # prefetch_mb（solid 包批量预取上限）
+[vartidy] # repo_dir / report_dir / passwords（CLI 整理子命令）
 ```
 
 > 约定：所有路径、阈值、扩展名列表、播放器参数均只在此文件配置，代码零硬编码。
+> 格式选型：TOML（而非 JSON）——原生 `#` 注释 + 强制 UTF-8，默认配置带中文说明每个参数含义；
+> 字符串必须双引号，无 YAML 裸标量陷阱（`yes/no` 变布尔、`#` 误注释）。
+> 默认文件由手写模板生成（`config.rs` 的 `DEFAULT_TOML`），防漂移测试保证模板与代码默认值一致。
 
 ---
 
@@ -245,21 +228,20 @@ trait VirtualFile: Read + Seek {
 | 3 | 分卷压缩（.part1.rar / .7z.001） | unrar 原生支持 RAR 分卷；ZIP 分卷需自行拼接 —— 二期 |
 | 4 | 加密 | 头加密阻止列目录 → 先弹密码框；密码仅内存传递不落盘 |
 | 5 | libmpv 嵌入渲染 | MVP 用原生子窗口嵌入（Windows `SetParent`）；纹理渲染方案后置 |
-| 6 | UnRAR.dll / mpv dll 分发 | 随程序打包 x64 dll；构建脚本从 config 指定的目录复制 |
-| 7 | 大图解码阻塞 UI | 解码全部在后台线程，完成后经 channel 通知 UI |
+| 6 | mpv dll 分发 | 仓库不含（超 GitHub 单文件限制），build.rs 从 `deps\mpv-dev` 复制，README 提供下载指引 |
+| 7 | 大图解码阻塞 UI | 已消解：图片统一走 mpv 渲染，无独立解码线程（见第 6 章） |
 
 ---
 
-## 9. 实施路线
+## 9. 实施路线与状态
 
-| 阶段 | 内容 | 交付物 |
-|---|---|---|
-| Phase 1 (MVP) | egui + libmpv + ZipVFS + 列表/搜索 + config.json + seek 基础链路 + 解码块 LRU | ZIP 内视频端到端可播可拖 |
-| Phase 2 | SevenzVFS / RarVFS + 固态探测 + 后台解压通路 + 解压任务 seek 重定向 + LRU 文件缓存 | 三格式全覆盖 |
-| Phase 3 | 图片查看器（解码/缩放/翻页/动图）+ 密码支持 | 类 HoneyView 体验 |
-| Phase 4 | 分卷、视频缩略图、播放记忆、PSD/HEIC | 完整版 |
-
-> 注：图片查看器架构自 Phase 1 起即预留接口（MediaDispatcher + VFS 消费者模式），实现排在 Phase 3。
+| 阶段 | 内容 | 交付物 | 状态 |
+|---|---|---|---|
+| Phase 1 (MVP) | egui + libmpv + ZipVFS + 列表/搜索 + config + seek 基础链路 + 解码块 LRU | ZIP 内视频端到端可播可拖 | ✅ |
+| Phase 2 | SevenzVFS / RarVFS + 固态探测 + 后台解压通路 + LRU 文件缓存 + 大包性能专项（第 11 章） | 三格式全覆盖，56G 固态包秒级定位 | ✅ |
+| Phase 3 | 图片查看（mpv 统一渲染 + PPT 自动翻页）+ 密码支持（多编码候选 + 会话记忆） | 图片/动图可看，加密包可开 | ✅ |
+| Phase 4 | 分卷 RAR（已支持）、分卷 ZIP、视频缩略图、播放记忆 | 完整版 | 🔶 部分完成 |
+| 追加 | VarTidy CLI 子命令（第 12 章）：var 资源包增量整理 | `archview.exe tidy` + 「发送到」 | ✅ |
 
 ---
 
@@ -267,12 +249,12 @@ trait VirtualFile: Read + Seek {
 
 ```
 ui          : egui / eframe
-player      : libmpv-rs (stream_cb)
+player      : 自研 mpv_ffi（libloading 动态加载 libmpv-2.dll，含 stream_cb）
 archive/zip : zip
-archive/7z  : sevenz-rust
+archive/7z  : sevenz-rust (BlockDecoder 固态直达)
 archive/rar : unrar (UnRAR.dll)
-image       : image
-serde       : serde + serde_json (config.json)
+image       : 无独立解码库（mpv 统一渲染）
+config      : serde + toml (config.toml)
 logging     : tracing
 ```
 
@@ -358,3 +340,127 @@ PointerMoved/MouseWheel 事件序列跑 100+ 帧，记录每帧 `ScrollArea::sta
   500ms 内解完则窗口从未隐藏——快速路径零闪烁。这是"延迟隐藏"而非"最短显示时间"：
   后者会人为拖慢快速解压。
 - 预取场景（目标 == 正在播放条目）永不遮挡画面，顶栏弱色短标记即可。
+
+---
+
+## 12. VarTidy：var 资源包增量整理（CLI 子命令）
+
+> 形态：`archview tidy` 命令行子命令，与播放器 GUI 共享同一个 exe 和 VFS 引擎，互不干扰
+> （无参数启动 = GUI 播放器，行为完全不变）。var 文件本身不可播放不可预览，
+> 整理功能与播放器 UI 无交集，因此走 CLI 而非塞进 GUI。
+>
+> 定位：替代手动五步流程——「解压整个包 → class_var.py 归类 → deal_invaild_files.py 搬运无效文件
+> → rm_empty_dir.py 清理 → 手动并入仓库再人工去重」，实现零临时全量落盘的原地整理
+> （50G 包手动流程需额外 ~100G 磁盘与两次全量搬运；新流程磁盘增量 ≈ 仓库确实缺少的 var 体积）。
+
+### 12.1 核心原则（不可违反的约束）
+
+1. **var_repo 对整理器只读 + 增量**：仓库是用户多年整理的资产。已有 var 文件与已有文件夹
+   一律不动——不修改、不移动、不删除、不复写。整理器仅允许两个写动作：
+   创建尚不存在的新作者子文件夹、向其中写入仓库没有的新 var。
+2. **同名冲突仓库版胜出**：待合入 var 与仓库已有 var 同名时一律跳过、记入报告，
+   代码中不存在任何"覆盖/替换"路径。
+3. **无效文件不落盘**：包内非 var / 命名非法条目只进报告，不解压不落盘。
+   对比手动流程"全部落盘 → 再搬进错误目录"：仓库零垃圾，也无需事后清理空目录。
+4. **零临时全量落盘**：不整包解压，按 entry 直写仓库目标路径。
+
+### 12.2 流水线
+
+```
+输入（单个包 / 目录递归扫描 / 多个包）
+  → 逐包打开（复用 VFS 三格式实现、加密密码候选链路、分卷 RAR）
+  → list() 平铺全部 entry（多级子目录天然覆盖）
+  → 分类（class_var.py 规则移植为 classify.rs）：
+      ├─ 合法：作者.内容.版本.var 四段校验（版本号纯数字、作者/内容非空）
+      └─ 无效：非var / 格式错误 / 版本号错误 / 作者缺失 / 内容缺失 → 仅记报告
+  → 包内去重（见 12.3）
+  → 仓库去重：仓库/作者/文件名 已存在 → 跳过（仓库版胜出）
+  → 磁盘余量预检：累计新增量 + 64MB 余量，不足直接报错（不做自动回退）
+  → 按压缩包内部顺序批量抽取（复用 extract_batch / prefetch / 取消机制）
+  → 直写 仓库/作者名/文件名（.part 临时名 + 原子 rename）
+  → 汇总报告：新增 / 仓库已有 / 包内重复 / 同名不同内容警告 / 无效 / 失败
+```
+
+**解压顺序与落盘位置解耦**：抽取按包内顺序进行（固态包 folder 定位成本最低，
+prefetch 顺带解出同 folder 后续目标摊薄成本），落盘按 `作者名/文件名` 定位。
+
+**命名兼容**：作者名 = 按点切分第一段（strip 首尾空格），段内字符原样保留——
+中文、空格、`&[]#%` 等 Windows 合法字符不影响分类与落盘（与 class_var.py 行为逐条对齐，
+回归测试钉死；含中文/空格的压缩包文件名亦全链路支持）。
+已知微小差异：Python `isdigit()` 接受全角数字而 Rust 用 `is_ascii_digit()` 更严格，
+全角数字版本号会被判"版本号错误"——VaM 生态中不存在此形态，严格校验更安全。
+
+### 12.3 两级去重
+
+| 层级 | 场景 | 判据 | 处理 |
+|---|---|---|---|
+| 包内去重 | 同一包的不同子目录出现同名 var | 文件名 + CRC32（entry 元数据自带，零解压成本） | 同名同 CRC → 保留首个，其余记「包内重复」；同名不同 CRC → 跳过后续并记警告，交人工确认，绝不自动挑选（可能挑错版本） |
+| 仓库去重 | 仓库/作者/文件名 已存在 | 文件名存在 | 跳过，保留仓库版（核心原则 2） |
+
+### 12.4 写入安全
+
+- `.part` 临时文件（文件名含 pid，防多实例踩踏）+ 原子 rename；
+  rename 前二次检查目标存在性，已存在则丢弃 `.part` 保留仓库文件（防并发写入窗口）。
+- 超长路径（>260 字符）走 `\\?\` 前缀。
+- 逐包隔离：单个包打开/解压失败不中断批次，记入报告，最终汇总。
+- 只读属性/权限导致的写失败：报错并记录，不静默跳过。
+
+### 12.5 CLI 用法与「发送到」快捷方式
+
+```
+archview.exe tidy <包或目录> [更多包...] [选项]
+
+  -o, --repo <dir>    目标仓库目录（缺省读 config.toml 的 vartidy.repo_dir）
+  -n, --dry-run       预演：仅做分类与两级去重检查（纯元数据操作，不解压），
+                      输出完整报告（新增 N / 仓库已有 M / 包内重复 K / 无效 J + 明细）
+  -p, --password <pw> 加密包密码（可多次指定，按序尝试；config vartidy.passwords 兜底）
+  -q, --quiet         静默：无控制台时结束不弹结果窗（脚本/计划任务防阻塞）
+  --report <path>     报告输出目录（默认 stdout 摘要 + 报告文件，见 vartidy.report_dir）
+```
+
+`repo_dir` 收进 config.toml 后，资源管理器「发送到」快捷方式只需一行目标：
+
+```
+"<archview.exe 全路径>" tidy "%1"
+```
+
+对任意压缩包右键 → 发送 → 即按配置的仓库执行整理。多包/目录批量场景用命令行或 bat。
+
+**加密包密码（CLI/SendTo 无交互输入的解法）**：尝试序列 = `[无密码] → CLI -p（按指定顺序）→ config vartidy.passwords`。
+加密头包（7z/RAR）密码不符在打开即失败，候选在规划阶段推进；内容加密包（zip AES 等）打开恒成功、
+密码错误在解压时才暴露，候选在执行阶段推进重开（已落盘文件按仓库存在性剔除，不重复计数）。
+选列表而非交互输入的原因：SendTo 无 stdin；N 个包批量逐个提示体验差；包密码来源固定（几个站点各一个），
+小列表即真实心智模型。密码仅用于解压，不写入日志与报告。
+
+**冒烟测试**：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `examples\make_smoke_fixtures`
+生成测试源（明文/AES zip/明文/内容加密 7z + 既有仓库）→ dry-run → 实际整理（含密码候选重试）→ 幂等重跑。
+
+### 12.6 配置（config.toml 新增节，代码零硬编码）
+
+```json
+"vartidy": {
+  "repo_dir": "D:/var_repo",
+  "report_dir": "auto",
+  "passwords": ["site-a 的密码", "site-b 的密码"]
+}
+```
+
+### 12.7 复用清单（并入本仓库而非独立项目的理由）
+
+| 复用能力 | 来源 | 对 var 整理的意义 |
+|---|---|---|
+| ZIP/7Z/RAR 读取、加密、分卷、密码候选 | `vfs/` 全部 | 下载包格式全覆盖，含 GBK 密码 |
+| 7z 固态包 folder 直达（BlockDecoder） | 11.1 节优化 | 50G 级固态包定位目标秒级，否则分钟级全包解压——原地整理的前提 |
+| extract_batch + prefetch + 取消 | 播放器慢路径同款 | 批量抽取摊薄固态定位成本 |
+| .part + 原子 rename、余量预检、pid 临时名 | `cache.rs` 机制 | 仓库写入安全（12.4） |
+| 后台任务 + 代际号模型 | OpenJob/ExtractJob | 多包排队处理的任务框架 |
+
+### 12.8 实施状态与后续阶段
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 1 | `src/vartidy/classify.rs` 移植 class_var.py 全部规则 | ✅ 完成（单测覆盖 5 类非法 + 合法 + 特殊字符命名） |
+| 2 | 流水线：两级去重（CRC 判重）、余量预检、批量抽取直写、报告、dry-run | ✅ 完成（含仓库只读三道闸、密码耗尽零痕迹回收） |
+| 3 | CLI 分发入口 + config `vartidy` 节（含密码列表）+ 「发送到」+ `-q` 防脚本阻塞 | ✅ 完成（30/30 测试 + setup.bat 6 包冒烟全链路） |
+| 4（可选） | 失败续跑（记录已完成包清单，重跑跳过） | 按需 |
+| 5（可选） | hash 级去重（防"同名不同内容"漏判）、多包并发 | 按需 |

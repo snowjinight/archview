@@ -155,11 +155,14 @@ impl ZipVFS {
                 fixed_size
             };
             f.seek(SeekFrom::Current(cmt_len)).ok()?;
+            // APPNOTE 4.3.7：16-19 CRC32（VarTidy 包内去重判据，元数据自带零解压成本）
+            let crc = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
             out.push(VirtualEntry {
                 name: name.clone(),
                 size,
                 is_dir: name.ends_with('/'),
                 encrypted: flags & 0b1 != 0,
+                crc: Some(crc),
             });
         }
         // 数量一致性：crate 的索引表会折叠重名条目而 CD 不会——
@@ -192,6 +195,7 @@ impl ZipVFS {
                     size: e.size(),
                     is_dir: e.is_dir(),
                     encrypted: e.encrypted(),
+                    crc: Some(e.crc32()),
                 })
             })
             .collect();
@@ -537,6 +541,7 @@ mod tests {
             assert_eq!(f.size, s.size);
             assert_eq!(f.is_dir, s.is_dir);
             assert_eq!(f.encrypted, s.encrypted);
+            assert_eq!(f.crc, s.crc, "CD 遍历与 fallback 的 CRC 应一致");
         }
         // list() 走的就是快路径结果（长度一致；字段已在上面与 fallback 对齐校验）
         assert_eq!(vfs.list().len(), fast.len());

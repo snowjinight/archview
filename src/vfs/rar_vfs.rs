@@ -207,6 +207,8 @@ impl ArchiveVFS for RarVFS {
                             size: h.unpacked_size,
                             is_dir: h.is_directory(),
                             encrypted: h.is_encrypted(),
+                            // RAR 头自带未压缩数据 CRC（VarTidy 包内去重判据）
+                            crc: Some(h.file_crc),
                         });
                     }
                     match head.skip() {
