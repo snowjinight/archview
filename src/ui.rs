@@ -1,4 +1,6 @@
-//! egui UI：左侧播放区（mpv 子窗口嵌入）+ 右侧文件列表+搜索 + 底部控制栏。
+//! egui UI：左侧文件列表（标签页/搜索/状态行）+ 中央播放区（mpv 子窗口嵌入
+//! + 底部全宽进度条）+ 底部控制栏。滚轮仅在视频区悬停时切换媒体
+//! （ui.wheel_switch_secs 节流），文件列表区滚轮为正常滚动列表。
 
 use crate::cache;
 use crate::config::Config;

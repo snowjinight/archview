@@ -187,7 +187,7 @@ trait VirtualFile: Read + Seek {
 
 | 功能 | 说明 |
 |---|---|
-| 翻页 | PgUp/PgDn 或滚轮在当前文件列表内切换（`ui.wheel_switch_secs` 节流） |
+| 翻页 | PgUp/PgDn 切换上/下一个；滚轮仅在**视频区**悬停时切换（`ui.wheel_switch_secs` 节流）——文件列表区滚轮是正常滚动列表，不切换 |
 | 动图 | GIF / WebP 动画由 mpv 逐帧渲染 |
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
