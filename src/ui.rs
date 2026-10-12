@@ -7,8 +7,8 @@ use crate::config::Config;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
 use crate::vfs::{
-    archives_in_dir, next_archive_in_dir, open_archive, AccessMode, ArchiveVFS, VfsError,
-    VirtualEntry,
+    archives_in_dir, next_archive_in_dir, open_with_password_probe, AccessMode, ArchiveVFS,
+    VfsError, VirtualEntry,
 };
 use egui::Widget;
 use std::path::{Path, PathBuf};
@@ -108,20 +108,20 @@ enum ExtMsg {
 struct OpenJob {
     gen: u64,
     path: PathBuf,
-    /// 提交的密码（打开成功后写入会话记忆）
-    pw: Option<String>,
-    /// 打开成功后要恢复播放的条目（replay_with_password 场景）；
-    /// 条目元数据同时用于 zip 内容加密的密码预校验
+    /// 打开成功后要恢复播放的条目（replay_with_password 场景）
     retry_play: Option<(usize, VirtualEntry)>,
     rx: Receiver<OpenMsg>,
 }
 
 enum OpenMsg {
-    /// 打开 + 注册完成（stream_cb 已注册，entries 已列出）
+    /// 打开 + 注册完成（stream_cb 已注册，entries 已列出）。
+    /// pw = 探测锁定的密码（None = 包未加密/无需密码；可能是 config 列表
+    /// 里的密码而非提交密码——用于会话记忆与 ArchiveState.password）
     Done {
         vfs: Arc<dyn ArchiveVFS>,
         id: u64,
         entries: Vec<VirtualEntry>,
+        pw: Option<String>,
     },
     /// 加密头或密码错误：需要（重新）弹密码框
     NeedPw {
@@ -342,7 +342,19 @@ impl App {
         let gen = self.next_gen;
         let (tx, rx) = mpsc::channel::<OpenMsg>();
         // 线程闭包拿副本，本地保留原值用于 OpenJob 状态
-        let (path_t, pw_t, retry_t) = (path.clone(), pw.clone(), retry_play.clone());
+        let path_t = path.clone();
+        // 密码探测链候选：显式密码（会话记忆/用户输入）优先，
+        // config 公用密码列表（播放器与 VarTidy 共享）兜底，去重保序
+        let mut candidates: Vec<String> = Vec::new();
+        for c in pw
+            .iter()
+            .filter(|p| !p.is_empty())
+            .chain(self.cfg.passwords.iter().filter(|p| !p.is_empty()))
+        {
+            if !candidates.contains(c) {
+                candidates.push(c.clone());
+            }
+        }
         let spawned = std::thread::Builder::new()
             .name("open_archive".into())
             .spawn(move || {
@@ -351,19 +363,12 @@ impl App {
                     fraction: None,
                     stage: "正在读取压缩包目录".into(),
                 });
-                let msg = match open_archive(&path_t, pw_t.as_deref()) {
-                    Ok(vfs) => {
+                // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：
+                // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
+                // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
+                let msg = match open_with_password_probe(&path_t, &candidates) {
+                    Ok((vfs, locked)) => {
                         let arc: Arc<dyn ArchiveVFS> = vfs.into();
-                        // zip 内容加密重开：正式注册前先校验密码
-                        // （错密码不替换状态，直接重弹；其它错误照常打开，播放时自然暴露）
-                        if let Some((_, entry)) = &retry_t {
-                            if arc.access_mode() == AccessMode::FastSeek {
-                                if let Err(VfsError::Password) = arc.open_entry(entry) {
-                                    let _ = tx.send(OpenMsg::NeedPw { wrong: true });
-                                    return;
-                                }
-                            }
-                        }
                         // 阶段 2（list，zip 的 CD 顺序遍历有真实百分比）
                         let (id, entries) =
                             stream_cb::register_with_progress(arc.clone(), &path_t, &|f, s| {
@@ -376,10 +381,11 @@ impl App {
                             vfs: arc,
                             id,
                             entries,
+                            pw: locked,
                         }
                     }
                     Err(VfsError::Password) => OpenMsg::NeedPw {
-                        wrong: pw_t.is_some(),
+                        wrong: pw.is_some(),
                     },
                     Err(e) => OpenMsg::Failed(format!("Failed to open {}: {e}", path_t.display())),
                 };
@@ -390,7 +396,6 @@ impl App {
             self.open_job = Some(OpenJob {
                 gen,
                 path,
-                pw,
                 retry_play,
                 rx,
             });
@@ -434,7 +439,12 @@ impl App {
             }
             self.open_progress = None; // 终态：清进度显示
             match msg {
-                OpenMsg::Done { vfs, id, entries } => {
+                OpenMsg::Done {
+                    vfs,
+                    id,
+                    entries,
+                    pw,
+                } => {
                     let path = job.path;
                     // 切换压缩包：按配置清理上一个包的解压缓存（默认不清理——保留可命中）
                     if self.cfg.cache.clean_on_switch {
@@ -449,8 +459,8 @@ impl App {
                         }
                     }
                     let stream = vfs.access_mode() == AccessMode::FastSeek;
-                    // 密码记忆：带密码成功打开的包记入会话表（切回来不用重输）
-                    if let Some(pw) = &job.pw {
+                    // 密码记忆：探测锁定密码的包记入会话表（切回来不用重探）
+                    if let Some(pw) = &pw {
                         self.pw_memory.insert(path.clone(), pw.clone());
                     }
                     // 会话内"看过"标记（切包弹窗中灰色显示）
@@ -463,7 +473,7 @@ impl App {
                         id,
                         name,
                         path: path.clone(),
-                        password: job.pw.clone(),
+                        password: pw.clone(),
                         entries,
                         view: Vec::new(),
                         vfs,

@@ -20,6 +20,11 @@ pub struct Config {
     /// zip/RAR4 老工具按系统 ANSI 代码页编码密码，解压时在 UTF-8 之外追加此编码候选。
     /// "none" 或空 = 只试 UTF-8。默认 "gbk"（简中 Windows）。
     pub password_codepage: String,
+    /// 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
+    /// 打开压缩包阶段即自动探测（无密码优先 → 此列表依次），全不匹配播放器才弹
+    /// 密码框、VarTidy 记失败；CLI 的 -p 密码排在此列表之前。
+    /// 密码仅用于解压，不写入日志/报告
+    pub passwords: Vec<String>,
     /// VarTidy（`archview tidy` CLI 子命令）配置
     pub vartidy: VarTidyConfig,
 }
@@ -33,10 +38,6 @@ pub struct VarTidyConfig {
     pub repo_dir: String,
     /// 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
     pub report_dir: String,
-    /// 加密包密码候选列表（按序尝试）。CLI/SendTo 模式无交互输入，
-    /// 依次用列表密码尝试打开与解压；CLI 的 -p 密码排在此列表之前。
-    /// 密码仅用于解压，不写入日志/报告
-    pub passwords: Vec<String>,
 }
 
 impl Default for VarTidyConfig {
@@ -44,7 +45,6 @@ impl Default for VarTidyConfig {
         Self {
             repo_dir: String::new(),
             report_dir: "auto".into(),
-            passwords: Vec::new(),
         }
     }
 }
@@ -184,6 +184,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             extract: ExtractConfig::default(),
             password_codepage: "gbk".into(),
+            passwords: Vec::new(),
             vartidy: VarTidyConfig::default(),
         }
     }
@@ -295,6 +296,11 @@ const DEFAULT_TOML: &str = r#"# ================================================
 # 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只试 UTF-8
 password_codepage = "gbk"
 
+# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
+# 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
+# 密码框、VarTidy 记失败跳包。密码始终用双引号包裹；仅用于解压，不写入日志/报告
+passwords = []
+
 [cache]
 # libmpv-2.dll 搜索目录；"auto" = exe 同目录
 dll_dir = "auto"
@@ -356,9 +362,6 @@ prefetch_mb = 512
 repo_dir = ""
 # 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
 report_dir = "auto"
-# 加密包密码候选列表（按序尝试；CLI 的 -p 密码排在此列表之前）。
-# 密码始终用双引号包裹；仅用于解压，不写入日志/报告
-passwords = []
 "#;
 
 #[cfg(test)]
@@ -386,14 +389,14 @@ mod tests {
     fn toml_special_char_passwords() {
         let text = r#"
 password_codepage = "gbk"
+passwords = ["p@ss #1", "中文密码 2026", "特!@#$%^&*()殊"]
 [vartidy]
 repo_dir = ""
 report_dir = "auto"
-passwords = ["p@ss #1", "中文密码 2026", "特!@#$%^&*()殊"]
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(
-            cfg.vartidy.passwords,
+            cfg.passwords,
             ["p@ss #1", "中文密码 2026", "特!@#$%^&*()殊"]
         );
     }

@@ -193,6 +193,22 @@ pub trait ArchiveVFS: Send + Sync {
         }
         Ok(())
     }
+
+    /// 校验密码能否解密指定条目（打开阶段密码探测用，ARCHITECTURE.md 12.5）。
+    /// - Ok(())：密码可用于该条目（或条目未加密，任意密码都通过）
+    /// - Err(Password)：密码错误 / 加密但未提供密码
+    /// 实现成本与格式相关：zip 构造 reader 即验 2 字节校验值（零解压）；
+    /// RAR5 头带 PswCheck、RAR4 无密码哈希，实现为解压该条目到临时文件；
+    /// 7z 无存储校验值，实现为解压该条目到内存 sink、靠 CRC 校验判错。
+    /// 探测目标应选最小的加密条目（见 `open_with_password_probe`）
+    fn verify_password(
+        &self,
+        entry: &VirtualEntry,
+        password: Option<&str>,
+    ) -> Result<(), VfsError> {
+        let _ = (entry, password);
+        Err(VfsError::Unsupported("此格式不支持密码校验".into()))
+    }
 }
 
 /// 按扩展名打开压缩包（7z/RAR 走固态慢路径，ZIP 走流式快路径）。
@@ -211,6 +227,70 @@ pub fn open_archive(path: &Path, password: Option<&str>) -> Result<Box<dyn Archi
         }
         "rar" => rar_vfs::RarVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>),
         _ => Err(VfsError::Unsupported(format!("暂不支持的格式: .{ext}"))),
+    }
+}
+
+/// 密码探测目标选择：最小的加密实体文件（三格式 encrypted 标志均可靠——
+/// zip/RAR 来自条目头，7z 由所在 folder 是否含 AES coder 推得）。
+/// 越小验证成本越低（RAR/7z 需真实解压该条目）。返回 None = 无可探测文件
+fn probe_entry(entries: &[VirtualEntry]) -> Option<&VirtualEntry> {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir && e.size > 0 && e.encrypted)
+        .min_by_key(|e| e.size)
+}
+
+/// 打开压缩包并在打开阶段锁定密码（规划期密码探测，ARCHITECTURE.md 12.5）。
+/// 尝试序列：无密码 → candidates 依次（绝大多数包不加密，无密码零成本直通）。
+/// - 加密头包（7z/RAR）：open 即验密码，候选逐个重开
+/// - 内容加密包（zip AES / 7z / RAR 明文头）：open 恒成功，对最小加密条目
+///   `verify_password` 逐候选校验，命中后带密码重开
+/// 返回 (VFS, 锁定的密码)：密码 None = 包未加密。候选全不匹配返回 Err(Password)，
+/// 调用方（CLI 记失败 / UI 弹密码框）据此走兜底路径
+pub fn open_with_password_probe(
+    path: &Path,
+    candidates: &[String],
+) -> Result<(Box<dyn ArchiveVFS>, Option<String>), VfsError> {
+    // ---- 加密头：open 即验，候选逐个重开 ----
+    let vfs = match open_archive(path, None) {
+        Ok(v) => v,
+        Err(VfsError::Password) => {
+            for pw in candidates {
+                match open_archive(path, Some(pw)) {
+                    Ok(v) => return Ok((v, Some(pw.clone()))),
+                    Err(VfsError::Password) => continue,
+                    // 非密码错误（损坏等）：换密码也没用，直接定性
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(VfsError::Password);
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ---- 内容加密：encrypted 标志可靠（7z 也由 folder coder 推得），
+    // 无加密条目直接零成本通过，不做任何探测 ----
+    let entries = vfs.list();
+    let Some(target) = probe_entry(&entries) else {
+        return Ok((vfs, None));
+    };
+    match vfs.verify_password(target, None) {
+        Ok(()) => Ok((vfs, None)),
+        Err(VfsError::Password) => {
+            for pw in candidates {
+                match vfs.verify_password(target, Some(pw)) {
+                    Ok(()) => {
+                        // 命中：带密码重开，VFS 内部以该密码解压全部条目
+                        let locked = open_archive(path, Some(pw))?;
+                        return Ok((locked, Some(pw.clone())));
+                    }
+                    Err(VfsError::Password) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(VfsError::Password)
+        }
+        Err(e) => Err(e),
     }
 }
 

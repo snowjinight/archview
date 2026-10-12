@@ -291,6 +291,18 @@ impl ArchiveVFS for ZipVFS {
         })?;
         Ok(())
     }
+
+    /// 密码校验：AES/ZipCrypto 的 reader 构造即验 2 字节密码校验值（零解压），
+    /// by_index 内部已按编码候选逐个尝试（InvalidPassword 换下一个），
+    /// 全部失败报 Password；条目未加密时任何密码都通过
+    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+        let mut archive = self.archive()?;
+        let index = archive
+            .index_for_name(&entry.name)
+            .ok_or_else(|| VfsError::Archive(format!("entry 不存在: {}", entry.name)))?;
+        let candidates = password.map(super::password_candidates).unwrap_or_default();
+        Self::by_index(&mut archive, index, &candidates).map(|_| ())
+    }
 }
 
 /// 可 seek 的 zip entry 读取器：archive 由自身持有。

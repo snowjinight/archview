@@ -8,7 +8,7 @@
 
 pub mod classify;
 
-use crate::vfs::{open_archive, ArchiveVFS, VirtualEntry, VfsError};
+use crate::vfs::{ArchiveVFS, VirtualEntry, VfsError};
 use classify::{classify_file_name, ClassifyResult};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -175,10 +175,6 @@ struct PlannedTarget {
 
 struct ArchivePlan {
     display: String,
-    /// 压缩包路径（密码候选重试时重开用）
-    path: PathBuf,
-    /// 当前打开所用密码（None = 无密码）
-    pw: Option<String>,
     vfs: Option<Box<dyn ArchiveVFS>>,
     targets: Vec<PlannedTarget>,
 }
@@ -190,15 +186,6 @@ struct ArchiveStat {
     in_archive_dup: usize,
     crc_conflict: usize,
     invalid: usize,
-}
-
-/// 密码候选序列：[无密码] + passwords（绝大多数包不加密，无密码优先零成本直通）。
-/// 加密头包（7z/RAR）密码不符在 open 即失败——候选循环在阶段 A 推进；
-/// 内容加密包（zip AES 等）open 恒成功、密码错误在解压时才暴露——候选循环在阶段 B 推进
-fn password_candidates(passwords: &[String]) -> Vec<Option<String>> {
-    std::iter::once(None)
-        .chain(passwords.iter().cloned().map(Some))
-        .collect()
 }
 
 /// 对单个包构建整理计划：分类 → 包内去重 → 仓库去重。
@@ -342,25 +329,26 @@ fn human_size(bytes: u64) -> String {
 /// - staging 文件名 `.vtp{pid}`：崩溃残留可安全手动删除（内容未提升，不是有效 var）
 /// - file_done 回调里做「提升」：目标已存在 → 丢弃 staging 保留仓库文件（二次检查，
 ///   防规划后到落盘前仓库出现同名文件的竞态）；否则 rename_no_replace 落地
-/// - 返回值：仅 `Err(Password)` 会向上传播（调用方推进密码候选重试）；
-///   其余错误已在本函数内记录（summary/lines）并返回 Ok
+/// - 所有错误（含罕见的探测遗漏 Password）已在本函数内记录（summary/lines），
+///   失败时回收 staging 与本次新建的空作者目录，仓库零痕迹
 fn execute_plan(
     plan: &mut ArchivePlan,
     repo: &Path,
     summary: &mut TidySummary,
     lines: &mut Vec<ReportLine>,
     out: &mut dyn FnMut(&str),
-) -> Result<(), VfsError> {
+) {
+
     let Some(vfs) = plan.vfs.take() else {
-        return Ok(());
+        return;
     };
     let display = plan.display.clone();
     if plan.targets.is_empty() {
-        return Ok(());
+        return;
     }
 
     // 作者目录：create_dir_all 对已存在目录是 no-op，不触碰其中内容。
-    // 记录本次新建的目录：密码候选耗尽时回收空目录，保持仓库零痕迹
+    // 记录本次新建的目录：执行失败时回收空目录，保持仓库零痕迹
     let mut created_dirs: Vec<PathBuf> = Vec::new();
     let mut authors: Vec<String> = plan.targets.iter().map(|t| t.author.clone()).collect();
     authors.sort_unstable();
@@ -391,7 +379,7 @@ fn execute_plan(
         }
     }
     if plan.targets.is_empty() {
-        return Ok(());
+        return;
     }
 
     let pid = std::process::id();
@@ -481,33 +469,31 @@ fn execute_plan(
     };
 
     match vfs.extract_batch(&targets, &cancel, &progress, &file_done) {
-        Ok(()) => Ok(()),
-        // 密码错误不在此记录：调用方可能换密码候选重试，避免中间状态进报告。
-        // 回收本次空建的作者目录（remove_dir 仅删空目录，已有提升文件的目录保留）
-        Err(e) if matches!(e, VfsError::Password) => {
+        Ok(()) => {}
+        Err(e) => {
+            // 批量失败：清理残留 staging、回收本次空建的作者目录（remove_dir 仅删
+            // 空目录，已有提升文件的目录保留）；逐条已完成的照常保留。
+            // 密码已在规划期锁定，Password 只在罕见场景出现（同一包内不同条目
+            // 用不同密码且探测条目恰好未覆盖），同样按失败记录
             for (staging, _) in &items {
                 std::fs::remove_file(staging).ok();
             }
             for d in &created_dirs {
                 std::fs::remove_dir(d).ok();
             }
-            Err(VfsError::Password)
-        }
-        Err(e) => {
-            // 批量失败：清理残留 staging；未提升的条目记失败（逐条已完成的照常保留）
-            for (staging, _) in &items {
-                std::fs::remove_file(staging).ok();
-            }
             let remaining = plan.targets.len() - promoted.get();
             let mut s = summary_cell.borrow_mut();
             s.failed_files += remaining;
             s.failed_archives += 1;
             drop(s);
-            let note = format!("解压中止: {e}；其余 {remaining} 个文件未处理");
+            let note = if matches!(e, VfsError::Password) {
+                format!("解压中止: 密码错误（探测条目未覆盖此条目的罕见多密码包）；其余 {remaining} 个文件未处理")
+            } else {
+                format!("解压中止: {e}；其余 {remaining} 个文件未处理")
+            };
             lines_cell
                 .borrow_mut()
                 .push(ReportLine::new(LineKind::Failed, &display, "-", note));
-            Ok(())
         }
     }
 }
@@ -538,33 +524,18 @@ pub fn run(
     let mut summary = TidySummary::default();
     let mut lines: Vec<ReportLine> = Vec::new();
     let mut plans: Vec<ArchivePlan> = Vec::new();
-    let candidates = password_candidates(&opts.passwords);
 
-    // ---- 阶段 A：规划（打开 + 分类 + 两级去重；纯元数据，不解压不写盘）----
+    // ---- 阶段 A：规划（打开 + 密码探测 + 分类 + 两级去重；不解压目标条目、不写盘）----
     for path in &archives {
         let display = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        // 密码候选逐个尝试打开：加密头包（7z/RAR）密码不符在此即失败，换下一候选
-        let mut opened: Option<(Box<dyn ArchiveVFS>, Option<String>)> = None;
-        let mut open_err: Option<VfsError> = None;
-        for cand in &candidates {
-            match open_archive(path, cand.as_deref()) {
-                Ok(vfs) => {
-                    opened = Some((vfs, cand.clone()));
-                    break;
-                }
-                Err(VfsError::Password) => continue,
-                // 非密码错误（损坏/不存在）：换密码也没用，直接定性
-                Err(e) => {
-                    open_err = Some(e);
-                    break;
-                }
-            }
-        }
-        match opened {
-            Some((vfs, pw)) => {
+        // 打开阶段即锁定密码（vfs::open_with_password_probe）：加密头在 open 即验；
+        // 内容加密（zip AES / 7z / RAR 明文头）对最小加密条目逐候选校验。
+        // 密码错误在规划期暴露并定性，执行期不再有换候选重开循环
+        match crate::vfs::open_with_password_probe(path, &opts.passwords) {
+            Ok((vfs, _pw)) => {
                 let (targets, stat) = build_plan(vfs.as_ref(), &display, repo, &mut lines);
                 out(&format!(
                     "[{display}] 规划完成：新增 {} / 仓库已有 {} / 包内重复 {} / 同名不同内容 {} / 无效 {}",
@@ -577,20 +548,28 @@ pub fn run(
                 summary.invalid += stat.invalid;
                 plans.push(ArchivePlan {
                     display,
-                    path: path.clone(),
-                    pw,
                     vfs: Some(vfs),
                     targets,
                 });
             }
-            None => {
+            // 无密码 + 全部候选都不匹配（加密头或内容加密），记失败跳包
+            Err(VfsError::Password) => {
                 summary.failed_archives += 1;
-                let note = match open_err {
-                    // 全部候选（含无密码）都报 Password = 加密头包且密码列表无匹配
-                    None => "打开失败：加密包，所有候选密码均不匹配（可用 -p 或 config vartidy.passwords 补充）".to_string(),
-                    Some(e) => format!("打开失败: {e}"),
-                };
-                lines.push(ReportLine::new(LineKind::Failed, &display, "-", note));
+                lines.push(ReportLine::new(
+                    LineKind::Failed,
+                    &display,
+                    "-",
+                    "打开失败：加密包，所有候选密码均不匹配（可用 -p 或 config passwords 补充）",
+                ));
+            }
+            Err(e) => {
+                summary.failed_archives += 1;
+                lines.push(ReportLine::new(
+                    LineKind::Failed,
+                    &display,
+                    "-",
+                    format!("打开失败: {e}"),
+                ));
             }
         }
     }
@@ -617,77 +596,10 @@ pub fn run(
             }
         }
 
+        // 密码已在阶段 A 锁定，逐包抽取即可；错误（含罕见的探测遗漏 Password）
+        // 已在 execute_plan 内记录（summary/lines），不中断其余包
         for plan in &mut plans {
-            // 密码候选重试循环：内容加密包（zip AES 等）open 成功但解压报 Password，
-            // 推进到下一候选重开重试；已落盘文件按仓库存在性剔除，不重复落盘与计数
-            let mut cand_idx = candidates.iter().position(|c| *c == plan.pw).unwrap_or(0);
-            loop {
-                match execute_plan(plan, repo, &mut summary, &mut lines, out) {
-                    Ok(()) => break,
-                    // 仅 Password 会传播到此（其余错误已在 execute_plan 内记录）
-                    Err(VfsError::Password) => {
-                        let mut next: Option<(Box<dyn ArchiveVFS>, Option<String>)> = None;
-                        while let Some(cand) = candidates.get(cand_idx + 1) {
-                            cand_idx += 1;
-                            match open_archive(&plan.path, cand.as_deref()) {
-                                Ok(vfs) => {
-                                    next = Some((vfs, cand.clone()));
-                                    break;
-                                }
-                                Err(VfsError::Password) => continue,
-                                Err(e) => {
-                                    summary.failed_archives += 1;
-                                    lines.push(ReportLine::new(
-                                        LineKind::Failed,
-                                        &plan.display,
-                                        "-",
-                                        format!("重开失败: {e}"),
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        match next {
-                            Some((vfs, pw)) => {
-                                plan.vfs = Some(vfs);
-                                plan.pw = pw;
-                                let display = plan.display.clone();
-                                let keep: Vec<PlannedTarget> = plan
-                                    .targets
-                                    .drain(..)
-                                    .filter(|t| {
-                                        !long_path(&repo.join(&t.author).join(&t.file_name))
-                                            .exists()
-                                    })
-                                    .collect();
-                                plan.targets = keep;
-                                out(&format!("[{display}] 切换密码候选，继续解压剩余条目"));
-                            }
-                            None => {
-                                summary.failed_archives += 1;
-                                lines.push(ReportLine::new(
-                                    LineKind::Failed,
-                                    &plan.display,
-                                    "-",
-                                    "解压失败：加密内容，所有候选密码均不匹配（可用 -p 或 config vartidy.passwords 补充）",
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    // 防御分支：非密码错误不应到达（execute_plan 内部已记录）
-                    Err(e) => {
-                        summary.failed_archives += 1;
-                        lines.push(ReportLine::new(
-                            LineKind::Failed,
-                            &plan.display,
-                            "-",
-                            format!("解压失败: {e}"),
-                        ));
-                        break;
-                    }
-                }
-            }
+            execute_plan(plan, repo, &mut summary, &mut lines, out);
         }
     }
 
@@ -836,7 +748,7 @@ archview tidy — var 资源包增量整理（架构与规则见 ARCHITECTURE.md
                        仓库已有文件绝不会被修改/覆盖/删除，仅增量合入新 var
   -n, --dry-run        预演：只做分类与两级去重检查并输出报告，不写任何文件
   -p, --password <pw>  加密压缩包密码（可多次指定，按序尝试；
-                       config.toml 的 vartidy.passwords 密码列表也会按序兜底尝试）
+                       config.toml 的 passwords 公用密码列表也会按序兜底尝试）
   -q, --quiet          静默：无控制台时结束也不弹结果窗（脚本/计划任务场景防阻塞；
                        有控制台时输出照常）
       --report <dir>   报告输出目录（缺省: 首个输入所在目录，不写入仓库）
@@ -846,7 +758,9 @@ archview tidy — var 资源包增量整理（架构与规则见 ARCHITECTURE.md
   archview tidy D:/downloads/pack.7z -o D:/var_repo
   archview tidy D:/downloads -n        # 先预演看报告，确认后再实际执行
 
-「发送到」快捷方式: 目标填 \"<archview.exe 完整路径>\" tidy \"%1\"
+「发送到」快捷方式: 运行仓库根目录 sendto_setup.bat 一键创建（顶部 EXE_PATH 按 exe 实际位置修改）；
+手动创建: shell:sendto 里新建快捷方式，目标填 \"<archview.exe 完整路径>\" tidy（不带 %1，
+选中文件由 Windows 自动追加为参数）
 （仓库目录在 config.toml 的 vartidy.repo_dir 配置，无需命令行参数）";
 
 /// CLI 输出：GUI 子系统 exe 从终端启动无控制台——附加父进程控制台经 CONOUT$ 直写；
@@ -1039,8 +953,8 @@ pub fn cli_main(args: &[String]) -> i32 {
         repo_dir: repo,
         dry_run: parsed.dry_run,
         report_dir,
-        // CLI -p 优先，config vartidy.passwords 兜底
-        passwords: merge_passwords(&parsed.passwords, &cfg.vartidy.passwords),
+        // CLI -p 优先，config 公用密码列表兜底
+        passwords: merge_passwords(&parsed.passwords, &cfg.passwords),
     };
 
     let mut printer = |s: &str| out.line(s);
@@ -1328,9 +1242,9 @@ mod tests {
         assert!(merge_passwords(&[], &[]).is_empty());
     }
 
-    /// 加密包密码候选链路：
-    /// - zip AES（内容加密）：open 恒成功，密码错误在解压期暴露 → 阶段 B 推进候选重试
-    /// - 7z 加密头：密码错误在 open 即失败 → 阶段 A 推进候选
+    /// 加密包密码候选链路（打开期锁定，vfs::open_with_password_probe）：
+    /// - zip AES（内容加密）：open 恒成功，对最小加密条目校验密码后锁定
+    /// - 7z 加密头：密码错误在 open 即失败，逐候选重开
     /// - 候选全错：两个包记密码失败，仓库零写入
     #[test]
     fn encrypted_password_candidates() {
@@ -1367,7 +1281,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        // 候选序列 [无密码, 错, 对]：zip 走解压期重试，7z 走打开期推进，最终都命中
+        // 候选序列 [无密码, 错, 对]：zip/7z 各自探测锁定，最终都命中
         let opts = TidyOptions {
             repo_dir: repo.clone(),
             dry_run: false,
@@ -1397,6 +1311,102 @@ mod tests {
         let r = run_quiet(&[zpath, spath], &opts_bad);
         assert_eq!(r.summary.added, 0);
         assert_eq!(r.summary.failed_archives, 2);
+        assert!(
+            repo2.read_dir().unwrap().next().is_none(),
+            "密码失败路径不得写仓库"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同批次多个加密包、每包不同密码、候选列表乱序：
+    /// 模拟 config passwords 配多个站点密码的真实场景——探测按包独立推进，
+    /// 各包从同一候选列表中各自命中（zip AES / 7z 内容加密 / 7z 加密头三形态）。
+    /// 全错时三包均记失败、零写入。
+    #[test]
+    fn distinct_passwords_per_archive() {
+        let dir = temp_dir("enc_multi");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // zip AES 内容加密，密码 alpha
+        let zpath = dir.join("a.zip");
+        {
+            let file = std::fs::File::create(&zpath).unwrap();
+            let mut w = zip::write::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .with_aes_encryption(zip::AesMode::Aes256, "alpha");
+            w.start_file("A.a.1.var", opts).unwrap();
+            w.write_all(b"alpha payload").unwrap();
+            w.finish().unwrap();
+        }
+        // 7z 内容加密（文件名明文），密码 beta
+        let bpath = dir.join("b.7z");
+        {
+            let payload = dir.join("pl_b.bin");
+            std::fs::write(&payload, b"beta payload").unwrap();
+            let mut w = sevenz_rust::SevenZWriter::create(&bpath).unwrap();
+            w.set_content_methods(vec![sevenz_rust::AesEncoderOptions::new(
+                sevenz_rust::Password::from("beta"),
+            )
+            .into()]);
+            let e = sevenz_rust::SevenZArchiveEntry::from_path(&payload, "B.b.1.var".into());
+            w.push_archive_entry(e, Some(std::fs::File::open(&payload).unwrap()))
+                .unwrap();
+            w.finish().unwrap();
+        }
+        // 7z 加密头，密码 gamma
+        let gpath = dir.join("g.7z");
+        {
+            let payload = dir.join("pl_g.bin");
+            std::fs::write(&payload, b"gamma payload").unwrap();
+            let mut w = sevenz_rust::SevenZWriter::create(&gpath).unwrap();
+            w.set_encrypt_header(true);
+            w.set_content_methods(vec![sevenz_rust::AesEncoderOptions::new(
+                sevenz_rust::Password::from("gamma"),
+            )
+            .into()]);
+            let e = sevenz_rust::SevenZArchiveEntry::from_path(&payload, "G.g.1.var".into());
+            w.push_archive_entry(e, Some(std::fs::File::open(&payload).unwrap()))
+                .unwrap();
+            w.finish().unwrap();
+        }
+
+        // 候选乱序（正确密码均不在与包对应的"天然"位置）：各包独立命中
+        let opts = TidyOptions {
+            repo_dir: repo.clone(),
+            dry_run: false,
+            report_dir: Some(dir.clone()),
+            passwords: vec!["gamma".into(), "alpha".into(), "beta".into()],
+        };
+        let r = run_quiet(&[zpath.clone(), bpath.clone(), gpath.clone()], &opts);
+        assert_eq!(r.summary.failed_archives, 0, "三个不同密码的包都应命中");
+        assert_eq!(r.summary.added, 3);
+        assert_eq!(
+            std::fs::read(repo.join("A").join("A.a.1.var")).unwrap(),
+            b"alpha payload"
+        );
+        assert_eq!(
+            std::fs::read(repo.join("B").join("B.b.1.var")).unwrap(),
+            b"beta payload"
+        );
+        assert_eq!(
+            std::fs::read(repo.join("G").join("G.g.1.var")).unwrap(),
+            b"gamma payload"
+        );
+
+        // 全错（新仓库基线）：三包均失败、零写入
+        let repo2 = dir.join("repo2");
+        std::fs::create_dir_all(&repo2).unwrap();
+        let opts_bad = TidyOptions {
+            repo_dir: repo2.clone(),
+            passwords: vec!["nope".into()],
+            ..opts
+        };
+        let r = run_quiet(&[zpath, bpath, gpath], &opts_bad);
+        assert_eq!(r.summary.added, 0);
+        assert_eq!(r.summary.failed_archives, 3);
         assert!(
             repo2.read_dir().unwrap().next().is_none(),
             "密码失败路径不得写仓库"

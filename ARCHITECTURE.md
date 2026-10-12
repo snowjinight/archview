@@ -203,13 +203,14 @@ PSD/HEIC 等专用格式（mpv 不支持，需引入解码库走纹理路径）�
 
 ```toml
 password_codepage = "gbk"   # 加密包密码候选代码页
+passwords = []              # 加密包密码候选列表（播放器与 VarTidy 公用，打开阶段自动探测）
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files / extract_overlay_delay_ms
 [extract] # prefetch_mb（solid 包批量预取上限）
-[vartidy] # repo_dir / report_dir / passwords（CLI 整理子命令）
+[vartidy] # repo_dir / report_dir（CLI 整理子命令）
 ```
 
 > 约定：所有路径、阈值、扩展名列表、播放器参数均只在此文件配置，代码零硬编码。
@@ -226,7 +227,7 @@ password_codepage = "gbk"   # 加密包密码候选代码页
 | 1 | deflate/LZMA entry 后向 seek 慢 | 解码块 LRU（必选组件）+ mpv 缓存参数调大 |
 | 2 | RAR5 默认固态 | 慢路径为必选实现；解压任务支持 seek 重定向 |
 | 3 | 分卷压缩（.part1.rar / .7z.001） | unrar 原生支持 RAR 分卷；ZIP 分卷需自行拼接 —— 二期 |
-| 4 | 加密 | 头加密阻止列目录 → 先弹密码框；密码仅内存传递不落盘 |
+| 4 | 加密 | 头加密阻止列目录 → 打开阶段自动探测密码（无密码 → config 列表），耗尽才弹密码框；密码仅内存传递不落盘 |
 | 5 | libmpv 嵌入渲染 | MVP 用原生子窗口嵌入（Windows `SetParent`）；纹理渲染方案后置 |
 | 6 | mpv dll 分发 | 仓库不含（超 GitHub 单文件限制），build.rs 从 `deps\mpv-dev` 复制，README 提供下载指引 |
 | 7 | 大图解码阻塞 UI | 已消解：图片统一走 mpv 渲染，无独立解码线程（见第 6 章） |
@@ -413,36 +414,42 @@ archview.exe tidy <包或目录> [更多包...] [选项]
   -o, --repo <dir>    目标仓库目录（缺省读 config.toml 的 vartidy.repo_dir）
   -n, --dry-run       预演：仅做分类与两级去重检查（纯元数据操作，不解压），
                       输出完整报告（新增 N / 仓库已有 M / 包内重复 K / 无效 J + 明细）
-  -p, --password <pw> 加密包密码（可多次指定，按序尝试；config vartidy.passwords 兜底）
+  -p, --password <pw> 加密包密码（可多次指定，按序尝试；config 顶层 passwords 兜底）
   -q, --quiet         静默：无控制台时结束不弹结果窗（脚本/计划任务防阻塞）
   --report <path>     报告输出目录（默认 stdout 摘要 + 报告文件，见 vartidy.report_dir）
 ```
 
-`repo_dir` 收进 config.toml 后，资源管理器「发送到」快捷方式只需一行目标：
+`repo_dir` 收进 config.toml 后，资源管理器「发送到」菜单即可承载整理入口——零注册表写入、零管理员权限、
+卸载无残留（SendTo 本就是 `%APPDATA%\Microsoft\Windows\SendTo` 文件夹的快捷方式枚举）。仓库根目录提供
+`sendto_setup.bat` 一键创建：顶部 `EXE_PATH` 改成 archview.exe 实际位置后双击，即在「发送到」菜单生成
+「Archview tidy」项（同名覆盖重建，换 exe 位置重跑即可）；bat 内嵌一行 PowerShell `WScript.Shell` COM
+调用创建 .lnk（bat 无原生建快捷方式能力）。手动创建等价：`shell:sendto` 里新建快捷方式，目标填
+`"<archview.exe 全路径>" tidy`——不带 `"%1"`（注册表 shell 命令语法，快捷方式里不替换；选中文件由
+Windows 自动追加为参数，多选天然支持）。工作目录设为 exe 所在目录，保证 config.toml 相对路径解析稳定。
 
-```
-"<archview.exe 全路径>" tidy "%1"
-```
+对任意压缩包右键（可多选）→ 发送 → Archview tidy → 即按配置的仓库执行整理。多包/目录批量场景用命令行或 bat。
 
-对任意压缩包右键 → 发送 → 即按配置的仓库执行整理。多包/目录批量场景用命令行或 bat。
-
-**加密包密码（CLI/SendTo 无交互输入的解法）**：尝试序列 = `[无密码] → CLI -p（按指定顺序）→ config vartidy.passwords`。
-加密头包（7z/RAR）密码不符在打开即失败，候选在规划阶段推进；内容加密包（zip AES 等）打开恒成功、
-密码错误在解压时才暴露，候选在执行阶段推进重开（已落盘文件按仓库存在性剔除，不重复计数）。
+**加密包密码（CLI/SendTo 无交互输入的解法）**：尝试序列 = `[无密码] → CLI -p（按指定顺序）→ config 顶层 passwords`（与播放器公用同一列表）。
+密码在**打开阶段即探测并锁定**（`vfs::open_with_password_probe`），不等到解压才暴露错误：
+加密头包（7z/RAR）open 即验；内容加密包打开恒成功，故对包内**最小的加密条目**做密码校验——
+ZIP 读 1 字节触发密码校验值、RAR5 头带 PswCheck（RAR4 无校验值，解压最小条目按 CRC 判定）、
+7z 无校验值（解压最小加密条目到内存 sink + CRC 判定；条目加密与否由所在 folder 是否含
+AES coder 检测）。探测命中后带锁定密码执行，执行期不再换候选重开；候选耗尽整包记失败、零痕迹回收。
 选列表而非交互输入的原因：SendTo 无 stdin；N 个包批量逐个提示体验差；包密码来源固定（几个站点各一个），
 小列表即真实心智模型。密码仅用于解压，不写入日志与报告。
 
 **冒烟测试**：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `examples\make_smoke_fixtures`
-生成测试源（明文/AES zip/明文/内容加密 7z + 既有仓库）→ dry-run → 实际整理（含密码候选重试）→ 幂等重跑。
+生成测试源（明文/AES zip/明文/内容加密 7z + 既有仓库）→ dry-run → 实际整理（含加密包打开期密码锁定）→ 幂等重跑。
 
 ### 12.6 配置（config.toml 新增节，代码零硬编码）
 
-```json
-"vartidy": {
-  "repo_dir": "D:/var_repo",
-  "report_dir": "auto",
-  "passwords": ["site-a 的密码", "site-b 的密码"]
-}
+```toml
+# 加密包密码候选（播放器与 VarTidy 公用，按序尝试；打开阶段自动探测）
+passwords = ["site-a 的密码", "site-b 的密码"]
+
+[vartidy]
+repo_dir = "D:/var_repo"   # var 仓库根目录（必须已存在；整理器只增量合入，绝不改动已有内容）
+report_dir = "auto"        # 报告目录；"auto" = 首个输入包所在目录（不写入仓库）
 ```
 
 ### 12.7 复用清单（并入本仓库而非独立项目的理由）
@@ -461,6 +468,7 @@ archview.exe tidy <包或目录> [更多包...] [选项]
 |---|---|---|
 | 1 | `src/vartidy/classify.rs` 移植 class_var.py 全部规则 | ✅ 完成（单测覆盖 5 类非法 + 合法 + 特殊字符命名） |
 | 2 | 流水线：两级去重（CRC 判重）、余量预检、批量抽取直写、报告、dry-run | ✅ 完成（含仓库只读三道闸、密码耗尽零痕迹回收） |
-| 3 | CLI 分发入口 + config `vartidy` 节（含密码列表）+ 「发送到」+ `-q` 防脚本阻塞 | ✅ 完成（30/30 测试 + setup.bat 6 包冒烟全链路） |
+| 3 | CLI 分发入口 + config `vartidy` 节 + 「发送到」（`sendto_setup.bat` 一键创建）+ `-q` 防脚本阻塞 | ✅ 完成（34/34 测试 + setup.bat 6 包冒烟全链路） |
+| 3.5 | 密码打开期锁定：`open_with_password_probe`（三格式 verify_password，7z folder 级 AES 检测）+ passwords 提为播放器/CLI 公用顶层配置 | ✅ 完成（CLI 删执行期重开循环；播放器 OpenJob 探测链，弹框降级为兜底） |
 | 4（可选） | 失败续跑（记录已完成包清单，重跑跳过） | 按需 |
 | 5（可选） | hash 级去重（防"同名不同内容"漏判）、多包并发 | 按需 |

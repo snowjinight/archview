@@ -277,6 +277,25 @@ impl ArchiveVFS for RarVFS {
         }
         Err(last_err)
     }
+
+    /// 密码校验：对编码候选（UTF-8 / 配置代码页，见 vfs::password_candidates）
+    /// 逐个试 verify_one——unrar 的密码是原始字节，编码不对与密码不对同样报错。
+    /// 密码/编码不匹配换下一候选，全部失败才报 Password
+    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+        let candidates: Vec<Option<Vec<u8>>> = match password {
+            None => vec![None],
+            Some(pw) => super::password_candidates(pw).into_iter().map(Some).collect(),
+        };
+        let mut last = VfsError::Password;
+        for c in &candidates {
+            match self.verify_one(entry, c.as_deref()) {
+                Ok(()) => return Ok(()),
+                Err(e) if is_pwd_or_crc(&e) => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
 }
 
 /// RAR4 不存密码哈希：错密码解出乱码常表现为 CRC 失败而非"password"——
@@ -287,6 +306,61 @@ fn is_pwd_or_crc(e: &VfsError) -> bool {
     }
     let s = e.to_string().to_lowercase();
     s.contains("password") || s.contains("crc")
+}
+
+impl RarVFS {
+    /// 单个密码候选（字节形态）的校验：open_for_processing 逐头定位目标条目，
+    /// extract_to 临时文件（unrar 无内存 sink；探测目标是最小加密条目，代价可控）。
+    /// RAR5 头带 PswCheck、错密码即报；RAR4 无密码哈希、靠解压结果 CRC 判错
+    fn verify_one(
+        &self,
+        entry: &VirtualEntry,
+        pw: Option<&[u8]>,
+    ) -> Result<(), VfsError> {
+        let arch = match pw {
+            Some(p) => Archive::with_password(&self.path, p),
+            None => Archive::new(&self.path),
+        };
+        let tmp = super::tmp_path(&std::env::temp_dir().join("archview_pw_probe.tmp"));
+        let mut open = arch
+            .open_for_processing()
+            .map_err(|e| VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display())))?;
+        loop {
+            match open.read_header().map_err(|e| {
+                VfsError::Archive(format!("读 RAR 头失败 [{}]: {e}", self.path.display()))
+            })? {
+                Some(head) => {
+                    let name = head.entry().filename.to_string_lossy().replace('\\', "/");
+                    if name == entry.name {
+                        let r = head.extract_to(&tmp).map_err(|e| {
+                            let mapped = if is_password_err(&e) {
+                                VfsError::Password
+                            } else {
+                                VfsError::Archive(format!(
+                                    "RAR 校验解压失败: 压缩包 [{}] 条目 [{}]: {e}",
+                                    self.path.display(),
+                                    name
+                                ))
+                            };
+                            // RAR4 错密码常表现为 CRC 失败（无密码哈希），同样按密码错处理
+                            if is_pwd_or_crc(&mapped) { VfsError::Password } else { mapped }
+                        });
+                        std::fs::remove_file(&tmp).ok();
+                        return r.map(|_| ());
+                    }
+                    open = head.skip().map_err(|e| {
+                        VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
+                    })?;
+                }
+                None => {
+                    return Err(VfsError::Archive(format!(
+                        "entry 不存在: {}",
+                        entry.name
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

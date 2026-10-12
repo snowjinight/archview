@@ -1,6 +1,6 @@
 ﻿# Archview — 压缩包媒体播放器
 
-直接预览播放压缩包内媒体的桌面工具：无需完整解压，打开 ZIP / 7Z / RAR 压缩包即可浏览和播放其中的视频与图片，支持加密压缩包（密码输入 + 会话内记忆）。
+直接预览播放压缩包内媒体的桌面工具：无需完整解压，打开 ZIP / 7Z / RAR 压缩包即可浏览和播放其中的视频与图片，支持加密压缩包（打开阶段自动探测密码 + 会话内记忆）。
 
 ## 功能概览
 
@@ -9,7 +9,7 @@
 | 压缩格式 | ZIP（含 deflate/store）、7Z、RAR（含分卷 RAR） |
 | 流式播放 | ZIP 直接边读边播（zvf:// 自定义流协议），不用先解压 |
 | 后台解压 | 7Z / RAR 自动后台解压到缓存目录，完成后无缝播放 |
-| 加密支持 | 加密头（7Z/RAR）打开时输密码；内容加密（ZIP AES 等）播放时输密码；多编码候选兼容汉字密码；会话内密码记忆（切换包后切回不用重输） |
+| 加密支持 | 打开阶段自动探测密码（无密码 → config 密码列表），耗尽才弹密码框；多编码候选兼容汉字密码；会话内密码记忆（切换包后切回不用重输） |
 | 文件列表 | 视频 / 图片两个标签页，序号 `[当前/总数]` 显示，支持搜索过滤，多级子目录平铺展示 |
 | 连续看包 | 翻到本包最后一项再往后翻（PgDn / 视频区滚轮 / ">" 按钮）时，弹出同目录压缩包列表（默认选中下一个，末包循环回第一个；分卷 RAR 只列首卷），点选任意包打开；本会话看过的包灰色显示；`ui.ask_next_archive` 可关 |
 | 播放控制 | mpv 风格快捷键、底部全宽进度条拖动 seek、音量调节、静音提示 |
@@ -57,7 +57,7 @@ archview.exe tidy <压缩包或目录> [更多输入...] [选项]
 |---|---|
 | `-o, --repo <dir>` | var 仓库目录（缺省用 config.toml 的 `vartidy.repo_dir`） |
 | `-n, --dry-run` | 预演：只做分类与两级去重检查并输出报告，不写任何文件 |
-| `-p, --password <pw>` | 加密包密码（可多次指定按序尝试；config.toml 的 `vartidy.passwords` 列表兜底） |
+| `-p, --password <pw>` | 加密包密码（可多次指定按序尝试；config.toml 顶层 `passwords` 列表兜底） |
 | `-q, --quiet` | 静默：无控制台时结束不弹结果窗（脚本/计划任务防阻塞） |
 | `--report <dir>` | 报告输出目录（缺省为首个输入所在目录，不写入仓库） |
 
@@ -69,7 +69,7 @@ archview.exe tidy <压缩包或目录> [更多输入...] [选项]
 - 支持中文、空格、特殊字符的作者名与压缩包名；加密包（含中文密码）；分卷 RAR（同族只整理首卷）。
 - 退出码：0 = 完成；1 = 有失败项（见报告）；2 = 用法/配置错误。
 
-**「发送到」快捷方式**：新建快捷方式，目标填 `"<archview.exe 完整路径>" tidy "%1"`，仓库目录在 config.toml 的 `vartidy.repo_dir` 配好后，右键任意压缩包 → 发送 → 即完成整理。
+**「发送到」快捷方式**：仓库根目录的 `sendto_setup.bat` 一键创建——顶部 `EXE_PATH` 按需改成 archview.exe 实际位置，双击运行即在「发送到」菜单生成「Archview tidy」项（已存在则覆盖重建）。手动创建也可以：在 `shell:sendto` 文件夹（`%APPDATA%\Microsoft\Windows\SendTo`）新建快捷方式，目标填 `"<archview.exe 完整路径>" tidy`——**不要带 `"%1"`**（那是注册表 shell 命令的语法，快捷方式里会当字面量传入；选中文件由 Windows 自动追加为参数）。仓库目录在 config.toml 的 `vartidy.repo_dir` 配好后，右键任意压缩包（可多选）→ 发送 → Archview tidy → 即完成整理。
 
 架构与设计原则详见 `ARCHITECTURE.md` 第 12 章。
 
@@ -125,14 +125,14 @@ cargo test -- --nocapture
 | e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证前向 / 后向 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归） |
 | e2e 解压播放 | 构造 7Z 包 → 后台解压 → headless mpv 播放本地文件全链路 |
 | flag 属性循环 | pause / mute 属性经 flag 格式读 → 翻转 → 写 → 读，覆盖空格暂停、静音按钮的行为路径 |
-| VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
+| VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头与内容加密 / 同批次多包各不同密码乱序命中 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
 | config | TOML 默认模板与代码默认值防漂移、序列化往返、特殊字符密码（`#`/空格/中文）引号保留 |
 
 e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time-pos` / `pause` / `eof-reached` 等属性断言播放状态，`cache=no` 强制 seek 请求打到 VFS 层，能真实暴露流实现缺陷。
 
 RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或 Program Files 常见路径，找不到自动跳过，不算失败）。
 
-VarTidy 另有本地冒烟环境：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包（明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run → 实际整理（含密码候选重试）→ 幂等重跑。
+VarTidy 另有本地冒烟环境：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包（明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run → 实际整理（加密包打开期即锁定密码）→ 幂等重跑。
 
 ## 配置文件 config.toml
 
@@ -141,6 +141,10 @@ VarTidy 另有本地冒烟环境：`test_tidy\setup.bat`（目录已 gitignore�
 ```toml
 # 加密包密码候选代码页（zip/RAR4 老工具按系统 ANSI 代码页编码密码）
 password_codepage = "gbk"
+
+# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
+# 打开压缩包阶段即自动探测；密码始终用双引号包裹
+passwords = []
 
 [cache]
 # libmpv-2.dll 搜索目录；"auto" = exe 同目录
@@ -194,8 +198,6 @@ prefetch_mb = 512
 repo_dir = ""
 # 报告输出目录；"auto" = 首个输入压缩包所在目录
 report_dir = "auto"
-# 加密包密码候选列表（按序尝试）；密码始终用双引号包裹
-passwords = []
 ```
 
 | 配置项 | 说明 |
@@ -213,8 +215,8 @@ passwords = []
 | `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
 | `ui.sort_files` | 文件列表是否按文件名排序（不区分大小写字典序，默认 true）。设为 false 保持压缩包内部顺序——漫画包通常打包时已按自然顺序排列，而字典序会把 `1/2/10` 排成 `1/10/2` |
 | `password_codepage` | 加密包密码候选代码页（老工具按系统 ANSI 编码密码），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只试 UTF-8 |
+| `passwords` | 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）：打开阶段自动探测（无密码优先 → 列表依次），全不匹配播放器才弹密码框、CLI 才记失败 |
 | `vartidy.repo_dir` | VarTidy（`archview.exe tidy` CLI 子命令）的 var 仓库目录；详见 ARCHITECTURE.md 第 12 章 |
-| `vartidy.passwords` | 加密包密码候选列表（按序尝试），CLI/SendTo 模式无交互输入的密码方案 |
 
 ### 路径写法（cache.dir 等所有路径项）
 
@@ -325,7 +327,7 @@ trait ArchiveVFS {
 
 **5. 子窗口嵌入与坐标同步。** mpv 以 `wid=<hwnd>` 渲染进 egui 画的占位矩形对应的原生子窗口；每帧把 egui 逻辑坐标乘 pixels_per_point 换算成物理像素后 SetWindowPos。全屏即隐藏全部 egui 面板、子窗口随中央面板铺满，退出时恢复。
 
-**6. 加密包密码链路。** 压缩包里的密码只是一串字节，各格式编码约定不一（7z=UTF-16LE、RAR5/跨平台工具=UTF-8、Windows 老工具创建的 zip/RAR4=系统 ANSI 代码页）。解压时生成 `UTF-8 + 配置代码页（默认 GBK）` 两个候选字节序列依次尝试（config 项 `password_codepage`）；密码仅存内存，会话内按包路径记忆（`HashMap<PathBuf, String>`），切换压缩包再切回无需重输，退出即丢。
+**6. 加密包密码链路。** 密码在**打开阶段即探测并锁定**：无密码优先 → 会话记忆/用户输入 → config 顶层 `passwords` 列表依次尝试，全不匹配才弹密码框（播放器）/记失败跳包（VarTidy）。内容加密包对包内最小的加密条目做校验（ZIP 读 1 字节验密码校验值、RAR5 头带 PswCheck、7z 解压最小加密条目验 CRC），不必等到播放/解压才暴露错误。密码字节序列各格式编码约定不一（7z=UTF-16LE、RAR5/跨平台工具=UTF-8、Windows 老工具创建的 zip/RAR4=系统 ANSI 代码页），尝试时生成 `UTF-8 + 配置代码页（默认 GBK）` 两个候选依次验证（config 项 `password_codepage`）；密码仅存内存，会话内按包路径记忆（`HashMap<PathBuf, String>`），切换压缩包再切回无需重输，退出即丢。
 
 **7. 稳定缓存命名与并发解压防护。** 缓存文件名中的 archive_id 取压缩包路径哈希（带注册表内防碰撞探测），同一路径的包切走再切回、甚至程序重启后重开，缓存均可命中；解压走"临时文件（`part{pid}_{seq}` 防多实例/同进程并发踩踏）+ 原子改名"，同一任务在跑时去重不再起新线程。
 
@@ -337,7 +339,7 @@ trait ArchiveVFS {
 
 **9. 大压缩包性能设计。** 针对万级条目、数十 GB 的包（尤其存放于网络盘/NAS）做了多层优化：
 
-- **打开后台化**：打开压缩包（解析头 + 列目录 + 密码预校验）在后台线程执行，顶栏与视频区显示阶段进度（zip 的目录遍历为真实百分比进度条；crate 内部解析阶段为旋转动画），窗口不再冻结。
+- **打开后台化**：打开压缩包（解析头 + 列目录 + 密码探测）在后台线程执行，顶栏与视频区显示阶段进度（zip 的目录遍历为真实百分比进度条；crate 内部解析阶段为旋转动画），窗口不再冻结。
 - **列表虚拟化**：文件列表用 `ScrollArea::show_viewport` 按可视区渲染（上下各 3 行余量），行标签与计数在排序后一次性缓存，万级条目下滚动保持流畅；超长文件名截断显示，完整文件名在悬停时显示于面板底部状态行（不用悬浮气泡——气泡会被 mpv 原生子窗口遮挡），行高均匀保证虚拟化数学成立。
 - **I/O 降次**：ZIP 的 central directory 打开时只解析一次并缓存元数据（`unsafe_new_with_metadata` 复用）；列表通过顺序遍历 CD 生成（一次几 MB 顺序读），避免逐条目 `by_index_raw` 引发的上万次本地文件头随机读（NAS 上是分钟级开销）。CD 遍历与 crate 条目数不一致时自动回退逐条模式。7z 头同样在打开时缓存，`list()` 不再重复解析。
 - **7z folder 直达**：7z 的 folder（固态块）彼此独立，pack 流偏移记录在头里。解压用 `BlockDecoder` 按目标所在 folder 直接 seek 定位，只顺序解压目标 folder 内目标之前的少量数据——不再像 crate 的 `for_each_entries` 那样从 folder 0 开始解压全部前置 folder（56G solid 包里目标排第 400 位时会无谓解压几十 GB 无关数据，约 10 分钟级、CPU 持续满载）。

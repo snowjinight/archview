@@ -31,17 +31,35 @@ impl SevenzVFS {
         let pw = password.map(Password::from).unwrap_or_else(Password::empty);
         let reader = SevenZReader::open(path, pw).map_err(map_7z_err)?;
         // 头读入后顺手缓存条目清单（list 直接 clone，不再重开重解析）
-        let entries = reader
-            .archive()
+        let archive = reader.archive();
+        // folder 级加密检测：AES coder（ID 06 F1 07 01）。sevenz-rust 不暴露
+        // 条目级 content_methods，但 7z 的加密本就是 folder（固态块）粒度，
+        // 条目加密 ⇔ 所在 folder 含 AES coder——由此 VirtualEntry.encrypted
+        // 三格式全部可靠，密码探测不再需要对 7z 试解压盲探
+        let enc_folder: Vec<bool> = archive
+            .folders
+            .iter()
+            .map(|f| {
+                f.coders.iter().any(|c| {
+                    c.decompression_method_id() == sevenz_rust::SevenZMethod::ID_AES256SHA256
+                })
+            })
+            .collect();
+        let entries = archive
             .files
             .iter()
-            .map(|e| VirtualEntry {
+            .enumerate()
+            .map(|(i, e)| VirtualEntry {
                 name: e.name.clone(),
                 size: e.size,
                 is_dir: e.is_directory,
-                // sevenz-rust 未公开条目加密检测（content_methods 私有），
-                // 内容加密条目在解压时报 Password，由 UI 弹密码框重试
-                encrypted: false,
+                // 无数据流的 0 字节条目不属于任何 folder，不算加密
+                encrypted: archive
+                    .stream_map
+                    .file_folder_index
+                    .get(i)
+                    .and_then(|f| *f)
+                    .is_some_and(|fi| enc_folder.get(fi).copied().unwrap_or(false)),
                 // CRC 来自 7z 头（个别条目无 CRC 时 None，VarTidy 去重退化为尺寸判同）
                 crc: if e.has_crc { Some(e.crc as u32) } else { None },
             })
@@ -255,6 +273,45 @@ impl ArchiveVFS for SevenzVFS {
                 names.join(", ")
             )));
         }
+        Ok(())
+    }
+
+    /// 密码校验：7z 头不存储密码校验值，唯一可靠的判据是真解压 + CRC——
+    /// 用 BlockDecoder folder 直达目标条目，解压到内存 sink（零落盘），
+    /// 错密码必致 CRC 失败，sevenz-rust 在密码非空时将其转报
+    /// MaybeBadPassword → Password。目标之前的同 folder 条目必须顺序消费
+    /// （solid 流不可跳），故探测目标应选最小加密条目
+    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+        let pw = password.map(Password::from).unwrap_or_else(Password::empty);
+        let reader = SevenZReader::open(&self.path, pw.clone()).map_err(map_7z_err)?;
+        let archive = reader.archive();
+        let fi = archive
+            .files
+            .iter()
+            .position(|f| f.name == entry.name)
+            .ok_or_else(|| VfsError::Archive(format!("entry 不存在: {}", entry.name)))?;
+        let Some(folder) = archive
+            .stream_map
+            .file_folder_index
+            .get(fi)
+            .copied()
+            .flatten()
+        else {
+            return Ok(()); // 无数据流（0 字节）条目：无内容可验
+        };
+        let pw_bytes = pw.to_vec();
+        let mut src = std::fs::File::open(&self.path).map_err(VfsError::Io)?;
+        let dec = sevenz_rust::BlockDecoder::new(folder, archive, &pw_bytes, &mut src);
+        let mut hit = false;
+        dec.for_each_entries(&mut |e, data| {
+            let is_target = e.name == entry.name && !hit;
+            if is_target {
+                hit = true;
+            }
+            std::io::copy(data, &mut std::io::sink()).map_err(sevenz_rust::Error::io)?;
+            Ok(!is_target) // 目标已验：停止迭代
+        })
+        .map_err(map_7z_err)?;
         Ok(())
     }
 }
