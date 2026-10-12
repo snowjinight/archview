@@ -1,28 +1,37 @@
 @echo off
-rem Create "Send to Archview" shortcut for VarTidy (tidy command).
-rem Usage: edit EXE_PATH below if archview.exe lives elsewhere, then double-click this bat.
+rem Create "Send to Archview" shortcuts (player + tidy).
+rem Place this bat NEXT TO archview.exe (package.bat does this automatically),
+rem then double-click. Exe path is auto-detected from the bat's own directory.
 setlocal
 
-rem ==== EDIT ME: full path to archview.exe ====
-set "EXE_PATH=%~dp0target\debug\archview.exe"
-rem ==========================================
+rem ==== Optional override: uncomment and edit if exe lives elsewhere ====
+rem set "EXE_PATH=C:\tools\archview\archview.exe"
+rem =====================================================================
+
+if not defined EXE_PATH set "EXE_PATH=%~dp0archview.exe"
 
 if not exist "%EXE_PATH%" (
     echo [ERROR] archview.exe not found: "%EXE_PATH%"
-    echo Edit EXE_PATH at the top of this bat, then run again.
+    echo Put this bat in the same folder as archview.exe, or set EXE_PATH inside this bat.
     pause
     exit /b 1
 )
 
-set "LNK=%APPDATA%\Microsoft\Windows\SendTo\Archview tidy.lnk"
-powershell -NoProfile -Command "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%LNK%'); $s.TargetPath = '%EXE_PATH%'; $s.Arguments = 'tidy'; $s.WorkingDirectory = (Split-Path '%EXE_PATH%'); $s.Description = 'VarTidy: incremental var merge into repo'; $s.Save()"
+powershell -NoProfile -Command ^
+  "$w = New-Object -ComObject WScript.Shell;" ^
+  "$wd = (Split-Path '%EXE_PATH%');" ^
+  "$p = $w.CreateShortcut($env:APPDATA+'\Microsoft\Windows\SendTo\Archview player.lnk');" ^
+  "$p.TargetPath = '%EXE_PATH%'; $p.WorkingDirectory = $wd; $p.Description = 'Open archive in Archview player'; $p.Save();" ^
+  "$t = $w.CreateShortcut($env:APPDATA+'\Microsoft\Windows\SendTo\Archview tidy.lnk');" ^
+  "$t.TargetPath = '%EXE_PATH%'; $t.Arguments = 'tidy'; $t.WorkingDirectory = $wd; $t.Description = 'VarTidy: incremental var merge into repo'; $t.Save()"
 
-if exist "%LNK%" (
-    echo [OK] Shortcut created:
-    echo   %LNK%
-    echo   Target: "%EXE_PATH%" tidy
+set "SENDTO_DIR=%APPDATA%\Microsoft\Windows\SendTo"
+if exist "%SENDTO_DIR%\Archview player.lnk" if exist "%SENDTO_DIR%\Archview tidy.lnk" (
+    echo [OK] Shortcuts created in SendTo menu:
+    echo   Archview player  -^> "%EXE_PATH%"
+    echo   Archview tidy    -^> "%EXE_PATH%" tidy
     echo.
-    echo Right-click any archive - Send to - "Archview tidy"
+    echo Right-click any archive - Send to - "Archview player" or "Archview tidy"
 ) else (
     echo [ERROR] Shortcut creation failed.
 )

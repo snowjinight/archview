@@ -205,10 +205,12 @@ pub struct App {
     next_archive_prompt: Option<NextArchivePrompt>,
     // 本会话打开过的压缩包路径（切包弹窗中灰色标记"看过"）
     seen_archives: std::collections::HashSet<PathBuf>,
+    // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
+    initial_open: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(cfg: Config, cc: &eframe::CreationContext) -> Self {
+    pub fn new(cfg: Config, cc: &eframe::CreationContext, initial: Option<PathBuf>) -> Self {
         Self::install_cjk_font(&cfg, &cc.egui_ctx);
         // 密码候选代码页（config: password_codepage，默认 gbk）
         crate::vfs::set_password_codepage(&cfg.password_codepage);
@@ -245,6 +247,7 @@ impl App {
             pw_memory: std::collections::HashMap::new(),
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
+            initial_open: initial,
         }
     }
 
@@ -480,6 +483,7 @@ impl App {
                         stream,
                     });
                     self.rebuild_view();
+                    tracing::info!("打开压缩包: {}（{} 项）", path.display(), self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0));
                     // 取消并清掉旧包的解压任务：不清会导致旧包 FileDone 到来时
                     // load_extracted 把画面切回旧包条目（playing 下标错乱）
                     if let Some(j) = &self.extract {
@@ -2027,6 +2031,10 @@ impl eframe::App for App {
 
         // 弹窗请求位重置：本帧各弹窗渲染时按需置位，帧末统一同步子窗口显隐
         self.overlay_open = false;
+        // 启动参数打开（SendTo「Archview player」/拖到 exe 上）：首帧触发一次
+        if let Some(path) = self.initial_open.take() {
+            self.open_path(path);
+        }
         // 拖放：压缩包文件拖入窗口即打开
         self.handle_dropped_files(&ctx);
         // 后台打开任务轮询（大包/网络盘）

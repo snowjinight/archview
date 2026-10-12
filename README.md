@@ -69,7 +69,12 @@ archview.exe tidy <压缩包或目录> [更多输入...] [选项]
 - 支持中文、空格、特殊字符的作者名与压缩包名；加密包（含中文密码）；分卷 RAR（同族只整理首卷）。
 - 退出码：0 = 完成；1 = 有失败项（见报告）；2 = 用法/配置错误。
 
-**「发送到」快捷方式**：仓库根目录的 `sendto_setup.bat` 一键创建——顶部 `EXE_PATH` 按需改成 archview.exe 实际位置，双击运行即在「发送到」菜单生成「Archview tidy」项（已存在则覆盖重建）。手动创建也可以：在 `shell:sendto` 文件夹（`%APPDATA%\Microsoft\Windows\SendTo`）新建快捷方式，目标填 `"<archview.exe 完整路径>" tidy`——**不要带 `"%1"`**（那是注册表 shell 命令的语法，快捷方式里会当字面量传入；选中文件由 Windows 自动追加为参数）。仓库目录在 config.toml 的 `vartidy.repo_dir` 配好后，右键任意压缩包（可多选）→ 发送 → Archview tidy → 即完成整理。
+**「发送到」快捷方式**：`sendto_setup.bat` 一键创建两个菜单项——放在 archview.exe 同目录（package.bat 打包后即如此）双击即可，exe 路径自动检测；也可用 bat 顶部的 `EXE_PATH` 覆盖：
+
+- **Archview player**：右键压缩包（可多选）→ 发送 → 直接用播放器打开（多选时打开第一个，同目录其余包按 N 键切换）。也适用于把压缩包/目录拖到 exe 上、文件关联等任意「带路径启动」场景。
+- **Archview tidy**：右键压缩包（可多选）→ 发送 → 按 config.toml 的 `vartidy.repo_dir` 增量整理。
+
+已存在则覆盖重建（换 exe 位置重跑一次即可）。手动创建也可以：在 `shell:sendto` 文件夹（`%APPDATA%\Microsoft\Windows\SendTo`）新建快捷方式，目标分别填 `"<archview.exe 完整路径>"` 和 `"<archview.exe 完整路径>" tidy`——**不要带 `"%1"`**（那是注册表 shell 命令的语法，快捷方式里会当字面量传入；选中文件由 Windows 自动追加为参数）。
 
 架构与设计原则详见 `ARCHITECTURE.md` 第 12 章。
 

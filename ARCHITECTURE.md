@@ -420,14 +420,19 @@ archview.exe tidy <包或目录> [更多包...] [选项]
 ```
 
 `repo_dir` 收进 config.toml 后，资源管理器「发送到」菜单即可承载整理入口——零注册表写入、零管理员权限、
-卸载无残留（SendTo 本就是 `%APPDATA%\Microsoft\Windows\SendTo` 文件夹的快捷方式枚举）。仓库根目录提供
-`sendto_setup.bat` 一键创建：顶部 `EXE_PATH` 改成 archview.exe 实际位置后双击，即在「发送到」菜单生成
-「Archview tidy」项（同名覆盖重建，换 exe 位置重跑即可）；bat 内嵌一行 PowerShell `WScript.Shell` COM
-调用创建 .lnk（bat 无原生建快捷方式能力）。手动创建等价：`shell:sendto` 里新建快捷方式，目标填
-`"<archview.exe 全路径>" tidy`——不带 `"%1"`（注册表 shell 命令语法，快捷方式里不替换；选中文件由
-Windows 自动追加为参数，多选天然支持）。工作目录设为 exe 所在目录，保证 config.toml 相对路径解析稳定。
+卸载无残留（SendTo 本就是 `%APPDATA%\Microsoft\Windows\SendTo` 文件夹的快捷方式枚举）。`sendto_setup.bat`
+一键创建两个菜单项：放在 archview.exe 同目录（package.bat 打包后即如此）双击即可，exe 路径自动检测
+（bat 顶部 `EXE_PATH` 可覆盖；同名覆盖重建，换 exe 位置重跑即可）；bat 内嵌 PowerShell `WScript.Shell`
+COM 调用创建 .lnk（bat 无原生建快捷方式能力）。手动创建等价：`shell:sendto` 里新建快捷方式，目标填
+`"<archview.exe 全路径>"`（播放器）或 `"<archview.exe 全路径>" tidy`（整理器）——不带 `"%1"`（注册表
+shell 命令语法，快捷方式里不替换；选中文件由 Windows 自动追加为参数，多选天然支持）。工作目录设为
+exe 所在目录，保证 config.toml 相对路径解析稳定。
 
-对任意压缩包右键（可多选）→ 发送 → Archview tidy → 即按配置的仓库执行整理。多包/目录批量场景用命令行或 bat。
+- **Archview player**：GUI 模式启动时解析命令行参数（main.rs `initial_archive`）——首个 zip/7z/rar 文件
+  直接打开；目录则按名取其中首个压缩包（其余包经「目录内连续看包」N 键可达）。首帧经 `open_path` 触发，
+  与拖放同链路（密码探测/弹窗/播放全复用）；非路径参数忽略，无参数启动行为不变。该入口同样覆盖
+  拖到 exe 上、文件关联等一切「带路径启动」场景
+- **Archview tidy**：对任意压缩包右键（可多选）→ 发送 → 即按配置的仓库执行整理。多包/目录批量场景用命令行或 bat
 
 **加密包密码（CLI/SendTo 无交互输入的解法）**：尝试序列 = `[无密码] → CLI -p（按指定顺序）→ config 顶层 passwords`（与播放器公用同一列表）。
 密码在**打开阶段即探测并锁定**（`vfs::open_with_password_probe`），不等到解压才暴露错误：

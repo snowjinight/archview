@@ -758,9 +758,9 @@ archview tidy — var 资源包增量整理（架构与规则见 ARCHITECTURE.md
   archview tidy D:/downloads/pack.7z -o D:/var_repo
   archview tidy D:/downloads -n        # 先预演看报告，确认后再实际执行
 
-「发送到」快捷方式: 运行仓库根目录 sendto_setup.bat 一键创建（顶部 EXE_PATH 按 exe 实际位置修改）；
-手动创建: shell:sendto 里新建快捷方式，目标填 \"<archview.exe 完整路径>\" tidy（不带 %1，
-选中文件由 Windows 自动追加为参数）
+「发送到」快捷方式: 运行 sendto_setup.bat 一键创建（放在 archview.exe 同目录，exe 路径自动检测；
+另生成 Archview player 项 = 右键直接用播放器打开）；手动创建: shell:sendto 里新建快捷方式，
+目标填 \"<archview.exe 完整路径>\" tidy（不带 %1，选中文件由 Windows 自动追加为参数）
 （仓库目录在 config.toml 的 vartidy.repo_dir 配置，无需命令行参数）";
 
 /// CLI 输出：GUI 子系统 exe 从终端启动无控制台——附加父进程控制台经 CONOUT$ 直写；

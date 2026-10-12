@@ -21,6 +21,10 @@ mkdir "%ARCHVIEW_DIST%"
 copy /y target\release\archview.exe "%ARCHVIEW_DIST%\" >nul
 if errorlevel 1 goto :fail
 
+rem SendTo shortcut setup script: runs from exe's own folder (auto-detects exe)
+copy /y sendto_setup.bat "%ARCHVIEW_DIST%\" >nul
+if errorlevel 1 goto :fail
+
 if exist "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" (
     copy /y "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" "%ARCHVIEW_DIST%\" >nul
 ) else (
