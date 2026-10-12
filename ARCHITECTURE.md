@@ -275,3 +275,86 @@ image       : image
 serde       : serde + serde_json (config.json)
 logging     : tracing
 ```
+
+---
+
+## 11. 性能优化与虚拟列表设计（大包实战：27G ZIP / 56G 7z / 万级条目）
+
+> 本章记录 Phase 2 大压缩包性能专项的实际优化与踩坑。核心教训：**万级条目 + GB 级包，
+> 任何 O(N) 的每帧操作、任何"顺带"的全量顺序解压，都会被放大成分钟级卡顿。**
+
+### 11.1 解压链路优化
+
+#### 7z folder 直达（最重要的一次修复）
+
+- **现象**：56G 固态 7z 包，解压第 417 个条目（仅一张 JPG）卡 10+ 分钟，CPU 持续满载——表象酷似死循环。
+- **根因**：sevenz-rust 的 `SevenZReader::for_each_entries` **从 folder 0 开始顺序解压全部前置 folder**。
+  7z 的 folder（固态块）彼此独立，每个 folder 的 pack 流偏移记录在头信息里，但该 API 不利用它。
+- **修复**：改用 `BlockDecoder::new(folder_index, ...)` —— 构造时直接 seek 到目标 folder 的 pack 流偏移，
+  **前置 folder 只 seek 不解压**。目标即使排在第 4 万个条目，也只需顺序解压其所在 folder 内
+  目标之前的少量数据。10 分钟级 → 秒级。
+- **教训**：读依赖库源码确认其遍历策略，"能跑通"的 API 路径可能隐含 O(全包) 成本。
+
+#### 批量解压摊薄固态包定位成本（extract_batch + prefetch）
+
+- 固态 folder 内部不可 seek，定位目标必须顺序解压一段前置数据——这部分成本无法消除，
+  但可以**摊薄**：一次顺序解压流顺带解出一批条目（目标 + 顺序后续，总量 ≤ `extract.prefetch_mb`，
+  默认 512MB）。翻页时直接命中缓存，无需再等。
+- trait 层新增 `extract_batch(targets, cancel, progress, file_done)`：ZIP 用默认实现逐条循环；
+  7z/RAR 各自实现单遍多目标（RAR 单次 processing 遍历内 skip 非目标、extract 目标）。
+- 取消机制：`Arc<AtomicBool>`；批内切换目标不取消不重启，批外目标才取消重起。
+  所有取消点必须打日志——否则表现为"多条后台解压日志但看不到打断"（实际是缓存命中
+  路径丢弃任务却没置 cancel 标志，旧线程静默跑完整个批，与新任务并行抢 NAS 带宽）。
+
+#### ZIP 头解析
+
+- 中央目录（CD）逐字段偏移曾被写错（compressed/uncompressed size、name/extra/comment length
+  共 6 个字段），导致 fast path 全挂、退回慢路径逐条试探——万级条目下就是"打开卡十几分钟"。
+  修复后单次顺序读 CD 即完成列表（NAS 随机读 → 顺序读，分钟级 → 秒级）。
+- ZIP64 支持：offset/size 超 32 位时的扩展字段解析。
+
+### 11.2 打开与列表：后台化 + 虚拟化
+
+#### 后台打开（OpenJob + 代数号）
+
+- 打开/列表解析全部移入后台线程，UI 显示"正在打开… x%"，不再冻结。
+- **代数号（generation）防错位**：用户快速切换压缩包时，旧任务完成回调不得套用到新包上——
+  每个任务携带递增 gen，主线程只接受 `gen == 当前` 的结果，旧的直接丢弃。
+
+#### 行列表虚拟化（egui 万级条目不卡的关键）
+
+**设计**（三层）：
+
+1. **行数据缓存**：`list_rows: Vec<Row>`（idx + 文件名引用）只在打开/搜索/切标签时重建一次。
+   早期版本每帧对万级条目做 clone + format + to_lowercase 过滤，UI 直接卡死——
+   **即时模式 UI 不等于可以每帧重算业务数据**。
+2. **虚拟化渲染**：`ScrollArea::show_viewport` 只渲染可视行 ± 3 行（overscan 防滚动露底）。
+   用 `skip_ahead_auto_ids(start_row)` 保持 widget Id 稳定（否则每帧 Id 漂移，选中态/悬态错乱）。
+   内容区总高度 = `set_height(总行数 × step)`，让滚动条比例正确。
+3. **行高实测反馈**：首帧用估算行高（18px）渲染，实测首行真实高度后反馈修正——
+   避免 DPI 缩放（125%/150%）下估算与实际不符导致的行间缝隙或重叠。
+
+**踩坑点**（每一条都有回归测试钉死）：
+
+| 坑 | 现象 | 修复 |
+|---|---|---|
+| **usize 下溢** | 手动向后翻列表再切歌 → 列表直接跳到底部。目标行在渲染范围之前时 `pos - range.start` 下溢，debug 下 panic，**release 下 wrap 成 2^64 级天文数字** → 滚动目标被钳到 max_offset | 一切虚拟化下标换算用 `isize` |
+| **行高不均匀** | 长文件名自动换行把行撑成 2 行高，首行实测高度被钉在 2 行值上 → 渲染范围按虚高缩水 → 底部空隙 + 翻页时行高双稳态翻转 | 所有列表行 `.truncate()` 强制单行；全名放视频区上方状态行 |
+| **scroll_to_rect 坐标系** | 高亮追踪滚动跳到错误位置。`scroll_to_rect` 接收**屏幕坐标**，而虚拟化闭包内 `max_rect().top()` = 内容顶 + min_row×step，需按此换算目标行 y | 换算公式 `(pos - range.start) × step + 闭包 max_rect().top()` |
+| **每帧重算** | 万级条目每帧过滤/排序/clone，UI 帧率跌到个位数 | 行缓存一次性构建；排序用 `sort_by_cached_key`（预生成小写键，避免比较器内每次 2 次 to_lowercase 分配） |
+
+**多帧测试方法论**：虚拟化 bug 大多是跨帧时序问题（滚轮惯性、动画收敛、行高反馈延迟），
+单帧单 pass 的 egui 测试 (`__run_test_ui`) 复现不了。用 `ctx.run_ui(RawInput)` 手动喂
+PointerMoved/MouseWheel 事件序列跑 100+ 帧，记录每帧 `ScrollArea::state.offset` 轨迹断言——
+上面的 usize 下溢 bug 就是这么先复现再修复的。
+
+### 11.3 解压进度 UX：顶栏 → 媒体区覆盖层
+
+- 顶栏一行放不下长文件名（截断、进度条看不见）→ 进度信息移到媒体区居中覆盖层：
+  完整文件名（换行）+ 两阶段进度（跳过前置文件阶段 = Spinner + 已解压字节；
+  写文件阶段 = 字节进度条）。
+- **防闪烁宽限期**：正在播 A 时切到需解压的 B，超过 `ui.extract_overlay_delay_ms`（默认 500ms）
+  仍未解完才隐藏视频窗口（mpv 原生子窗口永远盖在 egui 之上，必须 `ShowWindow` 隐藏）显示覆盖层；
+  500ms 内解完则窗口从未隐藏——快速路径零闪烁。这是"延迟隐藏"而非"最短显示时间"：
+  后者会人为拖慢快速解压。
+- 预取场景（目标 == 正在播放条目）永不遮挡画面，顶栏弱色短标记即可。
