@@ -60,9 +60,6 @@ struct MpvApi {
         format: c_int,
         out: *mut c_void,
     ) -> c_int,
-    get_property_string:
-        unsafe extern "C" fn(ctx: *mut MpvHandle, name: *const c_char) -> *mut c_char,
-    free: unsafe extern "C" fn(data: *mut c_void),
     error_string: unsafe extern "C" fn(err: c_int) -> *const c_char,
     stream_cb_add_ro: unsafe extern "C" fn(
         ctx: *mut MpvHandle,
@@ -101,8 +98,6 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             command_string: *lib.get(b"mpv_command_string").map_err(load_err)?,
             set_property_string: *lib.get(b"mpv_set_property_string").map_err(load_err)?,
             get_property: *lib.get(b"mpv_get_property").map_err(load_err)?,
-            get_property_string: *lib.get(b"mpv_get_property_string").map_err(load_err)?,
-            free: *lib.get(b"mpv_free").map_err(load_err)?,
             error_string: *lib.get(b"mpv_error_string").map_err(load_err)?,
             stream_cb_add_ro: *lib.get(b"mpv_stream_cb_add_ro").map_err(load_err)?,
             _lib: lib,
@@ -224,20 +219,6 @@ pub fn get_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<Option<bool>
         Ok(Some(out != 0))
     } else {
         Ok(None)
-    }
-}
-
-pub fn get_property_string(ctx: *mut MpvHandle, name: &str) -> Option<String> {
-    let a = api().ok()?;
-    let name = CString::new(name).ok()?;
-    unsafe {
-        let ptr = (a.get_property_string)(ctx, name.as_ptr());
-        if ptr.is_null() {
-            return None;
-        }
-        let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-        (a.free)(ptr as *mut c_void);
-        Some(s)
     }
 }
 
