@@ -196,6 +196,20 @@ pub trait ArchiveVFS: Send + Sync {
         Ok(())
     }
 
+    /// 定位该条目时顺序解压流的起始条目下标（list 顺序；None = 定位无前置解码）。
+    /// `[start, entry_idx)` 即"向前预取免费区"：这些条目在定位目标时必然被
+    /// 顺序解掉丢弃，顺带写盘零解码增量——UI 据此向前预取
+    /// （config `extract.prefetch_prev_mb`，随机跳看时往回翻直接命中缓存）。
+    /// - 7z：目标所在 folder 的首个条目（跨 folder 只 seek 不解压，
+    ///   向前预取不得超出 folder 边界）
+    /// - RAR：0（unrar 无 folder 直达，逐条 skip 定位，整个前缀都被顺序消费；
+    ///   非固态包成本退化为逐条正常解压，由预算上限约束）
+    /// - 默认 None（zip 快路径不走后台解压，无需向前预取）
+    fn locate_start(&self, entry_idx: usize) -> Option<usize> {
+        let _ = entry_idx;
+        None
+    }
+
     /// 校验密码能否解密指定条目（打开阶段密码探测用，ARCHITECTURE.md 12.5）。
     /// - Ok(())：密码可用于该条目（或条目未加密，任意密码都通过）
     /// - Err(Password)：密码错误 / 加密但未提供密码

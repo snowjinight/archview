@@ -704,8 +704,9 @@ impl App {
     }
 
     /// 启动后台解压任务；缓存命中（同尺寸文件已在）则直接播放。
-    /// 目标 + 后续预取条目组成一批，一次顺序解压流解出（solid 包定位目标
-    /// 需顺序解压前置数据，一次解一批摊薄固定成本，翻页直接命中缓存）
+    /// 目标 + 前后预取条目组成一批，一次顺序解压流解出（solid 包定位目标
+    /// 需顺序解压前置数据，一次解一批摊薄固定成本；前置条目定位时本就要被
+    /// 解掉丢弃，顺带写盘即"向前预取"——随机跳看后往回翻直接命中缓存）
     fn start_extract(&mut self, entry_idx: usize) {
         // 去重：该条目的解压线程已在跑（双击/重复点击会瞬时触发两次 play），
         // 不再起第二个线程——两个 unrar 抢写同一个临时文件会报 "Could not create file"。
@@ -795,6 +796,46 @@ impl App {
                     {
                         continue;
                     }
+                    batch_bytes += e.size;
+                    batch.push(i);
+                }
+            }
+        }
+
+        // 向前预取：免费区 = 定位目标时必然被顺序解掉丢弃的前置条目
+        // （locate_start 起点由格式决定——7z 目标所在 folder 起点、不跨 folder；
+        // RAR 整个前缀），顺带写盘零解码增量。预算 prefetch_prev_mb 独立封顶，
+        // 实取可能小于预算（folder 前缀不足时全取，不越界补齐）。
+        // 注意与向后预取去重：sort_files 开启时 view 序 ≠ 物理序，
+        // 后向批已收入的条目可能落在免费区内，重复入批会导致 file_done
+        // 下标错位（7z/RAR 的 remaining 表按名去重，但 batch 下标对不齐）
+        let prev_cap = self
+            .cfg
+            .extract
+            .prefetch_prev_mb
+            .saturating_mul(1024 * 1024);
+        if prev_cap > 0 {
+            if let Some(start) = arch.vfs.locate_start(entry_idx) {
+                let view_set: std::collections::HashSet<usize> =
+                    arch.view.iter().copied().collect();
+                let mut prev_bytes: u64 = 0;
+                for i in start..entry_idx {
+                    if prev_bytes >= prev_cap {
+                        break;
+                    }
+                    let e = &arch.entries[i];
+                    // 仅预取当前列表可见的条目（目录/搜索过滤外的文件用户点不到）
+                    if e.is_dir || !view_set.contains(&i) || batch.contains(&i) {
+                        continue;
+                    }
+                    let d = cache::dest_path(&dir, arch.id, i, &e.name);
+                    if std::fs::metadata(&d)
+                        .map(|m| m.len() == e.size)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    prev_bytes += e.size;
                     batch_bytes += e.size;
                     batch.push(i);
                 }
@@ -925,7 +966,15 @@ impl App {
             match msg {
                 ExtMsg::Progress(done, stage) => {
                     if let Some(j) = &mut self.extract {
-                        j.done = done;
+                        // 写文件阶段（stage 空）的字节数按目标尺寸封顶：批内
+                        // 前置预取文件先于目标落地，其写入进度若直接进目标
+                        // 进度条会出现"300MB / 60MB"的怪相（跳过阶段 stage
+                        // 非空、按字节文本展示，不受影响）
+                        j.done = if stage.is_empty() {
+                            done.min(j.total)
+                        } else {
+                            done
+                        };
                         j.stage = stage;
                     }
                     return; // 本帧处理完毕，下帧继续

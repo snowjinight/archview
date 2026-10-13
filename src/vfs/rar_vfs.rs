@@ -233,6 +233,14 @@ impl ArchiveVFS for RarVFS {
         AccessMode::Solid
     }
 
+    /// 向前预取免费区 = 整个前缀 [0, 目标)：unrar 定位目标需逐条 skip，
+    /// 前缀数据本就被顺序消费（固态包是真解码，非固态是廉价头跳过），
+    /// 把目标之前顺带解出的条目写盘即可。无 folder 概念 → 不设边界，
+    /// 由 config `extract.prefetch_prev_mb` 预算封顶
+    fn locate_start(&self, _entry_idx: usize) -> Option<usize> {
+        Some(0)
+    }
+
     fn extract_entry(
         &self,
         entry: &VirtualEntry,

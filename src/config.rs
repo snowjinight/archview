@@ -58,11 +58,18 @@ pub struct ExtractConfig {
     /// 一次顺序解压流解出一批文件，翻页时直接命中缓存，摊薄"定位目标需
     /// 顺序解压前置数据"的固定成本
     pub prefetch_mb: u64,
+    /// 向前预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置
+    /// 条目（7z 限于目标所在 folder 内、RAR 为整个前缀）顺带写盘，
+    /// 随机跳看后往回翻直接命中缓存。解码零增量，仅占磁盘写入量
+    pub prefetch_prev_mb: u64,
 }
 
 impl Default for ExtractConfig {
     fn default() -> Self {
-        Self { prefetch_mb: 512 }
+        Self {
+            prefetch_mb: 512,
+            prefetch_prev_mb: 512,
+        }
     }
 }
 
@@ -362,8 +369,12 @@ extract_overlay_delay_ms = 500
 
 [extract]
 # solid 包（7z/RAR）解压时顺带预取后续文件的总大小上限（MB），0 = 关闭。
-# 一次解压流解出一批文件，翻页直接命中，摊薄固态包定位成本
+# 一次顺序解压流解出一批文件，翻页直接命中，摊薄固态包定位成本
 prefetch_mb = 512
+# 向前预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+# （7z 限于目标所在 folder 内、RAR 为整个前缀）顺带写盘，随机跳看后
+# 往回翻直接命中缓存。解码零增量，仅占磁盘写入量
+prefetch_prev_mb = 512
 
 [vartidy]
 # VarTidy（"archview.exe tidy" CLI 子命令）配置

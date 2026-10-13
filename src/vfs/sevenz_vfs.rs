@@ -14,6 +14,10 @@ pub struct SevenzVFS {
     /// open 时从头解析并缓存的条目清单：list 不再重复解析 7z 头
     /// （旧实现 open/list 各解析一次，大包在网络盘上代价翻倍）
     entries: Vec<VirtualEntry>,
+    /// 条目 → 所在 folder（与 entries 同下标）；folder → 该 folder 首个条目下标。
+    /// 向前预取免费区 = [folder 首条目, 目标)（locate_start）
+    folder_of: Vec<Option<usize>>,
+    folder_first: std::collections::HashMap<usize, usize>,
 }
 
 /// sevenz-rust 错误 → VfsError（缺密码/密码错误统一映射 Password）
@@ -64,6 +68,20 @@ impl SevenzVFS {
                 crc: if e.has_crc { Some(e.crc as u32) } else { None },
             })
             .collect();
+        // folder 布局（locate_start 的向前预取免费区判据）：条目 → 所在 folder、
+        // folder → 首个条目（首个条目的 locate_start 即其自身，免费区为空）
+        let folder_of: Vec<Option<usize>> = archive
+            .stream_map
+            .file_folder_index
+            .iter()
+            .copied()
+            .collect();
+        let mut folder_first = std::collections::HashMap::new();
+        for (i, f) in folder_of.iter().enumerate() {
+            if let Some(f) = f {
+                folder_first.entry(*f).or_insert(i);
+            }
+        }
         Ok(Self {
             path: path.to_path_buf(),
             password: if password.is_some() {
@@ -72,6 +90,8 @@ impl SevenzVFS {
                 None
             },
             entries,
+            folder_of,
+            folder_first,
         })
     }
 
@@ -94,6 +114,15 @@ impl ArchiveVFS for SevenzVFS {
 
     fn access_mode(&self) -> AccessMode {
         AccessMode::Solid
+    }
+
+    /// 向前预取免费区 = 目标所在 folder 的 [首条目, 目标)：定位目标时
+    /// 这段数据必然被顺序解掉丢弃（BlockDecoder 从 folder 头解码到目标），
+    /// 顺带写盘零解码增量。跨 folder 不免费（只 seek 不解压）——
+    /// 向前预取不得超出 folder 边界（用户配置的预算可能大于 folder 前缀，实取以边界为准）
+    fn locate_start(&self, entry_idx: usize) -> Option<usize> {
+        let folder = self.folder_of.get(entry_idx).copied().flatten()?;
+        self.folder_first.get(&folder).copied()
     }
 
     fn extract_entry(
@@ -624,6 +653,77 @@ mod tests {
         assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(std::fs::read(&d1).unwrap(), srcs[0].1);
         assert_eq!(std::fs::read(&d3).unwrap(), srcs[2].1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// locate_start（向前预取免费区）：solid 单 folder 包 → 前缀整段免费；
+    /// 多 folder 包 → 免费区从目标所在 folder 首条目起，不跨 folder
+    /// （向前预取不得把前置 folder 的条目当免费数据）
+    #[test]
+    fn locate_start_zone_boundaries() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_ls_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("f1.bin".into(), vec![1u8; 30_000]),
+            ("f2.bin".into(), vec![2u8; 20_000]),
+            ("f3.bin".into(), vec![3u8; 25_000]),
+            ("f4.bin".into(), vec![4u8; 15_000]),
+        ];
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        // 两次 push_archive_entries = 两个 solid folder：f1+f2 / f3+f4
+        let arch = dir.join("two_folders.7z");
+        let mut w = SevenZWriter::create(&arch).unwrap();
+        for group in [&paths[..2], &paths[2..]] {
+            let entries: Vec<SevenZArchiveEntry> = group
+                .iter()
+                .map(|p| {
+                    SevenZArchiveEntry::from_path(
+                        p,
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = group
+                .iter()
+                .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+                .collect();
+            w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        // 前置断言：确实是双 folder 包（否则测不到边界）
+        {
+            let r = sevenz_rust::SevenZReader::open(&arch, Password::empty()).unwrap();
+            assert_eq!(
+                r.archive().folders.len(),
+                2,
+                "两次 push_archive_entries 应产生两个 folder，writer 行为变化？"
+            );
+        }
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.list().len(), 4);
+        // folder 0 内：f2 的免费区从 f1 起（整个 folder 0 前缀）
+        assert_eq!(vfs.locate_start(1), Some(0));
+        // folder 1 内：f4 的免费区从 f3 起，不得把 f1/f2（前置 folder）划进来
+        assert_eq!(
+            vfs.locate_start(3),
+            Some(2),
+            "向前预取免费区不得超出目标所在 folder"
+        );
+        // 各 folder 首条目：免费区为空（起点即自身）
+        assert_eq!(vfs.locate_start(0), Some(0));
+        assert_eq!(vfs.locate_start(2), Some(2));
+        // 越界/无数据流条目：None（不 panic）
+        assert_eq!(vfs.locate_start(4), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

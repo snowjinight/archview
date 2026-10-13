@@ -224,7 +224,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 [media]   # video_extensions / image_extensions
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms
-[extract] # prefetch_mb（solid 包批量预取上限）
+[extract] # prefetch_mb（solid 包批量预取上限）/ prefetch_prev_mb（向前预取上限，见 11.1）
 [vartidy] # repo_dir / report_dir（CLI 整理子命令）
 ```
 
@@ -304,6 +304,20 @@ sort        : alphanumeric-sort (file list natural order, optional mode for comi
 - 取消机制：`Arc<AtomicBool>`；批内切换目标不取消不重启，批外目标才取消重起。
   所有取消点必须打日志——否则表现为"多条后台解压日志但看不到打断"（实际是缓存命中
   路径丢弃任务却没置 cancel 标志，旧线程静默跑完整个批，与新任务并行抢 NAS 带宽）。
+
+#### 向前预取（免费区）：随机跳看后往回翻也能命中
+
+- 定位目标时，前置数据**必然被顺序解掉丢弃**（7z 是目标 folder 内从头解码到目标、
+  RAR 是逐条 skip 消费前缀）——把这段"本来要丢的字节"改写入缓存，解码零增量，
+  只增加磁盘写入。随机跳看场景下用户往回翻直接命中缓存，无需再付定位成本。
+- 免费区边界由格式决定（trait `locate_start`，默认 None = 不适用）：7z = 目标所在
+  folder 首条目（跨 folder 只 seek 不解压，向前预取**不得超出 folder 边界**——配置
+  512MB 但 folder 前缀不足时实取以边界为准）；RAR = 整个前缀（unrar 无 folder 直达）。
+- 预算独立封顶（`extract.prefetch_prev_mb`，默认 512MB，0 = 关闭），与向后预取
+  `prefetch_mb` 互不挤占；仅收当前列表可见条目（目录/搜索过滤外的文件用户点不到）。
+  前后批去重防 file_done 下标错位（sort_files 开启时 view 序 ≠ 物理序，两批可能重叠）。
+- 进度显示配合：前置文件先于目标落地，写文件阶段字节按目标尺寸封顶
+  （否则进度条出现"300MB / 60MB"怪相）；完成提示改"相邻 N 个文件"。
 
 #### ZIP 头解析
 
