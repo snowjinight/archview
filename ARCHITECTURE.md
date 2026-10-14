@@ -78,6 +78,7 @@
 │  stream_cb     │  │  → 直写 var 仓库（只增）   │
 └────┬───────────┘  └────┬──────────────────────┘
      │                   │ open_entry / extract_batch
+     │                   │ （播放侧解压走 extract_session，见 11.4）
      │ Read + Seek       │
 ┌────▼───────────────────▼─────────────────────────────┐
 │  VFS 层（核心抽象，播放与整理共用）                 │
@@ -167,8 +168,8 @@ GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开�
    小幅回跳（刚看过的地方）命中缓存，零成本 —— 覆盖最常见的拖拽场景。
 2. **解码块 LRU 缓存（快路径）**：解压后的数据按块（默认 4MB/块，可配）进 LRU；
    后向 seek 落在缓存内则 O(1)。播放为顺序读，"拖回刚才看过的地方"命中率极高。
-3. **解压任务重定向（慢路径/固态）**：seek 超出已解压区域时，解压管理器终止当前任务，
-   从目标 offset 所在固态块重起解压（途中数据只解不写）。UI 状态栏显示"跳转中…"。
+3. **解压任务重定向（慢路径/固态）**：seek 超出已解压区域时，重定向解压会话的目标集
+   （见 11.4），不终止解码流。UI 状态栏显示"跳转中…"。
 4. **读取阻塞即缓冲**：stream_cb 的 read/seek 回调在 mpv 缓存线程上同步执行，
    阻塞是安全的（与网络流一致），mpv 自动显示 buffering 动画。
 
@@ -258,6 +259,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | Phase 3 | 图片查看（mpv 统一渲染 + PPT 自动翻页）+ 密码支持（多编码候选 + 会话记忆） | 图片/动图可看，加密包可开 | ✅ |
 | Phase 4 | 分卷 RAR（已支持）、分卷 ZIP、视频缩略图、播放记忆 | 完整版 | 🔶 部分完成 |
 | 追加 | VarTidy CLI 子命令（第 12 章）：var 资源包增量整理 | `archview.exe tidy` + 「发送到」 | ✅ |
+| 追加 | 解压会话化（11.4）：extract_session 持久解码会话，跳转零取消 | 固态包随机跳看重定向不重起 | ✅ |
 
 ---
 
@@ -301,7 +303,8 @@ sort        : alphanumeric-sort (file list natural order, optional mode for comi
   默认 512MB）。翻页时直接命中缓存，无需再等。
 - trait 层新增 `extract_batch(targets, cancel, progress, file_done)`：ZIP 用默认实现逐条循环；
   7z/RAR 各自实现单遍多目标（RAR 单次 processing 遍历内 skip 非目标、extract 目标）。
-- 取消机制：`Arc<AtomicBool>`；批内切换目标不取消不重启，批外目标才取消重起。
+- 取消机制：`Arc<AtomicBool>`。批外跳转的"取消重起"后被解压会话化取代（见 11.4），
+  cancel 只剩一个用途：切换压缩包时终止解码线程。
   所有取消点必须打日志——否则表现为"多条后台解压日志但看不到打断"（实际是缓存命中
   路径丢弃任务却没置 cancel 标志，旧线程静默跑完整个批，与新任务并行抢 NAS 带宽）。
 
@@ -371,6 +374,89 @@ PointerMoved/MouseWheel 事件序列跑 100+ 帧，记录每帧 `ScrollArea::sta
   500ms 内解完则窗口从未隐藏——快速路径零闪烁。这是"延迟隐藏"而非"最短显示时间"：
   后者会人为拖慢快速解压。
 - 预取场景（目标 == 正在播放条目）永不遮挡画面，顶栏弱色短标记即可。
+
+### 11.4 解压会话化：extract_batch 整批快照 → 持久解码会话（extract_session）
+
+> 背景：extract_batch 是「整批快照」模型——UI 启动任务时一次性给全目标清单，用户跳到
+> 批外条目只能取消整个任务重起：解码线程销毁重建、7z 目标 folder 从头重解、解到一半的
+> 前置数据全部白付。频繁随机跳看（固态包最痛的场景）下，每次跳转都重付一轮定位成本。
+
+**设计**：UI 与解码线程之间改为**共享会话**——`SessionState { targets: HashMap<名字, (下标, 落盘路径)>, focus, alive }`（`SharedSession = Arc<Mutex<..>>`，vfs/mod.rs）。解码线程循环消费会话直到空闲退出；UI 任何时刻持锁改写目标集，**跳转永不取消解码流**：
+
+```
+UI 侧（任意跳转）        解码线程（每轮规划）
+targets.clear()          规划轮：targets 空？
++ 写入新批 + focus         ├─ 是 → 同锁置 alive=false → Ok(()) 空闲退出
+同锁读 alive：             └─ 否 → 按目标分组规划，逐组解压
+  true  → 复用线程/通道      落地一个目标 → 持锁 remove + 快照 → 锁外回调 file_done
+  false → 置 true + spawn
+```
+
+**协议的原子性要求**（三处必须各自在**同一次持锁**内完成，防竞态）：
+
+1. 线程侧「targets 判空 → 置 alive=false 退出」与取消检查同锁——否则 UI 正在加目标的
+   窗口期线程误退出，新目标永远没人解；
+2. UI 侧「写目标 + 读 alive + 需要时置 true」同锁——否则判定复用后线程恰巧空闲退出；
+3. 落地条目「remove + 状态快照」同锁且 remove 先行——防同一文件重复落地。
+
+另：file_done 回调必须在**锁外**调用（std::Mutex 不可重入）；回调内再锁 session 是合法且
+必要的——动态追加目标就靠它（见测试 `session_dynamic_targets_chain`：回调内链式加目标，
+单次调用解出全部四个）。
+
+**7z 实现**（sevenz_vfs.rs）：外层规划轮把 targets 按所在 folder 分组（BTreeSet 保序），
+**focus 所在 folder 抢道排到 order[0]**——用户正在等的最先落地；逐 folder 仍用 BlockDecoder
+直达（11.1 的 folder 直达不变）。每解一个条目持锁取三元组快照 `(是否目标, focus 漂移, folder 已清)`：
+**漂移**（focus 移到了别的 folder 且仍在 targets 中）→ 立即中断当前 folder，外层重排后从新
+focus folder 继续；被中断 folder 在后续轮次从头重解自愈（非目标条目只解码不落盘，重解成本 =
+folder 前缀，远小于跨包重起）。无进展保险：一整轮零落地且未发生中断 → `Err(Archive)`
+（防脏目标让线程空转，UI 据此报错并回收）。
+
+**RAR 实现**（rar_vfs.rs）：单次 processing 遍历内动态消费 targets（skip 非目标、extract
+目标）；目标在游标后方（behind）→ `PassFlow::Restart` 重启遍历——unrar 无 folder 直达，
+重启要重付前缀，但会话仍免掉线程/通道重建与 UI 侧任务状态错乱。候选轮/Restart 双层循环
+（重启上限 64）+ 连续两轮零落地的无进展保险。
+
+**UI 统一重定向路径 = 滑动窗口**（ui.rs `start_extract`）：缓存命中/批内切换/批外跳转三场景
+共用同一条路径——`compute_batch` 以 focus 为中心重算会话窗口（目标 + 向后预取 prefetch_mb +
+向前免费区 prefetch_prev_mb；已落地条目一律出窗，含目标本身——缓存命中时窗口纯做预取），
+持锁替换 targets + focus。窗口是**全量重算**而非增量平移：每次目标切换都按磁盘落地状态
+重算（落地即出窗、预算内补新），因此既会随连续观看前移，也会在跳回未落地处时整体回移到
+该处——窗口语义 = 「用户接下来可能看的、还没解好的工作集」。**窗口随用户滑动**：连续观看时
+每次切换都把窗口对齐当前位置，跨过窗口尾界无感续解（不必等整批重解）；等待期回看也不会把
+解码流白白拽回——回看目标已落地则缓存命中（窗口照常滑动），未落地则重定向，靠 7z folder
+直达/RAR Restart 尽快补上。
+
+| 场景 | 差异点（窗口重算 + 重定向共用） |
+|---|---|
+| 缓存命中 | 直接播 + 窗口滑动；会话已死则照常 spawn 预取会话（围绕已播目标续解后续）；磁盘不足时降级：播放不受影响，沿用旧窗口不滑动 |
+| 批内切换 | 同一路径（窗口平移：已落地头部出窗、尾部补新），覆盖层宽限期（started）不清零 |
+| 批外跳转 | 同一路径（窗口整体重算），started 重置 |
+
+整窗已落地（全缓存）时不重定向——空 targets 会让解码线程判空退出——仅对齐 focus + 播放，
+job 字段仍切换（Done 兜底补播以 entry_idx 为准）。
+注意 pending 表重定向后必须重建——旧批未落项已不在 targets 里永不落地，残留项会让批内
+切换误判。cancel 标志只剩切包时置位（终止解码线程，会话随旧包丢弃）。
+
+**收益**：随机跳看不再反复销毁/重建解码线程与重付 folder 定位成本；focus 抢道保证「正在
+看的」优先落地；缓存命中与后台预取并行不悖；窗口随 focus 滑动，连续观看无批尾等待断崖。
+VarTidy 仍走 extract_batch——一次性整批快照正适合 CLI 场景，不引入会话复杂度。
+
+**测试**（sevenz_vfs.rs，3 个）：`session_lifecycle_and_reuse`（空闲退出/空目标立即返回/
+复用时 focus 抢道落地顺序 [3,0]/脏目标 Err(Archive)）、`session_dynamic_targets_chain`
+（回调链式追加 → 单次调用解出全部）、`session_focus_drift_interrupts_folder`（solid folder
+内切 focus → 漂移中断 → 自愈补齐，落地顺序 [g1, h1, g3] 且三文件内容全验证）。
+
+**UI 层冒烟测试**（ui.rs `sliding_window_smoke_in_batch_back_and_forth`，模拟用户批内
+来回跳动）：不走 egui 渲染，直接驱动 `start_extract` + 轮询 `poll_extract` 模拟 UI 主循环
+（测试构造器 `new_for_test` 绕开 `eframe::CreationContext`；`start_extract`/`poll_extract`
+不依赖 frame 参数，天然可测）。6 × 1MB 伪随机 jpg 压成单 folder solid 7z，`prefetch_mb=3`
+使窗口恰为 [目标, +1, +2]、`prefetch_prev_mb=0` 让断言值可硬编码；跳转链
+0→1→0→2→（解净空闲退出）→5→0 覆盖全部分支：批内切换以 `Arc::ptr_eq(cancel)` 断言解码
+线程**不重启**且 `started` 不清零（覆盖层宽限期不清零）；回跳已落地目标缓存命中立即播放、
+窗口照常前滑（已落地头部出窗）；批内再跳窗口稳定；空闲退出后再跳重 spawn（新 cancel
+句柄）；整窗已落地不重定向（空 targets 防误杀空闲线程）；终态 6 文件逐字节与源数据比对
+（防落地错位）+ 会话干净退出。1MB 文件解码为百 ms 级而断言紧跟落地事件（μs 级），
+窗口期约千倍差，时序不抖。
 
 ---
 

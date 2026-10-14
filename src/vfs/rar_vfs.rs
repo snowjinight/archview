@@ -1,7 +1,7 @@
 //! RarVFS：RAR 格式（固态慢路径，unrar crate 内嵌编译 UnRAR 源码，支持 RAR4/5、分卷）。
 //! 与 7z 同理：后台解压到缓存目录 → 播放本地文件。
 
-use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
+use super::{AccessMode, ArchiveVFS, SharedSession, VfsError, VirtualEntry, VirtualFile};
 use std::path::{Path, PathBuf};
 use unrar::Archive;
 
@@ -187,6 +187,130 @@ impl RarVFS {
             }
         }
     }
+
+    /// 会话单遍处理（单密码候选）：一次 processing 遍历动态消费 targets
+    /// （try_batch 的会话版）。差异：目标集从 session 实时读取（UI 随时
+    /// 增删），落地即 remove + 锁外回调；focus 漂移到已越过位置
+    /// （behind：focus 仍待解且其下标 < 当前遍历位置）→ Restart 提前返回，
+    /// 外层从头重启遍历（unrar 无 folder 直达，重启是唯一回退手段）。
+    /// 遍历尽不报"entry 不存在"——目标集动态，可能是 UI 刚加的目标在
+    /// 已越过位置（外层下轮 Restart/重新遍历会处理），真不存在的由外层
+    /// 无进展保险兜底
+    fn session_pass(
+        &self,
+        pw: Option<&[u8]>,
+        session: &SharedSession,
+        name_idx: &std::collections::HashMap<String, usize>,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize, &Path),
+    ) -> Result<(PassFlow, usize), VfsError> {
+        let arch = match pw {
+            Some(p) => Archive::with_password(&self.path, p),
+            None => Archive::new(&self.path),
+        };
+        let mut open = arch.open_for_processing().map_err(|e| {
+            VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display()))
+        })?;
+        let mut landed = 0; // 本遍落地数
+        let mut skipped: usize = 0;
+        let mut skipped_bytes: u64 = 0;
+        loop {
+            // 逐条目定位期间检查取消（大包 / NAS 上定位耗时分钟级）
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(VfsError::Cancelled);
+            }
+            let head = match open.read_header().map_err(|e| {
+                VfsError::Archive(format!("读 RAR 头失败 [{}]: {e}", self.path.display()))
+            })? {
+                Some(h) => h,
+                None => return Ok((PassFlow::Done, landed)),
+            };
+            let name = head.entry().filename.to_string_lossy().replace('\\', "/");
+            // extract_to/skip 消费 head：先取需要的字段
+            let encrypted = head.entry().is_encrypted();
+            let size = head.entry().unpacked_size;
+            let cur_idx = name_idx.get(&name).copied();
+            // 持锁快照：本条目目标 / focus 是否漂移到已越过位置
+            let (tgt, behind) = {
+                let st = session.lock().unwrap();
+                let tgt = st.targets.get(&name).cloned();
+                // focus 仍待解（在下标相等的目标里）且在当前遍历位置之前
+                let behind = st.focus.is_some_and(|f| {
+                    st.targets.values().any(|(idx, _)| *idx == f)
+                        && cur_idx.is_some_and(|c| f < c)
+                });
+                (tgt, behind)
+            };
+            if behind {
+                return Ok((PassFlow::Restart, landed)); // 回退重启定位 focus
+            }
+            let Some((ti, dest)) = tgt else {
+                open = head.skip().map_err(|e| {
+                    VfsError::Archive(format!(
+                        "RAR 跳过条目 [{}] 失败（正在定位目标）: {e}",
+                        name
+                    ))
+                })?;
+                skipped += 1;
+                skipped_bytes += size;
+                if skipped % 64 == 0 {
+                    progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                }
+                continue;
+            };
+            if encrypted && pw.is_none() {
+                return Err(VfsError::Password);
+            }
+            // 缓存已存在且尺寸一致：幂等跳过（候选重试/会话重启后已解出的不重做）
+            if std::fs::metadata(&dest)
+                .map(|m| m.len() == size)
+                .unwrap_or(false)
+            {
+                if session.lock().unwrap().targets.remove(&name).is_some() {
+                    file_done(ti, &dest); // 锁已释放
+                    landed += 1;
+                }
+                open = head.skip().map_err(|e| {
+                    VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
+                })?;
+                continue;
+            }
+            // 解压到临时文件再改名（同 try_batch）；unrar 无逐字节回调：
+            // 写文件前发 0、完成后发全量，UI 能区分"跳过 → 写文件"两阶段
+            progress(0, "");
+            let tmp = super::tmp_path(&dest);
+            open = head.extract_to(&tmp).map_err(|e| {
+                std::fs::remove_file(&tmp).ok();
+                if is_password_err(&e) {
+                    VfsError::Password
+                } else {
+                    VfsError::Archive(format!(
+                        "RAR 解压失败: 压缩包 [{}] 条目 [{}] 解压到 [{}] 失败: {e}",
+                        self.path.display(),
+                        name,
+                        tmp.display()
+                    ))
+                }
+            })?;
+            std::fs::rename(&tmp, &dest).map_err(|e| {
+                std::fs::remove_file(&tmp).ok();
+                VfsError::Archive(format!(
+                    "重命名临时文件失败: [{}] → [{}]: {e}",
+                    tmp.display(),
+                    dest.display()
+                ))
+            })?;
+            if session.lock().unwrap().targets.remove(&name).is_some() {
+                file_done(ti, &dest); // 锁已释放
+                landed += 1;
+            }
+            progress(size, "");
+            if session.lock().unwrap().targets.is_empty() {
+                return Ok((PassFlow::Done, landed)); // 全部落地，提前收工
+            }
+        }
+    }
 }
 
 impl ArchiveVFS for RarVFS {
@@ -286,6 +410,117 @@ impl ArchiveVFS for RarVFS {
         Err(last_err)
     }
 
+    /// 持久化解码会话（trait 协议见 vfs/mod.rs）：session_pass 外再套两层——
+    /// 候选循环（密码/编码不匹配换候选，同 extract_batch）内含 Restart 重试
+    /// （focus 回跳重启定位，上限 64 次防 UI 抖动死循环），外层规划轮在
+    /// 一轮遍历尽后重读 targets（UI 新加的目标进下一轮；无人加则快照空
+    /// 退出）。连续两轮零落地且 targets 仍非空 = 真的 entry 不存在（单轮
+    /// 零落地可能是瞬态：遍历尽与 UI 加目标竞争），报错防死循环
+    fn extract_session(
+        &self,
+        session: &SharedSession,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize, &Path),
+    ) -> Result<(), VfsError> {
+        // 尝试序列：有密码 → 各编码候选 + 无密码兜底；无密码 → 仅无密码（同 extract_batch）
+        let mut attempts: Vec<Option<Vec<u8>>> = Vec::new();
+        if self.password.is_empty() {
+            attempts.push(None);
+        } else {
+            for c in &self.password {
+                attempts.push(Some(c.clone()));
+            }
+            attempts.push(None);
+        }
+        // 名字 → list 下标（behind 判定用；包内容不变，主循环外构建一次）
+        let name_idx: std::collections::HashMap<String, usize> = self
+            .list()
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (e.name, i))
+            .collect();
+        let mut stagnant = 0; // 连续零落地轮数（无进展保险）
+        loop {
+            // 持锁预检：取消 / 空闲退出（判空与置 alive=false 同锁，协议见 mod.rs）
+            {
+                let mut st = session.lock().unwrap();
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    st.alive = false;
+                    return Err(VfsError::Cancelled);
+                }
+                if st.targets.is_empty() {
+                    st.alive = false;
+                    return Ok(());
+                }
+            }
+            let mut landed = 0;
+            let mut restarts = 0;
+            let mut all_done = false;
+            let mut last_err = VfsError::Password;
+            'cand: for pw in &attempts {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    super::session_exit(session);
+                    return Err(VfsError::Cancelled);
+                }
+                loop {
+                    match self.session_pass(
+                        pw.as_deref(),
+                        session,
+                        &name_idx,
+                        cancel,
+                        progress,
+                        file_done,
+                    ) {
+                        Ok((PassFlow::Done, n)) => {
+                            landed += n;
+                            all_done = true;
+                            break 'cand;
+                        }
+                        Ok((PassFlow::Restart, n)) => {
+                            landed += n;
+                            restarts += 1;
+                            if restarts > 64 {
+                                super::session_exit(session);
+                                return Err(VfsError::Archive(
+                                    "RAR 会话定位重启次数过多（focus 频繁回跳）".into(),
+                                ));
+                            }
+                        }
+                        // 密码/编码不匹配：跳出 Restart 重试换下一候选
+                        // （已落地的幂等跳过，重试只补漏）
+                        Err(e) if is_pwd_or_crc(&e) => {
+                            last_err = e;
+                            break;
+                        }
+                        Err(e) => {
+                            super::session_exit(session);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            if !all_done {
+                super::session_exit(session);
+                return Err(last_err);
+            }
+            // 无进展保险：连续两轮零落地且 targets 仍非空 → 真的不在包内；
+            // 有落地重置计数，目标已空则外层预检正常收尾
+            if landed == 0 {
+                stagnant += 1;
+                if stagnant >= 2 && !session.lock().unwrap().targets.is_empty() {
+                    super::session_exit(session);
+                    return Err(VfsError::Archive(
+                        "RAR 会话无进展：目标条目不在包内".into(),
+                    ));
+                }
+            } else {
+                stagnant = 0;
+            }
+            // 有落地或瞬态零落地：外层重规划（UI 新加的目标进下一轮）
+        }
+    }
+
     /// 密码校验：对编码候选（UTF-8 / 配置代码页，见 vfs::password_candidates）
     /// 逐个试 verify_one——unrar 的密码是原始字节，编码不对与密码不对同样报错。
     /// 密码/编码不匹配换下一候选，全部失败才报 Password
@@ -314,6 +549,13 @@ fn is_pwd_or_crc(e: &VfsError) -> bool {
     }
     let s = e.to_string().to_lowercase();
     s.contains("password") || s.contains("crc")
+}
+
+/// 会话单遍处理的结果：Done = 本候选遍历尽（能做的都做完）；
+/// Restart = focus 漂移到已越过位置，需从头重启遍历回退定位
+enum PassFlow {
+    Done,
+    Restart,
 }
 
 impl RarVFS {

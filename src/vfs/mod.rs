@@ -138,6 +138,33 @@ impl From<std::io::Error> for VfsError {
     }
 }
 
+/// 固实包解码会话的共享状态（UI ↔ 后台解码线程，见 `ArchiveVFS::extract_session`）。
+/// 相比 `extract_batch` 的静态批，目标集在解码过程中可被 UI 动态增删——
+/// 跳转不再取消解码流：同 folder 向后跳零成本续解，跨 folder 只 seek。
+pub struct SessionState {
+    /// 待解条目：条目名 → (list 顺序下标, 落地路径)。
+    /// UI 点击/翻页组批时写入；解码线程每落地一个条目（临时文件 rename
+    /// 完成）即持锁移除并回调 file_done
+    pub targets: std::collections::HashMap<String, (usize, PathBuf)>,
+    /// UI 当前期望播放的条目下标：解码线程优先定位它——7z 把 focus 所在
+    /// folder 排到解码序最前（必要时中断当前 folder），RAR 据此判定是否
+    /// 重启遍历（focus 在已越过的位置才重启）
+    pub focus: Option<usize>,
+    /// 解码线程存活标志：线程启动前置 true；一切退出路径（targets 解空 /
+    /// cancel / 出错）都必须持锁置 false。UI 侧加目标后检查它：false 说明
+    /// 线程已退出需重新 spawn——置 false 与加目标在同一把锁下互斥，
+    /// 不会出现"UI 判定存活却随即线程退出丢目标"的竞态
+    pub alive: bool,
+}
+
+/// 会话共享句柄
+pub type SharedSession = std::sync::Arc<std::sync::Mutex<SessionState>>;
+
+/// 会话线程退出收尾：持锁置 `alive = false`（一切退出路径统一调用）
+pub(crate) fn session_exit(session: &SharedSession) {
+    session.lock().unwrap().alive = false;
+}
+
 /// 统一三种压缩包格式的读取接口（注册进全局注册表，跨线程共享）
 pub trait ArchiveVFS: Send + Sync {
     /// 列出所有 entry
@@ -194,6 +221,90 @@ pub trait ArchiveVFS: Send + Sync {
             file_done(i);
         }
         Ok(())
+    }
+
+    /// 持久化解码会话：动态目标集的批量解压——固态包随机访问优化的核心。
+    ///
+    /// 与 `extract_batch` 的静态批不同：`session` 由调用方持有、跨线程共享，
+    /// 解码期间目标集可被 UI 动态增删，**跳转不再取消解码流**：
+    /// - 同 folder 向后跳：目标就在解码流前方，零成本顺手解出
+    /// - 跨 folder 跳：当前 folder 收尾后只 seek 到新 folder（不解压前置）
+    /// - focus 漂移：实现方可中断当前 folder，优先解 focus 所在 folder
+    ///
+    /// 协议（覆盖实现必须遵守，字段语义见 `SessionState`）：
+    /// - 条目落地（临时文件 rename 完成）→ 持锁从 targets 移除 → **锁外**
+    ///   回调 `file_done(list 下标, 路径)`（回调可能再锁 session 加新目标，
+    ///   std::Mutex 不可重入，持锁回调必死锁）
+    /// - targets 解空 = 空闲：置 alive=false 返回 Ok（UI 之后加目标时据
+    ///   alive=false 重新 spawn；置 false 与加目标在同一把锁下互斥，无竞态）
+    /// - cancel 置位 / 出错：置 alive=false 再返回
+    ///
+    /// 默认实现退化为"快照 + extract_batch"循环：每轮把当前目标集转静态批
+    /// 解掉，批间重读 targets（期间新加的目标进下一轮）。zip 等无跳过成本的
+    /// 格式用默认即可；7z/RAR 覆写为不中断的单遍解码流
+    fn extract_session(
+        &self,
+        session: &SharedSession,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize, &Path),
+    ) -> Result<(), VfsError> {
+        loop {
+            // 持锁快照（空 = 空闲退出）。判空与置 alive=false 必须同一次持锁
+            // 完成：与 UI 侧"加目标后查 alive 决定是否重新 spawn"互斥——
+            // 若 drop 后重锁，窗口内 UI 加了目标却见 alive=true 不 spawn，目标滞留
+            let snapshot: Vec<(String, usize, PathBuf)> = {
+                let mut st = session.lock().unwrap();
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    st.alive = false;
+                    return Err(VfsError::Cancelled);
+                }
+                if st.targets.is_empty() {
+                    st.alive = false;
+                    return Ok(());
+                }
+                st.targets
+                    .iter()
+                    .map(|(n, (i, p))| (n.clone(), *i, p.clone()))
+                    .collect()
+            };
+            // 快照 → 静态批（按名字在 list 中定位条目）
+            let entries = self.list();
+            let mut batch: Vec<(&VirtualEntry, &Path)> = Vec::new();
+            for (name, _, dest) in &snapshot {
+                if let Some(e) = entries.iter().find(|e| e.name == name.as_str()) {
+                    batch.push((e, dest.as_path()));
+                }
+            }
+            if batch.is_empty() {
+                // 快照里的名字都不在列表中（异常）：报错而非死循环重试
+                session_exit(session);
+                return Err(VfsError::Archive("目标条目不存在".into()));
+            }
+            // extract_batch 的批内下标 → 快照定位：锁内 remove 成功才外抛
+            // （remove 失败 = 目标已被并发路径移除，跳过回调）
+            let batch_done = |bi: usize| {
+                let (name, idx, dest) = &snapshot[bi];
+                let hit = session
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .remove(name.as_str())
+                    .is_some();
+                if hit {
+                    file_done(*idx, dest); // 锁已释放
+                }
+            };
+            match self.extract_batch(&batch, cancel, progress, &batch_done) {
+                // 本轮解空：外层重快照（期间 UI 新加的目标进下一轮；
+                // 无人加目标则下轮快照空 → 正常收尾）
+                Ok(()) => {}
+                Err(e) => {
+                    session_exit(session);
+                    return Err(e);
+                }
+            }
+        }
     }
 
     /// 定位该条目时顺序解压流的起始条目下标（list 顺序；None = 定位无前置解码）。

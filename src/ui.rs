@@ -8,7 +8,7 @@ use crate::player::stream_cb;
 use crate::player::PlayerService;
 use crate::vfs::{
     archives_in_dir, next_archive_in_dir, open_with_password_probe, AccessMode, ArchiveVFS,
-    VfsError, VirtualEntry,
+    SessionState, SharedSession, VfsError, VirtualEntry,
 };
 use egui::Widget;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,10 @@ struct ArchiveState {
     vfs: Arc<dyn ArchiveVFS>,
     /// true = 流式播放（zip 快路径）；false = 后台解压（7z/RAR 慢路径）
     stream: bool,
+    /// 固实解码会话（UI ↔ 后台解码线程共享，生命周期与包一致；stream 包
+    /// 不使用）。UI 组批时重写 targets/focus，解码线程动态消费——跳转只
+    /// 更新目标集，不重启解码流（协议见 vfs::ArchiveVFS::extract_session）
+    session: SharedSession,
 }
 
 /// 密码输入弹窗：加密头（打开阶段）或内容加密（播放阶段）触发
@@ -65,7 +69,9 @@ struct NextArchivePrompt {
     sel: usize,
 }
 
-/// 后台解压任务（7z/RAR）：目标 + 预取的一批条目（一次顺序解压流解出）
+/// 后台解压任务（7z/RAR）：UI 侧的期望状态 + 消息通道。真正的解码循环
+/// 在会话线程里（ArchiveState.session 伴生，见 vfs::ArchiveVFS::extract_session），
+/// 跳转只重写会话目标集、不重启解码流；此对象描述"UI 现在想要什么"
 struct ExtractJob {
     gen: u64,
     /// 当前 UI 期望播放的条目（批内导航时切换，不重启任务）
@@ -87,8 +93,9 @@ struct ExtractJob {
     /// 快速解压全程不打扰播放，避免窗口闪烁。批内切换目标不重置
     /// （解压流本就在跑，切过去通常已在目标附近，立即显示进度是对的）
     started: std::time::Instant,
-    /// 取消标志：用户切换到批外条目时置位，解压线程尽快退出
-    /// （不取消会与新任务并行抢网络盘带宽，两边都变慢）
+    /// 取消标志：仅切换压缩包时置位（终止解码线程，会话随旧包一起丢弃）。
+    /// 批外跳转不取消——走会话重定向（session.targets 重写），解码流续跑
+    /// 免重启（solid 包重启 = 重新顺序解前置数据）
     cancel: Arc<AtomicBool>,
     rx: Receiver<ExtMsg>,
 }
@@ -249,6 +256,46 @@ impl App {
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
             initial_open: initial,
+        }
+    }
+
+    /// 测试专用构造：绕开 eframe::CreationContext（单测无 egui 上下文，
+    /// CJK 字体安装跳过），其余初始化与 App::new 一致
+    #[cfg(test)]
+    fn new_for_test(cfg: Config) -> Self {
+        cache::cleanup_partial(&cache::cache_dir(&cfg));
+        Self {
+            cfg,
+            archive: None,
+            search: String::new(),
+            playing: None,
+            child_hwnd: 0,
+            child_hidden: false,
+            overlay_open: false,
+            player: None,
+            dragging: false,
+            drag_pos: 0.0,
+            error: None,
+            notice: None,
+            fullscreen: false,
+            list_tab: ListTab::Video,
+            scrolled_to: None,
+            wheel_last: f64::NEG_INFINITY,
+            slideshow_on: false,
+            slideshow_idx: None,
+            slideshow_anchor: 0.0,
+            extract: None,
+            open_job: None,
+            open_progress: None,
+            next_gen: 0,
+            list_rows: Vec::new(),
+            list_counts: (0, 0),
+            row_h: None,
+            pw_prompt: None,
+            pw_memory: std::collections::HashMap::new(),
+            next_archive_prompt: None,
+            seen_archives: std::collections::HashSet::new(),
+            initial_open: None,
         }
     }
 
@@ -482,6 +529,13 @@ impl App {
                         view: Vec::new(),
                         vfs,
                         stream,
+                        // 全新会话：alive=false 起步，首次 play 组批后置 true
+                        // 并 spawn 解码线程（协议见 vfs::ArchiveVFS::extract_session）
+                        session: Arc::new(std::sync::Mutex::new(SessionState {
+                            targets: Default::default(),
+                            focus: None,
+                            alive: false,
+                        })),
                     });
                     self.rebuild_view();
                     tracing::info!("打开压缩包: {}（{} 项）", path.display(), self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0));
@@ -703,102 +757,45 @@ impl App {
         }
     }
 
-    /// 启动后台解压任务；缓存命中（同尺寸文件已在）则直接播放。
-    /// 目标 + 前后预取条目组成一批，一次顺序解压流解出（solid 包定位目标
-    /// 需顺序解压前置数据，一次解一批摊薄固定成本；前置条目定位时本就要被
-    /// 解掉丢弃，顺带写盘即"向前预取"——随机跳看后往回翻直接命中缓存）
-    fn start_extract(&mut self, entry_idx: usize) {
-        // 去重：该条目的解压线程已在跑（双击/重复点击会瞬时触发两次 play），
-        // 不再起第二个线程——两个 unrar 抢写同一个临时文件会报 "Could not create file"。
-        if self
-            .extract
-            .as_ref()
-            .is_some_and(|j| j.entry_idx == entry_idx)
-        {
-            return;
-        }
-        let Some(arch) = &self.archive else { return };
-        let entry = arch.entries[entry_idx].clone();
-        let vfs = arch.vfs.clone();
-        let dir = cache::cache_dir(&self.cfg);
-        let dest = cache::dest_path(&dir, arch.id, entry_idx, &entry.name);
-
-        // 缓存命中：尺寸一致直接播
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            if meta.len() == entry.size {
-                tracing::info!("缓存命中: {}", dest.display());
-                // 旧任务处理：目标已可直接播——
-                // · 目标在旧批内：只切期望目标（批继续预取后续条目；
-                //   FileDone 到来时 playing 已是该条目，不会重播）
-                // · 不在批内：用户已跳走，取消旧任务（不取消会与新任务
-                //   并行抢网络盘带宽，且旧线程无 journal 可见性——曾表现为
-                //   "多条后台解压日志但看不到打断"）
-                if self
-                    .extract
-                    .as_ref()
-                    .is_some_and(|j| j.pending.contains_key(&entry_idx))
-                {
-                    let j = self.extract.as_mut().unwrap();
-                    j.entry_idx = entry_idx;
-                    j.dest = dest.clone();
-                    j.entry_name = entry.name.clone();
-                    j.total = entry.size;
-                    j.done = 0;
-                    j.stage = String::new();
-                    tracing::info!("批内切换目标（缓存命中）: {}", entry.name);
-                } else if let Some(j) = &self.extract {
-                    tracing::info!("取消解压任务: {}（新目标已缓存命中）", j.entry_name);
-                    j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.extract = None;
-                }
-                self.load_extracted(&dest, entry_idx);
-                return;
-            }
-        }
-
-        // 批内切换：新目标在当前批的未完成清单里 → 不取消不重启，
-        // 只把期望目标切过去；该文件落地时（FileDone）立即播放
-        if self
-            .extract
-            .as_ref()
-            .is_some_and(|j| j.pending.contains_key(&entry_idx))
-        {
-            let j = self.extract.as_mut().unwrap();
-            j.entry_idx = entry_idx;
-            j.dest = dest;
-            j.entry_name = entry.name.clone();
-            j.total = entry.size;
-            j.done = 0;
-            j.stage = String::new();
-            tracing::info!("批内切换目标: {}", entry.name);
-            return;
-        }
-
-        // 组批：目标 + view 顺序（显示顺序）后续条目，累计不超过预取上限。
-        // 已缓存的条目跳过（无需解压、不占批额度）
+    /// 组批 = 会话窗口：目标 + view 顺序（显示顺序）后续条目（prefetch_mb
+    /// 封顶）+ 定位免费区前置条目（prefetch_prev_mb 封顶）。已落地条目跳过
+    /// （无需解压、不占批额度；目标本身已缓存时窗口纯做预取）。返回
+    /// (窗口条目下标, 窗口总字节)。窗口随 focus 滑动：每次目标切换都重算
+    /// 对齐，连续观看跨过窗口尾界时无感续解，不必等整批重新解压
+    fn compute_batch(&self, arch: &ArchiveState, entry_idx: usize, dir: &Path) -> (Vec<usize>, u64) {
+        // 判缓存：尺寸一致视为已落地
+        let on_disk = |i: usize| -> bool {
+            let e = &arch.entries[i];
+            let d = cache::dest_path(dir, arch.id, i, &e.name);
+            std::fs::metadata(&d)
+                .map(|m| m.len() == e.size)
+                .unwrap_or(false)
+        };
         let cap = self.cfg.extract.prefetch_mb.saturating_mul(1024 * 1024);
-        let mut batch: Vec<usize> = vec![entry_idx];
-        let mut batch_bytes = entry.size;
-        if cap > 0 {
-            if let Some(pos) = arch.view.iter().position(|&i| i == entry_idx) {
-                for &i in arch.view[pos + 1..].iter() {
-                    if batch_bytes >= cap {
-                        break;
-                    }
-                    let e = &arch.entries[i];
-                    if e.is_dir {
-                        continue;
-                    }
-                    let d = cache::dest_path(&dir, arch.id, i, &e.name);
-                    if std::fs::metadata(&d)
-                        .map(|m| m.len() == e.size)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    batch_bytes += e.size;
-                    batch.push(i);
+        let mut batch: Vec<usize> = Vec::new();
+        let mut batch_bytes: u64 = 0;
+        // 目标自身：未落地才入批（已缓存时窗口纯做预取，不占额度）
+        if !on_disk(entry_idx) {
+            batch.push(entry_idx);
+            batch_bytes = arch.entries[entry_idx].size;
+        }
+        // 目标不在当前 view（被过滤）：单独成批，不扫后续
+        let start = arch
+            .view
+            .iter()
+            .position(|&i| i == entry_idx)
+            .unwrap_or(usize::MAX);
+        if start != usize::MAX && cap > 0 {
+            for &i in arch.view[start + 1..].iter() {
+                if batch_bytes >= cap {
+                    break;
                 }
+                let e = &arch.entries[i];
+                if e.is_dir || on_disk(i) {
+                    continue;
+                }
+                batch_bytes += e.size;
+                batch.push(i);
             }
         }
 
@@ -815,11 +812,11 @@ impl App {
             .prefetch_prev_mb
             .saturating_mul(1024 * 1024);
         if prev_cap > 0 {
-            if let Some(start) = arch.vfs.locate_start(entry_idx) {
+            if let Some(s) = arch.vfs.locate_start(entry_idx) {
                 let view_set: std::collections::HashSet<usize> =
                     arch.view.iter().copied().collect();
                 let mut prev_bytes: u64 = 0;
-                for i in start..entry_idx {
+                for i in s..entry_idx {
                     if prev_bytes >= prev_cap {
                         break;
                     }
@@ -828,11 +825,7 @@ impl App {
                     if e.is_dir || !view_set.contains(&i) || batch.contains(&i) {
                         continue;
                     }
-                    let d = cache::dest_path(&dir, arch.id, i, &e.name);
-                    if std::fs::metadata(&d)
-                        .map(|m| m.len() == e.size)
-                        .unwrap_or(false)
-                    {
+                    if on_disk(i) {
                         continue;
                     }
                     prev_bytes += e.size;
@@ -841,73 +834,199 @@ impl App {
                 }
             }
         }
+        (batch, batch_bytes)
+    }
 
-        // 磁盘余量预检（整批）：缓存目录所在盘放不下（留 64MB 余量）则直接报错，
-        // 不发起到注定失败的解压。查不到余量（目录不可达等）跳过，让解压错误自己暴露。
-        if let Some(free) = cache::free_bytes(&dir) {
-            let need = batch_bytes.saturating_add(64 * 1024 * 1024);
-            if free < need {
-                let msg = format!(
-                    "缓存目录所在磁盘空间不足：剩余 {:.1}GB，本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.toml 的 cache.dir / extract.prefetch_mb）",
-                    free as f64 / (1024.0 * 1024.0 * 1024.0),
-                    batch.len(),
-                    need as f64 / (1024.0 * 1024.0 * 1024.0),
-                    dir.display()
-                );
-                tracing::error!("{msg}");
-                self.error = Some(msg);
+    /// 磁盘余量预检（整批）：缓存目录所在盘放不下（留 64MB 余量）则返回
+    /// 错误消息。查不到余量（目录不可达等）返回 None，让解压错误自己暴露。
+    fn disk_short(dir: &Path, batch_len: usize, batch_bytes: u64) -> Option<String> {
+        let free = cache::free_bytes(dir)?;
+        let need = batch_bytes.saturating_add(64 * 1024 * 1024);
+        (free < need).then(|| {
+            format!(
+                "缓存目录所在磁盘空间不足：剩余 {:.1}GB，本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.toml 的 cache.dir / extract.prefetch_mb）",
+                free as f64 / (1024.0 * 1024.0 * 1024.0),
+                batch_len,
+                need as f64 / (1024.0 * 1024.0 * 1024.0),
+                dir.display()
+            )
+        })
+    }
+
+    /// 启动/重定向后台解压任务。缓存命中（同尺寸文件已在）直接播放，窗口
+    /// 照常重算——会话窗口以 focus 为中心（目标 + 前后预取），每次目标切换
+    /// 都对齐滑动：批内切换/缓存命中让窗口跟随用户前移，批外跳转则整体
+    /// 重算，三分支共用同一条重定向路径（solid 包定位目标需顺序解压前置
+    /// 数据，一次解一批摊薄固定成本；前置条目定位时本就要被解掉丢弃，
+    /// 顺带写盘即"向前预取"——随机跳看后往回翻直接命中缓存）
+    fn start_extract(&mut self, entry_idx: usize) {
+        // 去重：该条目的解压线程已在跑（双击/重复点击会瞬时触发两次 play），
+        // 不再起第二个线程——两个 unrar 抢写同一个临时文件会报 "Could not create file"。
+        if self
+            .extract
+            .as_ref()
+            .is_some_and(|j| j.entry_idx == entry_idx)
+        {
+            return;
+        }
+        // 只读规划段：借 archive 组批并产出 owned 数据。后续预检/重定向/
+        // spawn 都要可变借用 self（方法调用借整个 self），须先结束 arch 借用
+        let (cached, was_pending, session, vfs, dir, dest, name, total, targets, batch_bytes) = {
+            let Some(arch) = &self.archive else { return };
+            let entry = &arch.entries[entry_idx];
+            let dir = cache::cache_dir(&self.cfg);
+            let dest = cache::dest_path(&dir, arch.id, entry_idx, &entry.name);
+            // 缓存命中：尺寸一致直接播（窗口照常重算，见函数 doc）
+            let cached = std::fs::metadata(&dest)
+                .map(|m| m.len() == entry.size)
+                .unwrap_or(false);
+            // 批内切换：新目标在当前批未完成清单里（覆盖层宽限期不清零的依据）
+            let was_pending = self
+                .extract
+                .as_ref()
+                .is_some_and(|j| j.pending.contains_key(&entry_idx));
+            let (batch, batch_bytes) = self.compute_batch(arch, entry_idx, &dir);
+            let targets: Vec<(String, usize, PathBuf)> = batch
+                .iter()
+                .map(|&i| {
+                    let e = &arch.entries[i];
+                    (e.name.clone(), i, cache::dest_path(&dir, arch.id, i, &e.name))
+                })
+                .collect();
+            (
+                cached,
+                was_pending,
+                arch.session.clone(),
+                arch.vfs.clone(),
+                dir,
+                dest,
+                entry.name.clone(),
+                entry.size,
+                targets,
+                batch_bytes,
+            )
+        };
+
+        // 整窗已落地：无事可解，不重定向会话（空 targets 会让解码线程判空
+        // 退出）。仅对齐 focus + 播放；j 字段仍要切——Done 兜底补播以
+        // j.entry_idx 为准，不切会在旧目标落地时把画面从当前条目拽走
+        if targets.is_empty() {
+            debug_assert!(cached);
+            if let Some(arch) = self.archive.as_ref() {
+                arch.session.lock().unwrap().focus = Some(entry_idx);
+            }
+            if let Some(j) = self.extract.as_mut() {
+                j.entry_idx = entry_idx;
+                j.dest = dest.clone();
+                j.entry_name = name.clone();
+                j.total = total;
+                j.done = 0;
+                j.stage = String::new();
+            }
+            tracing::info!("缓存命中（整窗已落地）: {name}");
+            self.load_extracted(&dest, entry_idx);
+            return;
+        }
+
+        // 磁盘余量预检（整批）：批外目标放不下直接报错，不发起到注定失败的
+        // 解压；缓存命中降级——播放不受影响，沿用旧窗口不滑动
+        if let Some(msg) = Self::disk_short(&dir, targets.len(), batch_bytes) {
+            if cached {
+                tracing::warn!("窗口滑动跳过（磁盘不足，播放不受影响）：{msg}");
+                if let Some(arch) = self.archive.as_ref() {
+                    arch.session.lock().unwrap().focus = Some(entry_idx);
+                }
+                self.load_extracted(&dest, entry_idx);
                 return;
             }
+            tracing::error!("{msg}");
+            self.error = Some(msg);
+            return;
         }
 
         cache::evict_if_needed(&dir, self.cfg.cache.max_size_mb * 1024 * 1024, batch_bytes);
 
-        // 取消旧解压任务：新目标不在旧批内（solid 包跳过前置文件可达分钟级，
-        // 旧任务继续跑只会与新任务并行抢网络盘带宽）
-        if let Some(j) = &self.extract {
-            tracing::info!("取消解压任务: {}（新目标不在旧批内）", j.entry_name);
-            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-
+        // 会话重定向（三分支共用）：清空旧目标写入新窗口 + focus。批内切换/
+        // 缓存命中时新窗口 ≈ 旧窗口平移（已落地头部出窗、尾部补新），批外
+        // 跳转则整体重算，对解码协议是同一件事。"写目标 + 查 alive + 需要
+        // 时置 true"同一次持锁完成，与解码线程的"判空退出"互斥，杜绝窗口
+        // 期目标丢失（协议见 vfs/mod.rs SessionState）
+        let batch_len = targets.len();
+        let alive = {
+            let mut st = session.lock().unwrap();
+            st.targets.clear();
+            for (n, i, d) in &targets {
+                st.targets.insert(n.clone(), (*i, d.clone()));
+            }
+            st.focus = Some(entry_idx);
+            let alive = st.alive;
+            if !alive {
+                st.alive = true;
+            }
+            alive
+        };
+        let pending: std::collections::HashMap<usize, PathBuf> = targets
+            .iter()
+            .map(|(_, i, d)| (*i, d.clone()))
+            .collect();
         self.next_gen += 1;
         let gen = self.next_gen;
+
+        if alive {
+            // 解码线程仍在：重定向目标集即可，解码流续跑（solid 包重启 =
+            // 重新顺序解前置数据，秒到分钟级浪费）。消息通道/取消标志复用
+            // 现任务；pending 重建——旧批未落项已不在 targets 永不落地，
+            // 残留会让"批内切换"误判（pending 命中却等不到 FileDone）
+            if let Some(j) = self.extract.as_mut() {
+                j.gen = gen;
+                j.entry_idx = entry_idx;
+                j.dest = dest.clone();
+                j.entry_name = name.clone();
+                j.total = total;
+                j.done = 0;
+                j.stage = String::new();
+                j.pending = pending;
+                j.batch_len = batch_len;
+                // started 仅批外新目标重置：批内切换/缓存命中沿用（覆盖层
+                // 宽限期不清零，立即显示进度是对的）
+                if !was_pending && !cached {
+                    j.started = std::time::Instant::now();
+                }
+                if cached {
+                    tracing::info!("缓存命中: {name}");
+                    self.load_extracted(&dest, entry_idx);
+                } else if was_pending {
+                    tracing::info!("批内切换目标: {name}（窗口滑动至 {} 项）", batch_len);
+                } else {
+                    tracing::info!("会话重定向: {name}（新批 {batch_len} 项，解码流续跑）");
+                }
+                return;
+            }
+            // 走不到（alive=true ⟺ 线程在跑 ⟺ 任务在）：防御性落到重启路径
+        }
+
+        // 解码线程已退出（空闲/出错/从未启动）：新线程 + 新通道消费会话。
+        // 缓存命中也照常起会话——窗口围绕已播目标继续预取，连续观看缓存
+        // 内容时跨出窗口同样无感滑动
+        if cached {
+            tracing::info!("缓存命中（预取会话启动）: {}", dest.display());
+            self.load_extracted(&dest, entry_idx);
+        }
         let (tx, rx) = mpsc::channel::<ExtMsg>();
-        let name = entry.name.clone();
-        let total = entry.size;
-        let batch_len = batch.len();
-        let batch_entries: Vec<crate::vfs::VirtualEntry> =
-            batch.iter().map(|&i| arch.entries[i].clone()).collect();
-        let batch_dests: Vec<PathBuf> = batch
-            .iter()
-            .map(|&i| {
-                let e = &arch.entries[i];
-                cache::dest_path(&dir, arch.id, i, &e.name)
-            })
-            .collect();
-        let pending: std::collections::HashMap<usize, PathBuf> = batch
-            .iter()
-            .copied()
-            .zip(batch_dests.iter().cloned())
-            .collect();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
+        let session_for_thread = session;
         std::thread::Builder::new()
             .name("extract".into())
             .spawn(move || {
-                let trefs: Vec<(&crate::vfs::VirtualEntry, &Path)> = batch_entries
-                    .iter()
-                    .zip(batch_dests.iter())
-                    .map(|(e, d)| (e, d.as_path()))
-                    .collect();
-                let idxs = batch.clone();
-                let r = vfs.extract_batch(
-                    &trefs,
+                let r = vfs.extract_session(
+                    &session_for_thread,
                     &cancel_for_thread,
                     &|done, stage| {
                         let _ = tx.send(ExtMsg::Progress(done, stage.to_string()));
                     },
-                    &|ti| {
-                        let _ = tx.send(ExtMsg::FileDone(idxs[ti]));
+                    &|idx, _path| {
+                        let _ = tx.send(ExtMsg::FileDone(idx));
                     },
                 );
                 match r {
@@ -915,7 +1034,7 @@ impl App {
                         let _ = tx.send(ExtMsg::Done);
                     }
                     Err(_) if cancel_for_thread.load(std::sync::atomic::Ordering::Relaxed) => {
-                        // 任务已被新目标取代（cancel 置位）：结果无意义，静默退出
+                        // 切换压缩包（cancel 置位）：会话随旧包丢弃，静默退出
                     }
                     Err(e) => {
                         let is_pwd = matches!(e, VfsError::Password);
@@ -925,11 +1044,13 @@ impl App {
             })
             .ok();
 
-        tracing::info!(
-            "后台解压: {name} → {}（顺带预取 {} 项）",
-            dest.display(),
-            batch_len - 1
-        );
+        if !cached {
+            tracing::info!(
+                "后台解压: {name} → {}（顺带预取 {} 项）",
+                dest.display(),
+                batch_len - 1
+            );
+        }
         self.extract = Some(ExtractJob {
             gen,
             entry_idx,
@@ -998,8 +1119,9 @@ impl App {
                 }
                 ExtMsg::Done => {
                     self.extract = None;
-                    // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 任务未被取代
-                    // 且未被批内切走）；文件在而没播过才补播
+                    // 会话空闲退出（targets 解空，线程已置 alive=false）。
+                    // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 期望
+                    // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播
                     if gen == self.next_gen && self.playing != Some(entry_idx) {
                         if std::fs::metadata(&dest).is_ok() {
                             self.load_extracted(&dest, entry_idx);
@@ -2439,5 +2561,250 @@ mod tests {
              触发前 offset={before}，step={step}，轨迹尾部={:?}",
             &offsets[140..]
         );
+    }
+
+    /// 滑动窗口冒烟测试（UI 层端到端）：模拟用户在批内来回跳动，验证
+    /// 窗口随 focus 滑动、解码流不重启、缓存命中即时播放。
+    ///
+    /// 造包：6 × 1MB 伪随机 jpg 压进同一 folder（solid）；
+    /// prefetch_mb=3（窗口 = 目标 + 2 个后续，恰好 3MB）、prev=0（聚焦向后滑动）。
+    /// 跳动链 0 → 1 → 0 → 2 →（等解净）→ 5 → 0，逐步断言：
+    /// - 批内切换（步骤 2）：窗口 [0,1,2]→[1,2,3] 平移（0 出窗、3 进窗），
+    ///   cancel 句柄不变（解码线程不重启）、started 不重置、画面停在旧目标
+    /// - 回跳缓存命中（步骤 3）：立即播放 + 窗口继续前滑 [2,3,4]
+    /// - 批内再跳（步骤 4）：窗口不动、focus 对齐
+    /// - 空闲后批外跳（步骤 6）：会话已退出 → 重 spawn（新 cancel）
+    /// - 整窗已落地（步骤 7）：不重定向会话，直接播放
+    /// - 终态：全部条目落地且内容无误、无错误、会话干净退出
+    ///
+    /// 时序说明：断言点都紧跟在目标落地之后（μs 级），此时解码线程正
+    /// 在解下一个 1MB 条目（百 ms 级），"未落地"状态窗口期充足，不抖
+    #[test]
+    fn sliding_window_smoke_in_batch_back_and_forth() {
+        use crate::vfs::sevenz_vfs::SevenzVFS;
+        use crate::vfs::{ArchiveVFS, SessionState};
+        use std::sync::Arc;
+
+        // xorshift64 伪随机数据：内容互异，落地后逐字节比对可捕获错位
+        fn prng_vec(seed: u64, len: usize) -> Vec<u8> {
+            let mut s = seed | 1;
+            let mut v = Vec::with_capacity(len);
+            while v.len() < len {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                v.extend_from_slice(&s.to_le_bytes());
+            }
+            v.truncate(len);
+            v
+        }
+
+        let dir = std::env::temp_dir().join(format!("ui_slide_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| (format!("p{i:02}.jpg"), prng_vec(i as u64 + 0x9E37, 1024 * 1024)))
+            .collect();
+
+        // solid 7z：全部条目压进同一 folder（顺序解压流，滑动窗口的主战场）
+        let arch = dir.join("slide.7z");
+        {
+            let mut paths = Vec::new();
+            for (name, data) in &srcs {
+                let p = dir.join(name);
+                std::fs::write(&p, data).unwrap();
+                paths.push(p);
+            }
+            let mut w = sevenz_rust::SevenZWriter::create(&arch).unwrap();
+            let entries: Vec<sevenz_rust::SevenZArchiveEntry> = paths
+                .iter()
+                .map(|p| {
+                    sevenz_rust::SevenZArchiveEntry::from_path(
+                        p,
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+                .iter()
+                .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+                .collect();
+            w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+                .unwrap();
+            w.finish().unwrap();
+            for p in &paths {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        // 独立缓存目录 + 窗口参数：prefetch_mb=3 → 窗口恰为 [目标, +1, +2]
+        let mut cfg = crate::config::Config::default();
+        cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+        cfg.cache.max_size_mb = 4096;
+        cfg.extract.prefetch_mb = 3;
+        cfg.extract.prefetch_prev_mb = 0;
+        let mut app = super::App::new_for_test(cfg);
+
+        let vfs: Arc<dyn ArchiveVFS> = Arc::new(SevenzVFS::open(&arch, None).unwrap());
+        let entries = vfs.list();
+        assert_eq!(entries.len(), 6);
+        let session: crate::vfs::SharedSession = Arc::new(std::sync::Mutex::new(SessionState {
+            targets: Default::default(),
+            focus: None,
+            alive: false,
+        }));
+        app.archive = Some(super::ArchiveState {
+            id: 7,
+            name: "slide.7z".into(),
+            path: arch.clone(),
+            password: None,
+            entries,
+            view: (0..6).collect(),
+            vfs,
+            stream: false,
+            session,
+        });
+
+        // 会话当前窗口（下标升序）
+        let window = |app: &super::App| -> Vec<usize> {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            let mut v: Vec<usize> = st.targets.values().map(|(i, _)| *i).collect();
+            v.sort_unstable();
+            v
+        };
+        // 模拟 UI 主循环：轮询消息直到目标开播（60s 兜底防死等）
+        fn wait_playing(app: &mut super::App, idx: usize, what: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.playing != Some(idx) {
+                if std::time::Instant::now() > deadline {
+                    panic!("等待 {what}（entry {idx}）播放超时");
+                }
+                if let Some(e) = &app.error {
+                    panic!("等待 {what} 时出错: {e}");
+                }
+                app.poll_extract();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // ---- 步骤 1：批外首发（spawn 解码线程，首窗 [0,1,2]）----
+        app.start_extract(0);
+        let j = app.extract.as_ref().expect("首发应有解压任务");
+        let cancel1 = j.cancel.clone();
+        let started1 = j.started;
+        assert_eq!(j.entry_idx, 0);
+        assert_eq!(j.batch_len, 3);
+        assert_eq!(window(&app), vec![0, 1, 2], "首窗应为 [0,1,2]");
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert_eq!(st.focus, Some(0));
+            assert!(st.alive, "线程启动后 alive 应为 true");
+        }
+        wait_playing(&mut app, 0, "p00 首播");
+
+        // ---- 步骤 2：批内跳动 0→1（解码流续跑，窗口平移 [0,1,2]→[1,2,3]）----
+        app.start_extract(1);
+        let j = app.extract.as_ref().expect("批内切换后任务应仍在");
+        assert_eq!(j.entry_idx, 1);
+        assert_eq!(j.batch_len, 3);
+        assert_eq!(app.next_gen, 2);
+        assert!(
+            Arc::ptr_eq(&j.cancel, &cancel1),
+            "批内跳动不应重启解码线程（cancel 句柄应复用）"
+        );
+        assert_eq!(
+            j.started, started1,
+            "批内切换（was_pending）不应重置覆盖层宽限起点"
+        );
+        assert_eq!(window(&app), vec![1, 2, 3], "窗口应滑动：0 已落地出窗、3 进窗");
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert_eq!(st.focus, Some(1));
+            assert!(st.alive, "解码线程应仍在跑");
+        }
+        assert_eq!(app.playing, Some(0), "新目标落地前画面应停在旧目标");
+        wait_playing(&mut app, 1, "批内切换后 p01 落地自动播放");
+
+        // ---- 步骤 3：回跳 1→0（缓存命中：立即播放 + 窗口继续前滑）----
+        app.start_extract(0);
+        assert_eq!(app.playing, Some(0), "缓存命中应立即播放");
+        let j = app.extract.as_ref().expect("缓存命中仍应保有任务（预取会话）");
+        assert!(
+            Arc::ptr_eq(&j.cancel, &cancel1),
+            "缓存命中的窗口滑动也不应重启解码线程"
+        );
+        assert_eq!(window(&app), vec![2, 3, 4], "回跳缓存命中：已落地头部（0/1）出窗");
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert_eq!(st.focus, Some(0));
+        }
+
+        // ---- 步骤 4：批内再跳 0→2（窗口不动、focus 对齐）----
+        app.start_extract(2);
+        assert_eq!(window(&app), vec![2, 3, 4], "窗口覆盖不变（尾部无新增可补）");
+        assert_eq!(app.playing, Some(0), "2 落地前画面不动");
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert_eq!(st.focus, Some(2));
+        }
+        assert!(Arc::ptr_eq(&app.extract.as_ref().unwrap().cancel, &cancel1));
+
+        // ---- 步骤 5：等整窗解净（会话空闲退出）----
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            app.poll_extract();
+            let drained = {
+                let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+                app.extract.is_none() && !st.alive && st.targets.is_empty()
+            };
+            if drained {
+                break;
+            }
+            assert!(std::time::Instant::now() <= deadline, "等待窗口解净超时");
+            if let Some(e) = &app.error {
+                panic!("解净阶段出错: {e}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.playing, Some(2), "末目标 p02 应已播放");
+
+        // ---- 步骤 6：跳到从未进过窗口的 5（会话已退出 → 重 spawn）----
+        app.start_extract(5);
+        let j = app.extract.as_ref().expect("空闲后跳转应重新 spawn 任务");
+        assert!(
+            !Arc::ptr_eq(&j.cancel, &cancel1),
+            "会话空闲退出后的跳转应重新起线程（新 cancel）"
+        );
+        assert_eq!(j.entry_idx, 5);
+        assert_eq!(window(&app), vec![5], "末条目窗口仅剩自身");
+        wait_playing(&mut app, 5, "p05 末条目播放");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while app.extract.is_some() {
+            app.poll_extract();
+            assert!(std::time::Instant::now() <= deadline, "等待末任务收尾超时");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // ---- 步骤 7：再点 0（整窗已落地：不重定向会话，直接播放）----
+        app.start_extract(0);
+        assert_eq!(app.playing, Some(0), "整窗已落地应直接播放");
+        assert!(
+            window(&app).is_empty(),
+            "整窗已落地不应重定向（空 targets 会误杀解码线程）"
+        );
+
+        // ---- 终态：全部落地 + 内容无误 + 会话干净退出 ----
+        for (i, (name, expect)) in srcs.iter().enumerate() {
+            let dest = crate::cache::dest_path(&dir.join("cache"), 7, i, name);
+            let data = std::fs::read(&dest).unwrap_or_else(|e| panic!("条目 {name} 应落地: {e}"));
+            assert_eq!(data, *expect, "条目 {name} 内容错位");
+        }
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert!(!st.alive, "终态会话应已退出");
+            assert!(st.targets.is_empty(), "终态 targets 应为空");
+        }
+        assert!(app.error.is_none(), "全程不应有错误");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

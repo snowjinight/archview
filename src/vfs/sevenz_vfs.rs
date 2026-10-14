@@ -2,7 +2,7 @@
 //! sevenz-rust 只支持顺序解压（固态块内 seek 需从块头重解），因此 open_entry 不支持，
 //! 播放走后台解压到缓存目录 → 播放本地文件。
 
-use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
+use super::{AccessMode, ArchiveVFS, SharedSession, VfsError, VirtualEntry, VirtualFile};
 use sevenz_rust::{Password, SevenZReader};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -215,50 +215,9 @@ impl ArchiveVFS for SevenzVFS {
                 if let Some(&ti) = remaining.get(e.name.as_str()) {
                     let dest = targets[ti].1;
                     left_in_folder -= 1;
-                    let done = (|| -> Result<(), sevenz_rust::Error> {
-                        // 写临时文件 + 改名：并发解压同一 dest 时不互相覆盖写坏缓存
-                        let tmp = super::tmp_path(dest);
-                        let res = (|| -> Result<(), sevenz_rust::Error> {
-                            let mut out = std::fs::File::create(&tmp).map_err(|err| {
-                                sevenz_rust::Error::other(format!(
-                                    "创建临时文件失败 [{}]: {err}",
-                                    tmp.display()
-                                ))
-                            })?;
-                            copy_with_progress(data, &mut out, e.size, &|done| progress(done, ""))
-                                .map_err(|err| match err {
-                                    // 读侧失败（解码/CRC）：保留 io 形态，sevenz-rust 在
-                                    // maybe_bad_password 里会把它转成 MaybeBadPassword →
-                                    // VfsError::Password（UI 弹密码框重试的关键路径）
-                                    CopyErr::Read(e) => sevenz_rust::Error::io(e),
-                                    CopyErr::Write(e) => sevenz_rust::Error::other(format!(
-                                        "写入临时文件失败 [{}]: {e}",
-                                        tmp.display()
-                                    )),
-                                })?;
-                            out.flush()
-                                .map_err(|err| sevenz_rust::Error::other(err.to_string()))?;
-                            std::fs::rename(&tmp, dest).map_err(|err| {
-                                sevenz_rust::Error::other(format!(
-                                    "重命名临时文件失败: [{}] → [{}]: {err}",
-                                    tmp.display(),
-                                    dest.display()
-                                ))
-                            })?;
-                            Ok(())
-                        })();
-                        if res.is_err() {
-                            std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件
-                        }
-                        res
-                    })();
-                    match done {
-                        Ok(()) => {
-                            remaining.remove(e.name.as_str());
-                            file_done(ti);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    write_entry_data(data, e.size, dest, progress)?;
+                    remaining.remove(e.name.as_str());
+                    file_done(ti);
                     // 本 folder 目标全部解出：停止迭代（后续 folder 由外层循环处理）
                     Ok(left_in_folder > 0)
                 } else {
@@ -303,6 +262,216 @@ impl ArchiveVFS for SevenzVFS {
             )));
         }
         Ok(())
+    }
+
+    /// 会话化解压（协议见 trait 注释）：外层规划循环 + folder 直达 +
+    /// focus 漂移中断，跳转不再取消解码流。
+    /// - 规划（持锁快照）：目标按 folder_of 分组（缓存自 open，无需扫包），
+    ///   无 folder（0 字节）条目直接落地空文件；focus 所在 folder 提到
+    ///   解码序最前（BTreeSet 升序底序，顺序读盘友好）
+    /// - folder 解码：BlockDecoder 直达，回调内动态查 targets（UI 随时增删）；
+    ///   本 folder 目标解净即停（folder 内后续条目不解压）；非目标条目
+    ///   顺序消费丢弃（solid 流不可跳，错位必 CRC 失败）
+    /// - 漂移中断：focus 移到其它 folder 且仍待解 → Ok(false) 中断当前
+    ///   folder 回外层重排（focus folder 最先）——被中断 folder 之后从头
+    ///   重解（自愈，成本与"取消重启"旧路径持平）
+    /// - 同 folder 向后跳（目标在本趟已越过位置）：本趟解到尾不会命中，
+    ///   下轮规划重排该 folder 从头重解补齐（自愈）
+    fn extract_session(
+        &self,
+        session: &SharedSession,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &dyn Fn(u64, &str),
+        file_done: &dyn Fn(usize, &Path),
+    ) -> Result<(), VfsError> {
+        use std::collections::BTreeSet;
+        use std::sync::atomic::Ordering;
+
+        let reader = self.reader()?;
+        let archive = reader.archive();
+        let pw = self
+            .password
+            .clone()
+            .unwrap_or_else(Password::empty)
+            .to_vec();
+
+        loop {
+            // ---- 规划：持锁快照目标集 → folder 分组 + focus 优先 ----
+            let (folders, focus_folder, zero_streams) = {
+                // 判空/取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
+                let mut st = session.lock().unwrap();
+                if cancel.load(Ordering::Relaxed) {
+                    st.alive = false;
+                    return Err(VfsError::Cancelled);
+                }
+                if st.targets.is_empty() {
+                    st.alive = false;
+                    return Ok(()); // 空闲收尾：UI 之后加目标会重新 spawn
+                }
+                let mut folders: BTreeSet<usize> = BTreeSet::new();
+                let mut zero: Vec<(String, usize, PathBuf)> = Vec::new();
+                for (name, (idx, dest)) in &st.targets {
+                    match self.folder_of.get(*idx).copied().flatten() {
+                        Some(f) => {
+                            folders.insert(f);
+                        }
+                        // 无数据流的 0 字节条目：不在任何 folder，落地空文件即完成
+                        None => zero.push((name.clone(), *idx, dest.clone())),
+                    }
+                }
+                // focus 仍待解且指向别的 folder → 该 folder 优先（漂移抢道）
+                let focus_folder = st
+                    .focus
+                    .filter(|fi| {
+                        self.entries
+                            .get(*fi)
+                            .is_some_and(|e| st.targets.contains_key(&e.name))
+                    })
+                    .and_then(|fi| self.folder_of.get(fi).copied().flatten());
+                (folders, focus_folder, zero)
+            };
+            let mut landed: usize = 0; // 本轮落地数（无进展保险的判据）
+            // 无 folder 条目：锁外写空文件 → 锁内 remove 成功才算落地
+            for (name, idx, dest) in zero_streams {
+                if let Err(e) = std::fs::write(&dest, b"") {
+                    super::session_exit(session);
+                    return Err(VfsError::Archive(format!(
+                        "写入空文件失败 [{}]: {e}",
+                        dest.display()
+                    )));
+                }
+                if session.lock().unwrap().targets.remove(&name).is_some() {
+                    file_done(idx, &dest); // 锁已释放
+                    landed += 1;
+                }
+            }
+            // 解码序：升序底序，focus folder 提到最前
+            let mut order: Vec<usize> = folders.into_iter().collect();
+            if let Some(ff) = focus_folder {
+                if let Some(pos) = order.iter().position(|&f| f == ff) {
+                    order.remove(pos);
+                    order.insert(0, ff);
+                }
+            }
+
+            let mut interrupted = false;
+            for &fi in &order {
+                if cancel.load(Ordering::Relaxed) {
+                    super::session_exit(session);
+                    return Err(VfsError::Cancelled);
+                }
+                // 该 folder 是否仍有目标（上轮部分解出后可能已清空）
+                let has_target = session.lock().unwrap().targets.values().any(|(idx, _)| {
+                    self.folder_of.get(*idx) == Some(&Some(fi))
+                });
+                if !has_target {
+                    continue;
+                }
+                // folder 独立文件句柄：BlockDecoder 自行 seek 到该 folder 的
+                // pack 偏移，前置 folder 只 seek 不解压
+                let mut src = match std::fs::File::open(&self.path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        super::session_exit(session);
+                        return Err(VfsError::Io(e));
+                    }
+                };
+                let dec = sevenz_rust::BlockDecoder::new(fi, archive, &pw, &mut src);
+                let mut skipped: usize = 0;
+                let mut skipped_bytes: u64 = 0;
+                let r = dec.for_each_entries(&mut |e, data| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(sevenz_rust::Error::other("cancelled"));
+                    }
+                    // 持锁三元组快照：本条目目标 / focus 漂移 / 本 folder 已解净
+                    let (tgt, drift, folder_clear) = {
+                        let st = session.lock().unwrap();
+                        let tgt = st.targets.get(e.name.as_str()).cloned();
+                        let drift = st.focus.is_some_and(|f_idx| match self.entries.get(f_idx)
+                        {
+                            // focus 仍待解且在别的 folder：抢道
+                            Some(fe) if st.targets.contains_key(&fe.name) => {
+                                self.folder_of.get(f_idx) != Some(&Some(fi))
+                            }
+                            _ => false,
+                        });
+                        let folder_clear = !st
+                            .targets
+                            .values()
+                            .any(|(idx, _)| self.folder_of.get(*idx) == Some(&Some(fi)));
+                        (tgt, drift, folder_clear)
+                    };
+                    if drift {
+                        interrupted = true;
+                        return Ok(false); // 中断本 folder，外层重排抢道 focus
+                    }
+                    if let Some((idx, dest)) = tgt {
+                        write_entry_data(data, e.size, &dest, progress)?;
+                        let hit = session
+                            .lock()
+                            .unwrap()
+                            .targets
+                            .remove(e.name.as_str())
+                            .is_some();
+                        if hit {
+                            file_done(idx, &dest); // 锁已释放
+                            landed += 1;
+                        }
+                        // 本 folder 目标解净：停止迭代（folder 内后续不解压）
+                        Ok(!folder_clear)
+                    } else {
+                        if folder_clear {
+                            return Ok(false);
+                        }
+                        // 非目标条目顺序消费丢弃（solid 流不可跳，同 extract_batch）
+                        std::io::copy(data, &mut std::io::sink())
+                            .map_err(sevenz_rust::Error::io)?;
+                        skipped += 1;
+                        skipped_bytes += e.size;
+                        if skipped % 64 == 0 {
+                            progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                        }
+                        Ok(true)
+                    }
+                });
+                if let Err(e) = r {
+                    super::session_exit(session);
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(VfsError::Cancelled);
+                    }
+                    let mapped = map_7z_err(e);
+                    return Err(match mapped {
+                        VfsError::Password => mapped,
+                        _ => {
+                            let names = session
+                                .lock()
+                                .unwrap()
+                                .targets
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            VfsError::Archive(format!(
+                                "7z 解压失败: 压缩包 [{}] 条目 [{}]: {mapped}",
+                                self.path.display(),
+                                names
+                            ))
+                        }
+                    });
+                }
+                if interrupted {
+                    break; // 回外层重新规划（focus folder 提前）
+                }
+            }
+            // 无进展保险：一轮正常跑完却零落地——目标永远解不出（异常路径），
+            // 报错退出防死循环（漂移中断轮允许零落地，下一轮会解 focus）
+            if !interrupted && landed == 0 {
+                super::session_exit(session);
+                return Err(VfsError::Archive(
+                    "7z 会话无进展: 目标条目未出现在 folder 解码流中".into(),
+                ));
+            }
+        }
     }
 
     /// 密码校验：7z 头不存储密码校验值，唯一可靠的判据是真解压 + CRC——
@@ -376,6 +545,48 @@ pub(crate) fn copy_with_progress(
         }
     }
     Ok(done)
+}
+
+/// 单条目落地：临时文件 + 进度拷贝 + flush + 原子改名，失败清理半截临时文件
+/// （并发解压同一 dest 时互不覆盖写坏缓存）。读侧错误（解码/CRC 失败）保留
+/// io 形态——可能是坏密码，sevenz-rust 在 maybe_bad_password 里把 io 错误
+/// 转成 MaybeBadPassword → VfsError::Password（UI 弹密码框重试的关键路径）。
+/// extract_batch 与 extract_session 共用
+fn write_entry_data(
+    data: &mut dyn Read,
+    size: u64,
+    dest: &Path,
+    progress: &dyn Fn(u64, &str),
+) -> Result<(), sevenz_rust::Error> {
+    let tmp = super::tmp_path(dest);
+    let res = (|| -> Result<(), sevenz_rust::Error> {
+        let mut out = std::fs::File::create(&tmp).map_err(|err| {
+            sevenz_rust::Error::other(format!("创建临时文件失败 [{}]: {err}", tmp.display()))
+        })?;
+        copy_with_progress(data, &mut out, size, &|done| progress(done, "")).map_err(
+            |err| match err {
+                CopyErr::Read(e) => sevenz_rust::Error::io(e),
+                CopyErr::Write(e) => sevenz_rust::Error::other(format!(
+                    "写入临时文件失败 [{}]: {e}",
+                    tmp.display()
+                )),
+            },
+        )?;
+        out.flush()
+            .map_err(|err| sevenz_rust::Error::other(err.to_string()))?;
+        std::fs::rename(&tmp, dest).map_err(|err| {
+            sevenz_rust::Error::other(format!(
+                "重命名临时文件失败: [{}] → [{}]: {err}",
+                tmp.display(),
+                dest.display()
+            ))
+        })?;
+        Ok(())
+    })();
+    if res.is_err() {
+        std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件
+    }
+    res
 }
 
 #[cfg(test)]
@@ -789,6 +1000,285 @@ mod tests {
         let data = std::fs::read(&dest).unwrap();
         assert_eq!(data.len(), 60_000);
         assert!(data.iter().all(|&b| b == 5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- extract_session（持久解码会话）协议测试 ----
+
+    /// 构造空闲会话（alive=false；UI 组批时写 targets + focus + 置 true，
+    /// 再调用 extract_session —— 协议见 vfs/mod.rs SessionState）
+    fn new_session() -> SharedSession {
+        std::sync::Arc::new(std::sync::Mutex::new(crate::vfs::SessionState {
+            targets: Default::default(),
+            focus: None,
+            alive: false,
+        }))
+    }
+
+    /// 建多 folder 测试包（每文件独立 folder，push_archive_entry）
+    fn make_multi_folder_7z(dir: &Path, srcs: &[(String, Vec<u8>)]) -> PathBuf {
+        let mut paths = Vec::new();
+        for (name, data) in srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("multi.7z");
+        let mut w = sevenz_rust::SevenZWriter::create(&arch).unwrap();
+        for p in &paths {
+            let entry = sevenz_rust::SevenZArchiveEntry::from_path(
+                p,
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+            );
+            w.push_archive_entry(entry, Some(std::fs::File::open(p).unwrap()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+        arch
+    }
+
+    /// 会话生命周期端到端：
+    /// 1) 目标解净 → Ok、targets 清空、alive=false、file_done 带 list 下标
+    /// 2) 空目标再入 = 空闲退出：立即 Ok，不触碰任何文件
+    /// 3) 会话复用：UI 重新加目标 + 置 alive，同一会话对象再跑；
+    ///    focus folder 抢先解（file_done 顺序验证）
+    /// 4) 目标不在包内：无进展保险报错防死循环（alive=false）
+    #[test]
+    fn session_lifecycle_and_reuse() {
+        let dir = std::env::temp_dir().join(format!("sevenz_sess_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("f1.bin".into(), vec![1u8; 30_000]),
+            ("f2.bin".into(), vec![2u8; 20_000]),
+            ("f3.bin".into(), vec![3u8; 25_000]),
+            ("f4.bin".into(), vec![4u8; 15_000]),
+        ];
+        let arch = make_multi_folder_7z(&dir, &srcs);
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.list().len(), 4);
+
+        // 1) 基本解出：目标 f3（folder 直达，前置 folder 只 seek 不解压）
+        let s = new_session();
+        let d3 = dir.join("s3.bin");
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("f3.bin".into(), (2, d3.clone()));
+            st.focus = Some(2);
+            st.alive = true;
+        }
+        let done_idx = std::sync::atomic::AtomicU64::new(u64::MAX);
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|idx, path| {
+                done_idx.store(idx as u64, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(path, d3.as_path(), "落地路径应为 f3 的目标路径");
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            done_idx.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "file_done 应回调 f3 的 list 下标"
+        );
+        assert_eq!(std::fs::read(&d3).unwrap(), srcs[2].1, "f3 内容错误");
+        {
+            let st = s.lock().unwrap();
+            assert!(st.targets.is_empty(), "解净后 targets 应清空");
+            assert!(!st.alive, "Ok 返回后 alive 应为 false");
+        }
+
+        // 2) 空目标 = 空闲退出：立即 Ok
+        vfs.extract_session(&s, &std::sync::atomic::AtomicBool::new(false), &|_, _| {}, &|_, _| {
+            panic!("空目标会话不应回调 file_done");
+        })
+        .unwrap();
+
+        // 3) 会话复用 + focus 抢道：目标 f1 + f4，focus=f4 → f4 先落地
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("f1.bin".into(), (0, dir.join("s1.bin")));
+            st.targets.insert("f4.bin".into(), (3, dir.join("s4.bin")));
+            st.focus = Some(3);
+            st.alive = true;
+        }
+        let order = std::sync::Mutex::new(Vec::new());
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|idx, _| order.lock().unwrap().push(idx),
+        )
+        .unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![3, 0], "focus folder 应最先解（f4 → f1）");
+        assert_eq!(std::fs::read(dir.join("s1.bin")).unwrap(), srcs[0].1);
+        assert_eq!(std::fs::read(dir.join("s4.bin")).unwrap(), srcs[3].1);
+
+        // 4) 目标不在包内：无进展保险报错，防死循环
+        let s2 = new_session();
+        {
+            let mut st = s2.lock().unwrap();
+            st.targets.insert("no_such.bin".into(), (0, dir.join("nope.bin")));
+            st.alive = true;
+        }
+        assert!(matches!(
+            vfs.extract_session(&s2, &std::sync::atomic::AtomicBool::new(false), &|_, _| {}, &|_, _| {
+                panic!("不存在的目标不应落地")
+            }),
+            Err(VfsError::Archive(_))
+        ));
+        assert!(!s2.lock().unwrap().alive, "报错路径应置 alive=false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 动态目标集：file_done 回调里追加下一个目标，单次会话调用链式解出
+    /// 全部条目（每轮规划重读 targets）。这正是 UI 预取期间用户翻页/点击
+    /// 追加目标的协议路径（锁外回调 → 回调内可安全再锁）
+    #[test]
+    fn session_dynamic_targets_chain() {
+        let dir = std::env::temp_dir().join(format!("sevenz_chain_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("f1.bin".into(), vec![1u8; 30_000]),
+            ("f2.bin".into(), vec![2u8; 20_000]),
+            ("f3.bin".into(), vec![3u8; 25_000]),
+            ("f4.bin".into(), vec![4u8; 15_000]),
+        ];
+        let arch = make_multi_folder_7z(&dir, &srcs);
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.list().len(), 4);
+
+        let s = new_session();
+        let dests: Vec<PathBuf> = (0..4).map(|i| dir.join(format!("chain_{i}.bin"))).collect();
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("f1.bin".into(), (0, dests[0].clone()));
+            st.focus = Some(0);
+            st.alive = true;
+        }
+        let done = std::sync::Mutex::new(Vec::new());
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|idx, _| {
+                done.lock().unwrap().push(idx);
+                // 落地即追加下一个目标（模拟 UI 组批）
+                if idx + 1 < 4 {
+                    let mut st = s.lock().unwrap();
+                    st.targets.insert(
+                        format!("f{}.bin", idx + 2),
+                        (idx + 1, dests[idx + 1].clone()),
+                    );
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(*done.lock().unwrap(), vec![0, 1, 2, 3], "应按链式追加顺序全部落地");
+        for (i, (_, data)) in srcs.iter().enumerate() {
+            assert_eq!(std::fs::read(&dests[i]).unwrap(), *data, "f{} 内容错误", i + 1);
+        }
+        assert!(!s.lock().unwrap().alive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// focus 漂移中断 + 自愈重解：folder A（solid g1+g2+g3）+ folder B（h1）。
+    /// 目标 = g1 + g3 + h1，focus 初始 g1（folder A 优先）。g1 落地回调里把
+    /// focus 切到 h1（另一 folder）→ g2 的持锁快照判漂移 → 中断 folder A →
+    /// 外层重排：folder B 先解（h1 落地），再从头重解 folder A 补 g3。
+    /// file_done 顺序 = [g1, h1, g3]，中断重解后内容仍正确
+    #[test]
+    fn session_focus_drift_interrupts_folder() {
+        let dir = std::env::temp_dir().join(format!("sevenz_drift_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("g1.bin".into(), vec![1u8; 20_000]),
+            ("g2.bin".into(), vec![2u8; 15_000]),
+            ("g3.bin".into(), vec![3u8; 25_000]),
+            ("h1.bin".into(), vec![8u8; 18_000]),
+        ];
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("drift.7z");
+        let mut w = sevenz_rust::SevenZWriter::create(&arch).unwrap();
+        // folder A：g1+g2+g3 同 folder（solid）；folder B：h1 独立
+        {
+            let group = &paths[..3];
+            let entries: Vec<sevenz_rust::SevenZArchiveEntry> = group
+                .iter()
+                .map(|p| {
+                    sevenz_rust::SevenZArchiveEntry::from_path(
+                        p,
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = group
+                .iter()
+                .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+                .collect();
+            w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+                .unwrap();
+        }
+        {
+            let p = &paths[3];
+            let entry = sevenz_rust::SevenZArchiveEntry::from_path(
+                p,
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+            );
+            w.push_archive_entry(entry, Some(std::fs::File::open(p).unwrap()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+        // 前置断言：folder A（solid 三条目）+ folder B
+        {
+            let r = sevenz_rust::SevenZReader::open(&arch, Password::empty()).unwrap();
+            assert_eq!(r.archive().folders.len(), 2, "应恰好两个 folder");
+        }
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        let listed = vfs.list();
+        assert_eq!(listed.len(), 4);
+        let (g1, g3, h1) = (0usize, 2usize, 3usize);
+
+        let s = new_session();
+        let d = |n: &str| dir.join(n);
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("g1.bin".into(), (g1, d("o_g1.bin")));
+            st.targets.insert("g3.bin".into(), (g3, d("o_g3.bin")));
+            st.targets.insert("h1.bin".into(), (h1, d("o_h1.bin")));
+            st.focus = Some(g1);
+            st.alive = true;
+        }
+        let order = std::sync::Mutex::new(Vec::new());
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|idx, _| {
+                order.lock().unwrap().push(idx);
+                if idx == g1 {
+                    // g1 刚落地：用户跳到另一 folder 的 h1 → 漂移
+                    s.lock().unwrap().focus = Some(h1);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![g1, h1, g3],
+            "漂移后应中断 folder A，先解 focus 所在 folder B，再回头补 g3"
+        );
+        assert_eq!(std::fs::read(d("o_g1.bin")).unwrap(), srcs[0].1);
+        assert_eq!(std::fs::read(d("o_g3.bin")).unwrap(), srcs[2].1, "中断重解后 g3 内容错误（自愈失败）");
+        assert_eq!(std::fs::read(d("o_h1.bin")).unwrap(), srcs[3].1);
+        assert!(!s.lock().unwrap().alive);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
