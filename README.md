@@ -25,8 +25,8 @@
 | 按键 | 功能 |
 |---|---|
 | 空格 | 暂停 / 播放（图片播放中 = 自动翻页开关） |
-| ← / → | 后退 / 前进 5 秒 |
-| Shift + ← / → | 后退 / 前进 1 秒（精确） |
+| ← / → | 快退 / 快进 5 秒 |
+| Shift + ← / → | 快退 / 快进 1 秒（精确） |
 | ↑ / ↓ | 音量 ±5（调整时自动解除静音） |
 | M | 静音切换（静音时音量条旁显示红色"静音"标识，点击可解除） |
 | PgUp / PgDn 或 鼠标滚轮（视频区） | 上一个 / 下一个媒体（同类型内导航，滚轮有节流间隔） |
@@ -128,7 +128,7 @@ cargo test -- --nocapture
 | 测试 | 验证内容 |
 |---|---|
 | VFS 单元测试 | ZIP / 7Z / RAR 各自的列表、读取、seek 正确性；7Z 测试包由 sevenz-rust 纯代码构造，无外部依赖 |
-| e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证前向 / 后向 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归） |
+| e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证下游 / 上游 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归） |
 | e2e 解压播放 | 构造 7Z 包 → 后台解压 → headless mpv 播放本地文件全链路 |
 | flag 属性循环 | pause / mute 属性经 flag 格式读 → 翻转 → 写 → 读，覆盖空格暂停、静音按钮的行为路径 |
 | VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头与内容加密 / 同批次多包各不同密码乱序命中 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
@@ -198,12 +198,13 @@ sort_files = true
 extract_overlay_delay_ms = 500
 
 [extract]
-# solid 包解压时顺带预取后续文件的总大小上限（MB），0 = 关闭
-prefetch_mb = 512
-# 向前预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+# solid 包解压时顺带预取后续文件的总大小上限（MB，下游预取），0 = 关闭
+prefetch_downstream_mb = 512
+# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
 # （7z 限于目标所在 folder 内、RAR 为整个前缀）顺带写盘，随机跳看后
 # 往回翻直接命中缓存。解码零增量，仅占磁盘写入量
-prefetch_prev_mb = 512
+# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
+prefetch_upstream_mb = 512
 
 [vartidy]
 # var 仓库根目录（archview.exe tidy 用；整理器绝不修改仓库已有内容，仅增量合入）
@@ -303,7 +304,7 @@ clean_on_switch = false
 | `src/player/mpv_ffi.rs` | mpv 最小 FFI 绑定：libloading 运行时动态加载 libmpv-2.dll |
 | `src/player/stream_cb.rs` | zvf:// 自定义流协议：mpv 回调 ↔ VirtualFile 的桥接与注册表 |
 | `src/vfs/mod.rs` | `ArchiveVFS` / `VirtualFile` trait 定义 + 按扩展名分发打开 |
-| `src/vfs/zip_vfs.rs` | ZIP 实现：自研 deflate 流式 seek（前向跳读、后向重开） |
+| `src/vfs/zip_vfs.rs` | ZIP 实现：自研 deflate 流式 seek（下游跳读、上游重开） |
 | `src/vfs/sevenz_vfs.rs` | 7Z 实现：sevenz-rust 纯 Rust 解压（无外部 exe 依赖） |
 | `src/vfs/rar_vfs.rs` | RAR 实现：unrar crate（内嵌编译 UnRAR 源码），分卷支持 |
 | `src/vartidy/mod.rs` | VarTidy CLI：输入展开 → 规划（分类+两级去重）→ 批量抽取直写仓库 → 报告；`tidy` 子命令参数解析 |
@@ -327,7 +328,7 @@ trait ArchiveVFS {
 
 **2. 双路径播放。**
 
-- **ZIP 快路径**：mp4 demuxer 需要随机读（读头部元数据 + seek 到尾部索引），ZIP 的 deflate 流可以按块重解压实现廉价前向 seek，因此走 `zvf://` 流式协议直接播压缩包内数据，零解压等待。
+- **ZIP 快路径**：mp4 demuxer 需要随机读（读头部元数据 + seek 到尾部索引），ZIP 的 deflate 流可以按块重解压实现廉价下游 seek，因此走 `zvf://` 流式协议直接播压缩包内数据，零解压等待。
 - **7Z/RAR 慢路径**：这两种格式多为 solid 压缩（中间任何字节都依赖前面全部数据），随机 seek 代价极高，所以走后台解压：UI 发起 ExtractJob → 子线程解压到缓存目录（.part 临时名 + rename 原子化）→ 完成后 mpv 播本地文件。解压期间界面保持响应并显示进度。
 
 **3. mpv stream_cb 桥接。** 通过 `mpv_stream_cb_add_ro` 注册 `zvf://<archive_id>/<entry_idx>` 协议，read/seek/size/close 四个回调直接对接 `VirtualFile`。关键约束：
@@ -355,14 +356,14 @@ trait ArchiveVFS {
 - **列表虚拟化**：文件列表用 `ScrollArea::show_viewport` 按可视区渲染（上下各 3 行余量），行标签与计数在排序后一次性缓存，万级条目下滚动保持流畅；超长文件名截断显示，完整文件名在悬停时显示于面板底部状态行（不用悬浮气泡——气泡会被 mpv 原生子窗口遮挡），行高均匀保证虚拟化数学成立。
 - **I/O 降次**：ZIP 的 central directory 打开时只解析一次并缓存元数据（`unsafe_new_with_metadata` 复用）；列表通过顺序遍历 CD 生成（一次几 MB 顺序读），避免逐条目 `by_index_raw` 引发的上万次本地文件头随机读（NAS 上是分钟级开销）。CD 遍历与 crate 条目数不一致时自动回退逐条模式。7z 头同样在打开时缓存，`list()` 不再重复解析。
 - **7z folder 直达**：7z 的 folder（固态块）彼此独立，pack 流偏移记录在头里。解压用 `BlockDecoder` 按目标所在 folder 直接 seek 定位，只顺序解压目标 folder 内目标之前的少量数据——不再像 crate 的 `for_each_entries` 那样从 folder 0 开始解压全部前置 folder（56G solid 包里目标排第 400 位时会无谓解压几十 GB 无关数据，约 10 分钟级、CPU 持续满载）。
-- **滑动窗口预取**：solid 包定位目标本就需顺序解压一段数据，一次解压流顺带解出目标之后的若干条目（`extract.prefetch_mb` 控制向后预取总量，默认 512MB，0 关闭）。解码会话常驻（见下文线程模型）：任何跳转只重定向目标、不重启解压；预取窗口以当前观看位置为中心随每次切换重算——连续翻页跨过窗口边界无感续解、看过的条目再点秒开。`extract.prefetch_prev_mb` 另有向前预取：定位目标时反正要顺序解掉丢弃的前置数据顺带写盘（解码零增量），随机跳看后往回翻直接命中缓存。
+- **滑动窗口预取**：solid 包定位目标本就需顺序解压一段数据，一次解压流顺带解出目标之后的若干条目（`extract.prefetch_downstream_mb` 控制下游预取总量，默认 512MB，0 关闭）。解码会话常驻（见下文线程模型）：任何跳转只重定向目标、不重启解压；预取窗口以当前观看位置为中心随每次切换重算——连续翻页跨过窗口边界无感续解、看过的条目再点秒开。`extract.prefetch_upstream_mb` 另有上游预取：定位目标时反正要顺序解掉丢弃的前置数据顺带写盘（解码零增量），随机跳看后往回翻直接命中缓存。
 
 ### 线程模型
 
 - **UI 线程**：egui 渲染、快捷键、mpv 命令（mpv handle 线程安全，但仅 UI 线程持有）。
 - **打开线程**：每个 OpenJob 一条线程，负责解析压缩包头与生成文件清单，完成后经 mpsc channel 交 UI 线程应用；与 ExtractJob 同样带代际号（gen），快速连续切换时旧结果丢弃。
 - **mpv 内部线程**：demux/decode，经 stream_cb 回调读压缩包数据，与 UI 仅通过 REGISTRY（Arc<dyn VirtualFile>）共享。
-- **解压线程**：每包一条持久解码会话线程（targets/focus 经 `Arc<Mutex<SessionState>>` 与 UI 共享），通过 mpsc channel 报告进度/结果/单文件完成（FileDone），UI 每帧轮询。任何跳转（批内切换/批外跳转/缓存命中）都走同一条重定向路径：UI 以新目标为中心重算预取窗口（受 `extract.prefetch_mb` / `extract.prefetch_prev_mb` 限制）持锁替换 targets，解码线程在规划轮动态消费——**跳转永不取消解码流**；7z 侧 focus 所在 folder 抢道最先落地、focus 漂移自动中断当前 folder 重排。targets 解空则线程空闲退出，下次跳转重新拉起；`AtomicBool` cancel 只在切换压缩包时置位终止线程。进度分两阶段上报：跳过前置文件阶段显示阶段文字与已解压字节数（媒体区居中覆盖层，含旋转动画），写出目标文件阶段显示字节进度条。
+- **解压线程**：每包一条持久解码会话线程（targets/focus 经 `Arc<Mutex<SessionState>>` 与 UI 共享），通过 mpsc channel 报告进度/结果/单文件完成（FileDone），UI 每帧轮询。任何跳转（批内切换/批外跳转/缓存命中）都走同一条重定向路径：UI 以新目标为中心重算预取窗口（受 `extract.prefetch_downstream_mb` / `extract.prefetch_upstream_mb` 限制）持锁替换 targets，解码线程在规划轮动态消费——**跳转永不取消解码流**；7z 侧 focus 所在 folder 抢道最先落地、focus 漂移自动中断当前 folder 重排。targets 解空则线程空闲退出，下次跳转重新拉起；`AtomicBool` cancel 只在切换压缩包时置位终止线程。进度分两阶段上报：跳过前置文件阶段显示阶段文字与已解压字节数（媒体区居中覆盖层，含旋转动画），写出目标文件阶段显示字节进度条。
 
 ## 已知限制与规划
 

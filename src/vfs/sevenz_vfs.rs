@@ -15,7 +15,7 @@ pub struct SevenzVFS {
     /// （旧实现 open/list 各解析一次，大包在网络盘上代价翻倍）
     entries: Vec<VirtualEntry>,
     /// 条目 → 所在 folder（与 entries 同下标）；folder → 该 folder 首个条目下标。
-    /// 向前预取免费区 = [folder 首条目, 目标)（locate_start）
+    /// 上游预取免费区 = [folder 首条目, 目标)（locate_start）
     folder_of: Vec<Option<usize>>,
     folder_first: std::collections::HashMap<usize, usize>,
 }
@@ -68,7 +68,7 @@ impl SevenzVFS {
                 crc: if e.has_crc { Some(e.crc as u32) } else { None },
             })
             .collect();
-        // folder 布局（locate_start 的向前预取免费区判据）：条目 → 所在 folder、
+        // folder 布局（locate_start 的上游预取免费区判据）：条目 → 所在 folder、
         // folder → 首个条目（首个条目的 locate_start 即其自身，免费区为空）
         let folder_of: Vec<Option<usize>> = archive
             .stream_map
@@ -116,10 +116,10 @@ impl ArchiveVFS for SevenzVFS {
         AccessMode::Solid
     }
 
-    /// 向前预取免费区 = 目标所在 folder 的 [首条目, 目标)：定位目标时
+    /// 上游预取免费区 = 目标所在 folder 的 [首条目, 目标)：定位目标时
     /// 这段数据必然被顺序解掉丢弃（BlockDecoder 从 folder 头解码到目标），
     /// 顺带写盘零解码增量。跨 folder 不免费（只 seek 不解压）——
-    /// 向前预取不得超出 folder 边界（用户配置的预算可能大于 folder 前缀，实取以边界为准）
+    /// 上游预取不得超出 folder 边界（用户配置的预算可能大于 folder 前缀，实取以边界为准）
     fn locate_start(&self, entry_idx: usize) -> Option<usize> {
         let folder = self.folder_of.get(entry_idx).copied().flatten()?;
         self.folder_first.get(&folder).copied()
@@ -275,7 +275,7 @@ impl ArchiveVFS for SevenzVFS {
     /// - 漂移中断：focus 移到其它 folder 且仍待解 → Ok(false) 中断当前
     ///   folder 回外层重排（focus folder 最先）——被中断 folder 之后从头
     ///   重解（自愈，成本与"取消重启"旧路径持平）
-    /// - 同 folder 向后跳（目标在本趟已越过位置）：本趟解到尾不会命中，
+    /// - 同 folder 回跳上游（目标在本趟已越过位置）：本趟解到尾不会命中，
     ///   下轮规划重排该 folder 从头重解补齐（自愈）
     fn extract_session(
         &self,
@@ -297,7 +297,7 @@ impl ArchiveVFS for SevenzVFS {
 
         loop {
             // ---- 规划：持锁快照目标集 → folder 分组 + focus 优先 ----
-            let (folders, focus_folder, zero_streams) = {
+            let (folders, focus_folder, zero_streams, round_gen) = {
                 // 判空/取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
                 let mut st = session.lock().unwrap();
                 if cancel.load(Ordering::Relaxed) {
@@ -308,6 +308,9 @@ impl ArchiveVFS for SevenzVFS {
                     st.alive = false;
                     return Ok(()); // 空闲收尾：UI 之后加目标会重新 spawn
                 }
+                // 本轮规划代数：UI 重定向在同一把锁内改 targets 并自增 gen，
+                // 两者快照同锁保证一致（gen 变了 ⟺ targets 换过）
+                let round_gen = st.gen;
                 let mut folders: BTreeSet<usize> = BTreeSet::new();
                 let mut zero: Vec<(String, usize, PathBuf)> = Vec::new();
                 for (name, (idx, dest)) in &st.targets {
@@ -328,10 +331,10 @@ impl ArchiveVFS for SevenzVFS {
                             .is_some_and(|e| st.targets.contains_key(&e.name))
                     })
                     .and_then(|fi| self.folder_of.get(fi).copied().flatten());
-                (folders, focus_folder, zero)
+                (folders, focus_folder, zero, round_gen)
             };
             let mut landed: usize = 0; // 本轮落地数（无进展保险的判据）
-            // 无 folder 条目：锁外写空文件 → 锁内 remove 成功才算落地
+                                       // 无 folder 条目：锁外写空文件 → 锁内 remove 成功才算落地
             for (name, idx, dest) in zero_streams {
                 if let Err(e) = std::fs::write(&dest, b"") {
                     super::session_exit(session);
@@ -361,9 +364,12 @@ impl ArchiveVFS for SevenzVFS {
                     return Err(VfsError::Cancelled);
                 }
                 // 该 folder 是否仍有目标（上轮部分解出后可能已清空）
-                let has_target = session.lock().unwrap().targets.values().any(|(idx, _)| {
-                    self.folder_of.get(*idx) == Some(&Some(fi))
-                });
+                let has_target = session
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .values()
+                    .any(|(idx, _)| self.folder_of.get(*idx) == Some(&Some(fi)));
                 if !has_target {
                     continue;
                 }
@@ -387,8 +393,7 @@ impl ArchiveVFS for SevenzVFS {
                     let (tgt, drift, folder_clear) = {
                         let st = session.lock().unwrap();
                         let tgt = st.targets.get(e.name.as_str()).cloned();
-                        let drift = st.focus.is_some_and(|f_idx| match self.entries.get(f_idx)
-                        {
+                        let drift = st.focus.is_some_and(|f_idx| match self.entries.get(f_idx) {
                             // focus 仍待解且在别的 folder：抢道
                             Some(fe) if st.targets.contains_key(&fe.name) => {
                                 self.folder_of.get(f_idx) != Some(&Some(fi))
@@ -464,8 +469,18 @@ impl ArchiveVFS for SevenzVFS {
                 }
             }
             // 无进展保险：一轮正常跑完却零落地——目标永远解不出（异常路径），
-            // 报错退出防死循环（漂移中断轮允许零落地，下一轮会解 focus）
+            // 报错退出防死循环（漂移中断轮允许零落地，下一轮会解 focus）。
+            // 例外：本轮中途 UI 重定向过（gen 已变）——如跳到已落地的缓存
+            // 项，focus 不在 targets、各 folder 均已解净，全程零落地属正常，
+            // 重新规划续跑新目标而非误报
             if !interrupted && landed == 0 {
+                let cur_gen = session.lock().unwrap().gen;
+                if cur_gen != round_gen {
+                    tracing::info!(
+                        "7z 会话本轮零落地但检测到重定向（gen {round_gen}→{cur_gen}），重新规划续跑"
+                    );
+                    continue;
+                }
                 super::session_exit(session);
                 return Err(VfsError::Archive(
                     "7z 会话无进展: 目标条目未出现在 folder 解码流中".into(),
@@ -479,7 +494,11 @@ impl ArchiveVFS for SevenzVFS {
     /// 错密码必致 CRC 失败，sevenz-rust 在密码非空时将其转报
     /// MaybeBadPassword → Password。目标之前的同 folder 条目必须顺序消费
     /// （solid 流不可跳），故探测目标应选最小加密条目
-    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+    fn verify_password(
+        &self,
+        entry: &VirtualEntry,
+        password: Option<&str>,
+    ) -> Result<(), VfsError> {
         let pw = password.map(Password::from).unwrap_or_else(Password::empty);
         let reader = SevenZReader::open(&self.path, pw.clone()).map_err(map_7z_err)?;
         let archive = reader.archive();
@@ -563,15 +582,14 @@ fn write_entry_data(
         let mut out = std::fs::File::create(&tmp).map_err(|err| {
             sevenz_rust::Error::other(format!("创建临时文件失败 [{}]: {err}", tmp.display()))
         })?;
-        copy_with_progress(data, &mut out, size, &|done| progress(done, "")).map_err(
-            |err| match err {
+        copy_with_progress(data, &mut out, size, &|done| progress(done, "")).map_err(|err| {
+            match err {
                 CopyErr::Read(e) => sevenz_rust::Error::io(e),
-                CopyErr::Write(e) => sevenz_rust::Error::other(format!(
-                    "写入临时文件失败 [{}]: {e}",
-                    tmp.display()
-                )),
-            },
-        )?;
+                CopyErr::Write(e) => {
+                    sevenz_rust::Error::other(format!("写入临时文件失败 [{}]: {e}", tmp.display()))
+                }
+            }
+        })?;
         out.flush()
             .map_err(|err| sevenz_rust::Error::other(err.to_string()))?;
         std::fs::rename(&tmp, dest).map_err(|err| {
@@ -867,9 +885,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// locate_start（向前预取免费区）：solid 单 folder 包 → 前缀整段免费；
+    /// locate_start（上游预取免费区）：solid 单 folder 包 → 前缀整段免费；
     /// 多 folder 包 → 免费区从目标所在 folder 首条目起，不跨 folder
-    /// （向前预取不得把前置 folder 的条目当免费数据）
+    /// （上游预取不得把前置 folder 的条目当免费数据）
     #[test]
     fn locate_start_zone_boundaries() {
         use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
@@ -928,7 +946,7 @@ mod tests {
         assert_eq!(
             vfs.locate_start(3),
             Some(2),
-            "向前预取免费区不得超出目标所在 folder"
+            "上游预取免费区不得超出目标所在 folder"
         );
         // 各 folder 首条目：免费区为空（起点即自身）
         assert_eq!(vfs.locate_start(0), Some(0));
@@ -1012,6 +1030,7 @@ mod tests {
             targets: Default::default(),
             focus: None,
             alive: false,
+            gen: 0,
         }))
     }
 
@@ -1090,9 +1109,14 @@ mod tests {
         }
 
         // 2) 空目标 = 空闲退出：立即 Ok
-        vfs.extract_session(&s, &std::sync::atomic::AtomicBool::new(false), &|_, _| {}, &|_, _| {
-            panic!("空目标会话不应回调 file_done");
-        })
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|_, _| {
+                panic!("空目标会话不应回调 file_done");
+            },
+        )
         .unwrap();
 
         // 3) 会话复用 + focus 抢道：目标 f1 + f4，focus=f4 → f4 先落地
@@ -1111,7 +1135,11 @@ mod tests {
             &|idx, _| order.lock().unwrap().push(idx),
         )
         .unwrap();
-        assert_eq!(*order.lock().unwrap(), vec![3, 0], "focus folder 应最先解（f4 → f1）");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![3, 0],
+            "focus folder 应最先解（f4 → f1）"
+        );
         assert_eq!(std::fs::read(dir.join("s1.bin")).unwrap(), srcs[0].1);
         assert_eq!(std::fs::read(dir.join("s4.bin")).unwrap(), srcs[3].1);
 
@@ -1119,16 +1147,114 @@ mod tests {
         let s2 = new_session();
         {
             let mut st = s2.lock().unwrap();
-            st.targets.insert("no_such.bin".into(), (0, dir.join("nope.bin")));
+            st.targets
+                .insert("no_such.bin".into(), (0, dir.join("nope.bin")));
             st.alive = true;
         }
         assert!(matches!(
-            vfs.extract_session(&s2, &std::sync::atomic::AtomicBool::new(false), &|_, _| {}, &|_, _| {
-                panic!("不存在的目标不应落地")
-            }),
+            vfs.extract_session(
+                &s2,
+                &std::sync::atomic::AtomicBool::new(false),
+                &|_, _| {},
+                &|_, _| { panic!("不存在的目标不应落地") }
+            ),
             Err(VfsError::Archive(_))
         ));
         assert!(!s2.lock().unwrap().alive, "报错路径应置 alive=false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gen 救回回归：零落地轮若期间 UI 重定向过（gen 变化），必须重新
+    /// 规划续跑而非误报"无进展"错误。
+    ///
+    /// 复现场景：solid 单 folder 65 条目，初始目标只有末位 n64；解码流
+    /// 顺序消费 n00-n63 时（skipped=64 处的 progress 回调模拟 UI 重定向
+    /// 协议：targets 换新 + focus 改写 + gen 自增）——本轮剩余流仅剩的
+    /// n64 已非目标，零落地。旧代码此时误报 Err 中止整个会话；新代码
+    /// 对比 gen 0→1，重新规划从头解出 n00 后干净收尾
+    #[test]
+    fn session_zero_landing_rescued_by_gen() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_gen_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 65 × 4KB 互异内容（i%251；skipped=64 的 progress 触发点恰在 n64 前）
+        let srcs: Vec<(String, Vec<u8>)> = (0..65)
+            .map(|i| (format!("n{i:02}.bin"), vec![(i % 251) as u8; 4096]))
+            .collect();
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("solid65.7z");
+        let mut w = SevenZWriter::create(&arch).unwrap();
+        // push_archive_entries（复数）：全部压进同一 folder = solid
+        let entries: Vec<SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                SevenZArchiveEntry::from_path(
+                    p,
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.list().len(), 65);
+
+        let s = new_session();
+        let d0 = dir.join("out_n00.bin");
+        let d64 = dir.join("out_n64.bin");
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("n64.bin".into(), (64, d64.clone()));
+            st.focus = Some(64);
+            st.alive = true;
+        }
+        // progress 回调里模拟 UI 重定向（一次性）：跳过计数满 64（即
+        // n63 消费完、n64 未到）时整体换目标——与 UI 重定向锁块同协议
+        let redirected = std::sync::atomic::AtomicBool::new(false);
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, stage| {
+                if !stage.starts_with("跳过前置文件") {
+                    return;
+                }
+                if redirected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let mut st = s.lock().unwrap();
+                st.targets.clear();
+                st.targets.insert("n00.bin".into(), (0, d0.clone()));
+                st.focus = Some(0);
+                st.gen += 1;
+            },
+            &|idx, _| {
+                assert_eq!(idx, 0, "重定向后唯一应落地的目标是 n00");
+            },
+        )
+        .unwrap_or_else(|e| panic!("gen 救回应重新规划续跑而非误报: {e}"));
+        assert_eq!(
+            std::fs::read(&d0).unwrap(),
+            srcs[0].1,
+            "重定向后 n00 应从头解出且内容正确"
+        );
+        assert!(!d64.exists(), "被重定向丢弃的 n64 不应落地");
+        {
+            let st = s.lock().unwrap();
+            assert!(st.targets.is_empty(), "终态 targets 应为空");
+            assert!(!st.alive, "终态会话应干净退出");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1175,9 +1301,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(*done.lock().unwrap(), vec![0, 1, 2, 3], "应按链式追加顺序全部落地");
+        assert_eq!(
+            *done.lock().unwrap(),
+            vec![0, 1, 2, 3],
+            "应按链式追加顺序全部落地"
+        );
         for (i, (_, data)) in srcs.iter().enumerate() {
-            assert_eq!(std::fs::read(&dests[i]).unwrap(), *data, "f{} 内容错误", i + 1);
+            assert_eq!(
+                std::fs::read(&dests[i]).unwrap(),
+                *data,
+                "f{} 内容错误",
+                i + 1
+            );
         }
         assert!(!s.lock().unwrap().alive);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1276,7 +1411,11 @@ mod tests {
             "漂移后应中断 folder A，先解 focus 所在 folder B，再回头补 g3"
         );
         assert_eq!(std::fs::read(d("o_g1.bin")).unwrap(), srcs[0].1);
-        assert_eq!(std::fs::read(d("o_g3.bin")).unwrap(), srcs[2].1, "中断重解后 g3 内容错误（自愈失败）");
+        assert_eq!(
+            std::fs::read(d("o_g3.bin")).unwrap(),
+            srcs[2].1,
+            "中断重解后 g3 内容错误（自愈失败）"
+        );
         assert_eq!(std::fs::read(d("o_h1.bin")).unwrap(), srcs[3].1);
         assert!(!s.lock().unwrap().alive);
         let _ = std::fs::remove_dir_all(&dir);

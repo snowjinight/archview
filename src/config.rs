@@ -54,21 +54,25 @@ impl Default for VarTidyConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtractConfig {
-    /// solid 包（7z/RAR）解压时顺带预取后续文件的总大小上限（MB），0 = 关闭。
+    /// 下游预取上限（MB），0 = 关闭：solid 包（7z/RAR）解压时顺带预取
+    /// 后续文件（下标更大的方向 = 列表向下 = 解码流推进方向）的总大小上限。
     /// 一次顺序解压流解出一批文件，翻页时直接命中缓存，摊薄"定位目标需
     /// 顺序解压前置数据"的固定成本
-    pub prefetch_mb: u64,
-    /// 向前预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置
-    /// 条目（7z 限于目标所在 folder 内、RAR 为整个前缀）顺带写盘，
-    /// 随机跳看后往回翻直接命中缓存。解码零增量，仅占磁盘写入量
-    pub prefetch_prev_mb: u64,
+    #[serde(alias = "prefetch_mb")]
+    pub prefetch_downstream_mb: u64,
+    /// 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置
+    /// 条目（下标更小的方向 = 列表向上；7z 限于目标所在 folder 内、RAR
+    /// 为整个前缀）顺带写盘，随机跳看后回看直接命中缓存。
+    /// 解码零增量，仅占磁盘写入量
+    #[serde(alias = "prefetch_prev_mb")]
+    pub prefetch_upstream_mb: u64,
 }
 
 impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
-            prefetch_mb: 512,
-            prefetch_prev_mb: 512,
+            prefetch_downstream_mb: 512,
+            prefetch_upstream_mb: 512,
         }
     }
 }
@@ -368,13 +372,15 @@ sort_files = false
 extract_overlay_delay_ms = 500
 
 [extract]
-# solid 包（7z/RAR）解压时顺带预取后续文件的总大小上限（MB），0 = 关闭。
-# 一次顺序解压流解出一批文件，翻页直接命中，摊薄固态包定位成本
-prefetch_mb = 512
-# 向前预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
-# （7z 限于目标所在 folder 内、RAR 为整个前缀）顺带写盘，随机跳看后
-# 往回翻直接命中缓存。解码零增量，仅占磁盘写入量
-prefetch_prev_mb = 512
+# 下游预取上限（MB），0 = 关闭：solid 包（7z/RAR）解压时顺带预取后续文件
+# （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
+# 翻页直接命中，摊薄固态包定位成本
+prefetch_downstream_mb = 512
+# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+# （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
+# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
+# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
+prefetch_upstream_mb = 512
 
 [vartidy]
 # VarTidy（"archview.exe tidy" CLI 子命令）配置
@@ -403,6 +409,20 @@ mod tests {
         let text = toml::to_string_pretty(&Config::default()).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, Config::default());
+    }
+
+    /// 旧键名兼容：prefetch_mb / prefetch_prev_mb（上游/下游正名前）经
+    /// serde alias 仍可解析，老用户的 config.toml 不失效
+    #[test]
+    fn extract_prefetch_legacy_keys() {
+        let cfg: Config = toml::from_str(
+            "[extract]
+prefetch_mb = 7
+prefetch_prev_mb = 9",
+        )
+        .unwrap();
+        assert_eq!(cfg.extract.prefetch_downstream_mb, 7);
+        assert_eq!(cfg.extract.prefetch_upstream_mb, 9);
     }
 
     /// 含特殊字符（#、空格、中文）的密码在 TOML 双引号内原样保留

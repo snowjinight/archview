@@ -191,7 +191,8 @@ impl RarVFS {
     /// 会话单遍处理（单密码候选）：一次 processing 遍历动态消费 targets
     /// （try_batch 的会话版）。差异：目标集从 session 实时读取（UI 随时
     /// 增删），落地即 remove + 锁外回调；focus 漂移到已越过位置
-    /// （behind：focus 仍待解且其下标 < 当前遍历位置）→ Restart 提前返回，
+    /// （upstream：focus 仍待解且其下标 < 当前遍历位置，即漂到上游）→
+    /// Restart 提前返回，
     /// 外层从头重启遍历（unrar 无 folder 直达，重启是唯一回退手段）。
     /// 遍历尽不报"entry 不存在"——目标集动态，可能是 UI 刚加的目标在
     /// 已越过位置（外层下轮 Restart/重新遍历会处理），真不存在的由外层
@@ -231,26 +232,22 @@ impl RarVFS {
             let encrypted = head.entry().is_encrypted();
             let size = head.entry().unpacked_size;
             let cur_idx = name_idx.get(&name).copied();
-            // 持锁快照：本条目目标 / focus 是否漂移到已越过位置
-            let (tgt, behind) = {
+            // 持锁快照：本条目目标 / focus 是否漂移到当前遍历位置的上游
+            let (tgt, upstream) = {
                 let st = session.lock().unwrap();
                 let tgt = st.targets.get(&name).cloned();
                 // focus 仍待解（在下标相等的目标里）且在当前遍历位置之前
-                let behind = st.focus.is_some_and(|f| {
-                    st.targets.values().any(|(idx, _)| *idx == f)
-                        && cur_idx.is_some_and(|c| f < c)
+                let upstream = st.focus.is_some_and(|f| {
+                    st.targets.values().any(|(idx, _)| *idx == f) && cur_idx.is_some_and(|c| f < c)
                 });
-                (tgt, behind)
+                (tgt, upstream)
             };
-            if behind {
+            if upstream {
                 return Ok((PassFlow::Restart, landed)); // 回退重启定位 focus
             }
             let Some((ti, dest)) = tgt else {
                 open = head.skip().map_err(|e| {
-                    VfsError::Archive(format!(
-                        "RAR 跳过条目 [{}] 失败（正在定位目标）: {e}",
-                        name
-                    ))
+                    VfsError::Archive(format!("RAR 跳过条目 [{}] 失败（正在定位目标）: {e}", name))
                 })?;
                 skipped += 1;
                 skipped_bytes += size;
@@ -271,9 +268,9 @@ impl RarVFS {
                     file_done(ti, &dest); // 锁已释放
                     landed += 1;
                 }
-                open = head.skip().map_err(|e| {
-                    VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
-                })?;
+                open = head
+                    .skip()
+                    .map_err(|e| VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name)))?;
                 continue;
             }
             // 解压到临时文件再改名（同 try_batch）；unrar 无逐字节回调：
@@ -357,10 +354,10 @@ impl ArchiveVFS for RarVFS {
         AccessMode::Solid
     }
 
-    /// 向前预取免费区 = 整个前缀 [0, 目标)：unrar 定位目标需逐条 skip，
+    /// 上游预取免费区 = 整个前缀 [0, 目标)：unrar 定位目标需逐条 skip，
     /// 前缀数据本就被顺序消费（固态包是真解码，非固态是廉价头跳过），
     /// 把目标之前顺带解出的条目写盘即可。无 folder 概念 → 不设边界，
-    /// 由 config `extract.prefetch_prev_mb` 预算封顶
+    /// 由 config `extract.prefetch_upstream_mb` 预算封顶
     fn locate_start(&self, _entry_idx: usize) -> Option<usize> {
         Some(0)
     }
@@ -433,7 +430,7 @@ impl ArchiveVFS for RarVFS {
             }
             attempts.push(None);
         }
-        // 名字 → list 下标（behind 判定用；包内容不变，主循环外构建一次）
+        // 名字 → list 下标（upstream 判定用；包内容不变，主循环外构建一次）
         let name_idx: std::collections::HashMap<String, usize> = self
             .list()
             .into_iter()
@@ -442,8 +439,10 @@ impl ArchiveVFS for RarVFS {
             .collect();
         let mut stagnant = 0; // 连续零落地轮数（无进展保险）
         loop {
-            // 持锁预检：取消 / 空闲退出（判空与置 alive=false 同锁，协议见 mod.rs）
-            {
+            // 持锁预检：取消 / 空闲退出（判空与置 alive=false 同锁，协议见
+            // mod.rs）。顺带快照本轮 gen——UI 重定向同锁自增，零落地轮末
+            // 比对可知"没进展"是否因中途换了目标
+            let round_gen = {
                 let mut st = session.lock().unwrap();
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     st.alive = false;
@@ -453,7 +452,8 @@ impl ArchiveVFS for RarVFS {
                     st.alive = false;
                     return Ok(());
                 }
-            }
+                st.gen
+            };
             let mut landed = 0;
             let mut restarts = 0;
             let mut all_done = false;
@@ -505,14 +505,21 @@ impl ArchiveVFS for RarVFS {
                 return Err(last_err);
             }
             // 无进展保险：连续两轮零落地且 targets 仍非空 → 真的不在包内；
-            // 有落地重置计数，目标已空则外层预检正常收尾
+            // 有落地重置计数，目标已空则外层预检正常收尾。本轮中途 UI 重
+            // 定向过（gen 已变）的零落地不计入——目标已换，旧计数作废
             if landed == 0 {
-                stagnant += 1;
-                if stagnant >= 2 && !session.lock().unwrap().targets.is_empty() {
-                    super::session_exit(session);
-                    return Err(VfsError::Archive(
-                        "RAR 会话无进展：目标条目不在包内".into(),
-                    ));
+                let (cur_gen, targets_left) = {
+                    let st = session.lock().unwrap();
+                    (st.gen, !st.targets.is_empty())
+                };
+                if cur_gen != round_gen {
+                    stagnant = 0;
+                } else {
+                    stagnant += 1;
+                    if stagnant >= 2 && targets_left {
+                        super::session_exit(session);
+                        return Err(VfsError::Archive("RAR 会话无进展：目标条目不在包内".into()));
+                    }
                 }
             } else {
                 stagnant = 0;
@@ -524,10 +531,17 @@ impl ArchiveVFS for RarVFS {
     /// 密码校验：对编码候选（UTF-8 / 配置代码页，见 vfs::password_candidates）
     /// 逐个试 verify_one——unrar 的密码是原始字节，编码不对与密码不对同样报错。
     /// 密码/编码不匹配换下一候选，全部失败才报 Password
-    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+    fn verify_password(
+        &self,
+        entry: &VirtualEntry,
+        password: Option<&str>,
+    ) -> Result<(), VfsError> {
         let candidates: Vec<Option<Vec<u8>>> = match password {
             None => vec![None],
-            Some(pw) => super::password_candidates(pw).into_iter().map(Some).collect(),
+            Some(pw) => super::password_candidates(pw)
+                .into_iter()
+                .map(Some)
+                .collect(),
         };
         let mut last = VfsError::Password;
         for c in &candidates {
@@ -562,19 +576,15 @@ impl RarVFS {
     /// 单个密码候选（字节形态）的校验：open_for_processing 逐头定位目标条目，
     /// extract_to 临时文件（unrar 无内存 sink；探测目标是最小加密条目，代价可控）。
     /// RAR5 头带 PswCheck、错密码即报；RAR4 无密码哈希、靠解压结果 CRC 判错
-    fn verify_one(
-        &self,
-        entry: &VirtualEntry,
-        pw: Option<&[u8]>,
-    ) -> Result<(), VfsError> {
+    fn verify_one(&self, entry: &VirtualEntry, pw: Option<&[u8]>) -> Result<(), VfsError> {
         let arch = match pw {
             Some(p) => Archive::with_password(&self.path, p),
             None => Archive::new(&self.path),
         };
         let tmp = super::tmp_path(&std::env::temp_dir().join("archview_pw_probe.tmp"));
-        let mut open = arch
-            .open_for_processing()
-            .map_err(|e| VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display())))?;
+        let mut open = arch.open_for_processing().map_err(|e| {
+            VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display()))
+        })?;
         loop {
             match open.read_header().map_err(|e| {
                 VfsError::Archive(format!("读 RAR 头失败 [{}]: {e}", self.path.display()))
@@ -593,7 +603,11 @@ impl RarVFS {
                                 ))
                             };
                             // RAR4 错密码常表现为 CRC 失败（无密码哈希），同样按密码错处理
-                            if is_pwd_or_crc(&mapped) { VfsError::Password } else { mapped }
+                            if is_pwd_or_crc(&mapped) {
+                                VfsError::Password
+                            } else {
+                                mapped
+                            }
                         });
                         std::fs::remove_file(&tmp).ok();
                         return r.map(|_| ());
@@ -602,12 +616,7 @@ impl RarVFS {
                         VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
                     })?;
                 }
-                None => {
-                    return Err(VfsError::Archive(format!(
-                        "entry 不存在: {}",
-                        entry.name
-                    )))
-                }
+                None => return Err(VfsError::Archive(format!("entry 不存在: {}", entry.name))),
             }
         }
     }

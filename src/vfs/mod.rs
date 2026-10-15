@@ -140,21 +140,30 @@ impl From<std::io::Error> for VfsError {
 
 /// 固实包解码会话的共享状态（UI ↔ 后台解码线程，见 `ArchiveVFS::extract_session`）。
 /// 相比 `extract_batch` 的静态批，目标集在解码过程中可被 UI 动态增删——
-/// 跳转不再取消解码流：同 folder 向后跳零成本续解，跨 folder 只 seek。
+/// 跳转不再取消解码流：同 folder 向下游跳零成本续解，跨 folder 只 seek。
 pub struct SessionState {
     /// 待解条目：条目名 → (list 顺序下标, 落地路径)。
     /// UI 点击/翻页组批时写入；解码线程每落地一个条目（临时文件 rename
     /// 完成）即持锁移除并回调 file_done
     pub targets: std::collections::HashMap<String, (usize, PathBuf)>,
-    /// UI 当前期望播放的条目下标：解码线程优先定位它——7z 把 focus 所在
-    /// folder 排到解码序最前（必要时中断当前 folder），RAR 据此判定是否
-    /// 重启遍历（focus 在已越过的位置才重启）
+    /// 解码抢道锚点 = 上次会话重定向写入的目标下标（非"当前播放"！）。
+    /// 仅被解码线程消费：7z 把 focus 所在 folder 排到解码序最前（必要时
+    /// 中断当前 folder），RAR 据此判定是否重启遍历（focus 在已越过的
+    /// 位置才重启）。UI 侧的播放高亮/滚动跟随用的是 `App::playing`，
+    /// 与本字段零耦合。回看（点击已落地的缓存命中项且位于 focus
+    /// 上游）走 keep 分支完全不碰它——锚点只向下游推进不回退，保证
+    /// 后台继续按原重定向计划解压
     pub focus: Option<usize>,
     /// 解码线程存活标志：线程启动前置 true；一切退出路径（targets 解空 /
     /// cancel / 出错）都必须持锁置 false。UI 侧加目标后检查它：false 说明
     /// 线程已退出需重新 spawn——置 false 与加目标在同一把锁下互斥，
     /// 不会出现"UI 判定存活却随即线程退出丢目标"的竞态
     pub alive: bool,
+    /// 会话重定向代数：UI 每次重写 targets（重定向/滑窗）在同一把锁内
+    /// 自增。解码线程每轮规划起始快照 round_gen，落地数为 0 时对比——
+    /// gen 已变说明期间 UI 换了目标（如重定向到已落地的 focus 中途），
+    /// 应重新规划续跑而非误报"无进展"错误
+    pub gen: u64,
 }
 
 /// 会话共享句柄
@@ -227,7 +236,7 @@ pub trait ArchiveVFS: Send + Sync {
     ///
     /// 与 `extract_batch` 的静态批不同：`session` 由调用方持有、跨线程共享，
     /// 解码期间目标集可被 UI 动态增删，**跳转不再取消解码流**：
-    /// - 同 folder 向后跳：目标就在解码流前方，零成本顺手解出
+    /// - 同 folder 向下游跳：目标就在解码流下游，零成本顺手解出
     /// - 跨 folder 跳：当前 folder 收尾后只 seek 到新 folder（不解压前置）
     /// - focus 漂移：实现方可中断当前 folder，优先解 focus 所在 folder
     ///
@@ -308,14 +317,14 @@ pub trait ArchiveVFS: Send + Sync {
     }
 
     /// 定位该条目时顺序解压流的起始条目下标（list 顺序；None = 定位无前置解码）。
-    /// `[start, entry_idx)` 即"向前预取免费区"：这些条目在定位目标时必然被
-    /// 顺序解掉丢弃，顺带写盘零解码增量——UI 据此向前预取
-    /// （config `extract.prefetch_prev_mb`，随机跳看时往回翻直接命中缓存）。
+    /// `[start, entry_idx)` 即"上游预取免费区"：这些条目在定位目标时必然被
+    /// 顺序解掉丢弃，顺带写盘零解码增量——UI 据此做上游预取
+    /// （config `extract.prefetch_upstream_mb`，随机跳看时往回翻直接命中缓存）。
     /// - 7z：目标所在 folder 的首个条目（跨 folder 只 seek 不解压，
-    ///   向前预取不得超出 folder 边界）
+    ///   上游预取不得超出 folder 边界）
     /// - RAR：0（unrar 无 folder 直达，逐条 skip 定位，整个前缀都被顺序消费；
     ///   非固态包成本退化为逐条正常解压，由预算上限约束）
-    /// - 默认 None（zip 快路径不走后台解压，无需向前预取）
+    /// - 默认 None（zip 快路径不走后台解压，无需上游预取）
     fn locate_start(&self, entry_idx: usize) -> Option<usize> {
         let _ = entry_idx;
         None

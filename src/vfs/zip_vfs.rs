@@ -1,8 +1,8 @@
 //! ZipVFS：基于 zip crate 的随机访问 VFS（快路径）。
 //!
 //! zip 8.x 的 `ZipFile` 只实现 Read；`by_index_seek` 仅支持 Stored。
-//! deflate 等压缩条目的 seek 由本模块实现：前向 seek = 继续解压丢弃输出；
-//! 后向 seek = 重开 entry 从头解压丢弃到目标偏移（O(target)，架构文档"解码块 LRU"的未加缓存版本）。
+//! deflate 等压缩条目的 seek 由本模块实现：下游 seek（向文件尾）= 继续解压丢弃输出；
+//! 上游 seek（向文件头）= 重开 entry 从头解压丢弃到目标偏移（O(target)，架构文档"解码块 LRU"的未加缓存版本）。
 
 use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
 use std::fs::File;
@@ -386,7 +386,11 @@ impl ArchiveVFS for ZipVFS {
     /// 密码校验：AES/ZipCrypto 的 reader 构造即验 2 字节密码校验值（零解压），
     /// by_index 内部已按编码候选逐个尝试（InvalidPassword 换下一个），
     /// 全部失败报 Password；条目未加密时任何密码都通过
-    fn verify_password(&self, entry: &VirtualEntry, password: Option<&str>) -> Result<(), VfsError> {
+    fn verify_password(
+        &self,
+        entry: &VirtualEntry,
+        password: Option<&str>,
+    ) -> Result<(), VfsError> {
         let mut archive = self.archive()?;
         let index = self
             .index_of(&archive, &entry.name)
@@ -405,7 +409,7 @@ struct SeekableZipFile {
     index: usize,
     size: u64,
     pos: u64,
-    /// 后向 seek 重开 entry 时解密用的密码候选
+    /// 上游 seek 重开 entry 时解密用的密码候选
     password: Vec<Vec<u8>>,
 }
 
@@ -457,12 +461,12 @@ impl Seek for SeekableZipFile {
             return Ok(target);
         }
         if target > self.pos && self.file.is_some() {
-            // 前向 seek：继续解压丢弃输出
+            // 下游 seek：继续解压丢弃输出
             let f = self.file.as_mut().unwrap();
             skip(f, target - self.pos)?;
             self.pos = target;
         } else {
-            // 后向 seek 或无流：重开 entry 从头丢弃（加密条目带密码候选重开）
+            // 上游 seek 或无流：重开 entry 从头丢弃（加密条目带密码候选重开）
             self.file = None;
             let f = ZipVFS::by_index(&mut self.archive, self.index, &self.password)
                 .map_err(std::io::Error::other)?;
@@ -520,7 +524,11 @@ mod tests {
             for &b in data {
                 c ^= b as u32;
                 for _ in 0..8 {
-                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
                 }
             }
             !c
@@ -608,7 +616,7 @@ mod tests {
             .any(|e| e.name == "dir/sub/b.mp4" && e.size == 4096));
         assert!(entries.iter().all(|e| !e.encrypted));
 
-        // deflate 条目：读 + seek 往返（前向/后向）
+        // deflate 条目：读 + seek 往返（下游/上游）
         let e = entries
             .iter()
             .find(|e| e.name == "dir/a.txt")
@@ -618,12 +626,12 @@ mod tests {
         let mut buf = String::new();
         f.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "hello zip vfs, this is a deflate payload!");
-        // 后向 seek（触发重开丢弃路径）
+        // 上游 seek（触发重开丢弃路径）
         f.seek(SeekFrom::Start(6)).unwrap();
         let mut b2 = [0u8; 3];
         f.read_exact(&mut b2).unwrap();
         assert_eq!(&b2, b"zip");
-        // 前向 seek（deflate 起点 d 在 25）
+        // 下游 seek（deflate 起点 d 在 25）
         f.seek(SeekFrom::Start(25)).unwrap();
         let mut b3 = [0u8; 6];
         f.read_exact(&mut b3).unwrap();
@@ -662,7 +670,7 @@ mod tests {
         // 3) 错密码读 → Password（AES 打开时即时校验）
         let vfs_bad = ZipVFS::open(&path, Some("wrong")).unwrap();
         assert!(matches!(vfs_bad.open_entry(&e), Err(VfsError::Password)));
-        // 4) 正确密码：读 + 后向 seek（重开路径要带密码解密）
+        // 4) 正确密码：读 + 上游 seek（重开路径要带密码解密）
         let vfs_ok = ZipVFS::open(&path, Some("pw123")).unwrap();
         let mut f = vfs_ok.open_entry(&e).unwrap();
         let mut buf = String::new();
@@ -699,7 +707,7 @@ mod tests {
         let mut buf = String::new();
         f.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "non-ascii password payload");
-        // 后向 seek：重开路径带候选重试
+        // 上游 seek：重开路径带候选重试
         f.seek(SeekFrom::Start(4)).unwrap();
         let mut b = [0u8; 5];
         f.read_exact(&mut b).unwrap();

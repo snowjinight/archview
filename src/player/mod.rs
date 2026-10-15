@@ -273,7 +273,7 @@ mod tests {
         }
     }
 
-    /// 端到端：zip 内 deflate 视频 → zvf:// 流 → headless mpv 播放 + 前向/后向 seek
+    /// 端到端：zip 内 deflate 视频 → zvf:// 流 → headless mpv 播放 + 下游/上游 seek
     #[test]
     fn e2e_playback_with_seek_via_stream_cb() {
         let Some(dll_dir) = find_mpv_dll_dir() else {
@@ -363,17 +363,17 @@ mod tests {
         mpv_ffi::set_property_string(ctx, "pause", "yes").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // 3) 前向 seek 到中点
+        // 3) 下游 seek 到中点（播放时间向文件尾）
         let target = dur * 0.5;
         mpv_ffi::command_string(ctx, &format!("seek {target} absolute")).unwrap();
         let reached = wait_prop(ctx, "time-pos", |t| (t - target).abs() < 1.0, 30);
-        assert!(reached.is_some(), "前向 seek 超时");
+        assert!(reached.is_some(), "下游 seek 超时");
 
-        // 4) 后向 seek 回 15% 处（deflate 重解压路径）
+        // 4) 上游 seek 回 15% 处（deflate 重解压路径）
         let back = dur * 0.15;
         mpv_ffi::command_string(ctx, &format!("seek {back} absolute")).unwrap();
         let reached_back = wait_prop(ctx, "time-pos", |t| (t - back).abs() < 1.0, 30);
-        assert!(reached_back.is_some(), "后向 seek 超时");
+        assert!(reached_back.is_some(), "上游 seek 超时");
 
         // 5) 真实场景复现：播完第一个视频（EOF）后切换第二个视频
         // 取消暂停让视频自然播到结尾（vo=null 全速），等待真正的 eof-reached=yes
