@@ -1743,16 +1743,15 @@ impl App {
             }
             // 解压/打开的详细进度不放顶栏：一行放不下长文件名（曾被截断），
             // 改在媒体区居中显示（见 video_area，超过宽限期还会隐藏视频窗口）。
-            // 这里只在预取场景（目标 == 正在播放条目）留一个短标记：
-            // 视频正被观看绝不能遮挡，无长文本不会截断
+            // 这里只留一个短标记（无长文本不会截断），且常显——keep 回看上游
+            // 缓存、等待新文件等所有场景下后台剩余量都可见；与媒体区覆盖层
+            // 信息重复无妨，视频正被观看绝不能遮挡
             if let Some(j) = &self.extract {
-                if self.playing == Some(j.entry_idx) {
-                    let left = j.pending.len();
-                    ui.colored_label(
-                        ui.visuals().weak_text_color(),
-                        format!("后台预取中…（剩余 {left} 项）"),
-                    );
-                }
+                let left = j.pending.len();
+                ui.colored_label(
+                    ui.visuals().weak_text_color(),
+                    format!("后台解压中…（剩余 {left} 项）"),
+                );
             }
         });
     }
