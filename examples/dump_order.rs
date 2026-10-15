@@ -30,14 +30,14 @@ fn main() {
 }
 
 fn dump_7z(path: &str, n: usize) {
-    let reader = match sevenz_rust::SevenZReader::open(Path::new(path), sevenz_rust::Password::empty())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("打开失败（加密头需密码，暂不支持）: {e}");
-            return;
-        }
-    };
+    let reader =
+        match sevenz_rust::SevenZReader::open(Path::new(path), sevenz_rust::Password::empty()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("打开失败（加密头需密码，暂不支持）: {e}");
+                return;
+            }
+        };
     println!("== 7z 头信息原始顺序（前 {n} 条）==");
     for (i, f) in reader.archive().files.iter().take(n).enumerate() {
         let tag = if f.is_directory { "[DIR] " } else { "      " };

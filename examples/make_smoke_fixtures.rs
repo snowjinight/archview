@@ -51,14 +51,14 @@ fn main() {
         let alice_v1: &[u8] = &vec![b'A'; 2000];
         let alice_v2: &[u8] = &vec![b'B'; 3000];
         for (name, data) in [
-            ("Alice.look1.1.var", alice_v1),      // 仓库已有（仓库去重）
-            ("dir1/Alice.look1.2.var", alice_v2), // 新增
-            ("dir2/sub/Alice.look1.1.var", alice_v1), // 同名同内容（包内重复）
+            ("Alice.look1.1.var", alice_v1),             // 仓库已有（仓库去重）
+            ("dir1/Alice.look1.2.var", alice_v2),        // 新增
+            ("dir2/sub/Alice.look1.1.var", alice_v1),    // 同名同内容（包内重复）
             ("dir3/Bob.scene.2.var", &[b'X'; 1000][..]), // 包内同名第一份
             ("dir4/Bob.scene.2.var", &[b'Y'; 1500][..]), // 同名不同内容（CRC 冲突）
-            ("readme.txt", b"junk"),              // 非var
-            ("Cara.bad.var", b"x"),               // 三段：格式错误
-            ("Cara.item.x.var", b"x"),            // 版本号非数字
+            ("readme.txt", b"junk"),                     // 非var
+            ("Cara.bad.var", b"x"),                      // 三段：格式错误
+            ("Cara.item.x.var", b"x"),                   // 版本号非数字
         ] {
             w.start_file(name, opts).unwrap();
             w.write_all(data).unwrap();
@@ -119,13 +119,12 @@ fn main() {
     // ---- 7z 包：payload 临时目录（from_path 需要真实文件），完成后清理 ----
     let payload_dir = root.join("_payload");
     std::fs::create_dir_all(&payload_dir).unwrap();
-    let push_7z = |w: &mut sevenz_rust::SevenZWriter<std::fs::File>,
-                   file: &str,
-                   name: &str| {
+    let push_7z = |w: &mut sevenz_rust::SevenZWriter<std::fs::File>, file: &str, name: &str| {
         let p = payload_dir.join(file);
         std::fs::write(&p, vec![b'7'; 1536]).unwrap();
         let e = sevenz_rust::SevenZArchiveEntry::from_path(&p, name.into());
-        w.push_archive_entry(e, Some(std::fs::File::open(&p).unwrap())).unwrap();
+        w.push_archive_entry(e, Some(std::fs::File::open(&p).unwrap()))
+            .unwrap();
     };
 
     // pack4.7z：明文，多级目录

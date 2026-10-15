@@ -8,7 +8,7 @@
 
 pub mod classify;
 
-use crate::vfs::{ArchiveVFS, VirtualEntry, VfsError};
+use crate::vfs::{ArchiveVFS, VfsError, VirtualEntry};
 use classify::{classify_file_name, ClassifyResult};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -294,7 +294,10 @@ fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
     let wide = |p: &Path| -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     };
     let s = wide(src);
     let d = wide(dst);
@@ -338,7 +341,6 @@ fn execute_plan(
     lines: &mut Vec<ReportLine>,
     out: &mut dyn FnMut(&str),
 ) {
-
     let Some(vfs) = plan.vfs.take() else {
         return;
     };
@@ -458,13 +460,15 @@ fn execute_plan(
                 LineKind::Added,
                 &display,
                 &t.entry.name,
-                format!("{}/{} ({})", t.author, t.file_name, human_size(t.entry.size)),
+                format!(
+                    "{}/{} ({})",
+                    t.author,
+                    t.file_name,
+                    human_size(t.entry.size)
+                ),
             ));
             drop(s);
-            (out_cell.borrow_mut())(&format!(
-                "[{display}] 已新增 {}/{}",
-                t.author, t.file_name
-            ));
+            (out_cell.borrow_mut())(&format!("[{display}] 已新增 {}/{}", t.author, t.file_name));
         }
     };
 
@@ -687,18 +691,31 @@ fn build_report_text(
     s.push_str(&format!("时间   : {now}\n"));
     s.push_str(&format!(
         "模式   : {}\n",
-        if opts.dry_run { "预演 (dry-run，未写入任何文件)" } else { "实际执行" }
+        if opts.dry_run {
+            "预演 (dry-run，未写入任何文件)"
+        } else {
+            "实际执行"
+        }
     ));
     s.push_str(&format!("仓库   : {}\n", opts.repo_dir.display()));
-    s.push_str(&format!("输入   : {} 个压缩包\n", summary.archives + summary.failed_archives));
+    s.push_str(&format!(
+        "输入   : {} 个压缩包\n",
+        summary.archives + summary.failed_archives
+    ));
     s.push_str("\n---------------------- 汇总 ----------------------\n");
     s.push_str(&format!(
         "新增文件           : {} 个 ({})\n",
         summary.added,
         human_size(summary.added_bytes)
     ));
-    s.push_str(&format!("仓库已有(跳过)     : {} 个\n", summary.repo_exists));
-    s.push_str(&format!("包内重复(跳过)     : {} 个\n", summary.in_archive_dup));
+    s.push_str(&format!(
+        "仓库已有(跳过)     : {} 个\n",
+        summary.repo_exists
+    ));
+    s.push_str(&format!(
+        "包内重复(跳过)     : {} 个\n",
+        summary.in_archive_dup
+    ));
     s.push_str(&format!(
         "同名不同内容(警告) : {} 个  ← 内容与首见条目不同，已跳过，需人工确认\n",
         summary.crc_conflict
@@ -724,7 +741,10 @@ fn build_report_text(
         if section.is_empty() {
             continue;
         }
-        s.push_str(&format!("\n------------------ 明细：{} ------------------\n", kind.label()));
+        s.push_str(&format!(
+            "\n------------------ 明细：{} ------------------\n",
+            kind.label()
+        ));
         for l in section {
             s.push_str(&format!("[{}] {} ： {}\n", l.archive, l.entry, l.note));
         }
@@ -812,12 +832,14 @@ fn msgbox(text: &str, error: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
     };
-    let wide = |s: &str| -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     let t = wide(text);
     let c = wide("Archview VarTidy");
-    let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
+    let icon = if error {
+        MB_ICONERROR
+    } else {
+        MB_ICONINFORMATION
+    };
     unsafe {
         MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | icon);
     }
@@ -907,7 +929,10 @@ pub fn cli_main(args: &[String]) -> i32 {
     if parsed.inputs.is_empty() {
         out.line(&format!("缺少输入（至少一个压缩包或目录）\n\n{USAGE}"));
         if !quiet {
-            msgbox("缺少输入：请在命令后指定压缩包或目录，或用「发送到」发送压缩包。", true);
+            msgbox(
+                "缺少输入：请在命令后指定压缩包或目录，或用「发送到」发送压缩包。",
+                true,
+            );
         }
         return 2;
     }
@@ -985,11 +1010,17 @@ pub fn cli_main(args: &[String]) -> i32 {
                     .map(|p| format!("\n\n报告文件:\n{}", p.display()))
                     .unwrap_or_default();
                 let conflict_note = if s.crc_conflict > 0 {
-                    format!("\n\n注意: 有 {} 个同名不同内容的 var 被跳过，详见报告。", s.crc_conflict)
+                    format!(
+                        "\n\n注意: 有 {} 个同名不同内容的 var 被跳过，详见报告。",
+                        s.crc_conflict
+                    )
                 } else {
                     String::new()
                 };
-                msgbox(&format!("{summary_text}{conflict_note}{report_note}"), false);
+                msgbox(
+                    &format!("{summary_text}{conflict_note}{report_note}"),
+                    false,
+                );
             }
             if s.failed_files > 0 || s.failed_archives > 0 {
                 1
@@ -1064,7 +1095,11 @@ mod tests {
         std::fs::create_dir_all(repo.join("Bob")).unwrap();
         // 仓库已有 Bob/Bob.scene.2.var（旧内容）——绝不允许被覆盖。
         // 注意约定：文件进作者目录保留完整原名（与 class_var.py 一致）
-        std::fs::write(repo.join("Bob").join("Bob.scene.2.var"), b"OLD-REPO-VERSION").unwrap();
+        std::fs::write(
+            repo.join("Bob").join("Bob.scene.2.var"),
+            b"OLD-REPO-VERSION",
+        )
+        .unwrap();
 
         let content_x = vec![0x58u8; 4096]; // Alice/look1.1.var 内容
         let content_y1 = vec![1u8; 2048]; // Bob/scene.2.var 包内第一份
@@ -1078,8 +1113,8 @@ mod tests {
                 ("dir3/Bob.scene.2.var", &content_y1),
                 ("dir4/Bob.scene.2.var", &content_y2), // 包内同名不同内容
                 ("dir1/readme.txt", b"not a var"),
-                ("dir1/Alice.bad.var", b"x"),           // 三段 → 格式错误
-                ("dir1/Alice.item.x.var", b"x"),        // 版本号非数字
+                ("dir1/Alice.bad.var", b"x"),    // 三段 → 格式错误
+                ("dir1/Alice.item.x.var", b"x"), // 版本号非数字
             ],
         );
 
@@ -1094,7 +1129,10 @@ mod tests {
         let r = run_quiet(&[arch.clone()], &opts(true));
         assert_eq!(r.summary.crc_conflict, 1);
         assert_eq!(r.summary.in_archive_dup, 1);
-        assert_eq!(r.summary.repo_exists, 1, "仓库已有的 Bob/scene.2.var 应跳过");
+        assert_eq!(
+            r.summary.repo_exists, 1,
+            "仓库已有的 Bob/scene.2.var 应跳过"
+        );
         assert_eq!(r.summary.invalid, 3, "readme.txt + 格式错误 + 版本号错误");
         // 计划新增 = Alice 一份
         assert_eq!(r.summary.added, 0, "dry-run 不落盘");
@@ -1224,7 +1262,10 @@ mod tests {
     #[test]
     fn cli_args_parsing() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let p = parse_args(&args(&["D:/dl", "-n", "-o", "D:/repo", "-p", "pw1", "-p", "pw2", "x.zip"])).unwrap();
+        let p = parse_args(&args(&[
+            "D:/dl", "-n", "-o", "D:/repo", "-p", "pw1", "-p", "pw2", "x.zip",
+        ]))
+        .unwrap();
         assert_eq!(p.inputs, ["D:/dl", "x.zip"]);
         assert!(p.dry_run);
         assert_eq!(p.repo.as_deref(), Some("D:/repo"));
