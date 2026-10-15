@@ -102,7 +102,8 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             stream_cb_add_ro: *lib.get(b"mpv_stream_cb_add_ro").map_err(load_err)?,
             _lib: lib,
         };
-        API.set(api).map_err(|_| "mpv API 已初始化".to_string())?;
+        // 并发竞态输家（如两个 e2e 测试并行 init）：复用赢家已装的 API
+        let _ = API.set(api);
     }
     Ok(())
 }
