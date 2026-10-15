@@ -42,10 +42,16 @@ fn main() -> eframe::Result<()> {
         tracing::error!("{e}");
     }
 
+    // 编译期内嵌 PNG 图标：标题栏 + 任务栏 + Alt+Tab 共用（eframe 在 Windows 上
+    // 自动按系统尺寸缩放为 ICON_BIG/ICON_SMALL），只支持 PNG、需透明通道
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("assets/icon.png 解码失败");
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("Archive Media Player"),
+            .with_title("Archive Media Player")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
