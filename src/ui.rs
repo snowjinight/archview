@@ -868,6 +868,23 @@ impl App {
         })
     }
 
+    /// 当前解码会话快照：(锚点 focus, 窗口摘要)。摘要格式
+    /// "N 项，物理 a..=b"（targets 的物理下标范围）；无包/空窗口为
+    /// None/"空"。供日志观测"后台此刻在解哪一段"
+    fn session_snapshot(&self) -> (Option<usize>, String) {
+        let Some(arch) = self.archive.as_ref() else {
+            return (None, "无会话".to_string());
+        };
+        let st = arch.session.lock().unwrap();
+        let mut idxs: Vec<usize> = st.targets.values().map(|t| t.0).collect();
+        idxs.sort_unstable();
+        let win = match (idxs.first(), idxs.last()) {
+            (Some(&lo), Some(&hi)) => format!("{} 项，物理 {lo}..={hi}", idxs.len()),
+            _ => "空".to_string(),
+        };
+        (st.focus, win)
+    }
+
     /// 启动/重定向后台解压任务。缓存命中（同尺寸文件已在）直接播放：
     /// 点击项在抢道锚点（focus，上次重定向目标）上游——即回看已看
     /// 内容——走 keep 分支完全不碰会话，后台继续解原计划（锚点只向
@@ -903,18 +920,35 @@ impl App {
                 .extract
                 .as_ref()
                 .is_some_and(|j| j.pending.contains_key(&entry_idx));
-            let (batch, batch_bytes) = self.compute_batch(arch, entry_idx, &dir);
-            let targets: Vec<(String, usize, PathBuf)> = batch
-                .iter()
-                .map(|&i| {
-                    let e = &arch.entries[i];
-                    (
-                        e.name.clone(),
-                        i,
-                        cache::dest_path(&dir, arch.id, i, &e.name),
-                    )
-                })
-                .collect();
+            // 非 solid 包（AccessMode::SingleFile）：非 solid RAR 逐文件独立
+            // 压缩（unrar 定位 = 廉价头跳转）；非 solid 7z 每文件独立 folder
+            // （BlockDecoder 按 pack 偏移直达）。只解点击项 = 真随机访问，
+            // 不组窗不预取（solid 包照旧 compute_batch 滑窗）
+            let single = arch.vfs.access_mode() == AccessMode::SingleFile;
+            let (targets, batch_bytes) = if single {
+                (
+                    vec![(
+                        entry.name.clone(),
+                        entry_idx,
+                        cache::dest_path(&dir, arch.id, entry_idx, &entry.name),
+                    )],
+                    entry.size,
+                )
+            } else {
+                let (batch, batch_bytes) = self.compute_batch(arch, entry_idx, &dir);
+                let targets: Vec<(String, usize, PathBuf)> = batch
+                    .iter()
+                    .map(|&i| {
+                        let e = &arch.entries[i];
+                        (
+                            e.name.clone(),
+                            i,
+                            cache::dest_path(&dir, arch.id, i, &e.name),
+                        )
+                    })
+                    .collect();
+                (targets, batch_bytes)
+            };
             (
                 cached,
                 was_pending,
@@ -955,6 +989,7 @@ impl App {
             // next_gen 不变，后台整批解完的 Done 兜底补播因 playing 已是
             // 本条目而天然不触发
             let pend = self.extract.as_ref().map(|j| j.pending.len()).unwrap_or(0);
+            let (_, win) = self.session_snapshot();
             if let Some(j) = self.extract.as_mut() {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
@@ -964,7 +999,7 @@ impl App {
                 j.stage = String::new();
             }
             tracing::info!(
-                "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项",
+                "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项，窗口 {win}",
                 click_pos.unwrap_or(usize::MAX),
                 sess_focus.unwrap_or(usize::MAX),
                 focus_pos.unwrap_or(usize::MAX),
@@ -980,6 +1015,7 @@ impl App {
         // 准，不切会在旧目标落地时把画面从当前条目拽走
         if targets.is_empty() {
             debug_assert!(cached);
+            let (_, win) = self.session_snapshot();
             if let Some(j) = self.extract.as_mut() {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
@@ -989,7 +1025,7 @@ impl App {
                 j.stage = String::new();
             }
             tracing::info!(
-                "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}",
+                "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
                 sess_focus,
                 self.playing
             );
@@ -1022,6 +1058,14 @@ impl App {
         // 时置 true"同一次持锁完成，与解码线程的"判空退出"互斥，杜绝窗口
         // 期目标丢失（协议见 vfs/mod.rs SessionState）
         let batch_len = targets.len();
+        let win_summary = {
+            let mut idxs: Vec<usize> = targets.iter().map(|(_, i, _)| *i).collect();
+            idxs.sort_unstable();
+            match (idxs.first(), idxs.last()) {
+                (Some(&lo), Some(&hi)) => format!("{batch_len} 项，物理 {lo}..={hi}"),
+                _ => format!("{batch_len} 项"),
+            }
+        };
         let alive = {
             let mut st = session.lock().unwrap();
             st.targets.clear();
@@ -1064,12 +1108,24 @@ impl App {
                     j.started = std::time::Instant::now();
                 }
                 if cached {
-                    tracing::info!("缓存命中: {name}");
+                    tracing::info!(
+                        "缓存命中: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
+                        sess_focus.unwrap_or(usize::MAX),
+                        self.playing
+                    );
                     self.load_extracted(&dest, entry_idx);
                 } else if was_pending {
-                    tracing::info!("批内切换目标: {name}（窗口滑动至 {} 项）", batch_len);
+                    tracing::info!(
+                        "批内切换目标: {name}（窗口滑动至 {win_summary}）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}",
+                        sess_focus.unwrap_or(usize::MAX),
+                        self.playing
+                    );
                 } else {
-                    tracing::info!("会话重定向: {name}（新批 {batch_len} 项，解码流续跑）");
+                    tracing::info!(
+                        "会话重定向: {name}（新批 {win_summary}，解码流续跑）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}",
+                        sess_focus.unwrap_or(usize::MAX),
+                        self.playing
+                    );
                 }
                 return;
             }
@@ -1081,7 +1137,8 @@ impl App {
         // 内容时跨出窗口同样无感滑动
         if cached {
             tracing::info!(
-                "缓存命中（预取会话启动）: {name}｜锚点 focus→{entry_idx}，切换前 playing={:?}，新窗 {batch_len} 项",
+                "缓存命中（预取会话启动）: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，新窗 {win_summary}",
+                sess_focus.unwrap_or(usize::MAX),
                 self.playing
             );
             self.load_extracted(&dest, entry_idx);
@@ -1120,9 +1177,10 @@ impl App {
 
         if !cached {
             tracing::info!(
-                "后台解压: {name} → {}（顺带预取 {} 项）｜锚点 focus→{entry_idx}，切换前 playing={:?}",
+                "后台解压: {name} → {}（顺带预取 {} 项）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
                 dest.display(),
                 batch_len - 1,
+                sess_focus.unwrap_or(usize::MAX),
                 self.playing
             );
         }
@@ -1195,6 +1253,14 @@ impl App {
                 ExtMsg::Done => {
                     self.extract = None;
                     // 会话空闲退出（targets 解空，线程已置 alive=false）。
+                    // 显式留痕：此后 keep 分支（要求会话存活）失效，下一次
+                    // 缓存命中点击会走 ⑤d 重新拉起预取会话并重写锚点——
+                    // 没有这条日志，该转折在日志流里完全不可见
+                    let (focus, win) = self.session_snapshot();
+                    tracing::info!(
+                        "会话解净空闲退出（窗口清空）: 最后目标 [{entry_name}]｜锚点 focus={focus:?}，当前窗口 {win}，playing={:?}",
+                        self.playing
+                    );
                     // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 期望
                     // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播
                     if gen == self.next_gen && self.playing != Some(entry_idx) {

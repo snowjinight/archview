@@ -1,4 +1,4 @@
-//! SevenzVFS：7z 格式（固态慢路径）。
+//! SevenzVFS：7z 格式（solid 走慢路径会话，全独立 folder 走单文件按需）。
 //! sevenz-rust 只支持顺序解压（固态块内 seek 需从块头重解），因此 open_entry 不支持，
 //! 播放走后台解压到缓存目录 → 播放本地文件。
 
@@ -18,6 +18,11 @@ pub struct SevenzVFS {
     /// 上游预取免费区 = [folder 首条目, 目标)（locate_start）
     folder_of: Vec<Option<usize>>,
     folder_first: std::collections::HashMap<usize, usize>,
+    /// 包是否 solid：任一 folder 含 ≥2 条目（7z 的 solid = 多文件压进同一
+    /// folder 顺序流；`7z a -ms=off` 每文件独立 folder，可 folder 直达随机
+    /// 访问，无需滑窗会话）。决定 access_mode：
+    /// solid = Solid（解压会话滑窗），全独立 = SingleFile（只解点击项）
+    solid: bool,
 }
 
 /// sevenz-rust 错误 → VfsError（缺密码/密码错误统一映射 Password）
@@ -77,11 +82,16 @@ impl SevenzVFS {
             .copied()
             .collect();
         let mut folder_first = std::collections::HashMap::new();
+        let mut folder_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         for (i, f) in folder_of.iter().enumerate() {
             if let Some(f) = f {
                 folder_first.entry(*f).or_insert(i);
+                *folder_size.entry(*f).or_insert(0) += 1;
             }
         }
+        // solid 判定：任一 folder 压了 ≥2 条目即顺序流；全部单条 folder
+        // （-ms=off）则每文件独立可直达，与"非 solid RAR"同理走单文件按需
+        let solid = folder_size.values().any(|&n| n >= 2);
         Ok(Self {
             path: path.to_path_buf(),
             password: if password.is_some() {
@@ -92,6 +102,7 @@ impl SevenzVFS {
             entries,
             folder_of,
             folder_first,
+            solid,
         })
     }
 
@@ -113,14 +124,26 @@ impl ArchiveVFS for SevenzVFS {
     }
 
     fn access_mode(&self) -> AccessMode {
-        AccessMode::Solid
+        if self.solid {
+            AccessMode::Solid
+        } else {
+            // 全独立 folder（-ms=off）：BlockDecoder 按 folder 头 pack 偏移
+            // 直达，随机访问只解点击项所在 folder = 单文件按需，不付滑窗/
+            // 预取/重定向成本
+            AccessMode::SingleFile
+        }
     }
 
     /// 上游预取免费区 = 目标所在 folder 的 [首条目, 目标)：定位目标时
     /// 这段数据必然被顺序解掉丢弃（BlockDecoder 从 folder 头解码到目标），
     /// 顺带写盘零解码增量。跨 folder 不免费（只 seek 不解压）——
-    /// 上游预取不得超出 folder 边界（用户配置的预算可能大于 folder 前缀，实取以边界为准）
+    /// 上游预取不得超出 folder 边界（用户配置的预算可能大于 folder 前缀，实取以边界为准）。
+    /// **仅 solid 7z 有意义**：全独立 folder 的包 BlockDecoder 直达本 folder
+    /// 首条目即目标，免费区为空，返回 None 不做上游预取
     fn locate_start(&self, entry_idx: usize) -> Option<usize> {
+        if !self.solid {
+            return None;
+        }
         let folder = self.folder_of.get(entry_idx).copied().flatten()?;
         self.folder_first.get(&folder).copied()
     }
@@ -953,6 +976,97 @@ mod tests {
         assert_eq!(vfs.locate_start(2), Some(2));
         // 越界/无数据流条目：None（不 panic）
         assert_eq!(vfs.locate_start(4), None);
+        // 双 folder（每 folder 2 条目）= solid：路由 Solid
+        assert_eq!(vfs.access_mode(), AccessMode::Solid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 7z solid/非 solid 路由：全独立 folder（-ms=off，每文件一个 folder）
+    /// → AccessMode::SingleFile + 无上游免费区（folder 直达是廉价 seek），
+    /// 中间条目直接解出 = 真随机访问；solid 单 folder → Solid + 整前缀
+    /// 免费区（locate_start = Some(0)）
+    #[test]
+    fn sevenz_solid_routing() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_route_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("f0.bin".into(), vec![7u8; 30_000]),
+            ("f1.bin".into(), vec![8u8; 30_000]),
+            ("f2.bin".into(), vec![9u8; 30_000]),
+        ];
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+
+        // ---- 非 solid：每文件独立 folder（push_archive_entry 单数）----
+        let ns_arch = dir.join("nonsolid.7z");
+        let mut w = SevenZWriter::create(&ns_arch).unwrap();
+        for p in &paths {
+            let entry = SevenZArchiveEntry::from_path(
+                p,
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+            );
+            w.push_archive_entry(entry, Some(std::fs::File::open(p).unwrap()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+        let ns = SevenzVFS::open(&ns_arch, None).unwrap();
+        assert_eq!(
+            ns.access_mode(),
+            AccessMode::SingleFile,
+            "全独立 folder 应走单文件按需"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                ns.locate_start(i),
+                None,
+                "非 solid 7z folder 直达无免费区，不应返回 Some"
+            );
+        }
+        // 中间条目直接解出（真随机访问，不依赖前缀顺序流）
+        let listed = ns.list();
+        assert_eq!(listed.len(), 3);
+        let dest = dir.join("ns_mid.bin");
+        ns.extract_entry(
+            &listed[1],
+            &dest,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), srcs[1].1);
+
+        // ---- solid：全部条目压进同一 folder（push_archive_entries 复数）----
+        let so_arch = dir.join("solid.7z");
+        let mut w = SevenZWriter::create(&so_arch).unwrap();
+        let entries: Vec<SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                SevenZArchiveEntry::from_path(
+                    p,
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+        let so = SevenzVFS::open(&so_arch, None).unwrap();
+        assert_eq!(so.access_mode(), AccessMode::Solid, "单 folder 顺序流应走滑窗会话");
+        assert_eq!(
+            so.locate_start(2),
+            Some(0),
+            "solid 包目标前整前缀都是免费区"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

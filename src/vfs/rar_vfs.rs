@@ -1,5 +1,6 @@
-//! RarVFS：RAR 格式（固态慢路径，unrar crate 内嵌编译 UnRAR 源码，支持 RAR4/5、分卷）。
-//! 与 7z 同理：后台解压到缓存目录 → 播放本地文件。
+//! RarVFS：RAR 格式（unrar crate 内嵌编译 UnRAR 源码，支持 RAR4/5、分卷）。
+//! solid 包（`rar a -s`，主头 ROADF_SOLID）走后台解压会话 + 滑窗预取；
+//! 非 solid 包（rar 默认）逐文件独立压缩，随机访问只解点击项（单文件按需）。
 
 use super::{AccessMode, ArchiveVFS, SharedSession, VfsError, VirtualEntry, VirtualFile};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,9 @@ pub struct RarVFS {
     /// 解密密码候选（UTF-8/GBK 等，见 vfs::password_candidates）；空 = 未提供密码。
     /// 加密头包在 open 阶段就会解析出唯一正确候选（见 open）。
     password: Vec<Vec<u8>>,
+    /// 包是否 solid（RAR 主头 ROADF_SOLID 标志）。决定 access_mode：
+    /// solid = Solid（解压会话滑窗），非 solid = SingleFile（只解点击项）
+    solid: bool,
 }
 
 /// unrar 错误信息按 Display 文本判断密码问题（"Password ... not specified"/"Wrong password"）
@@ -57,10 +61,29 @@ impl RarVFS {
             }
             Err(e) => return Err(VfsError::Archive(format!("打开 RAR 失败: {e}"))),
         }
+        // solid 判定：主头 ROADF_SOLID 标志（`rar a -s`），在 open 阶段零成本读出
+        let solid = Self::detect_solid(
+            &first,
+            candidates.first().map(|p| p.as_slice()),
+        );
         Ok(Self {
             path: first.to_path_buf(),
             password: candidates,
+            solid,
         })
+    }
+
+    /// 包是否 solid：读 RAR 主头标志（`unrar::OpenArchive::is_solid`）。
+    /// 探测失败（极端：加密头候选全部失效——上面已拦，正常到不了）按 solid
+    /// 兜底走慢路径，宁可多预取不可错判非 solid
+    fn detect_solid(first: &Path, pw: Option<&[u8]>) -> bool {
+        let arch = match pw {
+            Some(p) => Archive::with_password(first, p),
+            None => Archive::new(first),
+        };
+        arch.open_for_listing()
+            .map(|o| o.is_solid())
+            .unwrap_or(true)
     }
 
     /// listing 用（头未加密时任何候选/无密码均可）
@@ -346,20 +369,32 @@ impl ArchiveVFS for RarVFS {
 
     fn open_entry(&self, _entry: &VirtualEntry) -> Result<Box<dyn VirtualFile>, VfsError> {
         Err(VfsError::Unsupported(
-            "RAR 固态格式不支持流式读取，请走后台解压路径".into(),
+            "RAR 不支持流式读取（solid 走解压会话，非 solid 走单文件按需解压）".into(),
         ))
     }
 
     fn access_mode(&self) -> AccessMode {
-        AccessMode::Solid
+        // solid RAR：文件数据首尾相接成一条顺序解码流 → 解压会话 + 滑窗预取；
+        // 非 solid RAR（rar 默认 -s-）：每文件独立压缩，unrar 定位 = 廉价头
+        // 跳转，随机访问只需解点击项本身 → 单文件按需（历史版本行为），
+        // 不付滑窗/预取/重定向的成本
+        if self.solid {
+            AccessMode::Solid
+        } else {
+            AccessMode::SingleFile
+        }
     }
 
-    /// 上游预取免费区 = 整个前缀 [0, 目标)：unrar 定位目标需逐条 skip，
-    /// 前缀数据本就被顺序消费（固态包是真解码，非固态是廉价头跳过），
-    /// 把目标之前顺带解出的条目写盘即可。无 folder 概念 → 不设边界，
-    /// 由 config `extract.prefetch_upstream_mb` 预算封顶
+    /// 上游预取免费区 = 整个前缀 [0, 目标)：**仅 solid RAR 有意义**——unrar
+    /// 定位目标需逐条 skip，solid 前缀是真解码，把顺带解出的条目写盘零增量。
+    /// 非 solid RAR 返回 None：skip 是廉价头跳转，上游预取等于白白解码
+    /// 前置文件。预算由 config `extract.prefetch_upstream_mb` 封顶
     fn locate_start(&self, _entry_idx: usize) -> Option<usize> {
-        Some(0)
+        if self.solid {
+            Some(0)
+        } else {
+            None
+        }
     }
 
     fn extract_entry(
@@ -684,6 +719,103 @@ mod tests {
         let data = std::fs::read(&dest).unwrap();
         assert_eq!(data.len(), 50_000);
         assert!(data.iter().all(|&b| b == 9));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造包：3 × 30KB 不同填充字节的文件（f0=7, f1=8, f2=9，解出可校验）。
+    /// solid=true 加 -s（主头 ROADF_SOLID）；rar 默认（无 -s）即非固态。
+    /// 返回 (包路径, 临时目录)
+    fn make_rar(tag: &str, solid: bool) -> Option<(PathBuf, PathBuf)> {
+        let rar = rar_exe()?;
+        let dir = std::env::temp_dir().join(format!("rar_mode_test_{}_{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join(if solid { "solid.rar" } else { "plain.rar" });
+        let mut cmd = std::process::Command::new(&rar);
+        cmd.arg("a").arg("-ep"); // 包名必须紧跟命令，文件列表在后
+        if solid {
+            cmd.arg("-s");
+        }
+        cmd.arg(&arch);
+        for (i, fill) in [7u8, 8, 9].into_iter().enumerate() {
+            let p = dir.join(format!("f{i}.bin"));
+            std::fs::write(&p, vec![fill; 30_000]).unwrap();
+            cmd.arg(&p);
+        }
+        let st = cmd.output().unwrap();
+        assert!(
+            st.status.success(),
+            "rar.exe 打包失败: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        Some((arch, dir))
+    }
+
+    /// 非固态 RAR（rar 默认）→ AccessMode::SingleFile：随机访问只解点击项，
+    /// 无上游免费区（skip 是廉价头跳转，整前缀预取等于白白解码）。中间条目
+    /// 直接解压成功 = 真随机访问语义（不等价于顺序流定位）
+    #[test]
+    fn non_solid_rar_routes_single_file() {
+        let Some((arch, dir)) = make_rar("ns", false) else {
+            eprintln!("跳过：未找到 WinRAR rar.exe（可设 ARCHVIEW_TEST_RAR 指定）");
+            return;
+        };
+        let vfs = RarVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.access_mode(), AccessMode::SingleFile, "rar 默认非固态，应走单文件按需");
+        assert_eq!(
+            vfs.locate_start(0),
+            None,
+            "非固态无上游免费区：不应返回整前缀 Some(0)"
+        );
+
+        let entries = vfs.list();
+        assert_eq!(entries.len(), 3);
+        let dest = dir.join("mid.bin");
+        vfs.extract_entry(
+            &entries[1], // 中间的 f1.bin：非固态随机访问应直达
+            &dest,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+        )
+        .unwrap();
+        let data = std::fs::read(&dest).unwrap();
+        assert_eq!(data.len(), 30_000);
+        assert!(data.iter().all(|&b| b == 8), "解出应为本条目内容（填充 8）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 固态 RAR（rar a -s）→ AccessMode::Solid：解压会话滑窗路径 + 整前缀
+    /// 上游免费区（locate_start = Some(0)）；单遍 processing 跨中间条目解
+    /// 头尾两目标（skip 非目标、顺带解目标）
+    #[test]
+    fn solid_rar_routes_solid_and_batch_extracts() {
+        let Some((arch, dir)) = make_rar("so", true) else {
+            eprintln!("跳过：未找到 WinRAR rar.exe（可设 ARCHVIEW_TEST_RAR 指定）");
+            return;
+        };
+        let vfs = RarVFS::open(&arch, None).unwrap();
+        assert_eq!(vfs.access_mode(), AccessMode::Solid, "-s 打包应判为固态");
+        assert_eq!(
+            vfs.locate_start(2),
+            Some(0),
+            "固态包上游免费区 = 整个前缀 [0, 目标)"
+        );
+
+        let entries = vfs.list();
+        assert_eq!(entries.len(), 3);
+        let d0 = dir.join("o0.bin");
+        let d2 = dir.join("o2.bin");
+        vfs.extract_batch(
+            &[(&entries[0], &d0), (&entries[2], &d2)],
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _| {},
+            &|_| {},
+        )
+        .unwrap();
+        for (p, fill) in [(&d0, 7u8), (&d2, 9u8)] {
+            let data = std::fs::read(p).unwrap();
+            assert_eq!(data.len(), 30_000);
+            assert!(data.iter().all(|&b| b == fill), "解出应为本条目内容");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

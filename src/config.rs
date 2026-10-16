@@ -54,7 +54,8 @@ impl Default for VarTidyConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtractConfig {
-    /// 下游预取上限（MB），0 = 关闭：solid 包（7z/RAR）解压时顺带预取
+    /// 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取；
+    /// 非 solid RAR 走单文件按需，不组批，此项不生效
     /// 后续文件（下标更大的方向 = 列表向下 = 解码流推进方向）的总大小上限。
     /// 一次顺序解压流解出一批文件，翻页时直接命中缓存，摊薄"定位目标需
     /// 顺序解压前置数据"的固定成本
@@ -372,7 +373,7 @@ sort_files = false
 extract_overlay_delay_ms = 500
 
 [extract]
-# 下游预取上限（MB），0 = 关闭：solid 包（7z/RAR）解压时顺带预取后续文件
+# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件
 # （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
 # 翻页直接命中，摊薄固态包定位成本
 prefetch_downstream_mb = 512

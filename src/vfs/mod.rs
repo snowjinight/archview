@@ -102,10 +102,13 @@ pub trait VirtualFile: Read + Seek {
 /// 播放策略声明
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
-    /// seek 便宜（ZIP / 非固态），流式按需读取
+    /// seek 便宜（ZIP），流式按需读取
     FastSeek,
-    /// 固态，需后台解压回退（Phase 2）
+    /// 固态顺序流（7z / solid RAR），后台解压会话 + 滑窗预取
     Solid,
+    /// 非 solid 包（非 solid RAR / 全独立 folder 的 7z）：每文件独立压缩，
+    /// 随机访问只解点击项（单文件按需，不组窗）
+    SingleFile,
 }
 
 #[derive(Debug)]
