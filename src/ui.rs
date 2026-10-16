@@ -1200,7 +1200,8 @@ impl App {
         });
     }
 
-    /// 每帧轮询解压任务状态
+    /// 每帧轮询解压任务状态：循环排空通道内全部消息（Progress 是覆盖语义，
+    /// 排空中只留最新一条；FileDone/Done/Failed 逐条即时处理）
     fn poll_extract(&mut self) {
         loop {
             let Some(job) = &mut self.extract else { return };
@@ -1231,7 +1232,11 @@ impl App {
                         };
                         j.stage = stage;
                     }
-                    return; // 本帧处理完毕，下帧继续
+                    // 继续排空而非 return：Progress 若每帧只消费一条（10fps
+                    // ≈ 10条/秒），高速率落地时通道积压分钟级——线程退出后
+                    // 浮层仍转圈（用户误判会话活着，实际 alive 已 false）、
+                    // Done 延迟不达，且下一次点击 spawn 新会话换 rx 时积压
+                    // 连同 Done 被整个丢弃（"会话解净空闲退出"日志消失）
                 }
                 ExtMsg::FileDone(i) => {
                     // 批内条目落地：是当前期望目标则立即播放（预取的留在缓存里
