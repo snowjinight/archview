@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================
 rem  Release packaging script for archview
-rem  Usage:  package.bat
+rem  Usage:  package.bat [with-mpv^|no-mpv]   (default: with-mpv)
 rem  Optional env overrides (no hard-coded paths):
 rem    ARCHVIEW_MPV_DIR  - directory containing libmpv-2.dll (default: deps\mpv-dev)
 rem    ARCHVIEW_DIST     - output directory (default: dist)
@@ -10,6 +10,20 @@ setlocal
 
 if "%ARCHVIEW_MPV_DIR%"=="" set ARCHVIEW_MPV_DIR=deps\mpv-dev
 if "%ARCHVIEW_DIST%"=="" set ARCHVIEW_DIST=dist
+
+rem mpv.dll packaging switch: "no-mpv" builds a slim package (provide mpv beside the exe yourself, see README)
+set "ARCHVIEW_MPV=with-mpv"
+if not "%~1"=="" (
+    if /i "%~1"=="no-mpv" (
+        set "ARCHVIEW_MPV=no-mpv"
+    ) else if /i "%~1"=="with-mpv" (
+        set "ARCHVIEW_MPV=with-mpv"
+    ) else (
+        echo Unknown option: %~1
+        echo Usage: package.bat [with-mpv^|no-mpv]
+        exit /b 1
+    )
+)
 
 echo ==^> cargo build --release
 cargo build --release
@@ -25,10 +39,14 @@ rem SendTo shortcut setup script: runs from exe's own folder (auto-detects exe)
 copy /y sendto_setup.bat "%ARCHVIEW_DIST%\" >nul
 if errorlevel 1 goto :fail
 
-if exist "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" (
-    copy /y "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" "%ARCHVIEW_DIST%\" >nul
+if /i "%ARCHVIEW_MPV%"=="no-mpv" (
+    echo ==^> Skipping libmpv-2.dll ^(no-mpv^): package will not play video until mpv is provided beside the exe
 ) else (
-    echo WARNING: libmpv-2.dll not found in "%ARCHVIEW_MPV_DIR%" - package will not play video!
+    if exist "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" (
+        copy /y "%ARCHVIEW_MPV_DIR%\libmpv-2.dll" "%ARCHVIEW_DIST%\" >nul
+    ) else (
+        echo WARNING: libmpv-2.dll not found in "%ARCHVIEW_MPV_DIR%" - package will not play video!
+    )
 )
 
 rem copy config: config.toml preferred; legacy config.json also packed (auto-migrates on first run)

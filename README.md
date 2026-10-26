@@ -101,7 +101,8 @@ Archview 的视频播放基于 libmpv，**仓库不含该 dll**（约 120MB，�
 ### 打 release 包
 
 ```bat
-package.bat
+package.bat            rem 完整包（含 libmpv-2.dll，约 120 MB）
+package.bat no-mpv     rem 精简包（不含 mpv，自行下载放 exe 同目录，见下方依赖说明）
 ```
 
 产物：`dist\`（exe + libmpv-2.dll + config.toml）及 `dist.zip`。可用环境变量覆盖路径（不硬编码）：
