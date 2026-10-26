@@ -38,6 +38,19 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
     (ok != 0).then_some(avail)
 }
 
+/// 缓存目录当前占用字节数（只统计普通文件；目录不可达按 0）
+pub fn dir_usage(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// 计划写入 incoming_bytes 前，确保总量在上限内：超出则按 mtime 从旧到新删除
 pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {

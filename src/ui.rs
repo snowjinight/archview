@@ -6,6 +6,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
+use crate::vfs::dir_vfs::DirVFS;
 use crate::vfs::{
     archives_in_dir, next_archive_in_dir, open_with_password_probe, AccessMode, ArchiveVFS,
     SessionState, SharedSession, VfsError, VirtualEntry,
@@ -197,6 +198,13 @@ pub struct App {
     // 后台打开的当前进度：(fraction（None=不定进度）, 阶段文字)；任务结束即清
     open_progress: Option<(Option<f32>, String)>,
     next_gen: u64,
+    // 最后一次实际解压的锚点（重定向时与会话 focus 同步写入；会话退出后
+    // 保留）：「回到上次位置」的目标。不读会话 focus——会话死后点任何文件会
+    // 开新会话使 focus 跳变，而这里始终指向用户上次真实观看推进的位置
+    last_focus: Option<usize>,
+    // 解压完成待消费：锚点落地时用户正在回看（keep 改写了期望目标，自动
+    // 播放被吞）→ 置 true，顶栏显示"解压完成，点击观看"。播放到锚点即清
+    extract_ready: bool,
     // 文件列表虚拟化：当前标签页的行缓存（打开/搜索/切标签时重建，不再每帧重算）
     list_rows: Vec<ListRow>,
     // (视频, 图片) 计数（view 内，随 list_rows 一起重建）
@@ -248,6 +256,8 @@ impl App {
             open_job: None,
             open_progress: None,
             next_gen: 0,
+            last_focus: None,
+            extract_ready: false,
             list_rows: Vec::new(),
             list_counts: (0, 0),
             row_h: None,
@@ -288,6 +298,8 @@ impl App {
             open_job: None,
             open_progress: None,
             next_gen: 0,
+            last_focus: None,
+            extract_ready: false,
             list_rows: Vec::new(),
             list_counts: (0, 0),
             row_h: None,
@@ -355,7 +367,18 @@ impl App {
         self.open_path(path);
     }
 
-    /// 处理本帧拖入的文件（egui dropped_files）：取第一个 .zip 打开
+    /// 打开目录按钮：目录即媒体集合（递归收集图片/视频，跳过压缩包——
+    /// 与拖放/命令行参数同一条规则，ARCHITECTURE.md 4.2）。
+    /// 空集合提示在打开完成时统一给出（poll_open 的 Done 分支）
+    fn open_dir_dialog(&mut self) {
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.open_path(dir);
+    }
+
+    /// 处理本帧拖入的文件（egui dropped_files）：取第一个路径打开——
+    /// 压缩包开包、目录开媒体集合（同一条规则，见 spawn_open 目录分支）
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
@@ -406,18 +429,40 @@ impl App {
                 candidates.push(c.clone());
             }
         }
+        // 目录集合的媒体扩展名过滤集（视频+图片，配置驱动；压缩包等其它文件天然被排除）
+        let media_exts: Vec<String> = self
+            .cfg
+            .media
+            .video_extensions
+            .iter()
+            .chain(self.cfg.media.image_extensions.iter())
+            .cloned()
+            .collect();
         let spawned = std::thread::Builder::new()
             .name("open_archive".into())
             .spawn(move || {
-                // 阶段 1（crate 内部解析头/CD，无法细分）：不定进度
+                // 阶段 1（目录递归扫描 / crate 内部解析头/CD，无法细分）：不定进度
+                let stage = if path_t.is_dir() {
+                    "正在扫描目录"
+                } else {
+                    "正在读取压缩包目录"
+                };
                 let _ = tx.send(OpenMsg::Progress {
                     fraction: None,
-                    stage: "正在读取压缩包目录".into(),
+                    stage: stage.into(),
                 });
-                // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：
-                // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
-                // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
-                let msg = match open_with_password_probe(&path_t, &candidates) {
+                // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
+                // ARCHITECTURE.md 4.2）——无加密概念，不走密码探测链；文件模式照旧
+                let opened = if path_t.is_dir() {
+                    DirVFS::open(&path_t, &media_exts)
+                        .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
+                } else {
+                    // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：
+                    // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
+                    // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
+                    open_with_password_probe(&path_t, &candidates)
+                };
+                let msg = match opened {
                     Ok((vfs, locked)) => {
                         let arc: Arc<dyn ArchiveVFS> = vfs.into();
                         // 阶段 2（list，zip 的 CD 顺序遍历有真实百分比）
@@ -496,66 +541,10 @@ impl App {
                     entries,
                     pw,
                 } => {
-                    let path = job.path;
-                    // 切换压缩包：按配置清理上一个包的解压缓存（默认不清理——保留可命中）
-                    if self.cfg.cache.clean_on_switch {
-                        if let Some(old) = &self.archive {
-                            let freed = cache::clean_archive(&cache::cache_dir(&self.cfg), old.id);
-                            if freed > 0 {
-                                tracing::info!(
-                                    "切换压缩包，清理旧缓存 {:.1} MB",
-                                    freed as f64 / 1048576.0
-                                );
-                            }
-                        }
-                    }
-                    let stream = vfs.access_mode() == AccessMode::FastSeek;
-                    // 密码记忆：探测锁定密码的包记入会话表（切回来不用重探）
-                    if let Some(pw) = &pw {
-                        self.pw_memory.insert(path.clone(), pw.clone());
-                    }
-                    // 会话内"看过"标记（切包弹窗中灰色显示）
-                    self.seen_archives.insert(path.clone());
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.archive = Some(ArchiveState {
-                        id,
-                        name,
-                        path: path.clone(),
-                        password: pw.clone(),
-                        entries,
-                        view: Vec::new(),
-                        vfs,
-                        stream,
-                        // 全新会话：alive=false 起步，首次 play 组批后置 true
-                        // 并 spawn 解码线程（协议见 vfs::ArchiveVFS::extract_session）
-                        session: Arc::new(std::sync::Mutex::new(SessionState {
-                            targets: Default::default(),
-                            focus: None,
-                            alive: false,
-                            gen: 0,
-                        })),
-                    });
-                    self.rebuild_view();
-                    tracing::info!(
-                        "打开压缩包: {}（{} 项）",
-                        path.display(),
-                        self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0)
-                    );
-                    // 取消并清掉旧包的解压任务：不清会导致旧包 FileDone 到来时
-                    // load_extracted 把画面切回旧包条目（playing 下标错乱）
-                    if let Some(j) = &self.extract {
-                        tracing::info!("取消解压任务: {}（切换压缩包）", j.entry_name);
-                        j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    self.extract = None;
-                    self.playing = None;
-                    self.error = None;
-                    self.pw_prompt = None;
+                    let to_play =
+                        self.apply_open_done(job.path, job.retry_play, vfs, id, entries, pw);
                     // 密码重试场景：恢复播放提交密码时想看的条目
-                    if let Some((entry_idx, _)) = job.retry_play {
+                    if let Some(entry_idx) = to_play {
                         self.play(entry_idx, frame);
                     }
                 }
@@ -574,6 +563,87 @@ impl App {
             }
             return; // 终态处理完毕，本轮轮询结束
         }
+    }
+
+    /// 应用打开终态（Done）的状态迁移：建 ArchiveState、重建视图、清旧任务。
+    /// 返回需立即播放的条目下标（密码重试场景）——poll_open 在有 eframe::Frame
+    /// 的上下文里执行 play；独立成方法是因为单测造不出 Frame（见 dir_mode 测试）
+    fn apply_open_done(
+        &mut self,
+        path: PathBuf,
+        retry_play: Option<(usize, VirtualEntry)>,
+        vfs: Arc<dyn ArchiveVFS>,
+        id: u64,
+        entries: Vec<VirtualEntry>,
+        pw: Option<String>,
+    ) -> Option<usize> {
+        // 切换压缩包：按配置清理上一个包的解压缓存（默认不清理——保留可命中）
+        if self.cfg.cache.clean_on_switch {
+            if let Some(old) = &self.archive {
+                let freed = cache::clean_archive(&cache::cache_dir(&self.cfg), old.id);
+                if freed > 0 {
+                    tracing::info!("切换压缩包，清理旧缓存 {:.1} MB", freed as f64 / 1048576.0);
+                }
+            }
+        }
+        let stream = vfs.access_mode() == AccessMode::FastSeek;
+        // 密码记忆：探测锁定密码的包记入会话表（切回来不用重探）
+        if let Some(pw) = &pw {
+            self.pw_memory.insert(path.clone(), pw.clone());
+        }
+        // 会话内"看过"标记（切包弹窗中灰色显示）
+        self.seen_archives.insert(path.clone());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.archive = Some(ArchiveState {
+            id,
+            name,
+            path: path.clone(),
+            password: pw.clone(),
+            entries,
+            view: Vec::new(),
+            vfs,
+            stream,
+            // 全新会话：alive=false 起步，首次 play 组批后置 true
+            // 并 spawn 解码线程（协议见 vfs::ArchiveVFS::extract_session）
+            session: Arc::new(std::sync::Mutex::new(SessionState {
+                targets: Default::default(),
+                focus: None,
+                alive: false,
+                gen: 0,
+            })),
+        });
+        self.rebuild_view();
+        let what = if path.is_dir() {
+            "打开目录媒体集合"
+        } else {
+            "打开压缩包"
+        };
+        tracing::info!(
+            "{what}: {}（{} 项）",
+            path.display(),
+            self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0)
+        );
+        // 空集合提示（目录里没有媒体 / 压缩包内没有媒体文件）——
+        // 统一在此给出，各打开入口不必各自判断
+        if self.archive.as_ref().map_or(false, |a| a.view.is_empty()) {
+            self.notice = Some("没有可播放的视频/图片".into());
+        }
+        // 取消并清掉旧包的解压任务：不清会导致旧包 FileDone 到来时
+        // load_extracted 把画面切回旧包条目（playing 下标错乱）
+        if let Some(j) = &self.extract {
+            tracing::info!("取消解压任务: {}（切换压缩包）", j.entry_name);
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.extract = None;
+        self.playing = None;
+        self.last_focus = None; // 旧包的锚点下标对新包无意义
+        self.error = None;
+        self.pw_prompt = None;
+        // 密码重试场景：恢复播放提交密码时想看的条目（返回调用方执行）
+        retry_play.map(|(entry_idx, _)| entry_idx)
     }
 
     /// 重新计算过滤视图：搜索框子串匹配 + 只显示媒体文件（视频/图片按 config 分类），
@@ -853,19 +923,36 @@ impl App {
     }
 
     /// 磁盘余量预检（整批）：缓存目录所在盘放不下（留 64MB 余量）则返回
-    /// 错误消息。查不到余量（目录不可达等）返回 None，让解压错误自己暴露。
-    fn disk_short(dir: &Path, batch_len: usize, batch_bytes: u64) -> Option<String> {
+    /// 错误消息。计入 LRU 可换出量——写入本批后超出缓存上限的部分必被
+    /// evict_if_needed 驱逐（删除即释放磁盘），等效于凭空多出这部分余量；
+    /// 不算它会在"盘满但缓存满额可换出"时误报不足。查不到余量（目录
+    /// 不可达等）返回 None，让解压错误自己暴露。
+    fn disk_short(
+        dir: &Path,
+        batch_len: usize,
+        batch_bytes: u64,
+        quota_bytes: u64,
+    ) -> Option<String> {
         let free = cache::free_bytes(dir)?;
+        let evictable = Self::evictable_bytes(cache::dir_usage(dir), batch_bytes, quota_bytes);
+        let free = free.saturating_add(evictable);
         let need = batch_bytes.saturating_add(64 * 1024 * 1024);
         (free < need).then(|| {
             format!(
-                "缓存目录所在磁盘空间不足：剩余 {:.1}GB，本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.toml 的 cache.dir / extract.prefetch_downstream_mb）",
+                "缓存目录所在磁盘空间不足：剩余 {:.1}GB（含可 LRU 换出 {:.1}GB），本批 {} 个条目共需 {:.1}GB（缓存目录 [{}]，可清理缓存或修改 config.toml 的 cache.dir / extract.prefetch_downstream_mb）",
                 free as f64 / (1024.0 * 1024.0 * 1024.0),
+                evictable as f64 / (1024.0 * 1024.0 * 1024.0),
                 batch_len,
                 need as f64 / (1024.0 * 1024.0 * 1024.0),
                 dir.display()
             )
         })
+    }
+
+    /// 本批写入后必被 LRU 驱逐的字节数 = min(占用, 占用+本批-上限)。
+    /// 删除即释放磁盘，驱逐多少等效余量就多多少
+    fn evictable_bytes(usage: u64, batch_bytes: u64, quota_bytes: u64) -> u64 {
+        usage.min(usage.saturating_add(batch_bytes).saturating_sub(quota_bytes))
     }
 
     /// 当前解码会话快照：(锚点 focus, 窗口摘要)。摘要格式
@@ -1035,7 +1122,12 @@ impl App {
 
         // 磁盘余量预检（整批）：批外目标放不下直接报错，不发起到注定失败的
         // 解压；缓存命中降级——播放不受影响，沿用旧窗口不滑动
-        if let Some(msg) = Self::disk_short(&dir, targets.len(), batch_bytes) {
+        if let Some(msg) = Self::disk_short(
+            &dir,
+            targets.len(),
+            batch_bytes,
+            self.cfg.cache.max_size_mb * 1024 * 1024,
+        ) {
             if cached {
                 tracing::warn!(
                     "窗口滑动跳过（磁盘不足，播放不受影响）：{msg}｜锚点 focus={:?}，playing={:?}",
@@ -1073,6 +1165,14 @@ impl App {
                 st.targets.insert(n.clone(), (*i, d.clone()));
             }
             st.focus = Some(entry_idx);
+            // 「回到锚点」目标同步推进：仅目标未缓存（真正需要解压）时写。
+            // 缓存命中秒开只是回看/预取重定向，不算解压推进——否则会话
+            // 退出后翻看已缓存内容会把锚点污染掉，回不到真正的解压位置
+            if !cached {
+                self.last_focus = Some(entry_idx);
+                // 新解压开始：旧的"解压完成待消费"提醒作废
+                self.extract_ready = false;
+            }
             // 重定向代数 +1：解码线程每轮规划快照 gen，零落地时据此区分
             // "UI 换了目标"与"目标不在解码流中"（后者才报错，见 vfs/mod.rs）
             st.gen += 1;
@@ -1244,6 +1344,12 @@ impl App {
                     let mut play: Option<(PathBuf, usize)> = None;
                     if let Some(j) = &mut self.extract {
                         if let Some(d) = j.pending.remove(&i) {
+                            // 锚点落地但用户在看别处（回看中，keep 改写了期望
+                            // 目标，下面的自动播放被吞）：置"解压完成待消费"
+                            // 提醒——顶栏一键回锚点，避免解压成果闲置
+                            if Some(i) == self.last_focus && i != j.entry_idx {
+                                self.extract_ready = true;
+                            }
                             // 缓存命中路径已直接播放该条目时不重播
                             // （重播会让视频闪断、图片重置动画）
                             if i == j.entry_idx && self.playing != Some(i) {
@@ -1256,6 +1362,11 @@ impl App {
                     }
                 }
                 ExtMsg::Done => {
+                    // 回看提醒挂起（锚点落地被 keep 吞、待用户消费）时兜底
+                    // 补播必须让位：此刻强切 = 把用户从回看内容拽回锚点，
+                    // 还会经 load_extracted 清掉提醒——表现为"预取一完成
+                    // 画面被拽走、顶栏按钮消失"
+                    let reviewing = self.extract_ready;
                     self.extract = None;
                     // 会话空闲退出（targets 解空，线程已置 alive=false）。
                     // 显式留痕：此后 keep 分支（要求会话存活）失效，下一次
@@ -1268,7 +1379,7 @@ impl App {
                     );
                     // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 期望
                     // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播
-                    if gen == self.next_gen && self.playing != Some(entry_idx) {
+                    if !reviewing && gen == self.next_gen && self.playing != Some(entry_idx) {
                         if std::fs::metadata(&dest).is_ok() {
                             self.load_extracted(&dest, entry_idx);
                         }
@@ -1456,6 +1567,11 @@ impl App {
 
     /// 播放已解压到本地的文件
     fn load_extracted(&mut self, dest: &Path, entry_idx: usize) {
+        // 播放到锚点 = "解压完成待消费"提醒消费完毕（start_extract 缓存
+        // 命中不经 play()，提醒按钮/B 键/悬浮按钮/列表点击最终都汇到这里）
+        if self.last_focus == Some(entry_idx) {
+            self.extract_ready = false;
+        }
         if let Some(p) = &self.player {
             p.load_path(dest);
         }
@@ -1532,7 +1648,7 @@ impl App {
     }
 
     /// 空格=暂停/播放，←/→=±5s，Shift+←/→=±1s，↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
-    /// 回车=全屏切换，Esc=退出全屏
+    /// B=回到锚点，回车=全屏切换，Esc=退出全屏
     fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.player.is_none() {
             return;
@@ -1549,6 +1665,8 @@ impl App {
         // 回车=切换全屏；Esc=退出全屏（仅全屏时消费，避免抢其它控件的 Esc）
         let mut fs_toggle = false;
         let mut fs_exit = false;
+        // B=回到锚点（最后一次实际解压位置，见 App.last_focus）
+        let mut go_focus = false;
         // 从事件流里直接消费按键（过滤按住重复触发）：
         // 移除后同帧内其它控件（如聚焦的按钮）不会再响应，避免双重触发
         ctx.input_mut(|i| {
@@ -1606,6 +1724,10 @@ impl App {
                         step_entry = 1;
                         false
                     }
+                    egui::Key::B if m.is_none() => {
+                        go_focus = true;
+                        false
+                    }
                     egui::Key::Enter if m.is_none() => {
                         fs_toggle = true;
                         false
@@ -1641,6 +1763,14 @@ impl App {
         }
         if step_entry != 0 {
             self.play_adjacent(frame, step_entry, step_entry > 0);
+        }
+        // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
+        if go_focus {
+            if let Some(f) = self.last_focus {
+                if self.playing != Some(f) {
+                    self.play(f, frame);
+                }
+            }
         }
         if fs_toggle {
             self.set_fullscreen(!self.fullscreen, frame);
@@ -1700,18 +1830,24 @@ impl App {
                 // 已在最后一项再往后翻：弹窗选择打开同目录下一个压缩包
                 // （仅用户显式操作触发；图片自动翻页传 false，防每帧重复弹窗）
                 if ask_next && self.cfg.ui.ask_next_archive && self.next_archive_prompt.is_none() {
-                    let list = archives_in_dir(&a.path);
-                    if list.len() < 2 {
-                        self.notice = Some("此目录没有其它压缩包".into());
+                    if a.path.is_dir() {
+                        // 目录媒体集合模式（ARCHITECTURE.md 4.2）：路径本身是目录，
+                        // 没有"同目录下一个压缩包"概念
+                        self.notice = Some("目录集合模式：没有下一个压缩包".into());
                     } else {
-                        // 默认选中循环意义上的下一个（末包绕回第一个）
-                        let sel = next_archive_in_dir(&a.path)
-                            .and_then(|p| list.iter().position(|q| *q == p))
-                            .unwrap_or(0);
-                        self.next_archive_prompt = Some(NextArchivePrompt {
-                            archives: list,
-                            sel,
-                        });
+                        let list = archives_in_dir(&a.path);
+                        if list.len() < 2 {
+                            self.notice = Some("此目录没有其它压缩包".into());
+                        } else {
+                            // 默认选中循环意义上的下一个（末包绕回第一个）
+                            let sel = next_archive_in_dir(&a.path)
+                                .and_then(|p| list.iter().position(|q| *q == p))
+                                .unwrap_or(0);
+                            self.next_archive_prompt = Some(NextArchivePrompt {
+                                archives: list,
+                                sel,
+                            });
+                        }
                     }
                 }
                 return;
@@ -1741,19 +1877,50 @@ impl App {
 
     // ---- 各面板 ----
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         ui.horizontal(|ui| {
-            if ui.button("Open Archive…").clicked() {
+            // ---- 「文件」菜单：打开压缩包 / 打开压缩包目录 ----
+            // rfd 对话框阻塞 UI 线程，动作在菜单闭包外执行（闭包内只置标志）；
+            // 菜单是 egui 弹层，打开期间隐藏 mpv 子窗口（与帮助面板同机制）
+            let mut open_file = false;
+            let mut open_dir = false;
+            let file_menu = ui.menu_button("文件", |ui| {
+                if ui.button("打开压缩包…").clicked() {
+                    open_file = true;
+                    ui.close();
+                }
+                if ui.button("打开压缩包目录…").clicked() {
+                    open_dir = true;
+                    ui.close();
+                }
+            });
+            if file_menu.inner.is_some() {
+                self.overlay_open = true;
+            }
+            if open_file {
                 self.open_dialog();
             }
-            let arch_name = self
-                .archive
-                .as_ref()
-                .map(|a| format!("{} ({} media items)", a.name, a.view.len()))
-                .unwrap_or_else(|| "No archive".into());
-            ui.label(arch_name);
-            // 打开缓存目录（系统文件管理器；缓存目录本身不存在则先创建）
-            if ui.button("缓存目录").clicked() {
+            if open_dir {
+                self.open_dir_dialog();
+            }
+            // ---- 「缓存」菜单：打开缓存目录 / 清理缓存 ----
+            let mut open_cache = false;
+            let mut clean_cache = false;
+            let cache_menu = ui.menu_button("缓存", |ui| {
+                if ui.button("打开缓存目录").clicked() {
+                    open_cache = true;
+                    ui.close();
+                }
+                if ui.button("清理缓存").clicked() {
+                    clean_cache = true;
+                    ui.close();
+                }
+            });
+            if cache_menu.inner.is_some() {
+                self.overlay_open = true;
+            }
+            if open_cache {
+                // 打开缓存目录（系统文件管理器；缓存目录本身不存在则先创建）
                 let dir = cache::cache_dir(&self.cfg);
                 let _ = std::fs::create_dir_all(&dir);
                 // explorer 打开目录不占用等待（spawn 后立刻返回）
@@ -1761,7 +1928,7 @@ impl App {
                     self.notice = Some(format!("打开缓存目录失败: {e}"));
                 }
             }
-            if ui.button("清理缓存").clicked() {
+            if clean_cache {
                 let freed = cache::clean_all(&cache::cache_dir(&self.cfg));
                 self.notice = Some(format!("已清理缓存 {:.1} MB", freed as f64 / 1048576.0));
                 tracing::info!("手动清理缓存: {:.1} MB", freed as f64 / 1048576.0);
@@ -1780,6 +1947,7 @@ impl App {
                         ("↑ / ↓", "音量 ±5"),
                         ("M", "静音切换"),
                         ("PgUp / PgDn", "上一个 / 下一个"),
+                        ("B", "回到锚点（最后一次解压位置）"),
                         ("鼠标滚轮（视频区）", "上一个 / 下一个"),
                         ("回车 / 双击画面", "全屏切换"),
                         ("Esc", "退出全屏"),
@@ -1824,10 +1992,38 @@ impl App {
                     format!("后台解压中…（剩余 {left} 项）"),
                 );
             }
+            // 锚点落地即可点（无需等整批解完）：秒开锚点，预取批继续后台跑
+            if self.extract_ready {
+                if let Some(f) = self.last_focus {
+                    if self.playing != Some(f) {
+                        let name = self
+                            .archive
+                            .as_ref()
+                            .map(|a| a.entries[f].name.clone())
+                            .unwrap_or_default();
+                        let btn = ui.button(format!("解压完成：{name}｜点击观看"));
+                        if btn.clicked() {
+                            self.play(f, frame);
+                        }
+                        btn.on_hover_text("点击观看刚解压完成的文件（快捷键 B）");
+                    }
+                }
+            }
         });
     }
 
     fn file_list(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // 压缩包名（仅文件名，无路径；完整路径悬停显示）
+        if let Some(a) = &self.archive {
+            ui.add(
+                egui::Label::new(egui::RichText::new(&a.name).strong())
+                    .truncate()
+                    .selectable(false),
+            )
+            .on_hover_text(a.path.display().to_string());
+        } else {
+            ui.weak("未打开压缩包");
+        }
         ui.horizontal(|ui| {
             ui.label("Search:");
             let resp = egui::TextEdit::singleline(&mut self.search)
@@ -1880,8 +2076,9 @@ impl App {
         // ---- 虚拟化列表：只布局可见行（万级条目从每帧 O(n) 降到 O(可见行数)）----
         let mut action: Option<usize> = None;
         let mut scrolled = false;
-        // 高亮跟踪：playing 变化（快捷键/箭头切换）时滚动到该行（居中）。
-        // 虚拟化下行可能不在渲染范围内，用行号×行高换算矩形再 scroll_to_rect
+        // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
+        // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
+        // 换算矩形再 scroll_to_rect
         let scroll_pending = self.scrolled_to != self.playing;
         let target_row = scroll_pending
             .then(|| {
@@ -1898,7 +2095,7 @@ impl App {
         let has_archive = self.archive.is_some();
         let item_spacing_y = ui.spacing().item_spacing.y;
         // auto_shrink=false：滚动区域宽度固定占满面板，滚动条钉在右边界（不随文件名长度缩进）
-        egui::ScrollArea::vertical()
+        let sa = egui::ScrollArea::vertical()
             .auto_shrink(egui::Vec2b::new(false, false))
             .show_viewport(ui, |ui, viewport| {
                 let total = rows.len();
@@ -1972,6 +2169,46 @@ impl App {
             });
         if scrolled {
             self.scrolled_to = self.playing;
+        }
+        // 回到上次位置：盖在列表底部中央的悬浮按钮（约两行高、半透明、不占满
+        // 整行——按钮四周的列表项仍可点击）。目标 = last_focus（最后一次
+        // 实际解压的锚点，会话退出后保留）；正播在该位置时隐藏。快捷键 B
+        if let Some(f) = self.last_focus {
+            if self.playing != Some(f) {
+                let entry_name = self
+                    .archive
+                    .as_ref()
+                    .map(|a| a.entries[f].name.clone())
+                    .unwrap_or_default();
+                let area = sa.inner_rect;
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(area.left(), area.bottom() - 48.0),
+                    egui::pos2(area.right(), area.bottom() - 4.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
+                    // 半透明底色：叠在列表上仍能透出底下内容
+                    let bg = ui.visuals().window_fill;
+                    let fill =
+                        egui::Color32::from_rgba_premultiplied(bg.r(), bg.g(), bg.b(), 190);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("回到锚点")
+                                    .fill(fill)
+                                    .corner_radius(6)
+                                    .min_size(egui::vec2(0.0, 40.0)),
+                            )
+                            .on_hover_text(format!(
+                                "回到解压锚点：{entry_name}（快捷键 B）。已落地则秒开，\
+                                 未落地则跳回等待、落地自动播放"
+                            ))
+                            .clicked()
+                        {
+                            self.play(f, frame);
+                        }
+                    });
+                });
+            }
         }
         // 行高自校正：与估计值偏差超阈值时更新（DPI/主题变化后首帧即可收敛）
         if let Some(h) = measured {
@@ -2385,7 +2622,7 @@ impl eframe::App for App {
             self.sync_child_visibility();
             return;
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, frame));
         egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui, frame));
         // 文件列表放左侧（视频区在右）；悬停行的完整文件名显示在
         // 面板底部状态行（方案 A），不用 hover 气泡——气泡会被右侧 mpv
@@ -2437,7 +2674,159 @@ impl Drop for App {
 
 #[cfg(test)]
 mod tests {
+    use super::App;
     use egui::Widget as _;
+
+    /// 磁盘预检的 LRU 换出量计算：缓存未满不换出；超限部分换出但
+    /// 不超过缓存本身占用（盘上就这么多可删）
+    #[test]
+    fn disk_evictable_accounting() {
+        const G: u64 = 1 << 30;
+        // 缓存远未满（1GB/8GB）：无换出，预检退化为纯磁盘剩余判定
+        assert_eq!(App::evictable_bytes(G, G, 8 * G), 0);
+        // 缓存满额（8GB/8GB）：本批 2GB 把超限 2GB 全部换出腾盘
+        assert_eq!(App::evictable_bytes(8 * G, 2 * G, 8 * G), 2 * G);
+        // 本批大于整个配额：换出量被缓存占用封顶
+        assert_eq!(App::evictable_bytes(G, 8 * G, 8 * G), G);
+    }
+
+    /// Done 兜底补播与"回看提醒"的让位关系。回归：锚点落地落在 keep
+    /// 生效期（用户回看中）时置顶栏提醒，预取完成（Done）的瞬间兜底
+    /// 把画面从回看内容拽回锚点、还经 load_extracted 清掉提醒——表现
+    /// 为"预取一完成按钮直接消失"。钉死两条规则：
+    /// - 提醒挂起（extract_ready）时 Done 一律不兜底、不清提醒
+    /// - 无提醒挂起时兜底照常补救（文件在而没播过 → 补播）
+    #[test]
+    fn done_fallback_yields_to_extract_ready() {
+        let dir = std::env::temp_dir().join(format!("ui_done_fb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("anchor.jpg");
+        std::fs::write(&dest, b"x").unwrap(); // 锚点已落地
+
+        // 手造任务+通道：entry_idx=2 是 keep 改写后的期望目标（回看锚点
+        // 场景下 ≠ 实际在播的 0）；无需 archive——session_snapshot 对
+        // None 安全返回"无会话"，player 为 None 时 load_extracted 只记账
+        let mk_job = |rx: std::sync::mpsc::Receiver<super::ExtMsg>| super::ExtractJob {
+            gen: 1,
+            entry_idx: 2,
+            dest: dest.clone(),
+            entry_name: "anchor.jpg".into(),
+            total: 0,
+            done: 0,
+            stage: String::new(),
+            pending: std::collections::HashMap::new(),
+            batch_len: 1,
+            started: std::time::Instant::now(),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        };
+        let mut cfg = crate::config::Config::default();
+        cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+
+        // 正面：提醒挂起时 Done 让位——不抢画面、不清提醒、任务正常收尾
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(super::ExtMsg::Done).unwrap();
+        let mut app = App::new_for_test(cfg.clone());
+        app.last_focus = Some(2);
+        app.extract_ready = true;
+        app.playing = Some(0);
+        app.next_gen = 1;
+        app.extract = Some(mk_job(rx));
+        app.poll_extract();
+        assert_eq!(app.playing, Some(0), "提醒挂起时 Done 兜底不得抢画面");
+        assert!(app.extract_ready, "提醒应保留待用户消费");
+        assert!(app.extract.is_none(), "任务本身应正常收尾");
+
+        // 反面：无提醒挂起时兜底照常补救——把画面切到已落地锚点
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(super::ExtMsg::Done).unwrap();
+        let mut app = App::new_for_test(cfg);
+        app.last_focus = Some(2);
+        app.extract_ready = false;
+        app.playing = Some(0);
+        app.next_gen = 1;
+        app.extract = Some(mk_job(rx));
+        app.poll_extract();
+        assert_eq!(app.playing, Some(2), "无提醒时兜底应补播已落地锚点");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录 = 媒体集合模式（ARCHITECTURE.md 4.2）的打开链路回归：
+    /// 1) spawn_open 目录分支走真实后台线程（DirVFS::open → stream_cb 注册），
+    ///    Done 消息携带全部媒体条目、VFS 为 FastSeek、无密码概念
+    /// 2) apply_open_done 状态迁移：stream=true（流式快路径）、视图重建
+    /// 3) 空目录：打开成功但视图为空 → 统一提示"没有可播放的视频/图片"
+    #[test]
+    fn dir_mode_open_pipeline() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("ui_dir_mode_{}_{}", std::process::id(), uniq));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("子目录");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("b.mp4"), b"v").unwrap();
+        std::fs::write(sub.join("a.jpg"), b"i").unwrap();
+        std::fs::write(root.join("skip.zip"), b"z").unwrap(); // 压缩包跳过
+        std::fs::write(root.join("skip.txt"), b"t").unwrap(); // 非媒体跳过
+
+        let mut cfg = crate::config::Config::default();
+        cfg.cache.dir = root.join("cache").to_string_lossy().into_owned();
+        let mut app = App::new_for_test(cfg);
+
+        // 1) 真实 spawn_open 线程：目录 → DirVFS → Done（Progress 消息越过）
+        app.open_path(root.clone());
+        let super::OpenJob { rx, .. } = app.open_job.take().expect("open_job 应已建立");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (vfs, entries, id, pw) = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(super::OpenMsg::Progress { .. }) => continue,
+                Ok(super::OpenMsg::Done {
+                    vfs,
+                    id,
+                    entries,
+                    pw,
+                }) => break (vfs, entries, id, pw),
+                Ok(super::OpenMsg::NeedPw { .. }) => panic!("目录打开不应要求密码"),
+                Ok(super::OpenMsg::Failed(e)) => panic!("目录打开失败: {e}"),
+                Err(e) => panic!("打开线程消息异常: {e}"),
+            }
+        };
+        assert_eq!(pw, None, "目录集合无密码概念");
+        assert_eq!(vfs.access_mode(), super::AccessMode::FastSeek);
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["b.mp4", "子目录/a.jpg"],
+            "递归收集媒体（含子目录）且跳过压缩包/非媒体"
+        );
+
+        // 2) 状态迁移：stream=true（FastSeek → 流式快路径）、视图含全部媒体
+        assert_eq!(
+            app.apply_open_done(root.clone(), None, vfs, id, entries, None),
+            None
+        );
+        let a = app.archive.as_ref().unwrap();
+        assert!(a.stream, "目录集合应走流式快路径");
+        assert_eq!(a.path, root);
+        assert_eq!(a.view.len(), 2, "视图应含 2 个媒体条目");
+        assert!(app.notice.is_none(), "非空目录不应有提示");
+
+        // 3) 空目录：DirVFS 打开成功但零条目 → 统一提示
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
+            super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()]).unwrap(),
+        );
+        let entries2 = vfs2.list();
+        app.apply_open_done(empty, None, vfs2, 7, entries2, None);
+        assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 自然序排序管线（rebuild_view 同款：小写键 + alphanumeric_sort::compare_str）。
     /// 钉死语义：数字段按数值（1/2/10 而非字典序 1/10/2）、大小写不敏感、
@@ -2984,21 +3373,103 @@ mod tests {
         // keep 后 j.entry_idx 停在 0 且 playing==Some(0)：FileDone 不切画面、
         // Done 兜底补播（playing != Some(entry_idx)）也不触发——keep 的安全性
         assert_eq!(app.playing, Some(0), "解净后画面应停在回看项 p00");
-
-        // ---- 步骤 6：跳到从未进过窗口的 5（会话已退出 → 重 spawn）----
-        app.start_extract(5);
-        let j = app.extract.as_ref().expect("空闲后跳转应重新 spawn 任务");
+        // 锚点 2 落地时用户在回看（自动播放被吞）→ 应置"解压完成待消费"提醒
         assert!(
-            !Arc::ptr_eq(&j.cancel, &cancel1),
-            "会话空闲退出后的跳转应重新起线程（新 cancel）"
+            app.extract_ready,
+            "回看中锚点落地应置解压完成提醒（顶栏提醒的依据）"
         );
-        assert_eq!(j.entry_idx, 5);
-        assert_eq!(window(&app), vec![5], "末条目窗口仅剩自身");
-        wait_playing(&mut app, 5, "p05 末条目播放");
+
+        // ---- 步骤 5b：会话退出后按 last_focus 跳回锚点（"回到锚点"的
+        // 可测等价路径）----
+        // 空闲退出只清 targets/alive，focus 与 last_focus 保留——用户回看
+        // 缓存后一键跳回解压推进点（2）。锚点已落地 → 立即播放；下游 5
+        // 尚未落地 → 重算预取窗口 [5] 并重 spawn 会话顺带补齐（秒开锚点
+        // + 预取两不误）
+        assert_eq!(app.last_focus, Some(2), "会话退出后 last_focus 应保留（回到锚点的依据）");
+        assert_eq!(
+            app.archive.as_ref().unwrap().session.lock().unwrap().focus,
+            Some(2),
+            "会话空闲退出后 focus 锚点应保留"
+        );
+        app.start_extract(2);
+        let cancel2 = app
+            .extract
+            .as_ref()
+            .expect("5b 应重 spawn 预取任务")
+            .cancel
+            .clone();
+        assert!(
+            !Arc::ptr_eq(&cancel2, &cancel1),
+            "会话空闲退出后回锚点应重起线程（新 cancel）"
+        );
+        assert_eq!(app.playing, Some(2), "锚点已落地应立即播放");
+        assert!(!app.extract_ready, "跳回锚点播放后提醒应清除");
+        assert_eq!(window(&app), vec![5], "锚点下游未落地项应进预取窗口");
+        assert_eq!(app.next_gen, 4, "重 spawn 会话自增 gen");
+        {
+            let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+            assert_eq!(st.focus, Some(2), "回到锚点不改锚点");
+            assert!(st.alive, "预取会话应重新拉起");
+        }
+        assert_eq!(app.last_focus, Some(2), "回到锚点后 last_focus 保持");
+        // 等预取会话（补解 5）收尾，还原"会话已退出"前提给步骤 6
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while app.extract.is_some() {
+        loop {
             app.poll_extract();
-            assert!(std::time::Instant::now() <= deadline, "等待末任务收尾超时");
+            let drained = {
+                let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+                app.extract.is_none() && !st.alive && st.targets.is_empty()
+            };
+            if drained {
+                break;
+            }
+            assert!(std::time::Instant::now() <= deadline, "等待预取会话收尾超时");
+            if let Some(e) = &app.error {
+                panic!("预取收尾阶段出错: {e}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 预取会话补解的 5 应已落地（内容在终态统一比对）；playing 停在
+        // 锚点 2（FileDone 的 i=5 ≠ j.entry_idx=2，不切画面——正确）
+        let dest5 = crate::cache::dest_path(&dir.join("cache"), 7, 5, &srcs[5].0);
+        assert_eq!(
+            std::fs::metadata(&dest5).unwrap().len(),
+            srcs[5].1.len() as u64,
+            "预取会话应把下游 5 解压落地"
+        );
+        assert_eq!(app.playing, Some(2), "预取完成画面应停在锚点");
+
+        // ---- 步骤 5c：死后翻看已缓存项（"缓存命中预取会话启动"分支）——
+        // 锚点不被污染 ----
+        // 删掉 5 的落地文件模拟"未落地的下游"，再点已缓存的 3：目标秒开 +
+        // 预取重定向补解 5。缓存命中不算解压推进 → last_focus 保持 2，
+        // "回到锚点"仍指向真正的解压位置
+        std::fs::remove_file(&dest5).unwrap();
+        app.start_extract(3);
+        assert_eq!(app.playing, Some(3), "已缓存目标应立即播放");
+        assert_eq!(window(&app), vec![5], "缺失的下游 5 应进预取窗口");
+        assert_eq!(app.next_gen, 5, "预取重定向自增 gen");
+        assert_eq!(
+            app.last_focus,
+            Some(2),
+            "缓存命中不应推进 last_focus（回看不污染锚点）"
+        );
+        assert!(!app.extract_ready, "缓存命中不应置位提醒");
+        // 等预取会话（补解 5）收尾，还原全落地前提给步骤 7
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            app.poll_extract();
+            let drained = {
+                let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+                app.extract.is_none() && !st.alive && st.targets.is_empty()
+            };
+            if drained {
+                break;
+            }
+            assert!(std::time::Instant::now() <= deadline, "5c 预取收尾超时");
+            if let Some(e) = &app.error {
+                panic!("5c 预取收尾阶段出错: {e}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
 

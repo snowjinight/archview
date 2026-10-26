@@ -1,6 +1,7 @@
 //! VFS 层：统一压缩包读取接口。
 //! Phase 1 只实现 ZipVFS；7z/RAR 是后续 Phase，接口不变。
 
+pub mod dir_vfs;
 pub mod rar_vfs;
 pub mod sevenz_vfs;
 pub mod zip_vfs;
@@ -448,13 +449,10 @@ pub(crate) fn split_rar_family(name: &str) -> Option<String> {
     Some(prefix.to_string())
 }
 
-/// 同目录所有压缩包（zip/7z/rar，与 open_archive 支持集一致），按文件名升序。
+/// 目录内所有压缩包（zip/7z/rar，与 open_archive 支持集一致），按文件名升序。
 /// 分卷 RAR（`X.partN.rar`）每族只保留排序最前的一卷（通常为 part1）作为可打开条目，
 /// 避免列表里出现同一包的多卷。目录不可读返回空。
-pub fn archives_in_dir(cur: &Path) -> Vec<PathBuf> {
-    let Some(dir) = cur.parent() else {
-        return Vec::new();
-    };
+pub fn archives_in(dir: &Path) -> Vec<PathBuf> {
     let mut items: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -485,6 +483,14 @@ pub fn archives_in_dir(cur: &Path) -> Vec<PathBuf> {
         })
         .map(|(_, p)| p)
         .collect()
+}
+
+/// 同目录所有压缩包（当前包的父目录），按文件名升序（见 [`archives_in`]）。
+pub fn archives_in_dir(cur: &Path) -> Vec<PathBuf> {
+    let Some(dir) = cur.parent() else {
+        return Vec::new();
+    };
+    archives_in(dir)
 }
 
 /// 同目录中按文件名排序的下一个压缩包，已是最后一个时循环回第一个

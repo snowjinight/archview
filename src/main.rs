@@ -61,8 +61,9 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// GUI 启动参数解析：第一个存在的 zip/7z/rar 文件；目录则取其中首个压缩包
-/// （与 GUI「目录内连续看包」衔接，其余包按 N 键可达）。
+/// GUI 启动参数解析：压缩包文件直接打开；目录即媒体集合（递归收集图片/视频，
+/// 跳过压缩包——与拖放/打开目录对话框同一条规则，ARCHITECTURE.md 4.2）。
+/// 混合多选（目录+压缩包同时"发送到"）按参数顺序取第一个有效项，其余忽略。
 /// 非路径/非压缩包参数忽略——保持无参数启动行为完全不变
 fn initial_archive(args: &[String]) -> Option<std::path::PathBuf> {
     let is_archive = |p: &std::path::Path| {
@@ -73,22 +74,8 @@ fn initial_archive(args: &[String]) -> Option<std::path::PathBuf> {
     };
     for a in args {
         let p = std::path::Path::new(a);
-        if p.is_file() && is_archive(p) {
+        if (p.is_file() && is_archive(p)) || p.is_dir() {
             return Some(p.to_path_buf());
-        }
-        if p.is_dir() {
-            // read_dir 顺序不保证，按名排序取首个，行为可预期
-            let mut found: Vec<_> = std::fs::read_dir(p)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|path| path.is_file() && is_archive(path))
-                .collect();
-            found.sort();
-            if let Some(first) = found.first() {
-                return Some(first.clone());
-            }
         }
     }
     None
