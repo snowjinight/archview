@@ -36,7 +36,7 @@
 | 压缩包格式 | ZIP、7Z、RAR（含 RAR4/RAR5、分卷） |
 | 媒体类型 | 视频（播放）、图片（预览），文件分散在压缩包任意子目录 |
 | 播放能力 | 内嵌播放、拖动进度条 seek、暂停/音量等常规控制 |
-| 图片预览 | 缩放/平移/适应窗口、上一张/下一张、动图(GIF/WebP) |
+| 图片预览 | 缩放/平移/适应窗口、上一张/下一张、动图(GIF；webp 全按静图) |
 | 加密包 | 支持密码输入（不落盘） |
 | 配置 | 所有可变项集中在单一 JSON 配置文件，与代码解耦 |
 
@@ -53,7 +53,7 @@
 | 7Z 读取 | `sevenz-rust` | 纯 Rust；`BlockDecoder` 支持固态 folder 直达解压（见 11.1） |
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
 | 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 20 符号：核心 + stream_cb + render API）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
-| 图片渲染 | —— | 无独立解码库：图片（含 GIF/WebP 动图）与视频统一经 mpv `loadfile` 解码渲染，VFS/缓存/翻页链路完全复用；render API 落地后图片可进一步走 egui 纹理直显（见 6.4/13） |
+| 图片渲染 | `image` crate | 静态图（含全部 webp）与 GIF 动图走 egui 纹理直显（13.4）：全帧预解码/降采样/小图上采样/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
 | GL 后端 | `eframe` (glow) | 渲染器显式指定 glow（0.34 起 eframe 默认 wgpu，glow 才能拿到 `GL` 上下文喂给 mpv render API） |
 | 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
@@ -94,9 +94,9 @@
 ┌─────────────────────────────────────────────────────┐
 │  UI 层 (egui)                                       │
 │  左侧：文件列表（视频/图片标签页）+ 搜索            │
-│  右侧：媒体区 —— mpv render API 纹理渲染（单平面） │
-│         （视频与图片/动图同一条 loadfile 链路；    │
-│           PaintCallback 内 blit 到 egui 画布）      │
+│  右侧：媒体区 —— 视频 mpv render API / 图片 egui 纹理 │
+│         （图片含动图走纹理直显 13.4，mpv 只管视频； │
+│           视频 PaintCallback 内 blit 到 egui 画布）  │
 │  顶栏：打开/缓存管理；状态行：文件名/进度           │
 └──────────────────┬──────────────────────────────────┘
                    │ 命令/事件
@@ -242,10 +242,9 @@ GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开�
 
 ### 6.1 定位与实现决策
 
-与视频播放并列的 VFS 消费者。**图片不经独立解码库，统一走 mpv 解码渲染**
-（早期设计稿的 image crate + egui 纹理方案已放弃）：mpv 原生支持 JPEG/PNG/GIF/WebP/BMP
-等常见格式（含 GIF/WebP 动图逐帧播放），复用 loadfile 一条链路后，VFS 快慢路径、
-缓存、翻页导航、全屏、解压进度覆盖层全部零成本复用。
+与视频播放并列的 VFS 消费者。早期与视频统一走 mpv loadfile（一条链路零成本复用
+VFS/缓存/翻页）；**现已迁移至 image crate 解码 + egui 纹理直显**（13.4：翻页零延迟、
+缩放平移、动图逐帧播放、预取对动图生效），mpv 降级为解码失败时的回退路径。
 
 渲染层面：早期 mpv 以原生子窗口（wid 嵌入）盖在 egui 之上，形成双平面，引发一系列
 窗口叠放绕路（见 11.3 历史、13 迁移动机）；**现迁至 mpv render API 后整个窗口只有
@@ -255,8 +254,9 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 ### 6.2 数据流
 
 ```
-选中图片 → 与视频完全同路：ZipVFS 流式（zvf://）或固态包后台解压 → 缓存文件
-        → mpv loadfile 统一渲染（静态图 / GIF/WebP 动图）
+选中图片 → ZipVFS 流式（zvf://）或固态包后台解压 → 缓存文件
+        → image crate 解码 → egui 纹理直显（静态图含全部 webp / GIF 动图逐帧，13.4）
+        → 解码失败自动回退 mpv loadfile（旧链路保留为兜底；回退过的条目直接走 mpv）
         → PPT 式自动翻页（ui.slideshow_secs 间隔，空格/播放按钮开关）
 ```
 
@@ -265,7 +265,7 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 | 功能 | 说明 |
 |---|---|
 | 翻页 | PgUp/PgDn 切换上/下一个；滚轮仅在**视频区**悬停时切换（`ui.wheel_switch_secs` 节流）——文件列表区滚轮是正常滚动列表，不切换 |
-| 动图 | GIF / WebP 动画由 mpv 逐帧渲染 |
+| 动图 | GIF 动画逐帧预解码 + egui 定时切帧（13.4 第 4 步）；webp 全按静图取首帧（动画 webp 罕见，且静态 webp 无 ANMF 块 `num_frames()==0`，逐帧路线解出空集误报失败，实测踩坑） |
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
 
@@ -278,7 +278,7 @@ render API 迁移完成后，解锁"图片不走 mpv、直接解码进 egui 纹�
 | 零延迟首帧 | image/zune-image 解码 → `ColorImage` → egui 纹理直显 | 消除 mpv loadfile 初始化 50~200ms（建 demuxer/GL 管线），翻页即显 |
 | 缩放/平移 | 纹理 UV 变换（滚轮缩放锚定光标、拖拽平移），纯 egui 交互 | mpv `video-zoom/pan` 参数链路不再需要，交互跟手 |
 | 解码器覆盖 | PSD/HEIC/AVIF 等专用格式接解码库走同纹理路径 | mpv 不支持的格式不再缺位 |
-| 动图 | GIF/WebP 逐帧解码 → 定时更新纹理 | 与视频共用 PaintCallback rect，暂停/单帧步进自然实现 |
+| 动图 | GIF 逐帧解码 → 定时更新纹理 | 与视频共用 PaintCallback rect，暂停/单帧步进自然实现 |
 
 图片纹理路径与 mpv 路径并存（按格式/体积路由），VFS 层零改动——两者只是同一
 VirtualFile 流的不同消费者。
@@ -331,7 +331,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | 追加 | VarTidy CLI 子命令（第 12 章）：var 资源包增量整理 | `archview.exe tidy` + 「发送到」 | ✅ |
 | 追加 | 解压会话化（11.4）：extract_session 持久解码会话，跳转零取消 | 固态包随机跳看重定向不重起 | ✅ |
 | 追加 | 渲染架构迁移（13）：wid 原生子窗口 → mpv render API + glow 后端 + PaintCallback blit，删除全部窗口叠放绕路代码 | egui 单平面，视频画面缩放质量随窗口实时重采样 | ✅ |
-| 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + PSD/HEIC 扩展 | 纹理路径与 mpv 路径并存互兜底 | 🔶 方案已定，待启动 |
+| 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + 动图逐帧 | 纹理路径与 mpv 路径并存互兜底；mpv 收缩为纯视频 | 🔶 1-4 步已落地，5（PSD/HEIC/AVIF）按需 |
 
 ---
 
@@ -922,10 +922,10 @@ egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
 > 迁移过程中的三颗实际踩过的雷（FFI 盲区崩溃 / blit READ 绑定套娃虚影 /
 > smooth_scroll_delta 惯性尾巴）见 13.5 踩坑记录。
 
-### 13.4 下一步计划：图片专属纹理浏览器（方案）
+### 13.4 图片专属纹理浏览器（第 1-4 步 ✅ 已落地；5 按需）
 
 render API 迁移已完成（13.3），GL 上下文与 PaintCallback 机制就绪，本节从"预留
-扩展"（6.4）升级为下一步实施计划。能力收益对照见 6.4 表格；这里是落地方案。
+扩展"（6.4）升级为实施计划。能力收益对照见 6.4 表格；这里是落地方案与实况。
 
 **动机**：图片目前与视频同走 mpv loadfile，首帧带 50~200ms 的 demuxer/GL 管线
 初始化（翻页体感顿挫）；且 mpv 不支持的格式（PSD/HEIC/AVIF）永久缺位。图片
@@ -940,27 +940,66 @@ VirtualFile 流（复用 VFS 快慢路径 + 缓存）
   → egui ColorImage → TextureHandle 直显
 ```
 
-**路由**：play() 按扩展名分流——视频/动图仍走 mpv；静态图走纹理路径。纹理路径
-解码失败（格式不支持/数据损坏）**自动落回 mpv loadfile**，两条路径互为兜底；
-config 加 `ui.image_texture` 开关，异常时一键整体回退。
+**路由**（✅）：play() 顶部统一密码检查后按扩展名分流（`imgview::wants_texture`：
+静态图（**含全部 webp**——动画 webp 也只取首帧）+ GIF 动图 + `ui.image_texture`
+开关；**动图也走纹理直显，mpv 收缩为纯视频播放器**）——流式 zip/目录图走
+`play_image()`（不解压、不 ensure_player），7z/RAR 图照常解压会话，FileDone/
+缓存命中经 `load_extracted()` 分流纹理解码。纹理路径解码失败（格式不支持/数据
+损坏）经 `ImgEvent::Failed` **自动落回 mpv**（流式 load 流 URL / 落盘 load_path），
+两条路径互为兜底；config `ui.image_texture` 开关一键整体回退。曾评估过"压缩包内
+读 webp 头部 VP8X ANIM 位区分动/静"的路由细化，放弃：为路由而读头增加复杂度。
 
-**交互**：普通 egui::Image + Response 即可（无需 PaintCallback）——拖拽平移；
-滚轮缩放以 UV 变换实现并锚定光标位置；双击复位。全屏/翻页/解压进度覆盖层
-天然复用（单平面红利，wid 时代这些都需要窗口叠放绕路）。
+**回退链路修复**（✅，实测踩坑）：回退只 load mpv 还不够——`tex_image_key()` 仍按
+扩展名返回 Some，panels 的 mpv 分支要求 `img_key.is_none()` 才渲染，结果 mpv 已解出
+首帧却被 image_view 的"正在解码图片…"占位永久遮挡（LOG2：mpv 报
+`first video frame after restart shown` 但 UI 一直占位）。修复：App 增加
+`img_fallback: HashSet<ImgKey>`——`img_fallback_mpv()` 记入；`tex_image_key()` 剔除
+（mpv 分支立即恢复渲染）；`play_image()`/`load_extracted()` 命中直接走 mpv 不重复
+解码；`prefetch_images()` 跳过不再预取。
 
-**内存控制**：
-- 解码即降采样：100MP 级大图不进原尺寸纹理（防触顶/上传卡顿）；
-- ±1 张预取的 LRU 纹理缓存：连续翻页即显，看过的图翻回秒开；
-- 切包/退出时释放 TextureHandle，缓存容量走 config。
+**交互**（✅，参考 Honeyview 等主流看图软件）：
+- 绘制：`Mesh::with_texture + add_rect_with_uv` + `painter_at(媒体区)` 裁剪；
+  mpv PaintCallback 以 `tex_image_key().is_none()` 互斥；
+- 缩放状态 `ImgView { zoom: Option<f32>, pan }`：None=适应窗口；纯几何函数
+  `fit_scale`/`zoom_pan`/`clamp_pan` 独立单测（clamp 语义：大图不露边、小图归零居中）；
+- 拖拽平移；滚轮分层——fit 模式滚轮=翻页（沿用节流），缩放中锚光标 ±1.2×；
+  双击 = 适应窗口 ↔ 100%（锚光标），**全屏不再绑双击**（Enter/Esc 照旧）；
+- 键盘：←/→ 上一张/下一张；`+`/`−` 1.25× 步进（锚视口中心）；`0`=100%；
+  `Home`=适应窗口。
+
+**内存控制**（✅，`src/imgview.rs` ImageService）：
+- 后台线程解码（zip/dir 走 VFS 流读、7z/RAR 读落盘缓存），mpsc 回 UI 线程
+  `poll()` 上传纹理；
+- 解码即降采样：超 `image_max_dim`（默认 4096）等比缩——GPU 纹理上限/显存友好，
+  mipmap（TEX_OPTS）补缩小质量；
+- 小图（最长边 ≤ 512）Lanczos3 ×2 上采样，减轻 100% 下双线性模糊；
+- ±1 张预取的 LRU 纹理缓存（容量 = `image_cache_count`；逐出跳过刚推入与
+  正在显示（`shown`）两个 key，都不堪逐时允许临时超容、下次推入再收缩）：
+  连续翻页即显，看过的图翻回秒开；
+- TextureHandle 随 LRU 淘汰自动释放，切包/退出随 App 释放。
 
 **实施顺序**（每步独立可交付）：
-1. 静态图纹理路径 + 路由 + 失败回退（核心收益：翻页零延迟）；
-2. 滚轮缩放（锚定光标）/ 拖拽平移 / 双击复位；
-3. ±1 预取 LRU；
-4. GIF/WebP 动图逐帧解码接管（与视频共用播放/暂停语义）；
+1. ✅ 静态图纹理路径 + 路由 + 失败回退（核心收益：翻页零延迟）；
+2. ✅ 滚轮缩放（锚定光标）/ 拖拽平移 / 双击 fit↔100% + 快捷键（+/−/0/Home）；
+3. ✅ ±1 预取 LRU；
+4. ✅ GIF 动图逐帧解码接管（image crate `AnimationDecoder::into_frames`
+   全帧预解码 + 逐帧纹理；mpv 图片链路的 5s 黑屏/200ms 空洞问题随之整体消失；
+   **预取对动图生效**——mpv 路线动图走 loadfile 无法进 LRU，这是决定性差距）：
+   - **webp 不走逐帧**：静态 webp 无 ANMF 块，image-webp `num_frames()==0`，
+     `into_frames()` 解出空集 → 误报"动画无有效帧"回退 mpv（LOG2 实测踩坑，
+     回归测试 `decode_静态webp归静态`）；动画 webp 罕见，全按静图取首帧——
+     `decode_any` 仅 GIF 走逐帧，webp 及其余格式走单帧 `decode()`；
+   - 静态归一：解出 1 帧自动归 `Decoded::Static`（零时钟开销），判定依据是
+     解码结果而非扩展名/头部；
+   - 播放：`Cached { frames, delays, cur, next_at }` 状态机，UI 层取帧时推进
+     时钟并 `request_repaint_after(距下次切帧)` 驱动，稳态功耗 = 帧率；
+   - 帧延迟 < 20ms 钳 100ms（浏览器惯例，防 0 延迟坏帧疯闪）；帧数封顶
+     512（截断优于回退 mpv）；动图不上采样（多帧 ×4 显存不值当）；
+   - 附带：mpv 装载窗口 16ms 轮询（`has_painted_since_load`）——视频/回退路径
+     切换时 UI 高频 repaint 解除 mpv VO 等待，首帧画出即停（消两段 ~200ms 空洞）。
 5. PSD/HEIC/AVIF 扩展解码器（按需，接库走同纹理路径）。
 
-### 13.5 踩坑记录（本次迁移实际炸过的三颗雷）
+### 13.5 踩坑记录（本次迁移实际炸过的雷）
 
 **坑 1：手写 FFI 签名错 → 运行时 0xc000041D 崩溃。**
 `mpv_render_context_create` 的出参 `res` 是第一参数（不是指针垫在最后），
@@ -993,3 +1032,43 @@ prepare_painting 恢复 viewport/blend/scissor，**唯独 framebuffer 绑定必�
 触发切换 → 刚翻到末项就越界误弹「下一个压缩包」询问（点按钮无此问题，因为
 click 天然是单次事件）。修复：改用真实 `Event::MouseWheel` 事件驱动（帧内多
 事件合并方向判定），节流仅用于防触控板连扫。
+
+**坑 4：静态 webp 走逐帧解码 → 解出空集误报失败 + 回退后被占位遮挡。**
+现象：静态 webp 一直卡在"正在解码图片…"，mpv 兜底也看不到画面。两层根因：
+- image-webp 对静态文件（无 ANMF 块）`num_frames()==0`，`into_frames()` 迭代器
+  首查 `current == num_frames()` 直接 None → 解出空集 → 误报"动画无有效帧"回退
+  mpv（LOG2：`图片解码失败，回退 mpv 播放: 动画无有效帧`）。修法：webp 全按
+  静图走单帧 `decode()`，仅 GIF 走逐帧（回归测试 `decode_静态webp归静态`）；
+- 回退只 load mpv 不够：`tex_image_key()` 仍按扩展名返回 Some，panels 的 mpv
+  分支要求 `img_key.is_none()` 才渲染 → mpv 已解出首帧
+  （`first video frame after restart shown`）却被"正在解码"占位永久遮挡。修法：
+  `img_fallback` 集合（见 13.4 回退链路修复）。
+
+教训：只对 GIF 做过内存编码的单测（image crate 能编 GIF），webp 分支零覆盖——
+引入新格式的特殊路径前，先用 `cargo tree`/源码确认该格式解码器的实际行为。
+
+**坑 5：LRU 只保护刚推入的 key → 滚轮连翻把正在显示的图挤出 → 永久占位。**
+现象：滚轮来回切换几次后回到某 jpg，画面永久停在"正在解码图片…"，且只有
+滚轮触发（快捷键/列表点击不会）。根因两层叠加：
+- `cache_push` 逐出只跳过「本次刚推入的 key」，不保护「正在显示的 key」。
+  滚轮连翻 = 多跳 × 每跳 ±1 预取的推入洪水，cap=3 时正在显示的条目被从
+  队尾挤出 → `frame()`=None 走占位分支，而 pending 已空（就绪即推、推完即被
+  挤）→ 无人再触发解码 → 死局。快捷键/列表点击是离散单跳只推 2 张，显示中
+  条目在队首幸免——精确解释"只有滚轮触发"；
+- 修法：`ImageService.shown: Option<ImgKey>`，`frame()` 命中即标记，
+  `cache_push` 逐出跳过 pushed + shown，二者都不堪逐时允许临时超容（break，
+  下次推入再收缩）。回归测试 `lru_预取洪水不逐出正在显示的条目`。
+
+**坑 6：占位符分支早退跳过全部输入处理 → 异常态滚轮失灵。**
+`image_view` 原结构 `let Some((tex, _)) = frame() else { 占位; return; }`
+把滚轮/缩放处理放在早退之后——一旦卡在占位（正是坑 5 的现场），滚轮翻页
+失灵，只能靠文件列表救回。修法：滚轮处理前移到 `frame()` 之前（放大态
+缩放分支直接用 `img_view.zoom.unwrap()`，不依赖由 tex 推导的 fit）。教训：
+媒体区的输入处理不应依赖"当前帧有画面"这一前提，占位/加载态同样要能翻页离开。
+
+**坑 7：debug 构建解码慢 10~30 倍 → 误判为 webp 解码器性能问题。**
+现象：打开图片短暂显示"正在解码图片…"，LOG 显示 Jpeg 也要 256ms、WebP 508ms
+（release 应为几十 ms 内）。根因：一直在跑 `cargo run`（debug），image/解
+码依赖全部无优化。修法：`[profile.dev.package."*"] opt-level = 2`——依赖走
+O2、自身 UI 代码保持可调试；另在 worker 发送后 `ctx.request_repaint()` 唤醒
+UI 立即 poll（否则空闲时解码完成要等下一次重绘，实测多等 50~130ms）。

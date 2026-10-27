@@ -6,8 +6,12 @@ pub mod stream_cb;
 
 use crate::config::Config;
 use glow::HasContext as _;
-use std::ffi::c_void;
+use std::cell::Cell;
+use std::ffi::{c_void, CStr};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// mpv render API 的 get_proc_address 回调。glow 的加载器私有于 Context、不对外暴露，
 /// Windows 上直接走系统 API：扩展函数 wglGetProcAddress，GL 1.x 固定函数从
@@ -95,6 +99,12 @@ struct RenderState {
 pub struct PlayerService {
     ctx: *mut mpv_ffi::MpvHandle,
     render: Option<RenderState>,
+    /// mpv 日志泵线程停止标志（Drop 先停泵再 destroy，避免泵线程 use-after-free）
+    log_stop: Option<Arc<AtomicBool>>,
+    log_thread: Option<std::thread::JoinHandle<()>>,
+    /// loadfile 提交时刻 + 是否已记录首渲染（诊断切换延迟的时间线锚点）
+    load_mark: Cell<Option<Instant>>,
+    painted_since_load: Cell<bool>,
 }
 
 // mpv client API 线程安全；回调线程只走全局注册表，不触碰此 handle。
@@ -130,8 +140,77 @@ impl PlayerService {
         let mut s = Self {
             ctx,
             render: None,
+            log_stop: None,
+            log_thread: None,
+            load_mark: Cell::new(None),
+            painted_since_load: Cell::new(true),
         };
         // 播放器参数全部来自 config.toml
+        // mpv 日志泵：wait_event 同一 client 只能单线程消费（此处是进程内唯一消费者），
+        // LOG_MESSAGE 立即转 owned 字符串后走 tracing，带相对时间戳，形成
+        // "UI loadfile → mpv 内部事件 → egui 首渲染" 完整时间线（诊断切换延迟）
+        if cfg.player.mpv_log_level != "no" {
+            match mpv_ffi::request_log_messages(ctx, &cfg.player.mpv_log_level) {
+                Ok(()) => {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stop2 = stop.clone();
+                    // 裸指针以 usize 过线程边界（mpv client API 线程安全）
+                    let ctx_addr = ctx as usize;
+                    let t0 = Instant::now();
+                    s.log_thread = Some(std::thread::spawn(move || {
+                        let c = ctx_addr as *mut mpv_ffi::MpvHandle;
+                        loop {
+                            if stop2.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let ev = unsafe { mpv_ffi::wait_event(c, 0.2) };
+                            if ev.is_null() {
+                                continue;
+                            }
+                            let ev = unsafe { &*ev };
+                            match ev.event_id {
+                                mpv_ffi::MPV_EVENT_NONE => {}
+                                mpv_ffi::MPV_EVENT_SHUTDOWN => break,
+                                mpv_ffi::MPV_EVENT_LOG_MESSAGE => {
+                                    // 字符串指针归 mpv 所有、仅当次事件有效：先转 owned 再格式化
+                                    let m = unsafe {
+                                        &*(ev.data as *mut mpv_ffi::MpvEventLogMessage)
+                                    };
+                                    let (prefix, text) = unsafe {
+                                        (
+                                            CStr::from_ptr(m.prefix).to_string_lossy().into_owned(),
+                                            CStr::from_ptr(m.text).to_string_lossy().into_owned(),
+                                        )
+                                    };
+                                    tracing::info!(
+                                        "[mpv {:>8.3}] {}: {}",
+                                        t0.elapsed().as_secs_f64(),
+                                        prefix,
+                                        text.trim_end()
+                                    );
+                                }
+                                // 关键生命周期事件也打点：与日志行对齐成时间线
+                                mpv_ffi::MPV_EVENT_START_FILE
+                                | mpv_ffi::MPV_EVENT_END_FILE
+                                | mpv_ffi::MPV_EVENT_FILE_LOADED
+                                | mpv_ffi::MPV_EVENT_VIDEO_RECONFIG
+                                | mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
+                                    tracing::info!(
+                                        "[mpv {:>8.3}] == 事件 {} ==",
+                                        t0.elapsed().as_secs_f64(),
+                                        ev.event_id
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }));
+                    s.log_stop = Some(stop);
+                    tracing::info!("mpv 日志泵已启动 (level={})", cfg.player.mpv_log_level);
+                }
+                Err(e) => tracing::warn!("订阅 mpv 日志失败: {e}"),
+            }
+        }
         s.opt("hwdec", &cfg.player.hwdec);
         s.opt("cache-secs", &cfg.player.cache_secs.to_string());
         s.opt(
@@ -238,6 +317,9 @@ impl PlayerService {
         // keep-open=always 在 EOF 时会把 pause 置为 yes，且 loadfile 不清除它——
         // 不显式取消暂停的话，播完一个视频后切换新视频会停在第一帧
         self.set_prop_str("pause", "no");
+        // 装载窗口起点：供 note_painted 打首渲染耗时 + UI 轮询判定
+        self.load_mark.set(Some(Instant::now()));
+        self.painted_since_load.set(false);
     }
 
     /// 播放本地文件路径（7z/RAR 后台解压完成后的慢路径）
@@ -247,6 +329,41 @@ impl PlayerService {
             tracing::error!("loadfile {url} 失败: {e}");
         }
         self.set_prop_str("pause", "no"); // 同 load()：清除 EOF 粘滞的暂停态
+        self.load_mark.set(Some(Instant::now()));
+        self.painted_since_load.set(false);
+    }
+
+    /// PaintCallback 分支每帧调用（UI 线程）：load 后首次绘制时打日志，
+    /// 与 mpv 泵日志对齐成 "loadfile → mpv 就绪 → egui 实际画出" 时间线
+    pub fn note_painted(&self) {
+        if self.painted_since_load.get() {
+            return;
+        }
+        self.painted_since_load.set(true);
+        if let Some(t0) = self.load_mark.get() {
+            tracing::info!(
+                "mpv 画面首次渲染 距loadfile {:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    /// loadfile 后是否已画出首帧。false = 处于装载窗口，UI 应高频轮询
+    /// repaint（帧就绪后 mpv 不触发 update 回调，靠 200ms 内部超时推进，
+    /// 主动轮询把这段空洞压掉）
+    pub fn has_painted_since_load(&self) -> bool {
+        self.painted_since_load.get()
+    }
+
+    /// 停止播放并清空画面（视频 → 静态图纹理直显切换时调用）：
+    /// mpv stop 命令清空播放列表进入 idle——音频立即停止，末帧不再占窗口
+    pub fn stop(&self) {
+        if let Err(e) = mpv_ffi::command_string(self.ctx, "stop") {
+            tracing::error!("stop 失败: {e}");
+        }
+        // 复位装载窗口：stop 后无画面可画，UI 不再轮询（图片直显模式）
+        self.load_mark.set(None);
+        self.painted_since_load.set(true);
     }
 
     pub fn toggle_pause(&self) {
@@ -685,5 +802,124 @@ mod tests {
         mpv_ffi::destroy(ctx);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("7z 解压播放端到端测试通过 ✓");
+    }
+
+    /// 诊断：webp 起播 ~5 秒延迟的卡点定位。同一 mpv 实例三场景对比：
+    /// A zvf:// 冷启（生产链路）→ B file:/// 直读（绕过 zvf，隔离 mpv/lavf
+    /// 对 webp 本身的处理）→ C zvf:// 切换（复现"上一个 webp 切下一个"）。
+    /// 逐条打印 mpv 内部日志（带时间戳，level=v），到 PLAYBACK_RESTART
+    /// （首帧呈现）为止。前置：libmpv-2.dll + test_media\641.webp、1000.webp。
+    #[test]
+    fn diag_webp_load_latency() {
+        let Some(dll_dir) = find_mpv_dll_dir() else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        let Some(media_dir) = std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .map(|m| m.join("test_media"))
+        else {
+            return;
+        };
+        if !media_dir.join("641.webp").exists() || !media_dir.join("1000.webp").exists() {
+            eprintln!("跳过：test_media 缺 641.webp / 1000.webp");
+            return;
+        }
+
+        mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
+
+        // 目录模式注册（同生产：本地文件 O(1) seek 直通）
+        let dir_vfs = crate::vfs::dir_vfs::DirVFS::open(&media_dir, &["webp".to_string()]).unwrap();
+        let vfs: std::sync::Arc<dyn crate::vfs::ArchiveVFS> = std::sync::Arc::new(dir_vfs);
+        let (archive_id, entries) = stream_cb::register_with_progress(vfs, &media_dir, &|_, _| {});
+        let idx641 = entries
+            .iter()
+            .position(|e| e.name == "641.webp")
+            .expect("应有 641.webp");
+        let idx1000 = entries
+            .iter()
+            .position(|e| e.name == "1000.webp")
+            .expect("应有 1000.webp");
+
+        // headless，但 cache/demuxer/keep-open 与生产 PlayerService 一致
+        let ctx = mpv_ffi::create().unwrap();
+        mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "ao", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "hwdec", "no").unwrap();
+        mpv_ffi::set_option_string(ctx, "cache-secs", "30").unwrap();
+        mpv_ffi::set_option_string(ctx, "demuxer-max-bytes", "512MiB").unwrap();
+        mpv_ffi::set_option_string(ctx, "keep-open", "always").unwrap();
+        mpv_ffi::stream_cb_add_ro(ctx, "zvf", std::ptr::null_mut(), stream_cb::open_cb)
+            .expect("注册 zvf:// 失败");
+        mpv_ffi::request_log_messages(ctx, "v").unwrap();
+
+        fn ev_name(id: std::ffi::c_int) -> &'static str {
+            match id {
+                mpv_ffi::MPV_EVENT_NONE => "NONE",
+                mpv_ffi::MPV_EVENT_SHUTDOWN => "SHUTDOWN",
+                mpv_ffi::MPV_EVENT_LOG_MESSAGE => "LOG",
+                mpv_ffi::MPV_EVENT_START_FILE => "START_FILE",
+                mpv_ffi::MPV_EVENT_END_FILE => "END_FILE",
+                mpv_ffi::MPV_EVENT_FILE_LOADED => "FILE_LOADED",
+                mpv_ffi::MPV_EVENT_VIDEO_RECONFIG => "VIDEO_RECONFIG",
+                mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => "PLAYBACK_RESTART",
+                _ => "OTHER",
+            }
+        }
+
+        // loadfile 并抽水事件直到 PLAYBACK_RESTART（返回耗时）或超时；日志逐条带时间戳
+        let run = |label: &str, uri: String| -> f64 {
+            eprintln!("\n===== 场景 {label}: {uri}");
+            let t0 = std::time::Instant::now();
+            mpv_ffi::command_string(ctx, &format!("loadfile {uri} replace")).unwrap();
+            loop {
+                let ev = unsafe { mpv_ffi::wait_event(ctx, 0.1) };
+                let dt = t0.elapsed().as_secs_f64();
+                let id = unsafe { (*ev).event_id };
+                if id == mpv_ffi::MPV_EVENT_NONE {
+                    if dt > 20.0 {
+                        eprintln!("[{dt:8.3}] !!! 20 秒未到 PLAYBACK_RESTART");
+                        return dt;
+                    }
+                    continue;
+                }
+                if id == mpv_ffi::MPV_EVENT_LOG_MESSAGE {
+                    let m = unsafe { (*ev).data as *mut mpv_ffi::MpvEventLogMessage };
+                    let s = |p: *const std::ffi::c_char| unsafe {
+                        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                    };
+                    eprintln!(
+                        "[{dt:8.3}] {:<12} {}",
+                        unsafe { s((*m).prefix) },
+                        unsafe { s((*m).text) }.trim_end()
+                    );
+                    continue;
+                }
+                eprintln!("[{dt:8.3}] >>> 事件 {}", ev_name(id));
+                if id == mpv_ffi::MPV_EVENT_PLAYBACK_RESTART {
+                    eprintln!("===== 场景 {label} 首帧呈现耗时 {dt:.3}s");
+                    return dt;
+                }
+            }
+        };
+        // 场景间隙抽水残余事件（上个文件的 EOF 等），不污染下个场景计时
+        let drain = |ms: u64| {
+            let dl = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < dl {
+                unsafe { mpv_ffi::wait_event(ctx, 0.05) };
+            }
+        };
+
+        let t_a = run("A zvf冷启641", stream_cb::entry_uri(archive_id, idx641));
+        drain(300);
+        let t_b = run("B file直读1000", to_file_url(&media_dir.join("1000.webp")));
+        drain(300);
+        let t_c = run("C zvf切换1000", stream_cb::entry_uri(archive_id, idx1000));
+        drain(300);
+
+        mpv_ffi::destroy(ctx);
+        eprintln!("\n===== 汇总: A(zvf冷启)={t_a:.3}s  B(file直读)={t_b:.3}s  C(zvf切换)={t_c:.3}s");
+        eprintln!("A/C 慢而 B 快 → zvf 链路问题；三者都慢 → mpv/lavf 对 webp 本身的问题");
     }
 }

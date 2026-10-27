@@ -111,6 +111,8 @@ pub struct PlayerConfig {
     pub cache_secs: u64,
     pub demuxer_max_mb: u64,
     pub volume: i64,
+    /// 订阅 mpv 内部日志（"no" 关闭；诊断切换延迟时可设 "v"）
+    pub mpv_log_level: String,
 }
 
 impl Default for CacheConfig {
@@ -151,6 +153,7 @@ impl Default for PlayerConfig {
             cache_secs: 30,
             demuxer_max_mb: 512,
             volume: 100,
+            mpv_log_level: "no".into(),
         }
     }
 }
@@ -176,6 +179,15 @@ pub struct UiConfig {
     /// 超过该时长仍未解完才隐藏视频窗口并显示进度覆盖层——快速解压
     /// （缓存命中/小文件）全程不打扰播放，避免窗口闪烁
     pub extract_overlay_delay_ms: u64,
+    /// 静态图片 egui 纹理直显（后台 image crate 解码 → 纹理，跳过 mpv；
+    /// 动图 gif/webp 始终走 mpv，解码失败自动回退 mpv）
+    pub image_texture: bool,
+    /// 图片纹理 LRU 缓存张数（含当前张）：±1 相邻页预解码，翻页零等待
+    pub image_cache_count: usize,
+    /// 图片纹理上传前最大边长（像素）：超过则等比降采样——超大图（高清照片）
+    /// 解码后直接上传会受 GPU 纹理尺寸上限与显存约束，降采样后配合 mipmap
+    /// 缩小显示仍平滑
+    pub image_max_dim: u32,
 }
 
 impl Default for UiConfig {
@@ -187,6 +199,9 @@ impl Default for UiConfig {
             ask_next_archive: true,
             sort_files: false,
             extract_overlay_delay_ms: 500,
+            image_texture: true,
+            image_cache_count: 3,
+            image_max_dim: 4096,
         }
     }
 }
@@ -350,6 +365,9 @@ cache_secs = 30
 demuxer_max_mb = 512
 # 初始音量（0-100）
 volume = 100
+# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
+# 排查切换卡顿时设为 "v"，配合主程序日志定位耗时环节；平时保持 "no"
+mpv_log_level = "no"
 
 [ui]
 # CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
@@ -371,6 +389,14 @@ sort_files = false
 # 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
 # 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
 extract_overlay_delay_ms = 500
+# 静态图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；动图 gif/webp
+# 仍走 mpv）。解码失败的图片自动回退 mpv
+image_texture = true
+# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
+image_cache_count = 3
+# 图片纹理上传前最大边长（像素）：超过等比降采样（超大高清图显存可控，
+# 缩小显示配合 mipmap 仍平滑）
+image_max_dim = 4096
 
 [extract]
 # 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件

@@ -5,7 +5,8 @@ use super::*;
 impl App {
     // ---- 快捷键（参考 mpv 习惯） ----
 
-    /// 全屏切换（双击画面 / F11），全屏时隐藏所有面板只留视频+进度条
+    /// 全屏切换（回车；原双击画面已取消：与图片双击缩放习惯统一），
+    /// 全屏时隐藏所有面板只留视频+进度条
     pub(super) fn set_fullscreen(&mut self, on: bool, frame: &mut eframe::Frame) {
         self.fullscreen = on;
         if let Some(w) = frame.winit_window() {
@@ -18,10 +19,13 @@ impl App {
         tracing::info!("全屏: {on}");
     }
 
-    /// 空格=暂停/播放，←/→=±5s，Shift+←/→=±1s，↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
-    /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏
+    /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张），Shift+←/→=±1s，
+    /// ↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
+    /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
+    /// 图片模式：+/−=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if self.player.is_none() {
+        // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
+        if self.player.is_none() && self.tex_image_key().is_none() {
             return;
         }
         // 只有搜索框聚焦时才让出键盘（输入搜索词需要空格/字母/方向键）。
@@ -40,6 +44,9 @@ impl App {
         let mut go_focus = false;
         // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
         let mut ask_next_key = false;
+        // 图片模式缩放：+/−=步进，0=100%，Home=适应窗口
+        let img_mode = self.tex_image_key().is_some();
+        let (mut zoom_in, mut zoom_out, mut zoom_100, mut zoom_fit) = (false, false, false, false);
         // 从事件流里直接消费按键（过滤按住重复触发）：
         // 移除后同帧内其它控件（如聚焦的按钮）不会再响应，避免双重触发
         ctx.input_mut(|i| {
@@ -69,12 +76,39 @@ impl App {
                         do_pause = true;
                         false
                     }
+                    egui::Key::ArrowLeft if img_mode => {
+                        // 图片模式：←=上一张（视频=seek ±5s，见下方兜底臂）
+                        step_entry = -1;
+                        false
+                    }
+                    egui::Key::ArrowRight if img_mode => {
+                        step_entry = 1;
+                        false
+                    }
                     egui::Key::ArrowLeft => {
                         seek_rel = if m.shift { -1.0 } else { -5.0 };
                         false
                     }
                     egui::Key::ArrowRight => {
                         seek_rel = if m.shift { 1.0 } else { 5.0 };
+                        false
+                    }
+                    // 缩放键（图片模式）：+/=/− 步进，0=100%，Home=适应窗口。
+                    // '=' 也接放大（主键盘 '+' 需 Shift+='='，两种都收）
+                    egui::Key::Plus | egui::Key::Equals if img_mode && m.is_none() => {
+                        zoom_in = true;
+                        false
+                    }
+                    egui::Key::Minus if img_mode && m.is_none() => {
+                        zoom_out = true;
+                        false
+                    }
+                    egui::Key::Num0 if img_mode && m.is_none() => {
+                        zoom_100 = true;
+                        false
+                    }
+                    egui::Key::Home if img_mode && m.is_none() => {
+                        zoom_fit = true;
                         false
                     }
                     egui::Key::ArrowUp if m.is_none() => {
@@ -140,6 +174,19 @@ impl App {
         }
         if step_entry != 0 {
             self.play_adjacent(step_entry, step_entry > 0);
+        }
+        // 图片缩放键：+/− 步进（锚视口中心），0=100%，Home=适应窗口
+        if zoom_in {
+            self.img_zoom_step(1.25);
+        }
+        if zoom_out {
+            self.img_zoom_step(1.0 / 1.25);
+        }
+        if zoom_100 {
+            self.img_zoom_to(Some(1.0));
+        }
+        if zoom_fit {
+            self.img_zoom_to(None);
         }
         // N：直接弹出下一个压缩包选择窗（不等翻到末项）
         if ask_next_key {

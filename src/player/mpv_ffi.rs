@@ -13,6 +13,15 @@ pub const MPV_ERROR_UNSUPPORTED: c_int = -18;
 // 属性格式
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
+// mpv_event_id（client.h 精确值）
+pub const MPV_EVENT_NONE: c_int = 0;
+pub const MPV_EVENT_SHUTDOWN: c_int = 1;
+pub const MPV_EVENT_LOG_MESSAGE: c_int = 2;
+pub const MPV_EVENT_START_FILE: c_int = 5;
+pub const MPV_EVENT_END_FILE: c_int = 6;
+pub const MPV_EVENT_FILE_LOADED: c_int = 7;
+pub const MPV_EVENT_VIDEO_RECONFIG: c_int = 15;
+pub const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 
 pub type MpvHandle = c_void;
 
@@ -38,6 +47,26 @@ pub struct StreamCbInfo {
     pub cancel_fn: Option<unsafe extern "C" fn(cookie: *mut c_void)>,
 }
 
+// ---------- 事件轮询（client.h，诊断与后续事件驱动用） ----------
+
+/// mpv_wait_event 返回的事件头。data 按 event_id 解释（LOG_MESSAGE → MpvEventLogMessage）
+#[repr(C)]
+pub struct MpvEvent {
+    pub event_id: c_int,
+    pub error: c_int,
+    pub reply_userdata: u64,
+    pub data: *mut c_void,
+}
+
+/// MPV_EVENT_LOG_MESSAGE 的 data（字符串指针归 mpv 所有，仅当次事件内有效）
+#[repr(C)]
+pub struct MpvEventLogMessage {
+    pub prefix: *const c_char,
+    pub level: *const c_char,
+    pub text: *const c_char,
+    pub log_level: c_int,
+}
+
 // ---------- render API（render.h，用于 egui 单平面纹理渲染，ARCHITECTURE.md 13）----------
 
 pub type MpvRenderContext = c_void;
@@ -48,7 +77,8 @@ pub const MPV_RENDER_PARAM_API_TYPE: u32 = 1;
 pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: u32 = 2;
 pub const MPV_RENDER_PARAM_OPENGL_FBO: u32 = 3;
 pub const MPV_RENDER_PARAM_FLIP_Y: u32 = 4;
-// mpv_render_update_flag
+// mpv_render_update_flag（当前 render 无条件执行，此位仅作参考保留）
+#[allow(dead_code)]
 pub const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 
 pub const MPV_RENDER_API_TYPE_OPENGL: &[u8] = b"opengl\0";
@@ -104,6 +134,9 @@ struct MpvApi {
         out: *mut c_void,
     ) -> c_int,
     error_string: unsafe extern "C" fn(err: c_int) -> *const c_char,
+    request_log_messages:
+        unsafe extern "C" fn(ctx: *mut MpvHandle, min_level: *const c_char) -> c_int,
+    wait_event: unsafe extern "C" fn(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent,
     stream_cb_add_ro: unsafe extern "C" fn(
         ctx: *mut MpvHandle,
         protocol: *const c_char,
@@ -159,6 +192,8 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             set_property_string: *lib.get(b"mpv_set_property_string").map_err(load_err)?,
             get_property: *lib.get(b"mpv_get_property").map_err(load_err)?,
             error_string: *lib.get(b"mpv_error_string").map_err(load_err)?,
+            request_log_messages: *lib.get(b"mpv_request_log_messages").map_err(load_err)?,
+            wait_event: *lib.get(b"mpv_wait_event").map_err(load_err)?,
             stream_cb_add_ro: *lib.get(b"mpv_stream_cb_add_ro").map_err(load_err)?,
             render_context_create: *lib.get(b"mpv_render_context_create").map_err(load_err)?,
             render_context_free: *lib.get(b"mpv_render_context_free").map_err(load_err)?,
@@ -288,6 +323,26 @@ pub fn get_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<Option<bool>
     } else {
         Ok(None)
     }
+}
+
+/// 订阅 mpv 内部日志消息（client.h mpv_request_log_messages）。
+/// min_level："no"/"fatal"/"error"/"warn"/"info"/"status"/"v"/"debug"/"trace"
+pub fn request_log_messages(ctx: *mut MpvHandle, min_level: &str) -> Result<(), String> {
+    let a = api()?;
+    let lvl = CString::new(min_level).map_err(|e| e.to_string())?;
+    let r = unsafe { (a.request_log_messages)(ctx, lvl.as_ptr()) };
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
+}
+
+/// 轮询一个事件（timeout 秒，0=立即返回）。无事件时返回 event_id == MPV_EVENT_NONE
+/// 的指针（mpv 静态占位）。事件内存归 mpv 所有，必须在下一次 wait_event 前读完。
+pub unsafe fn wait_event(ctx: *mut MpvHandle, timeout_s: f64) -> *mut MpvEvent {
+    let a = api().expect("libmpv 未初始化");
+    (a.wait_event)(ctx, timeout_s)
 }
 
 /// 注册 stream_cb 只读协议（zvf://）

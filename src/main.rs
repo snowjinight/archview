@@ -3,6 +3,7 @@
 
 mod cache;
 mod config;
+mod imgview;
 mod player;
 mod ui;
 mod vartidy;

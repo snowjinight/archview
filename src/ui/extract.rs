@@ -26,27 +26,42 @@ impl App {
     }
 
     pub(super) fn play(&mut self, entry_idx: usize) {
-        // 先读模式标记结束借用，再 ensure_player（需要 &mut self）
-        let Some(stream) = self.archive.as_ref().map(|a| a.stream) else {
+        // 先读模式与条目标记结束借用（后续各分支需要 &mut self）
+        let Some((stream, encrypted, has_pw, name)) = self.archive.as_ref().map(|a| {
+            (
+                a.stream,
+                a.entries[entry_idx].encrypted,
+                a.password.is_some(),
+                a.entries[entry_idx].name.clone(),
+            )
+        }) else {
             return;
         };
-        // 两条路径都需要播放器，先就绪
+        // 内容加密条目（zip AES/ZipCrypto；7z/RAR 加密头已挡在打开阶段）：
+        // 无密码先弹密码框，带密码重建 VFS 后再播——图片/视频同规则
+        if encrypted && !has_pw {
+            self.pw_prompt = Some(PwPrompt {
+                kind: PwKind::Play(entry_idx),
+                input: String::new(),
+                wrong: false,
+            });
+            return;
+        }
+        // 图片路由：流式 zip 图片（静态图含全部 webp + gif 动图，13.4 第 4 步）
+        // 走纹理直显（跳过 mpv，不解压）；7z/RAR 图片仍走解压会话（批次/预取
+        // 机制复用），落地后在 load_extracted 分流为纹理解码
+        if stream && crate::imgview::wants_texture(&self.cfg, &name) {
+            self.play_image(entry_idx);
+            return;
+        }
+        // 视频路径需要播放器，先就绪
         if !self.ensure_player() {
             return;
         }
         if stream {
             // 快路径：流式播放（zvf://）
             let Some(arch) = &self.archive else { return };
-            // 内容加密条目（zip AES/ZipCrypto）：无密码先弹密码框，带密码重建 VFS 后再播
-            if arch.entries[entry_idx].encrypted && arch.password.is_none() {
-                self.pw_prompt = Some(PwPrompt {
-                    kind: PwKind::Play(entry_idx),
-                    input: String::new(),
-                    wrong: false,
-                });
-                return;
-            }
-            let (archive_id, name) = (arch.id, arch.entries[entry_idx].name.clone());
+            let archive_id = arch.id;
             if let Some(p) = &self.player {
                 p.load(archive_id, entry_idx);
             }
@@ -54,21 +69,169 @@ impl App {
             self.dragging = false;
             tracing::info!("播放: {name}");
         } else {
-            // 慢路径：后台解压（7z/RAR 固态）
-            // 已知加密且无密码：直接弹密码框（RAR 加密与否在解压时才暴露，仍走线程反馈）
-            let need_pw = self
-                .archive
-                .as_ref()
-                .is_some_and(|a| a.entries[entry_idx].encrypted && a.password.is_none());
-            if need_pw {
-                self.pw_prompt = Some(PwPrompt {
-                    kind: PwKind::Play(entry_idx),
-                    input: String::new(),
-                    wrong: false,
-                });
-                return;
-            }
+            // 慢路径：后台解压（7z/RAR 固态；RAR 运行时才暴露的加密走线程反馈）
             self.start_extract(entry_idx);
+        }
+    }
+
+    /// 图片纹理直显（流式包静态图含全部 webp + gif 动图）：停掉 mpv 画面，
+    /// 请求后台解码（LRU 命中直接显示）。解码失败在 poll_img 中回退 mpv 兜底
+    fn play_image(&mut self, entry_idx: usize) {
+        let Some((key, source, name)) = self.archive.as_ref().map(|a| {
+            (
+                (a.id, entry_idx),
+                ImageSource::Stream(a.vfs.clone(), a.entries[entry_idx].clone()),
+                a.entries[entry_idx].name.clone(),
+            )
+        }) else {
+            return;
+        };
+        // 曾经解码失败回退 mpv：直接走兜底装载，不再重复解码
+        if self.img_fallback.contains(&key) {
+            self.playing = Some(entry_idx);
+            self.img_view = ImgView::default();
+            self.img_fallback_mpv(entry_idx);
+            return;
+        }
+        // mpv 若有画面（上一张为视频/动图），stop 清画面断音频
+        if let Some(p) = &self.player {
+            p.stop();
+        }
+        let max_dim = self.cfg.ui.image_max_dim;
+        if !self.img.has(key) && !self.img.is_pending(key) {
+            self.img.request(key, source, max_dim, &name);
+        }
+        self.playing = Some(entry_idx);
+        self.dragging = false;
+        // 切图即复位视图（重新适应窗口）
+        self.img_view = ImgView::default();
+        tracing::info!("图片直显: {name}");
+        self.prefetch_images();
+    }
+
+    /// 当前纹理图片的 key (archive_id, playing)。无包/未播放/当前条目
+    /// 非纹理图（视频、开关关闭、曾解码失败回退 mpv）= None。nav/panels
+    /// 判定图片模式与 poll_img 匹配失败回退共用
+    pub(super) fn tex_image_key(&self) -> Option<ImgKey> {
+        let arch = self.archive.as_ref()?;
+        let i = self.playing?;
+        let key = (arch.id, i);
+        // 回退过的条目不再走纹理：否则 mpv 画面被 image_view 的
+        // "正在解码图片…"占位永久遮挡（mpv 分支要求 img_key.is_none()）
+        (!self.img_fallback.contains(&key)
+            && crate::imgview::wants_texture(&self.cfg, &arch.entries[i].name))
+        .then_some(key)
+    }
+
+    /// 每帧轮询图片解码结果：Ready 纹理已由服务上传进 LRU（绘制时查缓存，
+    /// 无需额外处理）；Failed 清 pending，当前显示的图回退 mpv 兜底播放，
+    /// 预取图只记日志（用户翻到时 mpv 不一定可用，见 img_fallback_mpv）
+    pub(super) fn poll_img(&mut self) {
+        for ev in self.img.poll() {
+            match ev {
+                ImgEvent::Ready(key) => tracing::debug!("图片纹理就绪: {key:?}"),
+                ImgEvent::Failed(key, e) => {
+                    if self.tex_image_key() == Some(key) {
+                        tracing::warn!("图片解码失败，回退 mpv 播放: {e}");
+                        self.img_fallback_mpv(key.1);
+                    } else {
+                        tracing::warn!("图片预取解码失败: {e}");
+                    }
+                }
+            }
+        }
+        self.heal_current_image();
+    }
+
+    /// 每帧自愈：当前应为纹理图，却既不在缓存也不在解码中 → 立即补发请求。
+    /// 此前请求只由 nav 的 play_image 发起：条目若在他图显示/占位期间被
+    /// 预取推入挤出 LRU（占位期 shown 保护的还是上一张图），回到该图必须
+    /// 再翻动一次才恢复——用户停在这张图时就表现为永久"正在解码图片…"
+    /// 占位符。补发幂等（已缓存/解码中直接返回），任何掉出一帧内重建；
+    /// 与看门狗配合：pending 卡死 10s 剔除后也走这里重新发起
+    fn heal_current_image(&mut self) {
+        let Some(key) = self.tex_image_key() else { return };
+        if self.img.has(key) || self.img.is_pending(key) {
+            return;
+        }
+        let Some(arch) = self.archive.as_ref() else { return };
+        let e = &arch.entries[key.1];
+        let src = ImageSource::Stream(arch.vfs.clone(), e.clone());
+        let name = e.name.clone();
+        let max_dim = self.cfg.ui.image_max_dim;
+        tracing::warn!("当前图不在缓存且无在途解码，补发请求: {name}");
+        self.img.request(key, src, max_dim, &name);
+    }
+
+    /// 图片解码失败的 mpv 兜底：mpv 支持的图片格式更广。流式包直接 load
+    /// 流 URL；7z/RAR 图片通常已解压落盘，load_path 缓存文件。
+    /// 记入 img_fallback：tex_image_key 剔除该条目，mpv 画面才能显示；
+    /// 再次播放同条目时直接走 mpv 不重复解码
+    fn img_fallback_mpv(&mut self, entry_idx: usize) {
+        if !self.ensure_player() {
+            return;
+        }
+        let Some((stream, archive_id, name)) = self.archive.as_ref().map(|a| {
+            (a.stream, a.id, a.entries[entry_idx].name.clone())
+        }) else {
+            return;
+        };
+        self.img_fallback.insert((archive_id, entry_idx));
+        if let Some(p) = &self.player {
+            if stream {
+                p.load(archive_id, entry_idx);
+            } else {
+                let dir = cache::cache_dir(&self.cfg);
+                let dest = cache::dest_path(&dir, archive_id, entry_idx, &name);
+                if dest.exists() {
+                    p.load_path(&dest);
+                }
+            }
+        }
+        self.dragging = false;
+    }
+
+    /// 图片 ±1 预取：view 中相邻条目里的图片（含 gif 动图）请求后台解码，翻页零
+    /// 等待（LRU 上限自然淘汰）。7z/RAR 仅对已完整落盘的条目发起——未落盘的
+    /// 归 extract 会话管（半截文件也解不出图）
+    fn prefetch_images(&mut self) {
+        // 阶段一（不可变借用）：收集邻居候选（位置 → key + 解码源 + 名）
+        let cands: Vec<(ImgKey, ImageSource, String)> = {
+            let Some(arch) = self.archive.as_ref() else { return };
+            let Some(cur) = self.playing else { return };
+            let Some(pos) = arch.view.iter().position(|&i| i == cur) else { return };
+            let dir = cache::cache_dir(&self.cfg);
+            let mut v = Vec::with_capacity(2);
+            for p in [pos.checked_sub(1), Some(pos + 1)].into_iter().flatten() {
+                let Some(&i) = arch.view.get(p) else { continue };
+                let e = &arch.entries[i];
+                if !crate::imgview::wants_texture(&self.cfg, &e.name) {
+                    continue;
+                }
+                let src = if arch.stream {
+                    ImageSource::Stream(arch.vfs.clone(), e.clone())
+                } else {
+                    let dest = cache::dest_path(&dir, arch.id, i, &e.name);
+                    if std::fs::metadata(&dest).map(|m| m.len() == e.size).unwrap_or(false) {
+                        ImageSource::File(dest)
+                    } else {
+                        continue;
+                    }
+                };
+                v.push(((arch.id, i), src, e.name.clone()));
+            }
+            v
+        };
+        // 阶段二（可变借用）：已缓存/解码中的跳过（has 不打乱 LRU）；
+        // 曾回退 mpv 的条目跳过（mpv 链路显示，不再纹理解码）
+        let max_dim = self.cfg.ui.image_max_dim;
+        for (key, src, name) in cands {
+            if self.img_fallback.contains(&key) {
+                continue;
+            }
+            if !self.img.has(key) && !self.img.is_pending(key) {
+                self.img.request(key, src, max_dim, &name);
+            }
         }
     }
 
@@ -664,17 +827,44 @@ impl App {
         self.spawn_open(path, Some(pw), Some((entry_idx, entry)));
     }
 
-    /// 播放已解压到本地的文件
+    /// 播放已解压到本地的文件。视频走 mpv load_path；图片（纹理路由）停掉
+    /// mpv 画面后从落盘文件后台解码——7z/RAR 图片的公共出口（解压落地
+    /// FileDone、缓存命中、锚点回放都汇到这里）
     pub(super) fn load_extracted(&mut self, dest: &Path, entry_idx: usize) {
         // 播放到锚点 = "解压完成待消费"提醒消费完毕（start_extract 缓存
         // 命中不经 play()，提醒按钮/B 键/悬浮按钮/列表点击最终都汇到这里）
         if self.last_focus == Some(entry_idx) {
             self.extract_ready = false;
         }
+        self.playing = Some(entry_idx);
+        self.dragging = false;
+        // 先取 owned 元组结束不可变借用；无 archive（防御）退化为 mpv 直载
+        let routed = self.archive.as_ref().map(|a| {
+            (
+                (a.id, entry_idx),
+                crate::imgview::wants_texture(&self.cfg, &a.entries[entry_idx].name),
+                a.entries[entry_idx].name.clone(),
+            )
+        });
+        // 曾解码失败回退 mpv 的条目不再走纹理解码，直接落到下方 mpv 装载
+        let routed = routed.filter(|(key, _, _)| !self.img_fallback.contains(key));
+        if let Some((key, true, name)) = routed {
+            // 图片：停 mpv 画面（可能有上一张视频/动图），落盘文件后台解码
+            if let Some(p) = &self.player {
+                p.stop();
+            }
+            let max_dim = self.cfg.ui.image_max_dim;
+            if !self.img.has(key) && !self.img.is_pending(key) {
+                self.img
+                    .request(key, ImageSource::File(dest.to_path_buf()), max_dim, &name);
+            }
+            self.img_view = ImgView::default();
+            tracing::info!("图片装载: {name}");
+            self.prefetch_images();
+            return;
+        }
         if let Some(p) = &self.player {
             p.load_path(dest);
         }
-        self.playing = Some(entry_idx);
-        self.dragging = false;
     }
 }

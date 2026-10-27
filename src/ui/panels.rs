@@ -73,8 +73,12 @@ impl App {
                         ("PgUp / PgDn", "上一个 / 下一个"),
                         ("N", "打开下一个压缩包（连续看包）"),
                         ("B", "回到锚点（最后一次解压位置）"),
-                        ("鼠标滚轮（视频区）", "上一个 / 下一个"),
-                        ("回车 / 双击画面", "全屏切换"),
+                        ("鼠标滚轮", "上一个 / 下一个（图片放大时=缩放）"),
+                        ("+ / -", "图片缩放步进（锚视口中心）"),
+                        ("0", "图片 100% 显示"),
+                        ("Home", "图片适应窗口"),
+                        ("双击图片", "适应窗口 ↔ 100%"),
+                        ("回车", "全屏切换"),
                         ("Esc", "退出全屏"),
                     ] {
                         ui.horizontal(|ui| {
@@ -340,7 +344,7 @@ impl App {
         }
     }
 
-    pub(super) fn video_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    pub(super) fn video_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // 顶部一行：当前正在预览的文件名（图片/视频通用）。
         // 放视频区上方（顶栏之下）：视频区宽，长名大多能完整放下；
         // 超出时截断。全屏不显示（全屏=纯视频+进度条）；
@@ -376,8 +380,10 @@ impl App {
         // 视频画面占满整个中央面板剩余区域（render API 纹理 blit，无原生子窗口）
         let video = ui.available_rect_before_wrap();
 
-        // 视频区；双击=全屏（单击暂停已取消：与双击冲突，改控制栏按钮）
-        let resp = ui.allocate_rect(video, egui::Sense::click());
+        // 媒体区；click_and_drag 为图片拖拽平移准备（视频无副作用）
+        let resp = ui.allocate_rect(video, egui::Sense::click_and_drag());
+        // 当前条目是否纹理直显图片（视频/动图/开关关闭 = None，走 mpv 分支）
+        let img_key = self.tex_image_key();
         // 解压覆盖层显示条件：
         // - 目标 == 正在播放条目 = 预取场景：不打扰播放，走顶栏短标记
         // - 目标 ≠ 正在播放 = 用户在等新文件：
@@ -479,8 +485,18 @@ impl App {
         }
         // mpv render API 纹理渲染（ARCHITECTURE.md 13，照搬开源参考实现的
         // PaintCallback 模式）：离屏 FBO ← mpv 绘制 → blit 到 egui 画布。
-        // extract_wait 期间该帧不提交画面，覆盖层自然露出（取代旧"隐藏子窗口"）
-        if !extract_wait && self.playing.is_some() {
+        // extract_wait 期间该帧不提交画面，覆盖层自然露出（取代旧"隐藏子窗口"）；
+        // 图片模式 mpv 已 stop（idle），不提交 PaintCallback（避免黑帧盖住纹理）
+        if !extract_wait && self.playing.is_some() && img_key.is_none() {
+            // mpv 装载窗口 60fps 轮询：帧就绪后 mpv 不触发 update 回调、靠
+            // 200ms 内部超时推进（实测切换含两段 ~200ms 空洞）。主动高频
+            // repaint 让 PaintCallback 无条件 render 立即解除 mpv 的 VO 等待，
+            // 首帧画出（note_painted）即停，不影响稳态功耗
+            if let Some(p) = &self.player {
+                if !p.has_painted_since_load() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+            }
             let ppp = ctx.pixels_per_point();
             let phys_w = ((video.width() * ppp).round() as i32).max(1);
             let phys_h = ((video.height() * ppp).round() as i32).max(1);
@@ -493,6 +509,7 @@ impl App {
             let y1 = surf_h - (video.min.y * ppp).round() as i32;
             if let (Some(gl), Some(p)) = (&self.gl, self.player.as_mut()) {
                 if let Some(info) = p.render_info(gl, phys_w, phys_h) {
+                    p.note_painted(); // 首渲染时间线锚点（诊断切换延迟）
                     let cb = eframe::egui_glow::CallbackFn::new(move |_cb_info, painter| {
                         let gl = painter.gl();
                         use glow::HasContext as _;
@@ -514,15 +531,19 @@ impl App {
                                 )),
                             );
                             gl.viewport(0, 0, info.w, info.h);
-                            let flags = mpv_ffi::render_context_update(info.rctx.as_ptr());
-                            if flags & mpv_ffi::MPV_RENDER_UPDATE_FRAME != 0 {
-                                let _ = mpv_ffi::render_gl_render(
-                                    info.rctx.as_ptr(),
-                                    info.fbo as i32,
-                                    info.w,
-                                    info.h,
-                                );
-                            }
+                            // update() 仅用于消费/清除待渲染标志（避免 update 回调
+                            // 反复唤醒）；render 必须无条件执行：切文件的时序下 FRAME
+                            // 标志可能被上一次 UI 忙帧的 update() 提前消费（读到 0），
+                            // 若据此跳过 render，mpv 单帧 Image 会互相死等——直到
+                            // image-display-duration 超时 EOF 的下一次 update 才补画
+                            // （实测 webp 切换黑屏 5 秒）。重复 render 只是重画当前帧
+                            let _flags = mpv_ffi::render_context_update(info.rctx.as_ptr());
+                            let _ = mpv_ffi::render_gl_render(
+                                info.rctx.as_ptr(),
+                                info.fbo as i32,
+                                info.w,
+                                info.h,
+                            );
                             // FBO → egui 默认帧缓冲 blit（FBO 数据已被 mpv 翻转，
                             // 目标矩形上下对调即与屏幕坐标一致）。
                             // read 必须显式锁定到视频 FBO：mpv 内部渲染可能把 read
@@ -570,28 +591,184 @@ impl App {
                 }
             }
         }
-        if resp.double_clicked() {
-            self.set_fullscreen(!self.fullscreen, frame);
-        }
+        if let Some(key) = img_key {
+            // ---- 图片分支：纹理直显（缩放/平移/双击），全屏走回车/Esc ----
+            self.image_view(ui, &resp, video, key, !extract_wait);
+        } else {
+            // ---- 视频分支：全屏只走回车/Esc（双击全屏已取消：与图片双击
+            // 适应窗口↔100% 的看图习惯统一，避免误触全屏）----
 
-        // 滚轮=上一个/下一个（悬停视频区时）：以真实滚轮事件触发（帧内多事件合并
-        // 方向），间隔内（config: ui.wheel_switch_secs）的后续操作忽略（防触控板连跳）。
-        // 不用 smooth_scroll_delta：那是平滑插值量，一次滚轮后惯性尾巴持续多帧非零，
-        // 节流窗口一过就误触发第二次切换——刚翻到末项就弹出"下一个压缩包"询问
+            // 滚轮=上一个/下一个（悬停视频区时）：以真实滚轮事件触发（帧内多事件合并
+            // 方向），间隔内（config: ui.wheel_switch_secs）的后续操作忽略（防触控板连跳）。
+            // 不用 smooth_scroll_delta：那是平滑插值量，一次滚轮后惯性尾巴持续多帧非零，
+            // 节流窗口一过就误触发第二次切换——刚翻到末项就弹出"下一个压缩包"询问
+            if resp.hovered() {
+                let dy = ui.input(|i| {
+                    i.events.iter().fold(0.0_f32, |acc, e| match e {
+                        egui::Event::MouseWheel { delta, .. } => acc + delta.y,
+                        _ => acc,
+                    })
+                });
+                if dy != 0.0 {
+                    let now = ui.input(|i| i.time);
+                    if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
+                        self.wheel_last = now;
+                        let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
+                        self.play_adjacent(dir, dir > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 图片纹理直显分支：Mesh + UV 绘制（zoom/pan），拖拽平移、滚轮分层
+    /// （适应窗口=翻页，放大=锚光标缩放）、双击 适应窗口↔100%
+    /// （Honeyview 等主流看图软件习惯；原双击全屏改为回车/Esc）。
+    /// visible=false（解压覆盖层期间）只处理视图状态不绘制
+    fn image_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        resp: &egui::Response,
+        video: egui::Rect,
+        key: ImgKey,
+        visible: bool,
+    ) {
+        // 记录视口（缩放快捷键 img_zoom_step 需要视口几何，绘制区域随面板拖动变化）
+        self.img_viewport = video;
+        // ---- 滚轮先于 frame() 处理：占位期间（解码中/缓存被挤）必须仍可翻页，
+        // 否则异常态下滚轮失灵，只能靠文件列表救回 ----
+        // 适应窗口=翻页（与视频同款节流），放大=锚光标缩放（上滚放大）
         if resp.hovered() {
-            let dy = ui.input(|i| {
-                i.events.iter().fold(0.0_f32, |acc, e| match e {
+            let (dy, cursor) = ui.input(|i| {
+                let dy = i.events.iter().fold(0.0_f32, |acc, e| match e {
                     egui::Event::MouseWheel { delta, .. } => acc + delta.y,
                     _ => acc,
-                })
+                });
+                (dy, i.pointer.latest_pos())
             });
             if dy != 0.0 {
-                let now = ui.input(|i| i.time);
-                if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
-                    self.wheel_last = now;
-                    let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
-                    self.play_adjacent(dir, dir > 0);
+                if self.img_view.zoom.is_none() {
+                    let now = ui.input(|i| i.time);
+                    if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
+                        self.wheel_last = now;
+                        let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
+                        self.play_adjacent(dir, dir > 0);
+                    }
+                } else if let Some(pos) = cursor {
+                    if video.contains(pos) {
+                        let factor = if dy > 0.0 { 1.2 } else { 1.0 / 1.2 };
+                        // 放大态下 zoom 即 img_view.zoom（Some 分支，unwrap 安全）
+                        self.img_zoom_at(self.img_view.zoom.unwrap(), factor, pos, video);
+                    }
                 }
+            }
+        }
+        // frame() 同时推进动画时钟（动图到点切帧）；Some(rest) = 距下次切帧，
+        // 定时 repaint 驱动播放（静态图 rest=None，不加轮询开销）
+        let Some((tex, rest)) = self.img.frame(key) else {
+            // 后台解码中（流式路径通常 <100ms）：占位提示
+            if visible {
+                ui.put(
+                    egui::Rect::from_center_size(video.center(), egui::vec2(240.0, 30.0)),
+                    egui::Label::new(egui::RichText::new("正在解码图片…").weak()).selectable(false),
+                );
+            }
+            return;
+        };
+        if let Some(rest) = rest {
+            ui.ctx().request_repaint_after(rest);
+        }
+        let native = tex.size_vec2();
+        let fit = fit_scale(video, native);
+        let zoom = self.img_view.zoom.unwrap_or(fit);
+
+        // ---- 交互：先改 zoom/pan，绘制时统一 clamp ----
+        // 拖拽平移（fit 模式图像不大于视口，clamp 会归零，无副作用）
+        if resp.dragged() {
+            self.img_view.pan += resp.drag_delta();
+        }
+        // 双击：适应窗口 ↔ 100%（锚光标；非全屏——全屏走回车/Esc）
+        if resp.double_clicked() {
+            let cursor = ui
+                .input(|i| i.pointer.latest_pos())
+                .unwrap_or_else(|| video.center());
+            match self.img_view.zoom {
+                // fit → 100%：光标下的图像点保持不动
+                None => {
+                    let pan = zoom_pan(self.img_view.pan, fit, 1.0, cursor - video.center());
+                    self.img_view = ImgView { zoom: Some(1.0), pan };
+                }
+                // 100%（或任意倍率）→ 适应窗口
+                Some(_) => self.img_view = ImgView::default(),
+            }
+        }
+
+        // ---- 绘制：图像中心 clamp 在视口内（拖不丢，总有部分可见）----
+        self.img_view.pan = clamp_pan(self.img_view.pan, native * zoom, video);
+        if !visible {
+            return;
+        }
+        let rect =
+            egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        mesh.add_rect_with_uv(
+            rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        // painter_at 以媒体区裁剪：放大后超出部分不画到面板外
+        ui.painter_at(video).add(egui::Shape::mesh(mesh));
+    }
+
+    /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。
+    /// 滚轮/快捷键共用；倍率 clamp 在 [MIN_ZOOM, MAX_ZOOM]
+    fn img_zoom_at(
+        &mut self,
+        cur_zoom: f32,
+        factor: f32,
+        anchor: egui::Pos2,
+        viewport: egui::Rect,
+    ) {
+        let new_zoom = (cur_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.img_view.pan =
+            zoom_pan(self.img_view.pan, cur_zoom, new_zoom, anchor - viewport.center());
+        self.img_view.zoom = Some(new_zoom);
+    }
+
+    /// 快捷键缩放一步（锚视口中心）：factor > 1 放大，< 1 缩小。
+    /// fit 模式先落地为当前 fit 倍率再乘（视口变化时 fit 是实时值）
+    pub(super) fn img_zoom_step(&mut self, factor: f32) {
+        let Some(key) = self.tex_image_key() else { return };
+        let viewport = self.img_viewport;
+        if !viewport.is_finite() || viewport.width() <= 0.0 || viewport.height() <= 0.0 {
+            return;
+        }
+        let Some((tex, _)) = self.img.frame(key) else { return };
+        let fit = fit_scale(viewport, tex.size_vec2());
+        let cur = self.img_view.zoom.unwrap_or(fit);
+        self.img_zoom_at(cur, factor, viewport.center(), viewport);
+    }
+
+    /// 快捷键直接设倍率：Some(z) = 100%（z=1.0，锚视口中心）；None = 适应窗口
+    pub(super) fn img_zoom_to(&mut self, target: Option<f32>) {
+        let Some(key) = self.tex_image_key() else { return };
+        let viewport = self.img_viewport;
+        if !viewport.is_finite() {
+            return;
+        }
+        match target {
+            None => self.img_view = ImgView::default(),
+            Some(z) => {
+                let Some((tex, _)) = self.img.frame(key) else { return };
+                let fit = fit_scale(viewport, tex.size_vec2());
+                let cur = self.img_view.zoom.unwrap_or(fit);
+                self.img_view.pan = zoom_pan(
+                    self.img_view.pan,
+                    cur,
+                    z,
+                    viewport.center() - viewport.center(),
+                );
+                self.img_view.zoom = Some(z);
             }
         }
     }

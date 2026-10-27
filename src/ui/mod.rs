@@ -12,6 +12,10 @@
 
 use crate::cache;
 use crate::config::Config;
+use crate::imgview::{
+    clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView, MAX_ZOOM,
+    MIN_ZOOM,
+};
 use crate::player::mpv_ffi;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
@@ -187,6 +191,15 @@ pub struct App {
     /// egui 上下文：mpv render update 回调跨线程 request_repaint 唤醒 UI 重绘
     egui_ctx: egui::Context,
     player: Option<PlayerService>,
+    // 图片纹理直显服务：后台线程解码 → mpsc → UI 线程上传纹理（LRU 缓存）
+    img: ImageService,
+    // 解码失败已回退 mpv 的图片条目（archive_id, entry_idx）：tex_image_key 剔除
+    // 避免"正在解码"占位遮挡 mpv 画面；play_image/load_extracted 直走 mpv 不重复解码
+    img_fallback: std::collections::HashSet<ImgKey>,
+    // 图片视图状态：zoom=None=适应窗口，Some(z)=100% 倍率；pan=平移偏移
+    img_view: ImgView,
+    // 上帧图片绘制区域（滚轮缩放锚点 / 拖拽限位用；未绘制过 = NOTHING）
+    img_viewport: egui::Rect,
     // 进度条拖动状态
     dragging: bool,
     drag_pos: f64,
@@ -246,6 +259,7 @@ impl App {
         crate::vfs::set_codepage(&cfg.codepage);
         // 清理上次中断解压留下的 .part 半截文件
         cache::cleanup_partial(&cache::cache_dir(&cfg));
+        let img_cap = cfg.ui.image_cache_count.max(1);
         Self {
             cfg,
             archive: None,
@@ -254,6 +268,10 @@ impl App {
             gl: cc.gl.clone(),
             egui_ctx: cc.egui_ctx.clone(),
             player: None,
+            img: ImageService::new(cc.egui_ctx.clone(), img_cap),
+            img_fallback: std::collections::HashSet::new(),
+            img_view: ImgView::default(),
+            img_viewport: egui::Rect::NOTHING,
             dragging: false,
             drag_pos: 0.0,
             error: None,
@@ -287,14 +305,20 @@ impl App {
     #[cfg(test)]
     fn new_for_test(cfg: Config) -> Self {
         cache::cleanup_partial(&cache::cache_dir(&cfg));
+        let ctx = egui::Context::default();
+        let img_cap = cfg.ui.image_cache_count.max(1);
         Self {
             cfg,
             archive: None,
             search: String::new(),
             playing: None,
             gl: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx: ctx.clone(),
             player: None,
+            img: ImageService::new(ctx, img_cap),
+            img_fallback: std::collections::HashSet::new(),
+            img_view: ImgView::default(),
+            img_viewport: egui::Rect::NOTHING,
             dragging: false,
             drag_pos: 0.0,
             error: None,
@@ -384,6 +408,8 @@ impl eframe::App for App {
         self.poll_open();
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
+        // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
+        self.poll_img();
         // 键盘快捷键（mpv 风格）
         self.handle_shortcuts(&ctx, frame);
         // 图片自动翻页（PPT 式）
@@ -397,7 +423,7 @@ impl eframe::App for App {
             // 全屏：隐藏所有面板，只留视频+底部进度条
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| self.video_area(ui, &ctx, frame));
+                .show(ui, |ui| self.video_area(ui, &ctx));
             return;
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
@@ -407,7 +433,7 @@ impl eframe::App for App {
         egui::Panel::left("files")
             .default_size(300.0)
             .show(ui, |ui| self.file_list(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.video_area(ui, &ctx, frame));
+        egui::CentralPanel::default().show(ui, |ui| self.video_area(ui, &ctx));
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
