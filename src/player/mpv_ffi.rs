@@ -38,6 +38,49 @@ pub struct StreamCbInfo {
     pub cancel_fn: Option<unsafe extern "C" fn(cookie: *mut c_void)>,
 }
 
+// ---------- render API（render.h，用于 egui 单平面纹理渲染，ARCHITECTURE.md 13）----------
+
+pub type MpvRenderContext = c_void;
+
+// mpv_render_param_type 精确枚举值
+pub const MPV_RENDER_PARAM_INVALID: u32 = 0;
+pub const MPV_RENDER_PARAM_API_TYPE: u32 = 1;
+pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: u32 = 2;
+pub const MPV_RENDER_PARAM_OPENGL_FBO: u32 = 3;
+pub const MPV_RENDER_PARAM_FLIP_Y: u32 = 4;
+// mpv_render_update_flag
+pub const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
+
+pub const MPV_RENDER_API_TYPE_OPENGL: &[u8] = b"opengl\0";
+
+/// get_proc_address 回调：按名称返回 GL 函数指针（喂给 mpv 的 GL 加载器）
+pub type GetProcAddressFn =
+    unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char) -> *mut c_void;
+/// render 更新回调：无返回值（render.h: typedef void (*mpv_render_update_fn)(void *cb_ctx)）
+pub type RenderUpdateFn = unsafe extern "C" fn(cb_ctx: *mut c_void);
+
+/// 参数数组元素，以 `{ MPV_RENDER_PARAM_INVALID, null }` 结尾
+#[repr(C)]
+pub struct MpvRenderParam {
+    pub param_type: u32,
+    pub data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct MpvOpenglInitParams {
+    pub get_proc_address: Option<GetProcAddressFn>,
+    pub get_proc_address_ctx: *mut c_void,
+}
+
+/// 注意：宽高在结构体内（不是独立的 FBO_WIDTH/HEIGHT 参数）
+#[repr(C)]
+pub struct MpvOpenglFbo {
+    pub fbo: c_int,
+    pub w: c_int,
+    pub h: c_int,
+    pub internal_format: c_int,
+}
+
 struct MpvApi {
     _lib: Library,
     create: unsafe extern "C" fn() -> *mut MpvHandle,
@@ -66,6 +109,23 @@ struct MpvApi {
         protocol: *const c_char,
         user_data: *mut c_void,
         open_fn: StreamCbOpenRoFn,
+    ) -> c_int,
+    // render API（签名严格对照 mpv render.h，参数顺序不可颠倒）
+    render_context_create: unsafe extern "C" fn(
+        res: *mut *mut MpvRenderContext,
+        mpv: *mut MpvHandle,
+        params: *mut MpvRenderParam,
+    ) -> c_int,
+    render_context_free: unsafe extern "C" fn(ctx: *mut MpvRenderContext),
+    render_context_set_update_callback: unsafe extern "C" fn(
+        ctx: *mut MpvRenderContext,
+        callback: Option<RenderUpdateFn>,
+        callback_ctx: *mut c_void,
+    ),
+    render_context_update: unsafe extern "C" fn(ctx: *mut MpvRenderContext) -> u64,
+    render_context_render: unsafe extern "C" fn(
+        ctx: *mut MpvRenderContext,
+        params: *mut MpvRenderParam,
     ) -> c_int,
 }
 
@@ -100,6 +160,13 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             get_property: *lib.get(b"mpv_get_property").map_err(load_err)?,
             error_string: *lib.get(b"mpv_error_string").map_err(load_err)?,
             stream_cb_add_ro: *lib.get(b"mpv_stream_cb_add_ro").map_err(load_err)?,
+            render_context_create: *lib.get(b"mpv_render_context_create").map_err(load_err)?,
+            render_context_free: *lib.get(b"mpv_render_context_free").map_err(load_err)?,
+            render_context_set_update_callback: *lib
+                .get(b"mpv_render_context_set_update_callback")
+                .map_err(load_err)?,
+            render_context_update: *lib.get(b"mpv_render_context_update").map_err(load_err)?,
+            render_context_render: *lib.get(b"mpv_render_context_render").map_err(load_err)?,
             _lib: lib,
         };
         // 并发竞态输家（如两个 e2e 测试并行 init）：复用赢家已装的 API
@@ -237,5 +304,99 @@ pub fn stream_cb_add_ro(
         Err(err_str(r))
     } else {
         Ok(())
+    }
+}
+
+/// 创建 render context（须在 GL current 的线程上调用；mpv 侧先设好 vo=libmpv）
+pub fn render_context_create(
+    mpv: *mut MpvHandle,
+    get_proc_address: GetProcAddressFn,
+    gp_ctx: *mut c_void,
+) -> Result<*mut MpvRenderContext, String> {
+    let a = api()?;
+    unsafe {
+        let init_params = MpvOpenglInitParams {
+            get_proc_address: Some(get_proc_address),
+            get_proc_address_ctx: gp_ctx,
+        };
+        let mut params = [
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_API_TYPE,
+                data: MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void,
+            },
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                data: &init_params as *const MpvOpenglInitParams as *mut c_void,
+            },
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+        let mut rctx: *mut MpvRenderContext = std::ptr::null_mut();
+        let r = (a.render_context_create)(&mut rctx, mpv, params.as_mut_ptr());
+        if r < 0 {
+            return Err(format!("mpv_render_context_create 失败: {}", err_str(r)));
+        }
+        Ok(rctx)
+    }
+}
+
+/// 释放 render context。必须先于 mpv handle 释放、在创建它的 GL current 线程上调用。
+pub fn render_context_free(ctx: *mut MpvRenderContext) {
+    if let Ok(a) = api() {
+        if !ctx.is_null() {
+            unsafe { (a.render_context_free)(ctx) };
+        }
+    }
+}
+
+/// 设置帧更新回调（callback 传 None 即移除）
+pub fn render_context_set_update_callback(
+    ctx: *mut MpvRenderContext,
+    callback: Option<RenderUpdateFn>,
+    callback_ctx: *mut c_void,
+) {
+    if let Ok(a) = api() {
+        if !ctx.is_null() {
+            unsafe { (a.render_context_set_update_callback)(ctx, callback, callback_ctx) };
+        }
+    }
+}
+
+/// 查询待处理更新标志位（MPV_RENDER_UPDATE_FRAME 等）
+pub fn render_context_update(ctx: *mut MpvRenderContext) -> u64 {
+    match api() {
+        Ok(a) if !ctx.is_null() => unsafe { (a.render_context_update)(ctx) },
+        _ => 0,
+    }
+}
+
+/// 渲染一帧到指定 FBO。flip_y=1：GL FBO 原点在左下，让 mpv 翻转以匹配 GL 约定。
+pub fn render_gl_render(ctx: *mut MpvRenderContext, fbo: c_int, w: c_int, h: c_int) -> Result<(), String> {
+    let a = api()?;
+    unsafe {
+        let mut fbo_param = MpvOpenglFbo { fbo, w, h, internal_format: 0 };
+        let mut flip_y: c_int = 1;
+        let mut params = [
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_OPENGL_FBO,
+                data: &mut fbo_param as *mut MpvOpenglFbo as *mut c_void,
+            },
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_FLIP_Y,
+                data: &mut flip_y as *mut c_int as *mut c_void,
+            },
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+        let r = (a.render_context_render)(ctx, params.as_mut_ptr());
+        if r < 0 {
+            Err(format!("mpv_render_context_render 失败: {}", err_str(r)))
+        } else {
+            Ok(())
+        }
     }
 }

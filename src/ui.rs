@@ -1,9 +1,10 @@
-//! egui UI：左侧文件列表（标签页/搜索/状态行）+ 中央播放区（mpv 子窗口嵌入
-//! + 底部全宽进度条）+ 底部控制栏。滚轮仅在视频区悬停时切换媒体
+//! egui UI：左侧文件列表（标签页/搜索/状态行）+ 中央播放区（mpv render API
+//! 纹理 blit，无原生子窗口）+ 底部控制栏。滚轮仅在视频区悬停时切换媒体
 //! （ui.wheel_switch_secs 节流），文件列表区滚轮为正常滚动列表。
 
 use crate::cache;
 use crate::config::Config;
+use crate::player::mpv_ffi;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
 use crate::vfs::dir_vfs::DirVFS;
@@ -165,13 +166,12 @@ pub struct App {
     search: String,
     /// 当前播放的 entry（entries 下标）
     playing: Option<usize>,
-    /// mpv 播放子窗口 HWND（0 = 未创建）
-    child_hwnd: isize,
-    // 子窗口当前是否因弹窗遮挡而临时隐藏
-    child_hidden: bool,
-    // 本帧是否有弹窗打开（帮助/密码框）：mpv 子窗口永远盖在 egui 之上，
-    // 任何弹窗显示期间需隐藏子窗口，帧末统一同步（每帧开头重置）
-    overlay_open: bool,
+    /// glow GL 上下文（启动期 CreationContext 注入，照搬开源参考方案）：
+    /// PlayerService 惰性创建 mpv render context 时喂 get_proc_address；
+    /// on_exit 时（GL 仍 current）销毁 render 资源。None = 非 glow 后端
+    gl: Option<Arc<glow::Context>>,
+    /// egui 上下文：mpv render update 回调跨线程 request_repaint 唤醒 UI 重绘
+    egui_ctx: egui::Context,
     player: Option<PlayerService>,
     // 进度条拖动状态
     dragging: bool,
@@ -237,9 +237,8 @@ impl App {
             archive: None,
             search: String::new(),
             playing: None,
-            child_hwnd: 0,
-            child_hidden: false,
-            overlay_open: false,
+            gl: cc.gl.clone(),
+            egui_ctx: cc.egui_ctx.clone(),
             player: None,
             dragging: false,
             drag_pos: 0.0,
@@ -279,9 +278,8 @@ impl App {
             archive: None,
             search: String::new(),
             playing: None,
-            child_hwnd: 0,
-            child_hidden: false,
-            overlay_open: false,
+            gl: None,
+            egui_ctx: egui::Context::default(),
             player: None,
             dragging: false,
             drag_pos: 0.0,
@@ -504,7 +502,7 @@ impl App {
 
     /// 每帧轮询后台打开任务；Progress 消息只更新进度状态，
     /// 终态（Done/NeedPw/Failed/线程中断）完成后套用与旧同步路径相同的状态迁移
-    fn poll_open(&mut self, frame: &mut eframe::Frame) {
+    fn poll_open(&mut self) {
         loop {
             // 借用结束后再处理，避免 &self（job）与状态迁移的 &mut self 冲突
             let msg = match self.open_job.as_ref().map(|j| j.rx.try_recv()) {
@@ -545,7 +543,7 @@ impl App {
                         self.apply_open_done(job.path, job.retry_play, vfs, id, entries, pw);
                     // 密码重试场景：恢复播放提交密码时想看的条目
                     if let Some(entry_idx) = to_play {
-                        self.play(entry_idx, frame);
+                        self.play(entry_idx);
                     }
                 }
                 OpenMsg::NeedPw { wrong } => {
@@ -566,8 +564,8 @@ impl App {
     }
 
     /// 应用打开终态（Done）的状态迁移：建 ArchiveState、重建视图、清旧任务。
-    /// 返回需立即播放的条目下标（密码重试场景）——poll_open 在有 eframe::Frame
-    /// 的上下文里执行 play；独立成方法是因为单测造不出 Frame（见 dir_mode 测试）
+    /// 返回需立即播放的条目下标（密码重试场景）——poll_open 收到终态后执行
+    /// play；独立成方法是因为单测造不出完整打开链路（见 dir_mode 测试）
     fn apply_open_done(
         &mut self,
         path: PathBuf,
@@ -755,10 +753,16 @@ impl App {
 
     // ---- 播放 ----
 
-    /// 确保 mpv 播放器与子窗口就绪；返回 false 时已设置错误
-    fn ensure_player(&mut self, frame: &mut eframe::Frame) -> bool {
+    /// 确保 mpv 播放器就绪；返回 false 时已设置错误。
+    /// GL/egui 上下文来自启动期 CreationContext（照搬开源参考方案：
+    /// PlayerService 惰性创建，GL 句柄启动时即注入备用）
+    fn ensure_player(&mut self) -> bool {
         if self.player.is_none() {
-            match PlayerService::new(&self.cfg) {
+            let Some(gl) = self.gl.as_deref() else {
+                self.set_err("glow 上下文不可用（应使用 eframe glow 后端启动）");
+                return false;
+            };
+            match PlayerService::new(&self.cfg, gl, &self.egui_ctx) {
                 Ok(p) => self.player = Some(p),
                 Err(e) => {
                     self.set_err(e);
@@ -766,32 +770,16 @@ impl App {
                 }
             }
         }
-        if self.child_hwnd == 0 {
-            match native_hwnd(frame) {
-                Some(parent) => self.create_child(parent),
-                None => {
-                    self.set_err("Failed to get native window handle");
-                    return false;
-                }
-            }
-            if self.child_hwnd == 0 {
-                self.set_err("Failed to create player child window");
-                return false;
-            }
-            if let Some(p) = &self.player {
-                p.embed(self.child_hwnd);
-            }
-        }
         true
     }
 
-    fn play(&mut self, entry_idx: usize, frame: &mut eframe::Frame) {
+    fn play(&mut self, entry_idx: usize) {
         // 先读模式标记结束借用，再 ensure_player（需要 &mut self）
         let Some(stream) = self.archive.as_ref().map(|a| a.stream) else {
             return;
         };
-        // 两条路径都需要播放器与子窗口，先就绪
-        if !self.ensure_player(frame) {
+        // 两条路径都需要播放器，先就绪
+        if !self.ensure_player() {
             return;
         }
         if stream {
@@ -1424,15 +1412,12 @@ impl App {
         self.spawn_open(path, Some(pw), Some((entry_idx, entry)));
     }
 
-    /// 密码输入弹窗（加密头=打开阶段 / 加密条目=播放阶段）。
-    /// 弹窗期间隐藏 mpv 子窗口，窗口视口居中
+    /// 密码输入弹窗（加密头=打开阶段 / 加密条目=播放阶段）。窗口视口居中
     fn password_dialog(&mut self, ctx: &egui::Context) {
         let Some(p) = self.pw_prompt.as_mut() else {
             return;
         };
-        // 密码框显示期间隐藏 mpv 子窗口（与帮助弹窗同机制，帧末统一同步）；
         // anchor 视口居中：egui 逻辑坐标下 125%/150% 缩放均保持居中
-        self.overlay_open = true;
         let mut submitted = false;
         let mut cancelled = false;
         let title = match &p.kind {
@@ -1487,8 +1472,7 @@ impl App {
         }
     }
 
-    /// 末项后询问打开下一个压缩包的确认弹窗（与密码框同机制：
-    /// overlay_open 置位隐藏 mpv 子窗口，帧末统一同步显隐）。
+    /// 末项后询问打开下一个压缩包的确认弹窗。
     /// 列出同目录全部压缩包（分卷族合并为首卷），默认选中循环意义上的
     /// 下一个（末包绕回第一个），点选任意包可直接打开；
     /// 本会话打开过的包灰色显示，帮助绕圈时分辨看过的。
@@ -1503,7 +1487,6 @@ impl App {
         let Some(prompt) = self.next_archive_prompt.as_mut() else {
             return;
         };
-        self.overlay_open = true;
         let mut open = false;
         let mut cancelled = false;
         egui::Window::new("打开下一个压缩包？")
@@ -1579,59 +1562,6 @@ impl App {
         self.dragging = false;
     }
 
-    fn create_child(&mut self, parent: isize) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_TRANSPARENT, WS_VISIBLE,
-        };
-        const CLASS: &[u16] = &[83, 84, 65, 84, 73, 67, 0]; // "STATIC\0"
-                                                            // WS_EX_TRANSPARENT：鼠标事件穿透回 egui 宿主窗口——
-                                                            // 否则整个视频区（子窗口覆盖处）的滚轮/双击/悬停全部被子窗口吞掉
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_TRANSPARENT,
-                CLASS.as_ptr(),
-                std::ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                0,
-                0,
-                100,
-                100,
-                parent as _,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        self.child_hwnd = hwnd as isize;
-    }
-
-    /// 每帧同步子窗口矩形到 egui 播放区（物理像素坐标）。
-    /// egui 矩形是逻辑点，SetWindowPos 要物理像素：x/y/w/h 必须全部乘 ppp，
-    /// 否则高分屏（如 150% 缩放）下子窗口会向左上偏移、侵入文件列表
-    fn sync_child_rect(&self, rect: egui::Rect, ppp: f32) {
-        if self.child_hwnd == 0 {
-            return;
-        }
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
-        };
-        let x = (rect.left() * ppp) as i32;
-        let y = (rect.top() * ppp) as i32;
-        let w = (rect.width() * ppp) as i32;
-        let h = (rect.height() * ppp) as i32;
-        unsafe {
-            SetWindowPos(
-                self.child_hwnd as _,
-                std::ptr::null_mut(),
-                x,
-                y,
-                w.max(1),
-                h.max(1),
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-
     // ---- 快捷键（参考 mpv 习惯） ----
 
     /// 全屏切换（双击画面 / F11），全屏时隐藏所有面板只留视频+进度条
@@ -1648,7 +1578,7 @@ impl App {
     }
 
     /// 空格=暂停/播放，←/→=±5s，Shift+←/→=±1s，↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
-    /// B=回到锚点，回车=全屏切换，Esc=退出全屏
+    /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏
     fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.player.is_none() {
             return;
@@ -1667,6 +1597,8 @@ impl App {
         let mut fs_exit = false;
         // B=回到锚点（最后一次实际解压位置，见 App.last_focus）
         let mut go_focus = false;
+        // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
+        let mut ask_next_key = false;
         // 从事件流里直接消费按键（过滤按住重复触发）：
         // 移除后同帧内其它控件（如聚焦的按钮）不会再响应，避免双重触发
         ctx.input_mut(|i| {
@@ -1728,6 +1660,10 @@ impl App {
                         go_focus = true;
                         false
                     }
+                    egui::Key::N if m.is_none() => {
+                        ask_next_key = true;
+                        false
+                    }
                     egui::Key::Enter if m.is_none() => {
                         fs_toggle = true;
                         false
@@ -1762,13 +1698,17 @@ impl App {
             }
         }
         if step_entry != 0 {
-            self.play_adjacent(frame, step_entry, step_entry > 0);
+            self.play_adjacent(step_entry, step_entry > 0);
+        }
+        // N：直接弹出下一个压缩包选择窗（不等翻到末项）
+        if ask_next_key {
+            self.ask_next_archive();
         }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
             if let Some(f) = self.last_focus {
                 if self.playing != Some(f) {
-                    self.play(f, frame);
+                    self.play(f);
                 }
             }
         }
@@ -1789,12 +1729,41 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// 弹出「打开下一个压缩包」选择窗（N 键 / 本包末项后继续后翻共用）。
+    /// 列出同目录全部压缩包（分卷族合并为首卷），默认选中循环意义上的
+    /// 下一个（末包绕回第一个）；目录集合模式 / 无其它包时给出一次性提示。
+    fn ask_next_archive(&mut self) {
+        if !self.cfg.ui.ask_next_archive || self.next_archive_prompt.is_some() {
+            return;
+        }
+        let Some(a) = &self.archive else { return };
+        if a.path.is_dir() {
+            // 目录媒体集合模式（ARCHITECTURE.md 4.2）：路径本身是目录，
+            // 没有"同目录下一个压缩包"概念
+            self.notice = Some("目录集合模式：没有下一个压缩包".into());
+            return;
+        }
+        let list = archives_in_dir(&a.path);
+        if list.len() < 2 {
+            self.notice = Some("此目录没有其它压缩包".into());
+            return;
+        }
+        // 默认选中循环意义上的下一个（末包绕回第一个）
+        let sel = next_archive_in_dir(&a.path)
+            .and_then(|p| list.iter().position(|q| *q == p))
+            .unwrap_or(0);
+        self.next_archive_prompt = Some(NextArchivePrompt {
+            archives: list,
+            sel,
+        });
+    }
+
     /// 播放列表中的上一个/下一个媒体（offset = -1/+1）。
     /// 只在当前条目同类型内导航（视频↔视频，图片↔图片），避免视频播着切到图片。
     /// 未播放时：按当前标签页类型从第一项（下一个）/最后一项（上一个）开始。
     /// ask_next = 用户显式的"下一个"操作（快捷键/滚轮/按钮）：已在本包最后一项
     /// 再往后翻时，询问是否打开同目录下一个压缩包（config: ui.ask_next_archive）。
-    fn play_adjacent(&mut self, frame: &mut eframe::Frame, offset: i32, ask_next: bool) {
+    fn play_adjacent(&mut self, offset: i32, ask_next: bool) {
         let Some(a) = &self.archive else { return };
         // 未播放：类型由当前标签页决定
         let (cur, want_video) = match self.playing {
@@ -1829,36 +1798,18 @@ impl App {
             if (np as usize) >= same_kind.len() {
                 // 已在最后一项再往后翻：弹窗选择打开同目录下一个压缩包
                 // （仅用户显式操作触发；图片自动翻页传 false，防每帧重复弹窗）
-                if ask_next && self.cfg.ui.ask_next_archive && self.next_archive_prompt.is_none() {
-                    if a.path.is_dir() {
-                        // 目录媒体集合模式（ARCHITECTURE.md 4.2）：路径本身是目录，
-                        // 没有"同目录下一个压缩包"概念
-                        self.notice = Some("目录集合模式：没有下一个压缩包".into());
-                    } else {
-                        let list = archives_in_dir(&a.path);
-                        if list.len() < 2 {
-                            self.notice = Some("此目录没有其它压缩包".into());
-                        } else {
-                            // 默认选中循环意义上的下一个（末包绕回第一个）
-                            let sel = next_archive_in_dir(&a.path)
-                                .and_then(|p| list.iter().position(|q| *q == p))
-                                .unwrap_or(0);
-                            self.next_archive_prompt = Some(NextArchivePrompt {
-                                archives: list,
-                                sel,
-                            });
-                        }
-                    }
+                if ask_next {
+                    self.ask_next_archive();
                 }
                 return;
             }
             same_kind[np as usize]
         };
-        self.play(ei, frame);
+        self.play(ei);
     }
 
     /// 图片自动播放（PPT 式翻页）：间隔到了切下一张；手动切换会重置计时
-    fn slideshow_tick(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn slideshow_tick(&mut self, ctx: &egui::Context) {
         if !self.slideshow_on || !self.playing_is_image() {
             return;
         }
@@ -1871,32 +1822,28 @@ impl App {
         }
         if now - self.slideshow_anchor >= self.cfg.ui.slideshow_secs {
             // 自动翻页不触发"打开下一个压缩包"询问（到最后一张停住）
-            self.play_adjacent(frame, 1, false);
+            self.play_adjacent(1, false);
         }
     }
 
     // ---- 各面板 ----
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // ---- 「文件」菜单：打开压缩包 / 打开压缩包目录 ----
-            // rfd 对话框阻塞 UI 线程，动作在菜单闭包外执行（闭包内只置标志）；
-            // 菜单是 egui 弹层，打开期间隐藏 mpv 子窗口（与帮助面板同机制）
+            // ---- 「文件」菜单：打开压缩包 / 打开媒体目录 ----
+            // rfd 对话框阻塞 UI 线程，动作在菜单闭包外执行（闭包内只置标志）
             let mut open_file = false;
             let mut open_dir = false;
-            let file_menu = ui.menu_button("文件", |ui| {
+            ui.menu_button("文件", |ui| {
                 if ui.button("打开压缩包…").clicked() {
                     open_file = true;
                     ui.close();
                 }
-                if ui.button("打开压缩包目录…").clicked() {
+                if ui.button("打开媒体目录…").clicked() {
                     open_dir = true;
                     ui.close();
                 }
             });
-            if file_menu.inner.is_some() {
-                self.overlay_open = true;
-            }
             if open_file {
                 self.open_dialog();
             }
@@ -1906,7 +1853,7 @@ impl App {
             // ---- 「缓存」菜单：打开缓存目录 / 清理缓存 ----
             let mut open_cache = false;
             let mut clean_cache = false;
-            let cache_menu = ui.menu_button("缓存", |ui| {
+            ui.menu_button("缓存", |ui| {
                 if ui.button("打开缓存目录").clicked() {
                     open_cache = true;
                     ui.close();
@@ -1916,9 +1863,6 @@ impl App {
                     ui.close();
                 }
             });
-            if cache_menu.inner.is_some() {
-                self.overlay_open = true;
-            }
             if open_cache {
                 // 打开缓存目录（系统文件管理器；缓存目录本身不存在则先创建）
                 let dir = cache::cache_dir(&self.cfg);
@@ -1935,7 +1879,7 @@ impl App {
             }
             // 快捷键帮助（弹出面板，不占常驻空间；egui 0.36 用 from_toggle_button_response 自管开关）
             let help_btn = ui.button("快捷键 ?");
-            let help_open = egui::Popup::from_toggle_button_response(&help_btn)
+            egui::Popup::from_toggle_button_response(&help_btn)
                 .show(|ui| {
                     ui.set_min_width(280.0);
                     ui.strong("快捷键");
@@ -1947,6 +1891,7 @@ impl App {
                         ("↑ / ↓", "音量 ±5"),
                         ("M", "静音切换"),
                         ("PgUp / PgDn", "上一个 / 下一个"),
+                        ("N", "打开下一个压缩包（连续看包）"),
                         ("B", "回到锚点（最后一次解压位置）"),
                         ("鼠标滚轮（视频区）", "上一个 / 下一个"),
                         ("回车 / 双击画面", "全屏切换"),
@@ -1962,13 +1907,7 @@ impl App {
                             );
                         });
                     }
-                })
-                .is_some();
-            // mpv 原生子窗口永远盖在 egui 之上：帮助面板打开期间临时隐藏子窗口
-            // （置位 overlay_open，帧末统一同步 ShowWindow，与密码框共用机制）
-            if help_open {
-                self.overlay_open = true;
-            }
+                });
             if let Some(n) = &self.notice {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, n);
             }
@@ -2003,7 +1942,7 @@ impl App {
                             .unwrap_or_default();
                         let btn = ui.button(format!("解压完成：{name}｜点击观看"));
                         if btn.clicked() {
-                            self.play(f, frame);
+                            self.play(f);
                         }
                         btn.on_hover_text("点击观看刚解压完成的文件（快捷键 B）");
                     }
@@ -2012,7 +1951,7 @@ impl App {
         });
     }
 
-    fn file_list(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn file_list(&mut self, ui: &mut egui::Ui) {
         // 压缩包名（仅文件名，无路径；完整路径悬停显示）
         if let Some(a) = &self.archive {
             ui.add(
@@ -2204,7 +2143,7 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.play(f, frame);
+                            self.play(f);
                         }
                     });
                 });
@@ -2217,7 +2156,7 @@ impl App {
             }
         }
         if let Some(ei) = action {
-            self.play(ei, frame);
+            self.play(ei);
         }
     }
 
@@ -2254,40 +2193,32 @@ impl App {
                 }
             }
         }
-        // mpv 子窗口占满整个中央面板剩余区域（子窗口带 WS_EX_TRANSPARENT，鼠标事件穿透回 egui）
+        // 视频画面占满整个中央面板剩余区域（render API 纹理 blit，无原生子窗口）
         let video = ui.available_rect_before_wrap();
-        let child = video;
 
-        // 视频区（原生子窗口占位）；双击=全屏（单击暂停已取消：与双击冲突，改控制栏按钮）
+        // 视频区；双击=全屏（单击暂停已取消：与双击冲突，改控制栏按钮）
         let resp = ui.allocate_rect(video, egui::Sense::click());
-        // 解压覆盖层显示条件（同时驱动 mpv 子窗口隐藏）：
+        // 解压覆盖层显示条件：
         // - 目标 == 正在播放条目 = 预取场景：不打扰播放，走顶栏短标记
         // - 目标 ≠ 正在播放 = 用户在等新文件：
         //   · 未在播放：无画面可挡，直接显示（无闪烁问题）
         //   · 正在播 A 等 B：超过宽限期（ui.extract_overlay_delay_ms）
-        //     才隐藏窗口显示覆盖层——快速解压全程不打扰 A，避免闪烁
-        //   · 子窗口未创建（child_hwnd == 0）：无窗口可挡，直接显示
+        //     才停绘视频帧显示覆盖层——快速解压全程不打扰 A，避免闪烁
         let extract_wait = self.extract.as_ref().is_some_and(|j| {
             self.playing != Some(j.entry_idx)
                 && (self.playing.is_none()
-                    || self.child_hwnd == 0
                     || j.started.elapsed()
                         >= std::time::Duration::from_millis(self.cfg.ui.extract_overlay_delay_ms))
         });
-        if extract_wait {
-            // mpv 原生子窗口永远盖在 egui 之上：隐藏后覆盖层才可见
-            // （与密码框/帮助面板共用机制，帧末统一同步 ShowWindow）
-            self.overlay_open = true;
-        }
-        if extract_wait || self.playing.is_none() || self.child_hwnd == 0 {
+        if extract_wait || self.playing.is_none() {
             if let Some(j) = &self.extract {
                 // 解压覆盖层：媒体区居中多行显示。顶栏一行放不下长文件名
                 // （曾被截断、进度条看不见），这里空间充足：完整文件名换行 +
                 // 阶段进度（solid 包跳过前置文件阶段无法算百分比 → 转圈 +
                 // 已解压字节数，让用户看到"在动"）+ 写文件阶段字节进度条
                 let rect = egui::Rect::from_center_size(
-                    child.center(),
-                    egui::vec2(child.width().min(760.0), 170.0),
+                    video.center(),
+                    egui::vec2(video.width().min(760.0), 170.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.vertical_centered(|ui| {
@@ -2361,35 +2292,131 @@ impl App {
                     "先打开一个压缩包（ZIP / 7Z / RAR）".to_string()
                 };
                 ui.put(
-                    egui::Rect::from_center_size(child.center(), egui::vec2(400.0, 30.0)),
+                    egui::Rect::from_center_size(video.center(), egui::vec2(400.0, 30.0)),
                     egui::Label::new(egui::RichText::new(text).weak()).selectable(false),
                 );
+            }
+        }
+        // mpv render API 纹理渲染（ARCHITECTURE.md 13，照搬开源参考实现的
+        // PaintCallback 模式）：离屏 FBO ← mpv 绘制 → blit 到 egui 画布。
+        // extract_wait 期间该帧不提交画面，覆盖层自然露出（取代旧"隐藏子窗口"）
+        if !extract_wait && self.playing.is_some() {
+            let ppp = ctx.pixels_per_point();
+            let phys_w = ((video.width() * ppp).round() as i32).max(1);
+            let phys_h = ((video.height() * ppp).round() as i32).max(1);
+            // blit 目标矩形（物理像素；GL 默认帧缓冲 y 轴向上，需用表面高度翻转）
+            let surf_h =
+                (ctx.input(|i| i.raw.screen_rect.map_or(0.0, |r| r.height())) * ppp).round() as i32;
+            let x0 = (video.min.x * ppp).round() as i32;
+            let y0 = surf_h - (video.max.y * ppp).round() as i32;
+            let x1 = (video.max.x * ppp).round() as i32;
+            let y1 = surf_h - (video.min.y * ppp).round() as i32;
+            if let (Some(gl), Some(p)) = (&self.gl, self.player.as_mut()) {
+                if let Some(info) = p.render_info(gl, phys_w, phys_h) {
+                    let cb = eframe::egui_glow::CallbackFn::new(move |_cb_info, painter| {
+                        let gl = painter.gl();
+                        use glow::HasContext as _;
+                        unsafe {
+                            // egui_glow 不代管回调内的 GL 状态：进入时 BLEND（premultiplied）
+                            // 与 SCISSOR_TEST 处于开启态，而 mpv 渲染与 blit 都要求干净状态
+                            // ——blit 若开着 BLEND，FBO 黑边（mpv 清屏为 alpha=0）会把下层/
+                            // 上一帧内容透进画面，产生套娃虚影与闪烁。全程关闭，事后还原。
+                            let prev_fbo = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
+                            let prev_blend = gl.is_enabled(glow::BLEND);
+                            let prev_scissor = gl.is_enabled(glow::SCISSOR_TEST);
+                            gl.disable(glow::BLEND);
+                            gl.disable(glow::SCISSOR_TEST);
+                            // bind FRAMEBUFFER 同时设置 read+draw（mpv 需要两者都指向目标 FBO）
+                            gl.bind_framebuffer(
+                                glow::FRAMEBUFFER,
+                                Some(glow::NativeFramebuffer(
+                                    std::num::NonZeroU32::new(info.fbo).unwrap(),
+                                )),
+                            );
+                            gl.viewport(0, 0, info.w, info.h);
+                            let flags = mpv_ffi::render_context_update(info.rctx.as_ptr());
+                            if flags & mpv_ffi::MPV_RENDER_UPDATE_FRAME != 0 {
+                                let _ = mpv_ffi::render_gl_render(
+                                    info.rctx.as_ptr(),
+                                    info.fbo as i32,
+                                    info.w,
+                                    info.h,
+                                );
+                            }
+                            // FBO → egui 默认帧缓冲 blit（FBO 数据已被 mpv 翻转，
+                            // 目标矩形上下对调即与屏幕坐标一致）。
+                            // read 必须显式锁定到视频 FBO：mpv 内部渲染可能把 read
+                            // 绑定留在别处（如屏幕），src 读到屏幕会造成"屏幕自我拷贝"
+                            // 的套娃反馈（进度条/时间/暂停按钮逐级缩小的虚影 + 闪烁）
+                            gl.bind_framebuffer(
+                                glow::READ_FRAMEBUFFER,
+                                Some(glow::NativeFramebuffer(
+                                    std::num::NonZeroU32::new(info.fbo).unwrap(),
+                                )),
+                            );
+                            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+                            gl.blit_framebuffer(
+                                0,
+                                0,
+                                info.w,
+                                info.h,
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                                glow::COLOR_BUFFER_BIT,
+                                glow::LINEAR,
+                            );
+                            // egui_glow 约定：回调必须把 FRAMEBUFFER 成对恢复（read 不允许
+                            // 残留指向本 FBO，否则污染后续依赖 read 绑定的 GL 操作）
+                            match std::num::NonZeroU32::new(prev_fbo as u32) {
+                                Some(id) => gl.bind_framebuffer(
+                                    glow::FRAMEBUFFER,
+                                    Some(glow::NativeFramebuffer(id)),
+                                ),
+                                // 0 = 默认帧缓冲（egui 画布）
+                                None => gl.bind_framebuffer(glow::FRAMEBUFFER, None),
+                            }
+                            if prev_blend {
+                                gl.enable(glow::BLEND);
+                            }
+                            if prev_scissor {
+                                gl.enable(glow::SCISSOR_TEST);
+                            }
+                        }
+                    });
+                    ui.painter()
+                        .add(egui::PaintCallback { rect: video, callback: Arc::new(cb) });
+                }
             }
         }
         if resp.double_clicked() {
             self.set_fullscreen(!self.fullscreen, frame);
         }
 
-        // 滚轮=上一个/下一个（悬停视频区时）：检测到滚动即切换一次，
-        // 间隔内（config: ui.wheel_switch_secs）的后续滚轮操作忽略（防惯性/触控板连跳）
+        // 滚轮=上一个/下一个（悬停视频区时）：以真实滚轮事件触发（帧内多事件合并
+        // 方向），间隔内（config: ui.wheel_switch_secs）的后续操作忽略（防触控板连跳）。
+        // 不用 smooth_scroll_delta：那是平滑插值量，一次滚轮后惯性尾巴持续多帧非零，
+        // 节流窗口一过就误触发第二次切换——刚翻到末项就弹出"下一个压缩包"询问
         if resp.hovered() {
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            let dy = ui.input(|i| {
+                i.events.iter().fold(0.0_f32, |acc, e| match e {
+                    egui::Event::MouseWheel { delta, .. } => acc + delta.y,
+                    _ => acc,
+                })
+            });
             if dy != 0.0 {
                 let now = ui.input(|i| i.time);
                 if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
                     self.wheel_last = now;
                     let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
-                    self.play_adjacent(frame, dir, dir > 0);
+                    self.play_adjacent(dir, dir > 0);
                 }
             }
         }
-
-        // 每帧同步子窗口位置（含 ppp 变化/窗口缩放）
-        let ppp = ctx.pixels_per_point();
-        self.sync_child_rect(child, ppp);
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn controls(&mut self, ui: &mut egui::Ui) {
         #[derive(Default)]
         struct Act {
             step: i32,
@@ -2481,7 +2508,7 @@ impl App {
 
         // 闭包外应用动作（避免嵌套借用 self）
         if act.step != 0 {
-            self.play_adjacent(frame, act.step, act.step > 0);
+            self.play_adjacent(act.step, act.step > 0);
         }
         if act.toggle {
             if let Some(p) = &self.player {
@@ -2575,26 +2602,12 @@ fn fmt_time(t: f64) -> String {
     }
 }
 
-/// 取 eframe 原生窗口 HWND（Windows，经 winit_window + raw-window-handle）
-fn native_hwnd(frame: &eframe::Frame) -> Option<isize> {
-    use raw_window_handle::HasWindowHandle;
-    let w = frame.winit_window()?;
-    let handle = w.window_handle().ok()?;
-    if let raw_window_handle::RawWindowHandle::Win32(w) = handle.as_raw() {
-        Some(w.hwnd.get() as isize)
-    } else {
-        None
-    }
-}
-
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // 播放中需要持续重绘刷新进度条
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        // 弹窗请求位重置：本帧各弹窗渲染时按需置位，帧末统一同步子窗口显隐
-        self.overlay_open = false;
         // 启动参数打开（SendTo「Archview player」/拖到 exe 上）：首帧触发一次
         if let Some(path) = self.initial_open.take() {
             self.open_path(path);
@@ -2602,13 +2615,13 @@ impl eframe::App for App {
         // 拖放：压缩包文件拖入窗口即打开
         self.handle_dropped_files(&ctx);
         // 后台打开任务轮询（大包/网络盘）
-        self.poll_open(frame);
+        self.poll_open();
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
         // 键盘快捷键（mpv 风格）
         self.handle_shortcuts(&ctx, frame);
         // 图片自动翻页（PPT 式）
-        self.slideshow_tick(&ctx, frame);
+        self.slideshow_tick(&ctx);
         // 密码输入弹窗（加密压缩包：加密头=打开阶段 / 加密条目=播放阶段）
         self.password_dialog(&ctx);
         // 末项后询问打开同目录下一个压缩包
@@ -2619,51 +2632,31 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.video_area(ui, &ctx, frame));
-            self.sync_child_visibility();
             return;
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, frame));
-        egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui, frame));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui));
         // 文件列表放左侧（视频区在右）；悬停行的完整文件名显示在
-        // 面板底部状态行（方案 A），不用 hover 气泡——气泡会被右侧 mpv
-        // 原生子窗口挡住（egui 感知不到子窗口，自动避让只认屏幕边界）
+        // 面板底部状态行（方案 A）——媒体区空间留给画面
         egui::Panel::left("files")
             .default_size(300.0)
-            .show(ui, |ui| self.file_list(ui, frame));
+            .show(ui, |ui| self.file_list(ui));
         egui::CentralPanel::default().show(ui, |ui| self.video_area(ui, &ctx, frame));
-        // 帧末统一同步：任一弹窗（帮助/密码框）打开期间隐藏 mpv 子窗口，全部关闭后恢复
-        self.sync_child_visibility();
     }
-}
 
-impl App {
-    /// 弹窗显隐 → mpv 子窗口同步（mpv 子窗口永远盖在 egui 绘制之上，
-    /// 靠每帧重算的 overlay_open 请求位驱动，多弹窗嵌套开关时状态始终正确）
-    fn sync_child_visibility(&mut self) {
-        if self.overlay_open != self.child_hidden {
-            self.child_hidden = self.overlay_open;
-            if self.child_hwnd != 0 {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
-                unsafe {
-                    ShowWindow(
-                        self.child_hwnd as _,
-                        if self.overlay_open { SW_HIDE } else { SW_SHOW },
-                    );
-                }
-            }
+    fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        // GL 仍 current：按序销毁 mpv render 资源（shutdown_render）后再整体销毁 mpv
+        if let (Some(p), Some(gl)) = (self.player.as_mut(), gl) {
+            p.shutdown_render(gl);
         }
+        self.player = None;
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.player = None; // 先销毁 mpv（含子窗口渲染）
-        if self.child_hwnd != 0 {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.child_hwnd as _);
-            }
-            self.child_hwnd = 0;
-        }
+        // GL 资源清理在 eframe::App::on_exit（GL 仍 current 时销毁 render 资源，
+        // 且早于 painter drop）；这里只剩 mpv terminate 与磁盘缓存清理
         // 退出时自动清空解压缓存（config: cache.clean_on_exit）
         if self.cfg.cache.clean_on_exit {
             let freed = cache::clean_all(&cache::cache_dir(&self.cfg));

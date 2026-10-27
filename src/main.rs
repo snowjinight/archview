@@ -48,6 +48,8 @@ fn main() -> eframe::Result<()> {
         .expect("assets/icon.png 解码失败");
 
     let opts = eframe::NativeOptions {
+        // glow 渲染器：mpv render API 需要 GL 上下文（wgpu 默认下无 glow painter）
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("Archive Media Player")

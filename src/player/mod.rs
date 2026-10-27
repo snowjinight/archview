@@ -5,18 +5,132 @@ pub mod mpv_ffi;
 pub mod stream_cb;
 
 use crate::config::Config;
+use glow::HasContext as _;
+use std::ffi::c_void;
+use std::ptr::null_mut;
+
+/// mpv render API 的 get_proc_address 回调。glow 的加载器私有于 Context、不对外暴露，
+/// Windows 上直接走系统 API：扩展函数 wglGetProcAddress，GL 1.x 固定函数从
+/// opengl32.dll 导出表兜底（libmpv-rs 同款做法）；user_data 不需要（传 null_mut()）。
+#[cfg(windows)]
+unsafe extern "C" fn gpa_trampoline(
+    _user: *mut c_void,
+    name: *const std::ffi::c_char,
+) -> *mut c_void {
+    use windows_sys::Win32::Graphics::OpenGL::wglGetProcAddress;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    let sym = std::ffi::CStr::from_ptr(name).as_ptr().cast::<u8>();
+    if let Some(f) = wglGetProcAddress(sym) {
+        return f as *const () as *mut c_void;
+    }
+    let module: Vec<u16> = "opengl32.dll\0".encode_utf16().collect();
+    let lib = GetModuleHandleW(module.as_ptr());
+    match GetProcAddress(lib, sym) {
+        Some(f) => f as *const () as *mut c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// mpv 帧更新回调：request_repaint 唤醒 egui（Context 线程安全，专为跨线程唤醒设计）。
+/// 回调无返回值（render.h: typedef void (*mpv_render_update_fn)(void *cb_ctx)）
+unsafe extern "C" fn update_trampoline(user: *mut c_void) {
+    let c = &*(user as *const egui::Context);
+    c.request_repaint();
+}
+
+/// 创建离屏 FBO + RGBA 纹理（mpv 渲染目标），并清成黑底防首帧前闪未定义内容
+fn make_fbo(gl: &glow::Context, w: i32, h: i32) -> (glow::NativeFramebuffer, glow::NativeTexture) {
+    unsafe {
+        let texture = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            w,
+            h,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
+        );
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        let fbo = gl.create_framebuffer().unwrap();
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        debug_assert_eq!(
+            gl.check_framebuffer_status(glow::FRAMEBUFFER),
+            glow::FRAMEBUFFER_COMPLETE,
+            "视频离屏 FBO 不完整，mpv 渲染将静默失败"
+        );
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        (fbo, texture)
+    }
+}
+
+/// render API 状态（ARCHITECTURE.md 13）。生存到 shutdown_render（eframe on_exit，
+/// GL current 线程、早于 mpv terminate）——顺序不可颠倒。
+struct RenderState {
+    rctx: *mut mpv_ffi::MpvRenderContext,
+    fbo: glow::NativeFramebuffer,
+    texture: glow::NativeTexture,
+    w: i32,
+    h: i32,
+    /// FFI user_data 薄指针的原始 Box（闭包/Context 不能直接过 FFI），shutdown 时按原型回收
+    update_user_data: *mut egui::Context,
+}
 
 pub struct PlayerService {
     ctx: *mut mpv_ffi::MpvHandle,
+    render: Option<RenderState>,
 }
 
 // mpv client API 线程安全；回调线程只走全局注册表，不触碰此 handle。
 unsafe impl Send for PlayerService {}
 
+/// mpv render context 句柄包装：egui PaintCallback 闭包按字段捕获（2021 edition
+/// disjoint capture），裸字段必须自带 Send/Sync；实际使用恒在 UI/GL 线程
+/// （mpv render 调用要求与创建同线程），安全
+#[derive(Clone, Copy)]
+pub struct MpvRenderCtx(pub *mut mpv_ffi::MpvRenderContext);
+impl MpvRenderCtx {
+    /// 方法调用（而非 .0 字段访问）保证闭包捕获止步于本 newtype
+    pub fn as_ptr(self) -> *mut mpv_ffi::MpvRenderContext {
+        self.0
+    }
+}
+unsafe impl Send for MpvRenderCtx {}
+unsafe impl Sync for MpvRenderCtx {}
+
+/// PaintCallback 绘制闭包捕获用的全部值（全 Copy，不引用 PlayerService）
+#[derive(Clone, Copy)]
+pub struct RenderInfo {
+    pub rctx: MpvRenderCtx,
+    /// glow FBO 裸名（回调内经 NativeFramebuffer(name) 重建绑定）
+    pub fbo: u32,
+    pub w: i32,
+    pub h: i32,
+}
+
 impl PlayerService {
-    pub fn new(cfg: &Config) -> Result<Self, String> {
+    pub fn new(cfg: &Config, gl: &glow::Context, egui_ctx: &egui::Context) -> Result<Self, String> {
         let ctx = mpv_ffi::create()?;
-        let s = Self { ctx };
+        let mut s = Self {
+            ctx,
+            render: None,
+        };
         // 播放器参数全部来自 config.toml
         s.opt("hwdec", &cfg.player.hwdec);
         s.opt("cache-secs", &cfg.player.cache_secs.to_string());
@@ -29,8 +143,37 @@ impl PlayerService {
         s.opt("osd-level", "0"); // 不在预览窗口里弹 OSD 提示
         s.set_prop_str("volume", &cfg.player.volume.to_string());
         // 核心：注册 zvf:// 自定义协议
-        mpv_ffi::stream_cb_add_ro(ctx, "zvf", std::ptr::null_mut(), stream_cb::open_cb)
+        mpv_ffi::stream_cb_add_ro(ctx, "zvf", null_mut(), stream_cb::open_cb)
             .map_err(|e| format!("注册 zvf:// 协议失败: {e}"))?;
+
+        // render API 模式（ARCHITECTURE.md 13）：vo=libmpv 必须在 create_render_context
+        // 之前设置；timing-offset=0 防 update 回调被 vsync 对齐阻塞
+        s.opt("vo", "libmpv");
+        s.opt("video-timing-offset", "0");
+
+        // get_proc_address 走系统 API（见 gpa_trampoline 注释），user_data 不需要
+        let rctx = match mpv_ffi::render_context_create(ctx, gpa_trampoline, null_mut()) {
+            Ok(r) => r,
+            Err(e) => {
+                mpv_ffi::destroy(ctx);
+                return Err(e);
+            }
+        };
+        let update_box = Box::into_raw(Box::new(egui_ctx.clone()));
+        mpv_ffi::render_context_set_update_callback(
+            rctx,
+            Some(update_trampoline),
+            update_box as *mut c_void,
+        );
+        let (fbo, texture) = make_fbo(gl, 16, 16);
+        s.render = Some(RenderState {
+            rctx,
+            fbo,
+            texture,
+            w: 16,
+            h: 16,
+            update_user_data: update_box,
+        });
         Ok(s)
     }
 
@@ -46,10 +189,44 @@ impl PlayerService {
         }
     }
 
-    /// 嵌入原生子窗口（Windows：HWND）
-    pub fn embed(&self, hwnd: isize) {
-        if let Err(e) = mpv_ffi::set_option_string(self.ctx, "wid", &hwnd.to_string()) {
-            tracing::error!("设置 wid 失败: {e}");
+    /// PaintCallback 前调用（UI 线程）：确保离屏 FBO 与目标物理像素同尺寸（变了就重建），
+    /// 返回闭包要捕获的全部值。w/h 为 0 时返回 None（无有效绘制目标）
+    pub fn render_info(&mut self, gl: &glow::Context, w: i32, h: i32) -> Option<RenderInfo> {
+        let r = self.render.as_mut()?;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        if r.w != w || r.h != h {
+            unsafe {
+                gl.delete_framebuffer(r.fbo);
+                gl.delete_texture(r.texture);
+            }
+            let (fbo, texture) = make_fbo(gl, w, h);
+            r.fbo = fbo;
+            r.texture = texture;
+            r.w = w;
+            r.h = h;
+        }
+        Some(RenderInfo {
+            rctx: MpvRenderCtx(r.rctx),
+            fbo: r.fbo.0.get(),
+            w: r.w,
+            h: r.h,
+        })
+    }
+
+    /// eframe on_exit 调用（GL current、早于 App drop 与 mpv terminate）。
+    /// 顺序：摘更新回调 → free render ctx → 回收 user_data 薄指针 Box → 删 GL 资源。
+    /// 之后 PlayerService Drop 只剩 mpv terminate_destroy。
+    pub fn shutdown_render(&mut self, gl: &glow::Context) {
+        if let Some(r) = self.render.take() {
+            mpv_ffi::render_context_set_update_callback(r.rctx, None, null_mut());
+            mpv_ffi::render_context_free(r.rctx);
+            unsafe {
+                drop(Box::from_raw(r.update_user_data));
+                gl.delete_framebuffer(r.fbo);
+                gl.delete_texture(r.texture);
+            }
         }
     }
 

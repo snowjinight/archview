@@ -4,8 +4,11 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.36"
+# glow 后端：eframe 0.34 起默认 wgpu，须显式关闭默认特性指定 glow——
+# mpv render API 需要拿 glow::Context 喂 get_proc_address（ARCHITECTURE.md 13）
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 egui = "0.36"
+glow = "0.17"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 rfd = "0.17"
 libloading = "0.8"
@@ -32,4 +35,6 @@ features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_SystemInformation",
+    "Win32_Graphics_OpenGL",
+    "Win32_System_LibraryLoader",
 ]

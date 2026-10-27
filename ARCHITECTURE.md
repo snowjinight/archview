@@ -52,8 +52,9 @@
 | ZIP 读取 | `zip` | 纯 Rust，支持按 entry 随机访问 |
 | 7Z 读取 | `sevenz-rust` | 纯 Rust；`BlockDecoder` 支持固态 folder 直达解压（见 11.1） |
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
-| 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 15 符号，含 stream_cb）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
-| 图片渲染 | —— | 无独立解码库：图片（含 GIF/WebP 动图）与视频统一经 mpv `loadfile` 渲染，VFS/缓存/翻页链路完全复用 |
+| 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 20 符号：核心 + stream_cb + render API）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
+| 图片渲染 | —— | 无独立解码库：图片（含 GIF/WebP 动图）与视频统一经 mpv `loadfile` 解码渲染，VFS/缓存/翻页链路完全复用；render API 落地后图片可进一步走 egui 纹理直显（见 6.4/13） |
+| GL 后端 | `eframe` (glow) | 渲染器显式指定 glow（0.34 起 eframe 默认 wgpu，glow 才能拿到 `GL` 上下文喂给 mpv render API） |
 | 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
 ### 2.2 播放方案：内嵌 libmpv（而非外部播放器 / 裸 FFmpeg）
@@ -93,8 +94,9 @@
 ┌─────────────────────────────────────────────────────┐
 │  UI 层 (egui)                                       │
 │  左侧：文件列表（视频/图片标签页）+ 搜索            │
-│  右侧：媒体区 —— mpv 原生子窗口统一渲染             │
-│         （视频与图片/动图同一条 loadfile 链路）      │
+│  右侧：媒体区 —— mpv render API 纹理渲染（单平面） │
+│         （视频与图片/动图同一条 loadfile 链路；    │
+│           PaintCallback 内 blit 到 egui 画布）      │
 │  顶栏：打开/缓存管理；状态行：文件名/进度           │
 └──────────────────┬──────────────────────────────────┘
                    │ 命令/事件
@@ -240,11 +242,15 @@ GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开�
 
 ### 6.1 定位与实现决策
 
-与视频播放并列的 VFS 消费者。**图片不经独立解码库，统一走 mpv 渲染**
+与视频播放并列的 VFS 消费者。**图片不经独立解码库，统一走 mpv 解码渲染**
 （早期设计稿的 image crate + egui 纹理方案已放弃）：mpv 原生支持 JPEG/PNG/GIF/WebP/BMP
 等常见格式（含 GIF/WebP 动图逐帧播放），复用 loadfile 一条链路后，VFS 快慢路径、
-缓存、翻页导航、全屏、解压进度覆盖层全部零成本复用，也避免了
-"mpv 子窗口永远盖在 egui 之上"（见 11.3）与纹理渲染的窗口叠放冲突。
+缓存、翻页导航、全屏、解压进度覆盖层全部零成本复用。
+
+渲染层面：早期 mpv 以原生子窗口（wid 嵌入）盖在 egui 之上，形成双平面，引发一系列
+窗口叠放绕路（见 11.3 历史、13 迁移动机）；**现迁至 mpv render API 后整个窗口只有
+egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，覆盖层/弹窗/提示
+天然盖在画面上，无需任何窗口操作。
 
 ### 6.2 数据流
 
@@ -263,10 +269,19 @@ GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开�
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
 
-### 6.4 预留扩展
+### 6.4 预留扩展：图片专属纹理浏览器（render API 已落地 ✅，落地方案见 13.4）
 
-缩放/平移交互、浏览位置记忆（需在 mpv 子窗口之上叠加 egui 交互层或改纹理渲染方案）、
-PSD/HEIC 等专用格式（mpv 不支持，需引入解码库走纹理路径）——均不影响 VFS 层。
+render API 迁移完成后，解锁"图片不走 mpv、直接解码进 egui 纹理"的专属看图路径：
+
+| 能力 | 方案 | 相对 mpv 路径的收益 |
+|---|---|---|
+| 零延迟首帧 | image/zune-image 解码 → `ColorImage` → egui 纹理直显 | 消除 mpv loadfile 初始化 50~200ms（建 demuxer/GL 管线），翻页即显 |
+| 缩放/平移 | 纹理 UV 变换（滚轮缩放锚定光标、拖拽平移），纯 egui 交互 | mpv `video-zoom/pan` 参数链路不再需要，交互跟手 |
+| 解码器覆盖 | PSD/HEIC/AVIF 等专用格式接解码库走同纹理路径 | mpv 不支持的格式不再缺位 |
+| 动图 | GIF/WebP 逐帧解码 → 定时更新纹理 | 与视频共用 PaintCallback rect，暂停/单帧步进自然实现 |
+
+图片纹理路径与 mpv 路径并存（按格式/体积路由），VFS 层零改动——两者只是同一
+VirtualFile 流的不同消费者。
 
 ---
 
@@ -299,7 +314,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | 2 | RAR5/7Z 固态 | 慢路径为必选实现；解压任务支持 seek 重定向；solid 按主头标志自动判定（非 solid RAR 走单文件按需） |
 | 3 | 分卷压缩（.part1.rar / .7z.001） | unrar 原生支持 RAR 分卷；ZIP 分卷需自行拼接 —— 二期 |
 | 4 | 加密 | 头加密阻止列目录 → 打开阶段自动探测密码（无密码 → config 列表），耗尽才弹密码框；密码仅内存传递不落盘 |
-| 5 | libmpv 嵌入渲染 | MVP 用原生子窗口嵌入（Windows `SetParent`）；纹理渲染方案后置 |
+| 5 | libmpv 嵌入渲染 | 已迁移 mpv render API 纹理渲染（glow 后端 + PaintCallback，见 13）；原生子窗口双平面问题连根移除，剩余风险为 FFI 生命周期顺序（on_exit 释放 render ctx 先于 mpv terminate） |
 | 6 | mpv dll 分发 | 仓库不含（超 GitHub 单文件限制），build.rs 从 `deps\mpv-dev` 复制，README 提供下载指引 |
 | 7 | 大图解码阻塞 UI | 已消解：图片统一走 mpv 渲染，无独立解码线程（见第 6 章） |
 
@@ -315,14 +330,17 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | Phase 4 | 分卷 RAR（已支持）、分卷 ZIP、视频缩略图、播放记忆 | 完整版 | 🔶 部分完成 |
 | 追加 | VarTidy CLI 子命令（第 12 章）：var 资源包增量整理 | `archview.exe tidy` + 「发送到」 | ✅ |
 | 追加 | 解压会话化（11.4）：extract_session 持久解码会话，跳转零取消 | 固态包随机跳看重定向不重起 | ✅ |
+| 追加 | 渲染架构迁移（13）：wid 原生子窗口 → mpv render API + glow 后端 + PaintCallback blit，删除全部窗口叠放绕路代码 | egui 单平面，视频画面缩放质量随窗口实时重采样 | ✅ |
+| 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + PSD/HEIC 扩展 | 纹理路径与 mpv 路径并存互兜底 | 🔶 方案已定，待启动 |
 
 ---
 
 ## 10. 技术选型清单（汇总）
 
 ```
-ui          : egui / eframe
-player      : 自研 mpv_ffi（libloading 动态加载 libmpv-2.dll，含 stream_cb）
+ui          : egui / eframe（glow 后端，Renderer::Glow；wgpu 默认下须显式指定）
+gl          : glow 0.17（eframe glow feature 同款；供 mpv render API 与 FBO blit 使用）
+player      : 自研 mpv_ffi（libloading 动态加载 libmpv-2.dll，含 stream_cb + render API）
 archive/zip : zip
 archive/7z  : sevenz-rust (BlockDecoder 固态直达)
 archive/rar : unrar (UnRAR.dll)
@@ -427,8 +445,10 @@ PointerMoved/MouseWheel 事件序列跑 100+ 帧，记录每帧 `ScrollArea::sta
   完整文件名（换行）+ 两阶段进度（跳过前置文件阶段 = Spinner + 已解压字节；
   写文件阶段 = 字节进度条）。
 - **防闪烁宽限期**：正在播 A 时切到需解压的 B，超过 `ui.extract_overlay_delay_ms`（默认 500ms）
-  仍未解完才隐藏视频窗口（mpv 原生子窗口永远盖在 egui 之上，必须 `ShowWindow` 隐藏）显示覆盖层；
-  500ms 内解完则窗口从未隐藏——快速路径零闪烁。这是"延迟隐藏"而非"最短显示时间"：
+  仍未解完才停止绘制视频帧并显示覆盖层（render API 下整个窗口只有 egui 一个平面——
+  该帧 PaintCallback 不提交画面，覆盖层即自然露出；历史 wid 方案时代须 `ShowWindow`
+  隐藏 mpv 原生子窗口，因 mpv 子窗口永远盖在 egui 之上）；
+  500ms 内解完则画面从未中断——快速路径零闪烁。这是"延迟隐藏"而非"最短显示时间"：
   后者会人为拖慢快速解压。
 - 预取场景（目标 == 正在播放条目）永不遮挡画面，顶栏弱色短标记即可。
 - 顶栏短标记"后台解压中…（剩余 N 项）"（N = `j.pending.len()`）**常显**——只要有
@@ -833,3 +853,143 @@ report_dir = "auto"        # 报告目录；"auto" = 首个输入包所在目录
 | 3.5 | 密码打开期锁定：`open_with_password_probe`（三格式 verify_password，7z folder 级 AES 检测）+ passwords 提为播放器/CLI 公用顶层配置 | ✅ 完成（CLI 删执行期重开循环；播放器 OpenJob 探测链，弹框降级为兜底） |
 | 4（可选） | 失败续跑（记录已完成包清单，重跑跳过） | 按需 |
 | 5（可选） | hash 级去重（防"同名不同内容"漏判）、多包并发 | 按需 |
+
+---
+
+## 13. 渲染架构迁移：wid 原生子窗口 → mpv render API（单平面）
+
+### 13.1 迁移动机：wid 双平面的先天缺陷
+
+MVP 采用 mpv 官方推荐的 Windows 嵌入方式：`SetParent` 把 mpv 原生子窗口塞进 egui
+窗口，视频画在子窗口、UI 画在父窗口——**两个独立平面，mpv 子窗口永远盖在 egui 之上**。
+由此产生一整串绕路代码（全部随迁移删除）：
+
+| 绕路 | 位置 | 问题 |
+|---|---|---|
+| 子窗口创建/同步/销毁 | ui.rs `create_child` / `sync_child_rect` / `sync_child_visibility` | 每帧 SetWindowPos 换算物理像素；显示状态手动同步 |
+| 覆盖层无法盖住视频 | 解压进度覆盖层、音量提示等 | 必须反 hid 子窗口才能露出 egui 内容（11.3） |
+| 弹窗/菜单遮挡 | 密码框、确认框 | 同上，全要绕 |
+| 画面缩放质量 | mpv 独立平面自行缩放 | 窗口缩放时锯齿/模糊不受控，无法与 egui 同步重采样 |
+| 多显示器 DPI | 子窗口像素坐标换算 | 整数/分数缩放下错位闪烁 |
+
+render API 下 mpv 只做解码 + 渲染到宿主提供的 FBO，**整个窗口只有 egui 一个 GL 平面**，
+以上问题全部不存在。
+
+### 13.2 新渲染链路
+
+```
+mpv (vo=libmpv, hwdec=auto-copy)
+  │ mpv_render_context_render → 宿主 glow FBO（离屏纹理）
+  ▼
+egui PaintCallback（video_area rect 处）
+  │ 1. bind READ/DRAW_FRAMEBUFFER = 宿主 FBO，viewport 其尺寸
+  │ 2. 需要新帧时调 mpv_render_context_render（flip-y=1 适配 GL 底朝上）
+  │ 3. gl.blit_framebuffer 到默认帧缓冲的目标 rect（y 轴翻转换算，LINEAR 过滤）
+  │ 4. 恢复 egui_glow 的 framebuffer 绑定（状态封闭，不污染后续绘制）
+  ▼
+egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
+```
+
+关键实现点：
+
+- **glow 后端**：Cargo.toml `eframe = { default-features = false, features = ["glow", ...] }`
+  + `NativeOptions.renderer = Renderer::Glow`。0.34 起 eframe 默认 wgpu，glow 才有
+  `painter.gl()`（glow::Context）可喂给 mpv 的 get_proc_address。
+- **FFI 符号**（mpv_ffi.rs 追加）：`mpv_render_context_create/free/render/set_update_callback/update`
+  + 参数结构 `mpv_render_param{type,data}`（`{INVALID,NULL}` 结尾）、
+  `mpv_opengl_init_params{get_proc_address,ctx}`、`mpv_opengl_fbo{fbo,w,h,internal_format}`
+  （宽高在结构体内）。精确枚举值：API_TYPE=1 / OPENGL_INIT_PARAMS=2 / OPENGL_FBO=3 / FLIP_Y=4。
+- **`vo=libmpv` 必须在 create_render_context 之前设置**；`video-timing-offset=0` 防
+  update 回调被 vsync 对齐阻塞。hwdec=auto 在 render 模式下 mpv 自动落 copy 模式，配置不变。
+- **FFI 闭包陷阱**：`Arc<dyn Fn>` 是双字 fat pointer，user_data 只收单指针——
+  先 `Box::into_raw(Box::new(arc))` 变 thin pointer，释放时按原型回收。
+- **销毁顺序**（全部在 GL current 线程，eframe `on_exit` 回调内，早于 App::drop）：
+  `set_update_callback(None)` → `render_context_free` → 回收两个 user_data Box →
+  删 glow FBO/纹理；`Drop` 只剩 mpv terminate_destroy。
+- **生命周期**：render ctx 必须先于 mpv handle 释放，否则 terminate 时 mpv 在无 GL
+  环境下清理渲染资源 → 崩溃。
+
+### 13.3 实施步骤（✅ 已全部完成）
+
+1. ✅ eframe 切 glow 后端（Cargo.toml + main.rs `Renderer::Glow`）；
+2. ✅ mpv_ffi.rs 扩展 render API 符号（5 函数指针 + 3 repr(C) 结构 + 常量）；
+3. ✅ player/mod.rs 新增 render context 管理（创建/更新回调/FBO 维护/render 调用）；
+4. ✅ ui.rs video_area 集成 PaintCallback blit；extract_wait 改为"跳过该帧视频绘制"；
+5. ✅ 验证后删除 wid 全套绕路代码：child_hwnd/child_hidden/overlay_open/native_hwnd/
+   create_child/sync_child_rect/sync_child_visibility/DestroyWindow/frame 参数链。
+   wid 路径不留开关、不做回退——双平面问题根除后无理由保留。
+
+> 迁移过程中的三颗实际踩过的雷（FFI 盲区崩溃 / blit READ 绑定套娃虚影 /
+> smooth_scroll_delta 惯性尾巴）见 13.5 踩坑记录。
+
+### 13.4 下一步计划：图片专属纹理浏览器（方案）
+
+render API 迁移已完成（13.3），GL 上下文与 PaintCallback 机制就绪，本节从"预留
+扩展"（6.4）升级为下一步实施计划。能力收益对照见 6.4 表格；这里是落地方案。
+
+**动机**：图片目前与视频同走 mpv loadfile，首帧带 50~200ms 的 demuxer/GL 管线
+初始化（翻页体感顿挫）；且 mpv 不支持的格式（PSD/HEIC/AVIF）永久缺位。图片
+不走 mpv、直接解码进 egui 纹理，可与 mpv 路径零成本并存。
+
+**数据流**（VFS 层零改动——两条路径只是同一 VirtualFile 流的不同消费者）：
+
+```
+VirtualFile 流（复用 VFS 快慢路径 + 缓存）
+  → 解码器（内置格式 image crate；扩展格式专用库）
+  → 解码即降采样到显示尺寸（≤ 视口 2x）
+  → egui ColorImage → TextureHandle 直显
+```
+
+**路由**：play() 按扩展名分流——视频/动图仍走 mpv；静态图走纹理路径。纹理路径
+解码失败（格式不支持/数据损坏）**自动落回 mpv loadfile**，两条路径互为兜底；
+config 加 `ui.image_texture` 开关，异常时一键整体回退。
+
+**交互**：普通 egui::Image + Response 即可（无需 PaintCallback）——拖拽平移；
+滚轮缩放以 UV 变换实现并锚定光标位置；双击复位。全屏/翻页/解压进度覆盖层
+天然复用（单平面红利，wid 时代这些都需要窗口叠放绕路）。
+
+**内存控制**：
+- 解码即降采样：100MP 级大图不进原尺寸纹理（防触顶/上传卡顿）；
+- ±1 张预取的 LRU 纹理缓存：连续翻页即显，看过的图翻回秒开；
+- 切包/退出时释放 TextureHandle，缓存容量走 config。
+
+**实施顺序**（每步独立可交付）：
+1. 静态图纹理路径 + 路由 + 失败回退（核心收益：翻页零延迟）；
+2. 滚轮缩放（锚定光标）/ 拖拽平移 / 双击复位；
+3. ±1 预取 LRU；
+4. GIF/WebP 动图逐帧解码接管（与视频共用播放/暂停语义）；
+5. PSD/HEIC/AVIF 扩展解码器（按需，接库走同纹理路径）。
+
+### 13.5 踩坑记录（本次迁移实际炸过的三颗雷）
+
+**坑 1：手写 FFI 签名错 → 运行时 0xc000041D 崩溃。**
+`mpv_render_context_create` 的出参 `res` 是第一参数（不是指针垫在最后），
+`mpv_render_update_fn` 返回 `void`（不是 u64）。编译器只校验"调用处 vs 我们的
+声明"，声明与调用**一致地错**可完全编译通过——这是手写 FFI 的固有盲区；且 53 个
+既有测试全部走 `vo=null` 无头管线或纯 Rust 逻辑，根本到不了 render 路径，静默
+通过。预防：bindgen 生成绑定，或至少加 GUI 冒烟脚本（启动 exe → 等 5s → 查存活）。
+
+**坑 2：blit 源跟随 READ 绑定 → "套娃虚影 + 疯狂闪烁"。**
+现象：播放时视频区出现逐级缩小、逐级右移的进度条/时间/暂停按钮虚影，全部同步
+移动，画面疯狂闪烁；暂停后虚影全消。根因链条：
+
+- `glBlitFramebuffer` 的 src 由 **READ 绑定**决定，`mpv_render_context_render`
+  内部渲染可能把 READ 留在别处（如屏幕）→ src(0,0,w,h) 实际读到**窗口左下角**
+  （正是左侧列表底部 + 控制条左段）；
+- 每帧执行 = 屏幕自我迭代拷贝 → 内容逐级缩小右移（套娃），且每帧实时重拷 → 同步
+  移动 + 闪烁；
+- 暂停后不再调 render、READ 保持上帧显式绑定 → 虚影消失（关键诊断线索）。
+
+修复：blit 前显式 `bind_framebuffer(READ_FRAMEBUFFER, 视频FBO)` 锁定拷贝源。
+附带的状态契约（egui_glow 0.36 源码 painter.rs 确认）：进入 PaintCallback 时
+BLEND（premultiplied）/SCISSOR_TEST 已开启；回调返回后 egui_glow 自己重跑
+prepare_painting 恢复 viewport/blend/scissor，**唯独 framebuffer 绑定必须由
+回调成对恢复（read+draw）**——`intermediate_fbo()` 恒返回 None，文档要求的
+恢复目标实为"默认帧缓冲"。
+
+**坑 3：`smooth_scroll_delta` 惯性尾巴 → 滚轮一次误切两项。**
+它是 egui 的平滑插值量，一次滚轮后连续多帧非零；"检测到滚动即切换 + 按时间节流
+（ui.wheel_switch_secs=0.3s）"的方案里，节流窗口一过尾巴残量仍非零 → 第二次
+触发切换 → 刚翻到末项就越界误弹「下一个压缩包」询问（点按钮无此问题，因为
+click 天然是单次事件）。修复：改用真实 `Event::MouseWheel` 事件驱动（帧内多
+事件合并方向判定），节流仅用于防触控板连扫。
