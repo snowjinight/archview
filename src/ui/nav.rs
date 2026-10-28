@@ -188,9 +188,9 @@ impl App {
         if zoom_fit {
             self.img_zoom_to(None);
         }
-        // N：直接弹出下一个压缩包选择窗（不等翻到末项）
+        // N：直接弹出下一个压缩包选择窗（不等翻到末项，主动触发无“已到末项”文案）
         if ask_next_key {
-            self.ask_next_archive();
+            self.ask_next_archive(false);
         }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
@@ -259,7 +259,7 @@ impl App {
                 // 已在最后一项再往后翻：弹窗选择打开同目录下一个压缩包
                 // （仅用户显式操作触发；图片自动翻页传 false，防每帧重复弹窗）
                 if ask_next {
-                    self.ask_next_archive();
+                    self.ask_next_archive(true);
                 }
                 return;
             }

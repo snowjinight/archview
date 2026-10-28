@@ -82,11 +82,13 @@ enum PwKind {
     Play(usize),
 }
 
-/// 末项后询问打开下一个压缩包的弹窗状态：
+/// 「打开下一个压缩包」选择弹窗状态（本包末项后翻 / N 键主动触发共用）：
 /// 同目录压缩包列表（分卷族已合并为首卷）+ 选中项下标（默认=循环意义上的下一个）
+/// + at_end（true=末项后翻触发，文案提示“已到最后一项”；false=N 键主动触发）
 struct NextArchivePrompt {
     archives: Vec<PathBuf>,
     sel: usize,
+    at_end: bool,
 }
 
 /// 后台解压任务（7z/RAR）：UI 侧的期望状态 + 消息通道。真正的解码循环
@@ -260,7 +262,7 @@ pub struct App {
     pw_memory: std::collections::HashMap<PathBuf, String>,
     // 末项后询问打开下一个压缩包：弹窗状态（目录内可选包列表 + 选中项）
     next_archive_prompt: Option<NextArchivePrompt>,
-    // 本会话打开过的压缩包路径（切包弹窗中灰色标记"看过"）
+    // 本会话打开过的压缩包路径（切包弹窗中灰色弱化标记"看过"）
     seen_archives: std::collections::HashSet<PathBuf>,
     // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
     initial_open: Option<PathBuf>,
@@ -447,8 +449,9 @@ impl eframe::App for App {
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui));
-        // 文件列表放左侧（视频区在右）；悬停行的完整文件名显示在
-        // 面板底部状态行（方案 A）——媒体区空间留给画面
+        // 文件列表放左侧（视频区在右）；悬停行显示完整包内路径气泡
+        //（路径/文件名分色）。render API 单平面后气泡不再被 mpv 原生
+        // 子窗口遮挡，hover 已恢复（wid 时代曾因此禁用）
         egui::Panel::left("files")
             .default_size(300.0)
             .show(ui, |ui| self.file_list(ui));

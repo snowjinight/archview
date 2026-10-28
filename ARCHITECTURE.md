@@ -431,7 +431,7 @@ sort        : alphanumeric-sort (file list natural order, optional mode for comi
 | 坑 | 现象 | 修复 |
 |---|---|---|
 | **usize 下溢** | 手动向列表上方滚动再点“下一个” → 列表直接跳到底部。目标行在渲染范围之前时 `pos - range.start` 下溢，debug 下 panic，**release 下 wrap 成 2^64 级天文数字** → 滚动目标被钳到 max_offset | 一切虚拟化下标换算用 `isize` |
-| **行高不均匀** | 长文件名自动换行把行撑成 2 行高，首行实测高度被钉在 2 行值上 → 渲染范围按虚高缩水 → 底部空隙 + 翻页时行高双稳态翻转 | 所有列表行 `.truncate()` 强制单行；全名放视频区上方状态行 |
+| **行高不均匀** | 长文件名自动换行把行撑成 2 行高，首行实测高度被钉在 2 行值上 → 渲染范围按虚高缩水 → 底部空隙 + 翻页时行高双稳态翻转 | 所有列表行 `.truncate()` 强制单行；完整路径走悬停气泡（wid 子窗口时代气泡被 mpv 原生窗口遮挡而禁用，render API 单平面后恢复；目录段琥珀色/文件名主题蓝分色，LayoutJob 单 Label 保证长路径换行正常） |
 | **scroll_to_rect 坐标系** | 高亮追踪滚动跳到错误位置。`scroll_to_rect` 接收**屏幕坐标**，而虚拟化闭包内 `max_rect().top()` = 内容顶 + min_row×step，需按此换算目标行 y | 换算公式 `(pos - range.start) × step + 闭包 max_rect().top()` |
 | **每帧重算** | 万级条目每帧过滤/排序/clone，UI 帧率跌到个位数 | 行缓存一次性构建；排序预生成小写键再按自然序比较（避免比较器内每次 2 次 to_lowercase 分配）；实测 7-Zip 打包时无视添加顺序强制按字典序写入，故 `ui.sort_files` 默认 false（包内顺序 = 固态包物理码流顺序，预取最优），true = 自然序（数字段按数值 1/2/10）供漫画/图集场景 |
 

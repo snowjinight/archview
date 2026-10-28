@@ -3,6 +3,7 @@
 use super::*;
 
 /// 进度条/播放头主题色
+/// 主题强调色（进度条/播放头共用）
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
 
 impl App {
@@ -214,6 +215,8 @@ impl App {
         let row_h = self.row_h.unwrap_or_else(|| ui.spacing().interact_size.y);
         // 预收集不可变数据，避免渲染闭包内借用 self
         let rows = &self.list_rows;
+        // hover 气泡要完整包内路径（含目录段），与 rows 一样预取引用进闭包
+        let entries = self.archive.as_ref().map(|a| &a.entries);
         let playing = self.playing;
         let has_archive = self.archive.is_some();
         let item_spacing_y = ui.spacing().item_spacing.y;
@@ -228,7 +231,7 @@ impl App {
                     ui.weak(if has_archive {
                         "（无匹配媒体文件）"
                     } else {
-                        "打开压缩包后文件列表显示在这里"
+                        "打开压缩包或媒体目录后，文件列表显示在这里"
                     });
                     return;
                 }
@@ -273,14 +276,64 @@ impl App {
                         scrolled = true;
                     }
                     for r in &rows[range] {
-                        // truncate：超长文件名截断显示（全名在面板底部状态行）。
+                        // truncate：超长文件名截断显示（完整路径在悬停气泡里）。
                         // 必须截断——selectable_label 默认换行会把长名行撑成 2 行高，
                         // 行高不均匀破坏虚拟化的等高前提：首行实测高被钉在 2 行值上，
                         // 渲染范围按虚高 step 缩水 → 底部空隙 + 翻页时 step 双稳态翻转
-                        let resp =
+                        let mut resp =
                             egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
                                 .truncate()
                                 .ui(ui);
+                        // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
+                        // 一个平面，气泡盖在视频画面上不再被 mpv 原生子窗口遮挡
+                        //（wid 时代因此禁用过 hover，见 ARCHITECTURE.md 11.2）。
+                        // 目录段/文件名双色显示，一眼区分
+                        if let Some(es) = entries {
+                            let name = es[r.idx].name.as_str();
+                            let (dir, file) = match name.rfind('/') {
+                                Some(p) => (&name[..p + 1], &name[p + 1..]),
+                                None => ("", name),
+                            };
+                            resp = resp.on_hover_ui(|ui| {
+                                // egui 0.36：LayoutJob/TextFormat 在 egui::text 模块下。
+                                // 两种颜色拼进同一个 LayoutJob → 单 Label 渲染，
+                                // 长路径按气泡宽度自然换行（两个 Label 横排则不换行）。
+                                // 真彩色而非主题强弱色（用户反馈强弱色对比不够明显）：
+                                // 目录段琥珀（文件夹联想）、文件名主题蓝（与进度条
+                                // ACCENT 同源）；深浅主题各配一档亮度保证对比度
+                                let (dir_c, file_c) = if ui.visuals().dark_mode {
+                                    (
+                                        egui::Color32::from_rgb(224, 172, 76),
+                                        ACCENT,
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(146, 102, 12),
+                                        egui::Color32::from_rgb(24, 98, 200),
+                                    )
+                                };
+                                let mut job = egui::text::LayoutJob::default();
+                                if !dir.is_empty() {
+                                    job.append(
+                                        dir,
+                                        0.0,
+                                        egui::text::TextFormat::simple(
+                                            egui::FontId::default(),
+                                            dir_c,
+                                        ),
+                                    );
+                                }
+                                job.append(
+                                    file,
+                                    0.0,
+                                    egui::text::TextFormat::simple(
+                                        egui::FontId::default(),
+                                        file_c,
+                                    ),
+                                );
+                                ui.label(job);
+                            });
+                        }
                         if measured.is_none() {
                             measured = Some(resp.rect.height());
                         }
@@ -473,9 +526,10 @@ impl App {
                         None => format!("正在打开 {name}…"),
                     }
                 } else if self.archive.is_some() {
-                    "点击左侧视频文件开始播放".to_string()
+                    "点击左侧列表中的视频/图片开始播放".to_string()
                 } else {
-                    "先打开一个压缩包（ZIP / 7Z / RAR）".to_string()
+                    // 宽度受 put 矩形（400px）约束，文案需保持单行可容纳
+                    "先打开压缩包（ZIP / 7Z / RAR）或媒体目录".to_string()
                 };
                 ui.put(
                     egui::Rect::from_center_size(video.center(), egui::vec2(400.0, 30.0)),

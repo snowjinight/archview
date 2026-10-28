@@ -1,4 +1,5 @@
-//! 弹窗：压缩包密码输入（加密头/内容加密两阶段）与末项后「下一个压缩包」询问。
+//! 弹窗：压缩包密码输入（加密头/内容加密两阶段）与「下一个压缩包」选择
+//!（本包末项后翻 / N 键主动触发共用）。
 
 use super::*;
 
@@ -63,12 +64,12 @@ impl App {
         }
     }
 
-    /// 末项后询问打开下一个压缩包的确认弹窗。
+    /// 「打开下一个压缩包」选择弹窗（本包末项后翻 / N 键主动触发共用）。
     /// 列出同目录全部压缩包（分卷族合并为首卷），默认选中循环意义上的
     /// 下一个（末包绕回第一个），点选任意包可直接打开；
-    /// 本会话打开过的包灰色显示，帮助绕圈时分辨看过的。
+    /// 三态区分（加粗=当前 / 弱灰=本会话看过 / 琥珀=未看）帮助绕圈时分辨。
     pub(super) fn next_archive_dialog(&mut self, ctx: &egui::Context) {
-        // 先取当前包路径（"当前"标记）与已看集合（灰色标记），避免与 prompt 可变借用冲突
+        // 先取当前包路径（“当前”标记）与已看集合（弱灰标记），避免与 prompt 可变借用冲突
         let cur_name = self
             .archive
             .as_ref()
@@ -86,7 +87,21 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.set_min_width(320.0);
-                ui.label("已到本压缩包的最后一项，选择要打开的压缩包：");
+                // 三态区分：未看过=琥珀（暖色=待看新内容，与选中蓝互补不冲突）/
+                // 已看过=弱灰（看过即淡出）/ 当前=正常色加粗（不着色——选中行
+                // 本身是蓝色高亮底，再用蓝色标“当前”会与选中态混淆）
+                let unseen_c = if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(232, 178, 72)
+                } else {
+                    egui::Color32::from_rgb(168, 118, 20)
+                };
+                // 文案区分触发来源：末项后翻带“已到最后一项”；
+                // N 键主动触发（还没看完）只列选择
+                ui.label(if prompt.at_end {
+                    "已到本压缩包的最后一项，选择要打开的压缩包："
+                } else {
+                    "选择要打开的压缩包："
+                });
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .auto_shrink([false, false])
@@ -104,17 +119,26 @@ impl App {
                             } else {
                                 name
                             };
-                            // 本会话看过的包灰色弱化，未看的正常色
-                            let text = if seen.contains(path) {
-                                egui::RichText::new(label).weak()
+                            // 当前=加粗（不着色）/ 未看过=琥珀 / 已看过=弱灰
+                            let text = if is_cur {
+                                egui::RichText::new(label).strong()
+                            } else if !seen.contains(path) {
+                                egui::RichText::new(label).color(unseen_c)
                             } else {
-                                egui::RichText::new(label)
+                                egui::RichText::new(label).weak()
                             };
                             if ui.selectable_label(prompt.sel == i, text).clicked() {
                                 prompt.sel = i;
                             }
                         }
                     });
+                // 颜色图例（小号，颜色/字重即含义）
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("当前").small().strong());
+                    ui.label(egui::RichText::new("已看过").small().weak());
+                    ui.label(egui::RichText::new("未看过").small().color(unseen_c));
+                });
                 ui.add_space(4.0);
                 // 按钮行右对齐（主按钮在最右）。先包一层 horizontal 限定单行高度，
                 // 否则 right_to_left 会占满剩余区域并把按钮垂直居中"悬浮"在框中部
@@ -142,7 +166,8 @@ impl App {
     /// 弹出「打开下一个压缩包」选择窗（N 键 / 本包末项后继续后翻共用）。
     /// 列出同目录全部压缩包（分卷族合并为首卷），默认选中循环意义上的
     /// 下一个（末包绕回第一个）；目录集合模式 / 无其它包时给出一次性提示。
-    pub(super) fn ask_next_archive(&mut self) {
+    /// at_end=true（末项后翻）：弹窗文案带“已到最后一项”；false（N 键）则不带。
+    pub(super) fn ask_next_archive(&mut self, at_end: bool) {
         if !self.cfg.ui.ask_next_archive || self.next_archive_prompt.is_some() {
             return;
         }
@@ -165,6 +190,7 @@ impl App {
         self.next_archive_prompt = Some(NextArchivePrompt {
             archives: list,
             sel,
+            at_end,
         });
     }
 }
