@@ -727,11 +727,17 @@ impl App {
         let native = tex.size_vec2();
         let fit = fit_scale(video, native);
         let zoom = self.img_view.zoom.unwrap_or(fit);
-        // ---- 大图原图升级：基础纹理最长边顶格（= 请求时被降采样，原图更大）
-        // 且放大到接近 1:1 时，按需解码原图纹理（上限 FULL_MAX_DIM）；就绪后
-        // 下帧无缝换画。img_source 由 play_image/load_extracted/heal 记录，
-        // 切视频即清（见 extract）----
-        if native.max_elem() as u32 >= self.cfg.ui.image_max_dim
+        // ---- 高清纹理升级：静态图放大到接近 1:1 时按需解码加强纹理——
+        // 仅在有望增益时请求：被降采样的大图（基础纹理顶格 image_max_dim）
+        // 取原图；≤2560 中小图（含 2K 级）×2 Lanczos 预放大补齐 4K 屏
+        // 密度。中间区间（2560, image_max_dim）基础即原图且不放大，请求
+        // 了也无增益（白解码一次 + 单槽显存翻倍），跳过。上限
+        // FULL_MAX_DIM（顶到它再升无意义甚至降级）。就绪后下帧无缝换画。
+        // img_source 由 play_image/load_extracted/heal 记录，切视频即清
+        // （见 extract）----
+        let native_max = native.max_elem() as u32;
+        if native_max < FULL_MAX_DIM
+            && (native_max >= self.cfg.ui.image_max_dim || native_max <= FULL_UPSCALE_MAX)
             && zoom >= 0.95
             && self.img.is_static(key)
             && !self.img.has_full(key)

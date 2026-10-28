@@ -41,10 +41,17 @@ const MAX_ANIM_FRAMES: usize = 512;
 /// 超过视为线程卡死或消息丢失，剔除 pending 允许重新发起
 const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 原图解码上限（放大到 1:1 附近时按需升级纹理用）：防病态大图
+/// 高清纹理解码上限（放大到 1:1 附近时按需升级纹理用）：防病态大图
 /// （30000×30000 像素图等）撑爆显存——8192²×4B=256MB 封顶，
-/// 绝大多数"原图"不受影响仍全分辨率
-const FULL_MAX_DIM: u32 = 8192;
+/// 绝大多数"原图"不受影响仍全分辨率。pub 供 UI 层判断升级触发条件
+pub const FULL_MAX_DIM: u32 = 8192;
+
+/// 高清路径 ×2 预放大门槛：最长边 ≤ 此值才升（含经典 2K=2560，×2 后
+/// ≤5120，覆盖 4K 屏密度）。更大图纹理密度已足不再升——再 ×2 到
+/// 6~8K 显存 96~256MB、Lanczos 重采样秒级，仅深放大时略优于 GPU
+/// 双线性，得不偿失。pub 供 UI 层判断升级触发条件（中间区间请求了
+/// 也无增益，直接跳过）
+pub const FULL_UPSCALE_MAX: u32 = 2560;
 
 /// 缓存键 = 压缩包 id + 条目下标（目录模式 id 同样有效，见 ArchiveState）
 pub type ImgKey = (u64, usize);
@@ -190,7 +197,7 @@ impl ImageService {
             // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
             // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_image(&source, max_dim)
+                decode_image(&source, max_dim, false)
             }));
             match r {
                 Ok(Ok(decoded)) => {
@@ -216,16 +223,20 @@ impl ImageService {
         }
     }
 
-    /// 请求解码原图（不降采样，上限 FULL_MAX_DIM）：大图放大到 1:1 附近时
-    /// 按需升级纹理，就绪后无缝换画（几何不变：屏幕矩形按基础纹理算，
-    /// UV 全图映射对两种分辨率通用）。幂等：已就绪/解码中/已放弃直接返回；
-    /// 动图不升级（全帧原图显存不可控，触发方已用 is_static 前置过滤，
-    /// 单帧动图落到这里按 FullFailed 放弃即可）
+    /// 请求解码高清纹理（上限 FULL_MAX_DIM）：大图放大到 1:1 附近时按需
+    /// 升级——被降采样的大图取原图；未被降采样的中小图（最长边 ≤
+    /// FULL_UPSCALE_MAX=2560，含 2K 级）×2 Lanczos 预放大补齐 4K 屏
+    /// 密度，放大区间细节优于 GPU 双线性（更大图密度已足不再升）。
+    /// 就绪后无缝换画
+    /// （几何不变：屏幕矩形按基础纹理算，UV 全图映射对两种分辨率通用）。
+    /// 幂等：已就绪/解码中/已放弃直接返回；动图不升级（全帧原图显存
+    /// 不可控，触发方已用 is_static 前置过滤，单帧动图落到这里按
+    /// FullFailed 放弃即可）
     pub fn request_full(&mut self, key: ImgKey, source: ImageSource, name: &str) {
         if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
             return;
         }
-        tracing::info!("发起原图解码 {name}");
+        tracing::info!("发起高清解码 {name}");
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         self.full_pending = Some((key, Instant::now()));
@@ -234,7 +245,7 @@ impl ImageService {
             .spawn(move || {
                 // 同 request：畸形文件可能 panic，捕获转 FullFailed 防死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image(&source, FULL_MAX_DIM)
+                    decode_image(&source, FULL_MAX_DIM, true)
                 }));
                 let msg = match r {
                     Ok(Ok(Decoded::Static(img))) => ImgMsg::FullReady { key, img },
@@ -442,15 +453,16 @@ impl ImageService {
     }
 }
 
-/// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA
-fn decode_image(source: &ImageSource, max_dim: u32) -> Result<Decoded, String> {
+/// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA。
+/// full=true 走高清路径（放大升级纹理用，上采样策略见 decode_any）
+fn decode_image(source: &ImageSource, max_dim: u32, full: bool) -> Result<Decoded, String> {
     match source {
         ImageSource::File(path) => {
             let reader = image::ImageReader::open(path)
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim)
+            decode_any(reader, max_dim, full)
         }
         ImageSource::Stream(vfs, entry) => {
             let mut vf = vfs
@@ -463,7 +475,7 @@ fn decode_image(source: &ImageSource, max_dim: u32) -> Result<Decoded, String> {
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim)
+            decode_any(reader, max_dim, full)
         }
     }
 }
@@ -474,6 +486,7 @@ fn decode_image(source: &ImageSource, max_dim: u32) -> Result<Decoded, String> {
 fn decode_any<R: BufRead + Seek>(
     reader: image::ImageReader<R>,
     max_dim: u32,
+    full: bool,
 ) -> Result<Decoded, String> {
     let fmt = reader.format();
     if fmt == Some(image::ImageFormat::Gif) {
@@ -499,7 +512,12 @@ fn decode_any<R: BufRead + Seek>(
         img.height(),
         t.elapsed().as_millis()
     );
-    Ok(Decoded::Static(color_image(resample(img, max_dim, true))))
+    // ×2 预放大门槛：基础路径仅 ≤512 小图（保 100% = 原尺寸语义，开销
+    // 小）；高清路径 ≤2560 中小图（含 2K 级）补齐 4K 屏密度——1080P/2K
+    // 放大时 GPU 双线性发糊，Lanczos 预放大显著保细节；更大图密度已足
+    // 不再升（代价见 FULL_UPSCALE_MAX 注释）
+    let up_max = if full { FULL_UPSCALE_MAX } else { 512 };
+    Ok(Decoded::Static(color_image(resample(img, max_dim, up_max))))
 }
 
 /// 帧迭代收集：逐帧尺寸适配 + 延迟钳正 + 帧数封顶
@@ -514,7 +532,7 @@ fn collect_frames(
         let img = resample(
             image::DynamicImage::ImageRgba8(fr.into_buffer()),
             max_dim,
-            false,
+            0, // 动图多帧 ×4 显存不值当，不预放大
         );
         out.push((color_image(img), delay));
         if out.len() >= MAX_ANIM_FRAMES {
@@ -544,8 +562,9 @@ fn anim_delay(d: image::Delay) -> Duration {
 }
 
 /// 尺寸适配：超限降采样（快速 box 采样，mipmap 补偿质量）；
-/// 小图 Lanczos3 ×2 上采样（仅静态图，动图多帧 ×4 显存不值当）
-fn resample(img: image::DynamicImage, max_dim: u32, upscale: bool) -> image::DynamicImage {
+/// 最长边 ≤ upscale_max 时 Lanczos3 ×2 上采样、封顶 max_dim
+/// （0 = 关闭）——比运行时 GPU 双线性放大锐
+fn resample(img: image::DynamicImage, max_dim: u32, upscale_max: u32) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
         return img;
@@ -557,8 +576,8 @@ fn resample(img: image::DynamicImage, max_dim: u32, upscale: bool) -> image::Dyn
         let nw = ((w as f64 * scale).round() as u32).max(1);
         let nh = ((h as f64 * scale).round() as u32).max(1);
         img.thumbnail(nw, nh)
-    } else if upscale && longest <= 512 {
-        // 小图 ×2 上采样（封顶 max_dim）：Lanczos3 比运行时双线性放大锐
+    } else if upscale_max > 0 && longest <= upscale_max {
+        // ×2 上采样（封顶 max_dim）：Lanczos3 比运行时双线性放大锐
         let nw = (w.saturating_mul(2)).min(max_dim);
         let nh = (h.saturating_mul(2)).min(max_dim);
         if nw != w || nh != h {
@@ -690,24 +709,43 @@ mod tests {
     #[test]
     fn resample_超限降采样() {
         let img = image::DynamicImage::new_rgb8(100, 80);
-        let out = resample(img, 32, true);
+        let out = resample(img, 32, 0);
         assert_eq!((out.width(), out.height()), (32, 26)); // 80*32/100 = 25.6 → 26
     }
 
     #[test]
     fn resample_小图上采样两倍() {
         let img = image::DynamicImage::new_rgb8(20, 10);
-        let out = resample(img, 4096, true);
+        let out = resample(img, 4096, 512);
         assert_eq!((out.width(), out.height()), (40, 20));
         // 动图不上采样（多帧 ×4 显存不值当）
-        let out = resample(image::DynamicImage::new_rgb8(20, 10), 4096, false);
+        let out = resample(image::DynamicImage::new_rgb8(20, 10), 4096, 0);
         assert_eq!((out.width(), out.height()), (20, 10));
+    }
+
+    #[test]
+    fn resample_高清路径小中图两倍预放大() {
+        // 高清路径门槛 FULL_UPSCALE_MAX（补齐 4K 屏密度）：≤门槛 ×2
+        // Lanczos 预放大（2K 级 2560→5120）；更大图密度已足不再升
+        // （再 ×2 到 6~8K 显存 96~256MB、重采样秒级，得不偿失）
+        let out = resample(image::DynamicImage::new_rgb8(1920, 1080), 8192, FULL_UPSCALE_MAX);
+        assert_eq!((out.width(), out.height()), (3840, 2160));
+        let out = resample(image::DynamicImage::new_rgb8(2560, 1440), 8192, FULL_UPSCALE_MAX);
+        assert_eq!((out.width(), out.height()), (5120, 2880), "2K 级边界内 ×2");
+        let out = resample(image::DynamicImage::new_rgb8(4096, 3072), 8192, FULL_UPSCALE_MAX);
+        assert_eq!((out.width(), out.height()), (4096, 3072), "超门槛不再升");
+        let out = resample(image::DynamicImage::new_rgb8(1920, 1080), 8192, 512);
+        assert_eq!(
+            (out.width(), out.height()),
+            (1920, 1080),
+            "基础路径门槛内不放大"
+        );
     }
 
     #[test]
     fn resample_中间尺寸不动() {
         let img = image::DynamicImage::new_rgb8(800, 600);
-        let out = resample(img, 4096, true);
+        let out = resample(img, 4096, 512);
         assert_eq!((out.width(), out.height()), (800, 600));
     }
 
@@ -758,7 +796,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim.gif");
         std::fs::write(&p, gif_bytes_2帧(8, 6)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("2 帧 GIF 应解出 Anim");
@@ -801,7 +839,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim_delay.gif");
         std::fs::write(&p, gif_bytes_delayed(8, 6, 80, 2)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("带真实延迟的 2 帧 GIF 应解出 Anim");
@@ -826,7 +864,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("single.gif");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
         std::fs::remove_file(&p).ok();
         assert!(matches!(out, Decoded::Static(_)), "单帧动画应归静态（免时钟开销）");
     }
@@ -842,13 +880,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.webp");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(tex) = out else {
             panic!("静态 webp 应走静图路径");
         };
         // 8x6 ≤512 触发小图 ×2 上采样（resample 既有行为）
         assert_eq!(tex.size, [16, 12]);
+    }
+
+    #[test]
+    fn decode_高清路径中图两倍预放大() {
+        // 800×600：基础路径不动（见 decode_file_从临时文件解码），高清路径
+        // 按余量 ×2（800 ≤ 8192/2）——放大区间 Lanczos 细节优于 GPU 双线性
+        let png = png_bytes(800, 600);
+        let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("full.png");
+        std::fs::write(&p, &png).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 8192, true).unwrap();
+        std::fs::remove_file(&p).ok();
+        let Decoded::Static(img) = out else {
+            panic!("PNG 应走静态路径");
+        };
+        assert_eq!(img.size, [1600, 1200]);
     }
 
     #[test]
@@ -859,7 +914,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
