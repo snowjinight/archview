@@ -294,7 +294,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume
-[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms
+[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim（图片纹理直显，见 13.4）
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
 [vartidy] # repo_dir / report_dir（CLI 整理子命令）
 ```
@@ -976,6 +976,9 @@ VirtualFile 流（复用 VFS 快慢路径 + 缓存）
 - ±1 张预取的 LRU 纹理缓存（容量 = `image_cache_count`；逐出跳过刚推入与
   正在显示（`shown`）两个 key，都不堪逐时允许临时超容、下次推入再收缩）：
   连续翻页即显，看过的图翻回秒开；
+- 防死局三件套（13.5 坑 8/9）：pending 看门狗 10s 剔除可重试、`catch_unwind`
+  捕获 worker panic 转 Failed 走回退、`heal_current_image()` 每帧自愈（当前图
+  不在缓存且无在途解码就补发请求）——杜绝任何形态的"永久占位"；
 - TextureHandle 随 LRU 淘汰自动释放，切包/退出随 App 释放。
 
 **实施顺序**（每步独立可交付）：

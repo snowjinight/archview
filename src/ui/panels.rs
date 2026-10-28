@@ -665,6 +665,11 @@ impl App {
         }
         // frame() 同时推进动画时钟（动图到点切帧）；Some(rest) = 距下次切帧，
         // 定时 repaint 驱动播放（静态图 rest=None，不加轮询开销）
+        // 滚轮翻页发生在本函数内（上方），而 key 是调用方进入前算好的旧值：
+        // 翻页帧仍拿旧 key 调 frame，shown 会停在上一张——刚翻到、还在 LRU
+        // 尾部的图在下一次预取完成挤出时不受保护（自愈虽能一帧内补发，但
+        // 白解码一遍且 warn 刷屏），故翻页后重取当前 key
+        let key = self.tex_image_key().unwrap_or(key);
         let Some((tex, rest)) = self.img.frame(key) else {
             // 后台解码中（流式路径通常 <100ms）：占位提示
             if visible {
