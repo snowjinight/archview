@@ -105,6 +105,11 @@ pub struct PlayerService {
     /// loadfile 提交时刻 + 是否已记录首渲染（诊断切换延迟的时间线锚点）
     load_mark: Cell<Option<Instant>>,
     painted_since_load: Cell<bool>,
+    /// mpv 是否已产出首个视频帧（PaintCallback 闭包内经 render_context_update
+    /// 检出 MPV_RENDER_UPDATE_FRAME 时置位）。与 painted_since_load 分离的原因：
+    /// 后者在"提交绘制"时置位会早于真实帧就绪 → 16ms 高频轮询过早停止，
+    /// 首帧实际呈现回落到 100ms 慢节拍 ≈ 200ms 切换延迟（LOG 实测）
+    first_frame: Arc<AtomicBool>,
 }
 
 // mpv client API 线程安全；回调线程只走全局注册表，不触碰此 handle。
@@ -124,14 +129,19 @@ impl MpvRenderCtx {
 unsafe impl Send for MpvRenderCtx {}
 unsafe impl Sync for MpvRenderCtx {}
 
-/// PaintCallback 绘制闭包捕获用的全部值（全 Copy，不引用 PlayerService）
-#[derive(Clone, Copy)]
+/// PaintCallback 绘制闭包捕获用的全部值（不引用 PlayerService）。
+/// 裸指针字段经 newtype 自带 Send/Sync；first_frame 为 Arc 共享原子——
+/// 闭包内写入、UI 线程读取。实际使用恒在 UI/GL 线程（mpv render 调用
+/// 要求与创建同线程），安全
+#[derive(Clone)]
 pub struct RenderInfo {
     pub rctx: MpvRenderCtx,
     /// glow FBO 裸名（回调内经 NativeFramebuffer(name) 重建绑定）
     pub fbo: u32,
     pub w: i32,
     pub h: i32,
+    /// 首帧检出标志：闭包内 render_context_update 返回 FRAME 位时置位
+    pub first_frame: Arc<AtomicBool>,
 }
 
 impl PlayerService {
@@ -144,6 +154,7 @@ impl PlayerService {
             log_thread: None,
             load_mark: Cell::new(None),
             painted_since_load: Cell::new(true),
+            first_frame: Arc::new(AtomicBool::new(true)),
         };
         // 播放器参数全部来自 config.toml
         // mpv 日志泵：wait_event 同一 client 只能单线程消费（此处是进程内唯一消费者），
@@ -291,6 +302,7 @@ impl PlayerService {
             fbo: r.fbo.0.get(),
             w: r.w,
             h: r.h,
+            first_frame: self.first_frame.clone(),
         })
     }
 
@@ -317,9 +329,10 @@ impl PlayerService {
         // keep-open=always 在 EOF 时会把 pause 置为 yes，且 loadfile 不清除它——
         // 不显式取消暂停的话，播完一个视频后切换新视频会停在第一帧
         self.set_prop_str("pause", "no");
-        // 装载窗口起点：供 note_painted 打首渲染耗时 + UI 轮询判定
+        // 装载窗口起点：供 has_painted_since_load 打首帧耗时 + UI 轮询判定
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
+        self.first_frame.store(false, Ordering::Relaxed);
     }
 
     /// 播放本地文件路径（7z/RAR 后台解压完成后的慢路径）
@@ -331,28 +344,36 @@ impl PlayerService {
         self.set_prop_str("pause", "no"); // 同 load()：清除 EOF 粘滞的暂停态
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
-    }
-
-    /// PaintCallback 分支每帧调用（UI 线程）：load 后首次绘制时打日志，
-    /// 与 mpv 泵日志对齐成 "loadfile → mpv 就绪 → egui 实际画出" 时间线
-    pub fn note_painted(&self) {
-        if self.painted_since_load.get() {
-            return;
-        }
-        self.painted_since_load.set(true);
-        if let Some(t0) = self.load_mark.get() {
-            tracing::info!(
-                "mpv 画面首次渲染 距loadfile {:.3}s",
-                t0.elapsed().as_secs_f64()
-            );
-        }
+        self.first_frame.store(false, Ordering::Relaxed);
     }
 
     /// loadfile 后是否已画出首帧。false = 处于装载窗口，UI 应高频轮询
     /// repaint（帧就绪后 mpv 不触发 update 回调，靠 200ms 内部超时推进，
-    /// 主动轮询把这段空洞压掉）
+    /// 主动轮询把这段空洞压掉）。
+    /// 首帧以 PaintCallback 闭包内 render_context_update 检出的
+    /// MPV_RENDER_UPDATE_FRAME 为准（真实换帧而非提交绘制）；另有 2s
+    /// 兜底超时——纯音频等永远无视频帧的场景停止高频轮询
     pub fn has_painted_since_load(&self) -> bool {
-        self.painted_since_load.get()
+        if !self.painted_since_load.get() && self.first_frame.load(Ordering::Relaxed) {
+            self.painted_since_load.set(true);
+            if let Some(t0) = self.load_mark.get() {
+                tracing::info!(
+                    "mpv 首帧真实渲染 距loadfile {:.3}s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if self.painted_since_load.get() {
+            return true;
+        }
+        match self.load_mark.get() {
+            Some(t0) if t0.elapsed() > std::time::Duration::from_secs(2) => {
+                self.painted_since_load.set(true);
+                tracing::warn!("2s 未见视频帧（纯音频或解码失败？），停止高频轮询");
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 停止播放并清空画面（视频 → 静态图纹理直显切换时调用）：
@@ -364,6 +385,7 @@ impl PlayerService {
         // 复位装载窗口：stop 后无画面可画，UI 不再轮询（图片直显模式）
         self.load_mark.set(None);
         self.painted_since_load.set(true);
+        self.first_frame.store(true, Ordering::Relaxed);
     }
 
     pub fn toggle_pause(&self) {

@@ -77,8 +77,8 @@ pub const MPV_RENDER_PARAM_API_TYPE: u32 = 1;
 pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: u32 = 2;
 pub const MPV_RENDER_PARAM_OPENGL_FBO: u32 = 3;
 pub const MPV_RENDER_PARAM_FLIP_Y: u32 = 4;
-// mpv_render_update_flag（当前 render 无条件执行，此位仅作参考保留）
-#[allow(dead_code)]
+// mpv_render_update_flag：update 返回 FRAME 位 = 有新帧待渲染
+// （PaintCallback 闭包用它做真实首帧检出）
 pub const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
 
 pub const MPV_RENDER_API_TYPE_OPENGL: &[u8] = b"opengl\0";

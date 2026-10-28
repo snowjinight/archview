@@ -65,6 +65,10 @@ impl App {
             if let Some(p) = &self.player {
                 p.load(archive_id, entry_idx);
             }
+            // 切视频清防闪快照与图片源：否则快照停留在视频前的旧图，下次
+            // 切图解码间隙会闪现那张隔了好几条的图
+            self.hold_img = None;
+            self.img_source = None;
             self.playing = Some(entry_idx);
             self.dragging = false;
             tracing::info!("播放: {name}");
@@ -98,6 +102,8 @@ impl App {
             p.stop();
         }
         let max_dim = self.cfg.ui.image_max_dim;
+        // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
+        self.img_source = Some((key, source.clone(), name.clone()));
         if !self.img.has(key) && !self.img.is_pending(key) {
             self.img.request(key, source, max_dim, &name);
         }
@@ -160,6 +166,7 @@ impl App {
         let name = e.name.clone();
         let max_dim = self.cfg.ui.image_max_dim;
         tracing::warn!("当前图不在缓存且无在途解码，补发请求: {name}");
+        self.img_source = Some((key, src.clone(), name.clone()));
         self.img.request(key, src, max_dim, &name);
     }
 
@@ -177,6 +184,9 @@ impl App {
             return;
         };
         self.img_fallback.insert((archive_id, entry_idx));
+        // 回退 mpv 同切视频：清快照防隔图闪现
+        self.hold_img = None;
+        self.img_source = None;
         if let Some(p) = &self.player {
             if stream {
                 p.load(archive_id, entry_idx);
@@ -854,15 +864,20 @@ impl App {
                 p.stop();
             }
             let max_dim = self.cfg.ui.image_max_dim;
+            let src = ImageSource::File(dest.to_path_buf());
+            // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
+            self.img_source = Some((key, src.clone(), name.clone()));
             if !self.img.has(key) && !self.img.is_pending(key) {
-                self.img
-                    .request(key, ImageSource::File(dest.to_path_buf()), max_dim, &name);
+                self.img.request(key, src, max_dim, &name);
             }
             self.img_view = ImgView::default();
             tracing::info!("图片装载: {name}");
             self.prefetch_images();
             return;
         }
+        // 落盘视频走 mpv：同流式路径清快照防隔图闪现
+        self.hold_img = None;
+        self.img_source = None;
         if let Some(p) = &self.player {
             p.load_path(dest);
         }

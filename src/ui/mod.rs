@@ -178,6 +178,15 @@ enum ListTab {
     Image,
 }
 
+/// 图片切换防闪保持画面：上一张最后一帧的绘制快照（纹理 + 屏幕矩形），
+/// 下一张就绪前原样重画（绘制时按 video 区裁剪）。since 每次成功绘制
+/// 刷新，因此 elapsed 度量的是"等待下一张"的时长而非观看时长
+struct HoldImg {
+    tex: egui::TextureHandle,
+    rect: egui::Rect,
+    since: std::time::Instant,
+}
+
 pub struct App {
     cfg: Config,
     archive: Option<ArchiveState>,
@@ -200,6 +209,12 @@ pub struct App {
     img_view: ImgView,
     // 上帧图片绘制区域（滚轮缩放锚点 / 拖拽限位用；未绘制过 = NOTHING）
     img_viewport: egui::Rect,
+    // 非 solid 图片切换防闪：下一张解码期间原样重画上一张（快照见 HoldImg），
+    // 超过 2s 仍未就绪才退回占位提示（避免无限解压时用户毫无感知）
+    hold_img: Option<HoldImg>,
+    // 当前图片的解码源 (key, source, 文件名)：放大到原尺寸附近时用同一源
+    // 按需解码不降采样的原图纹理；切视频/回退 mpv 时清空
+    img_source: Option<(ImgKey, ImageSource, String)>,
     // 进度条拖动状态
     dragging: bool,
     drag_pos: f64,
@@ -272,6 +287,8 @@ impl App {
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
+            hold_img: None,
+            img_source: None,
             dragging: false,
             drag_pos: 0.0,
             error: None,
@@ -319,6 +336,8 @@ impl App {
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
+            hold_img: None,
+            img_source: None,
             dragging: false,
             drag_pos: 0.0,
             error: None,

@@ -491,7 +491,7 @@ impl App {
             // mpv 装载窗口 60fps 轮询：帧就绪后 mpv 不触发 update 回调、靠
             // 200ms 内部超时推进（实测切换含两段 ~200ms 空洞）。主动高频
             // repaint 让 PaintCallback 无条件 render 立即解除 mpv 的 VO 等待，
-            // 首帧画出（note_painted）即停，不影响稳态功耗
+            // 检出真实首帧（render_context_update 的 FRAME 位）即停，不影响稳态功耗
             if let Some(p) = &self.player {
                 if !p.has_painted_since_load() {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -509,7 +509,6 @@ impl App {
             let y1 = surf_h - (video.min.y * ppp).round() as i32;
             if let (Some(gl), Some(p)) = (&self.gl, self.player.as_mut()) {
                 if let Some(info) = p.render_info(gl, phys_w, phys_h) {
-                    p.note_painted(); // 首渲染时间线锚点（诊断切换延迟）
                     let cb = eframe::egui_glow::CallbackFn::new(move |_cb_info, painter| {
                         let gl = painter.gl();
                         use glow::HasContext as _;
@@ -531,13 +530,19 @@ impl App {
                                 )),
                             );
                             gl.viewport(0, 0, info.w, info.h);
-                            // update() 仅用于消费/清除待渲染标志（避免 update 回调
-                            // 反复唤醒）；render 必须无条件执行：切文件的时序下 FRAME
+                            // update() 用于消费/清除待渲染标志（避免 update 回调
+                            // 反复唤醒），FRAME 位同时作为真实首帧检出信号
+                            // （has_painted_since_load 据此停 16ms 轮询）；
+                            // render 必须无条件执行：切文件的时序下 FRAME
                             // 标志可能被上一次 UI 忙帧的 update() 提前消费（读到 0），
                             // 若据此跳过 render，mpv 单帧 Image 会互相死等——直到
                             // image-display-duration 超时 EOF 的下一次 update 才补画
                             // （实测 webp 切换黑屏 5 秒）。重复 render 只是重画当前帧
-                            let _flags = mpv_ffi::render_context_update(info.rctx.as_ptr());
+                            let flags = mpv_ffi::render_context_update(info.rctx.as_ptr());
+                            if flags & mpv_ffi::MPV_RENDER_UPDATE_FRAME != 0 {
+                                info.first_frame
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let _ = mpv_ffi::render_gl_render(
                                 info.rctx.as_ptr(),
                                 info.fbo as i32,
@@ -671,12 +676,48 @@ impl App {
         // 白解码一遍且 warn 刷屏），故翻页后重取当前 key
         let key = self.tex_image_key().unwrap_or(key);
         let Some((tex, rest)) = self.img.frame(key) else {
-            // 后台解码中（流式路径通常 <100ms）：占位提示
+            // 解码未就绪（非 solid 大图解压+解码可达数秒）：优先原样重画上一张
+            // （HoldImg 快照）避免闪烁；无快照（首图）或等待超 2s（疑似无限
+            // 解压/卡死，用户需明确感知）退回占位提示并显示已等待时长
             if visible {
-                ui.put(
-                    egui::Rect::from_center_size(video.center(), egui::vec2(240.0, 30.0)),
-                    egui::Label::new(egui::RichText::new("正在解码图片…").weak()).selectable(false),
-                );
+                let hold = self
+                    .hold_img
+                    .as_ref()
+                    .filter(|h| h.since.elapsed() < std::time::Duration::from_secs(2));
+                match hold {
+                    Some(h) => {
+                        let mut mesh = egui::Mesh::with_texture(h.tex.id());
+                        mesh.add_rect_with_uv(
+                            h.rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        ui.painter_at(video).add(egui::Shape::mesh(mesh));
+                        // 新图随时可能就绪：高频轮询缩短替换延迟
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    None => {
+                        let wait = self
+                            .hold_img
+                            .as_ref()
+                            .map(|h| h.since.elapsed())
+                            .unwrap_or_default();
+                        ui.put(
+                            egui::Rect::from_center_size(video.center(), egui::vec2(300.0, 30.0)),
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "正在解码图片… 已等待 {:.1}s",
+                                    wait.as_secs_f64()
+                                ))
+                                .weak(),
+                            )
+                            .selectable(false),
+                        );
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                }
             }
             return;
         };
@@ -686,6 +727,24 @@ impl App {
         let native = tex.size_vec2();
         let fit = fit_scale(video, native);
         let zoom = self.img_view.zoom.unwrap_or(fit);
+        // ---- 大图原图升级：基础纹理最长边顶格（= 请求时被降采样，原图更大）
+        // 且放大到接近 1:1 时，按需解码原图纹理（上限 FULL_MAX_DIM）；就绪后
+        // 下帧无缝换画。img_source 由 play_image/load_extracted/heal 记录，
+        // 切视频即清（见 extract）----
+        if native.max_elem() as u32 >= self.cfg.ui.image_max_dim
+            && zoom >= 0.95
+            && self.img.is_static(key)
+            && !self.img.has_full(key)
+            && !self.img.is_full_pending(key)
+            && !self.img.is_full_failed(key)
+        {
+            if let Some((src_key, source, name)) = self.img_source.as_ref() {
+                if *src_key == key {
+                    let (source, name) = (source.clone(), name.clone());
+                    self.img.request_full(key, source, &name);
+                }
+            }
+        }
 
         // ---- 交互：先改 zoom/pan，绘制时统一 clamp ----
         // 拖拽平移（fit 模式图像不大于视口，clamp 会归零，无副作用）
@@ -713,6 +772,9 @@ impl App {
         if !visible {
             return;
         }
+        // 原图就绪即换画：矩形按基础纹理算（同宽高比 → 同屏幕矩形），
+        // UV 全图映射对两种分辨率通用——纯分辨率升级，无缩放跳变
+        let tex = self.img.full_tex(key).unwrap_or(tex);
         let rect =
             egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
         let mut mesh = egui::Mesh::with_texture(tex.id());
@@ -723,6 +785,13 @@ impl App {
         );
         // painter_at 以媒体区裁剪：放大后超出部分不画到面板外
         ui.painter_at(video).add(egui::Shape::mesh(mesh));
+        // 成功绘制即刷新防闪快照（纹理 Arc 克隆，廉价）：下次切换在解码间隙
+        // 原样重画此画面。since=now → elapsed 重新从 0 计"等待下一张"时长
+        self.hold_img = Some(HoldImg {
+            tex: tex.clone(),
+            rect,
+            since: std::time::Instant::now(),
+        });
     }
 
     /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。

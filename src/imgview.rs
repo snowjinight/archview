@@ -41,6 +41,11 @@ const MAX_ANIM_FRAMES: usize = 512;
 /// 超过视为线程卡死或消息丢失，剔除 pending 允许重新发起
 const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 原图解码上限（放大到 1:1 附近时按需升级纹理用）：防病态大图
+/// （30000×30000 像素图等）撑爆显存——8192²×4B=256MB 封顶，
+/// 绝大多数"原图"不受影响仍全分辨率
+const FULL_MAX_DIM: u32 = 8192;
+
 /// 缓存键 = 压缩包 id + 条目下标（目录模式 id 同样有效，见 ArchiveState）
 pub type ImgKey = (u64, usize);
 
@@ -74,6 +79,7 @@ pub fn wants_texture(cfg: &crate::config::Config, name: &str) -> bool {
 }
 
 /// 图片数据来源
+#[derive(Clone)]
 pub enum ImageSource {
     /// zip/目录：流式 open_entry 读虚拟文件解码（不解压落盘）
     Stream(Arc<dyn ArchiveVFS>, VirtualEntry),
@@ -104,6 +110,15 @@ enum ImgMsg {
         key: ImgKey,
         error: String,
     },
+    /// 原图（不降采样）解码完成（大图放大升级，见 request_full）
+    FullReady {
+        key: ImgKey,
+        img: egui::ColorImage,
+    },
+    /// 原图解码失败/放弃：UI 保持降采样纹理
+    FullFailed {
+        key: ImgKey,
+    },
 }
 
 /// LRU 缓存条目：逐帧纹理 + 播放状态（静态图 = 单帧无时钟）
@@ -132,6 +147,14 @@ pub struct ImageService {
     /// 洪水会把正在显示的条目从队尾挤出（cap 小时必现），导致该图
     /// frame()=None 而 pending 已空 → 永久停在"正在解码图片…"占位符
     shown: Option<ImgKey>,
+    /// 原图纹理单槽：大图放大到 1:1 附近时按需解码不降采样版本无缝换画。
+    /// 单槽不进 LRU——原图显存大（8192²×4B=256MB），只随当前显示条目存续
+    /// （frame() 切条目即弃）
+    full: Option<(ImgKey, egui::TextureHandle)>,
+    /// 原图解码中（key + 发起时刻，后者供看门狗超时判定）
+    full_pending: Option<(ImgKey, Instant)>,
+    /// 原图解码放弃标记（失败/超时/动图）：防止每帧重触发无限重解
+    full_failed: Option<ImgKey>,
 }
 
 impl ImageService {
@@ -145,6 +168,9 @@ impl ImageService {
             cache: VecDeque::new(),
             cap: cap.max(1),
             shown: None,
+            full: None,
+            full_pending: None,
+            full_failed: None,
         }
     }
 
@@ -190,6 +216,43 @@ impl ImageService {
         }
     }
 
+    /// 请求解码原图（不降采样，上限 FULL_MAX_DIM）：大图放大到 1:1 附近时
+    /// 按需升级纹理，就绪后无缝换画（几何不变：屏幕矩形按基础纹理算，
+    /// UV 全图映射对两种分辨率通用）。幂等：已就绪/解码中/已放弃直接返回；
+    /// 动图不升级（全帧原图显存不可控，触发方已用 is_static 前置过滤，
+    /// 单帧动图落到这里按 FullFailed 放弃即可）
+    pub fn request_full(&mut self, key: ImgKey, source: ImageSource, name: &str) {
+        if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
+            return;
+        }
+        tracing::info!("发起原图解码 {name}");
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        self.full_pending = Some((key, Instant::now()));
+        let r = std::thread::Builder::new()
+            .name("imgfull".into())
+            .spawn(move || {
+                // 同 request：畸形文件可能 panic，捕获转 FullFailed 防死局
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_image(&source, FULL_MAX_DIM)
+                }));
+                let msg = match r {
+                    Ok(Ok(Decoded::Static(img))) => ImgMsg::FullReady { key, img },
+                    // 单帧动图取唯一帧当静态原图
+                    Ok(Ok(Decoded::Anim(mut a))) if a.len() == 1 => {
+                        let (img, _) = a.pop().expect("len==1");
+                        ImgMsg::FullReady { key, img }
+                    }
+                    Ok(_) | Err(_) => ImgMsg::FullFailed { key },
+                };
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            });
+        if r.is_err() {
+            self.full_pending = None;
+        }
+    }
+
     /// 每帧排空回传通道：上传纹理进 LRU，收集事件
     pub fn poll(&mut self) -> Vec<ImgEvent> {
         // 看门狗：pending 超时（线程卡死/消息丢失的兜底）——剔除允许
@@ -204,6 +267,15 @@ impl ImageService {
         for k in expired {
             self.pending.remove(&k);
             tracing::warn!("解码超时（>{PENDING_TIMEOUT:?}）剔除，可重试: {k:?}");
+        }
+        // 原图看门狗：超时判死并标记放弃（区别于基础解码的可重试——重触发
+        // 条件 zoom≥0.95 在显示期间恒成立，可重试会无限重解卡死图）
+        if let Some((k, t0)) = self.full_pending {
+            if now.duration_since(t0) > PENDING_TIMEOUT {
+                tracing::warn!("原图解码超时（>{PENDING_TIMEOUT:?}）放弃: {k:?}");
+                self.full_pending = None;
+                self.full_failed = Some(k);
+            }
         }
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
@@ -244,6 +316,25 @@ impl ImageService {
                     self.pending.remove(&key);
                     out.push(ImgEvent::Failed(key, error));
                 }
+                ImgMsg::FullReady { key, img } => {
+                    // 只认当前 pending 的 key：槽已换条目/超时判死的迟到消息丢弃
+                    if self.full_pending.take().is_some_and(|(k, _)| k == key) {
+                        let t = std::time::Instant::now();
+                        let tex = self.ctx.load_texture(
+                            format!("img-full-{}-{}", key.0, key.1),
+                            img,
+                            TEX_OPTS,
+                        );
+                        tracing::info!("原图纹理上传: {}ms", t.elapsed().as_millis());
+                        self.full = Some((key, tex));
+                    }
+                }
+                ImgMsg::FullFailed { key } => {
+                    if self.full_pending.take().is_some_and(|(k, _)| k == key) {
+                        tracing::warn!("原图解码失败，保持降采样纹理: {key:?}");
+                        self.full_failed = Some(key);
+                    }
+                }
             }
         }
         out
@@ -254,6 +345,11 @@ impl ImageService {
     /// `request_repaint_after(delay)` 驱动动画；命中即提至 LRU 队首
     pub fn frame(&mut self, key: ImgKey) -> Option<(egui::TextureHandle, Option<Duration>)> {
         let pos = self.pos(key)?;
+        // 原图单槽生命周期跟随显示条目：切条目即弃（旧原图显存大不留驻）；
+        // 放弃标记不清——解码失败是确定性的，重试只会再失败一遍
+        if self.full.as_ref().is_some_and(|(k, _)| *k != key) {
+            self.full = None;
+        }
         // 标记显示中：cache_push 逐出时跳过（预取洪水不再挤掉正在显示的图）
         self.shown = Some(key);
         let (_, mut c) = self.cache.remove(pos).expect("pos 有效");
@@ -292,6 +388,36 @@ impl ImageService {
     /// 解码中（含等待 poll）判定
     pub fn is_pending(&self, key: ImgKey) -> bool {
         self.pending.contains_key(&key)
+    }
+
+    /// 静态图判定（动图不做原图升级：全帧原图显存不可控）
+    pub fn is_static(&self, key: ImgKey) -> bool {
+        self.cache
+            .iter()
+            .any(|(k, c)| *k == key && c.frames.len() == 1)
+    }
+
+    /// 原图纹理是否就绪
+    pub fn has_full(&self, key: ImgKey) -> bool {
+        self.full.as_ref().is_some_and(|(k, _)| *k == key)
+    }
+
+    /// 原图解码中判定
+    pub fn is_full_pending(&self, key: ImgKey) -> bool {
+        self.full_pending.is_some_and(|(k, _)| k == key)
+    }
+
+    /// 原图已放弃判定（失败/超时/动图）：不再重试
+    pub fn is_full_failed(&self, key: ImgKey) -> bool {
+        self.full_failed == Some(key)
+    }
+
+    /// 取原图纹理（匹配单槽才有效；未就绪 = None）
+    pub fn full_tex(&self, key: ImgKey) -> Option<egui::TextureHandle> {
+        self.full
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, t)| t.clone())
     }
 
     fn pos(&self, key: ImgKey) -> Option<usize> {
@@ -403,11 +529,18 @@ fn collect_frames(
 }
 
 /// 帧显示时长：GIF 惯例——< 20ms（多为浏览器时代的 0 延迟优化写法）钳到
-/// 100ms，否则疯闪；分母 0 等病态值按 100ms 兜底
+/// 100ms，否则疯闪；分母 0 等病态值按 100ms 兜底。
+/// 注意 `numer_denom_ms` 的比值单位本身就是毫秒（image 0.25 语义：
+/// from_numer_denom_ms(n, de) = n/de ms，GIF 解码产出 (delay_cs*10, 1)），
+/// 不可再 ×1000；换 µs 计算保留亚毫秒精度
 fn anim_delay(d: image::Delay) -> Duration {
     let (n, de) = d.numer_denom_ms();
-    let ms = n as u64 * 1000 / de.max(1) as u64;
-    Duration::from_millis(if ms < 20 { 100 } else { ms })
+    let d = Duration::from_micros(n as u64 * 1_000 / de.max(1) as u64);
+    if d < Duration::from_millis(20) {
+        Duration::from_millis(100)
+    } else {
+        d
+    }
 }
 
 /// 尺寸适配：超限降采样（快速 box 采样，mipmap 补偿质量）；
@@ -606,16 +739,17 @@ mod tests {
     #[test]
     fn anim_delay_短帧钳正() {
         use std::time::Duration;
-        // Delay 无直接构造 API：经 frame 验证——见 decode_动画多帧与延迟钳正
-        // 这里只验证纯逻辑边界：100ms 保持
-        let d = image::Delay::from_numer_denom_ms(100, 1000);
+        // from_numer_denom_ms(n, de) = n/de 毫秒（比值即毫秒，image animation.rs）
+        let d = image::Delay::from_numer_denom_ms(100, 1000); // 0.1ms
         assert_eq!(anim_delay(d), Duration::from_millis(100));
-        let d = image::Delay::from_numer_denom_ms(0, 1000);
+        let d = image::Delay::from_numer_denom_ms(0, 1000); // 0ms
         assert_eq!(anim_delay(d), Duration::from_millis(100), "0 延迟钳 100ms");
-        let d = image::Delay::from_numer_denom_ms(1, 100);
-        assert_eq!(anim_delay(d), Duration::from_millis(100), "10ms 钳 100ms");
-        let d = image::Delay::from_numer_denom_ms(50, 1000);
+        let d = image::Delay::from_numer_denom_ms(1, 100); // 0.01ms
+        assert_eq!(anim_delay(d), Duration::from_millis(100), "亚毫秒钳 100ms");
+        let d = image::Delay::from_numer_denom_ms(50, 1); // 50ms（GIF 5cs 真实值）
         assert_eq!(anim_delay(d), Duration::from_millis(50), "50ms 保持");
+        let d = image::Delay::from_numer_denom_ms(80, 1); // 80ms（GIF 8cs）
+        assert_eq!(anim_delay(d), Duration::from_millis(80), "80ms 保持");
     }
 
     #[test]
@@ -633,6 +767,51 @@ mod tests {
         assert_eq!(frames[0].0.size, [8, 6]);
         // GIF 帧延迟 0 → 浏览器惯例钳 100ms
         assert_eq!(frames[0].1, Duration::from_millis(100));
+    }
+
+    /// 生成带真实帧延迟的多帧 GIF（Frame::from_parts 显式指定 Delay；
+    /// delay_ms 须为 10 的倍数——GIF 磁盘格式以 10ms 为单位存储）
+    fn gif_bytes_delayed(w: u32, h: u32, delay_ms: u32, n: u32) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut buf);
+            for i in 0..n {
+                let fr = image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(
+                        w,
+                        h,
+                        image::Rgba([if i % 2 == 0 { 255 } else { 0 }, 0, 0, 255]),
+                    ),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(delay_ms, 1),
+                );
+                enc.encode_frame(fr).unwrap();
+            }
+        } // drop enc 释放 &mut buf
+        buf.into_inner()
+    }
+
+    #[test]
+    fn decode_动画真实延迟() {
+        // 回归：旧版 anim_delay 把毫秒比值再 ×1000，80ms 的 GIF 帧被算成
+        // 80s/帧 → 画面永远停在第一帧（UI 只显示首帧）。image 0.25 的 GIF
+        // 解码产出 Delay = (delay_cs*10, 1)，即比值已换算成毫秒，不得再乘
+        let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("anim_delay.gif");
+        std::fs::write(&p, gif_bytes_delayed(8, 6, 80, 2)).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096).unwrap();
+        std::fs::remove_file(&p).ok();
+        let Decoded::Anim(frames) = out else {
+            panic!("带真实延迟的 2 帧 GIF 应解出 Anim");
+        };
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0].1,
+            Duration::from_millis(80),
+            "80ms 帧延迟应按原值播放（旧版 ×1000 bug 会算成 80s）"
+        );
     }
 
     #[test]
