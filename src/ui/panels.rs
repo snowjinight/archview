@@ -6,6 +6,36 @@ use super::*;
 /// 主题强调色（进度条/播放头共用）
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
 
+// ---- 帧呈现节奏探针（常驻诊断，debug 级默认静默） ----
+// PaintCallback 闭包每帧重建，跨帧状态放 thread_local（回调恒在 UI/GL 线程）。
+// 每 5s 汇总：绘制次数与间隔 avg/max、>25ms 长帧归因（render 侧/UI 侧）、
+// mpv 换帧数、render 单次最重耗时。诊断时开启：
+//   PowerShell: $env:RUST_LOG="info,archview::ui::panels=debug"; cargo run
+// 判读：
+//   avg≈16.7ms 且 gaps=0  → 连续重绘成立，卡顿在呈现之外（如刷新率不整除 fps）
+//   avg 正常但 gaps 多（ui侧）→ UI 偶发长帧（debug 构建/布局/OS 调度底噪，~2 个/5s 属正常）
+//   gaps 多（render侧）   → render 撞 mpv core 锁（属性轮询未短路）；
+//                           首帧 1~2 个 70~90ms = 首帧 GLSL 编译（进程生命周期一次，可接受）
+//   avg≈100ms             → video_live 条件未生效（回落慢节拍）
+//   render最重 > 30ms     → BLOCK_FOR_TARGET_TIME=0 未生效（仍在阻塞）
+#[derive(Default)]
+struct Cadence {
+    last: Option<std::time::Instant>,
+    log_mark: Option<std::time::Instant>,
+    n: u32,
+    sum_ms: f64,
+    max_ms: f64,
+    /// >25ms 长帧且该帧 render>10ms：mpv render 侧（core 锁竞争或 GL 首编译）
+    gaps_render: u32,
+    /// >25ms 长帧且 render 正常：egui 布局/驱动 swap/OS 调度侧
+    gaps_ui: u32,
+    new_frames: u32,
+    render_ms_max: f64,
+}
+thread_local! {
+    static CAD: std::cell::RefCell<Cadence> = std::cell::RefCell::new(Cadence::default());
+}
+
 impl App {
     // ---- 各面板 ----
 
@@ -597,12 +627,15 @@ impl App {
                                 info.first_frame
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // [诊断] render 单次耗时：BLOCK=0 生效应 <2ms
+                            let t_render = std::time::Instant::now();
                             let _ = mpv_ffi::render_gl_render(
                                 info.rctx.as_ptr(),
                                 info.fbo as i32,
                                 info.w,
                                 info.h,
                             );
+                            let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
                             // FBO → egui 默认帧缓冲 blit（FBO 数据已被 mpv 翻转，
                             // 目标矩形上下对调即与屏幕坐标一致）。
                             // read 必须显式锁定到视频 FBO：mpv 内部渲染可能把 read
@@ -643,6 +676,57 @@ impl App {
                             if prev_scissor {
                                 gl.enable(glow::SCISSOR_TEST);
                             }
+                            // [诊断] 帧间隔统计（含本帧 render 耗时），每 5s 汇总一次
+                            CAD.with(|c| {
+                                let mut c = c.borrow_mut();
+                                let now = std::time::Instant::now();
+                                // 首次进入回调即打点：确认闭包真的在执行
+                                if c.log_mark.is_none() {
+                                    tracing::debug!("[cadence] PaintCallback 已激活");
+                                }
+                                if let Some(l) = c.last {
+                                    let d = now.duration_since(l).as_secs_f64() * 1000.0;
+                                    c.n += 1;
+                                    c.sum_ms += d;
+                                    c.max_ms = c.max_ms.max(d);
+                                    // 长帧归因：本帧 render 侧重还是 UI 侧
+                                    if d > 25.0 {
+                                        if render_ms > 10.0 {
+                                            c.gaps_render += 1;
+                                        } else {
+                                            c.gaps_ui += 1;
+                                        }
+                                    }
+                                }
+                                c.last = Some(now);
+                                if flags & mpv_ffi::MPV_RENDER_UPDATE_FRAME != 0 {
+                                    c.new_frames += 1;
+                                }
+                                c.render_ms_max = c.render_ms_max.max(render_ms);
+                                let mark = *c.log_mark.get_or_insert(now);
+                                if now.duration_since(mark).as_secs() >= 5 {
+                                    let avg = if c.n > 0 { c.sum_ms / c.n as f64 } else { 0.0 };
+                                    tracing::debug!(
+                                        "[cadence] paints={} avg={:.1}ms max={:.0}ms gaps>25ms={}（render侧{} ui侧{}） mpv新帧={} render最重={:.1}ms",
+                                        c.n,
+                                        avg,
+                                        c.max_ms,
+                                        c.gaps_render + c.gaps_ui,
+                                        c.gaps_render,
+                                        c.gaps_ui,
+                                        c.new_frames,
+                                        c.render_ms_max
+                                    );
+                                    // 保留 last/log_mark：间隔连续、已激活只打一次
+                                    let last = c.last;
+                                    let log_mark = Some(now);
+                                    *c = Cadence {
+                                        last,
+                                        log_mark,
+                                        ..Cadence::default()
+                                    };
+                                }
+                            });
                         }
                     });
                     ui.painter()

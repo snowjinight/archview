@@ -899,9 +899,36 @@ egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
 - **FFI 符号**（mpv_ffi.rs 追加）：`mpv_render_context_create/free/render/set_update_callback/update`
   + 参数结构 `mpv_render_param{type,data}`（`{INVALID,NULL}` 结尾）、
   `mpv_opengl_init_params{get_proc_address,ctx}`、`mpv_opengl_fbo{fbo,w,h,internal_format}`
-  （宽高在结构体内）。精确枚举值：API_TYPE=1 / OPENGL_INIT_PARAMS=2 / OPENGL_FBO=3 / FLIP_Y=4。
-- **`vo=libmpv` 必须在 create_render_context 之前设置**；`video-timing-offset=0` 防
-  update 回调被 vsync 对齐阻塞。hwdec=auto 在 render 模式下 mpv 自动落 copy 模式，配置不变。
+  （宽高在结构体内）。精确枚举值：API_TYPE=1 / OPENGL_INIT_PARAMS=2 / OPENGL_FBO=3 /
+  FLIP_Y=4 / **BLOCK_FOR_TARGET_TIME=12**。
+- **`vo=libmpv` 必须在 create_render_context 之前设置**；`video-timing-offset=0` +
+  render 传 `BLOCK_FOR_TARGET_TIME=0`（render.h 官方建议组合）：render 永不阻塞。
+  hwdec=auto 在 render 模式下 mpv 自动落 copy 模式，配置不变。
+- **帧呈现节奏（vsync 主钟）**：render() 默认（BLOCK_FOR_TARGET_TIME=1）阻塞调用
+  线程到帧目标显示时刻——UI 线程被卡在 render 内部（mpv 看门狗报 "not being
+  called or stuck"，实测首帧阻塞 ~550ms）；叠加"update 回调唤醒 → 事件循环调度"
+  链路上 1~15ms 的毫秒级抖动，30fps 帧的呈现时刻在 vsync 边界随机跨越（帧长
+  2/3 个 vsync 交替）→ 可感知卡顿。修复：视频播放中（ui/mod.rs `video_live`：
+  playing 且非图片且非暂停）逐 vsync 连续 `request_repaint()`，eframe 的 vsync
+  swap 成为节拍主钟；render 每次"当前应显示"的帧（BLOCK=0），换帧时刻锁定
+  vsync 边界，残余 judder 仅剩 fps 与刷新率的时钟漂移（ppm 级）。重复渲染同帧
+  无害（mpv 重画上一帧）；A/V 同步误差 ≤1 个 vsync（低于感知阈值）。暂停/图片
+  模式回落 100ms 慢节拍省功耗。
+- **打开窗口期属性门控（player/mod.rs `opening()`）**：loadfile → 首帧期间
+  mpv core 被 demux 探测 + hwdec 设备逐个试探（d3d11va→nvdec→copy）长段占锁，
+  UI 每帧 5~6 次 `get_property` FFI（paused/buffering/duration/time_pos/muted）
+  在 core 锁上排队 → 打开瞬间 UI 冻结（实测 475ms）。门控纯原子判定
+  （`load_mark.is_some() && !painted_since_load`，2s 兜底自限），窗口期内上述属性
+  全部短路返回占位值不进 mpv——装载动画维持 vsync 节拍（打开不冻结，视频就绪
+  即出画面），与旧 wid 子窗口模式"黑一下"体验等价。
+- **帧节奏探针（常驻诊断，panels.rs `Cadence` thread_local）**：每 5s 汇总
+  paints/avg/max/长帧归因（render 侧 = 本帧 render>10ms，撞 core 锁或首帧 GLSL
+  编译；ui 侧 = egui 布局/驱动 swap/OS 调度）/mpv 换帧数/render 最重耗时。
+  `debug` 级默认静默，诊断时
+  `$env:RUST_LOG="info,archview::ui::panels=debug"; cargo run`。
+  基线（release，60Hz/30fps）：avg=16.7ms 恒定、render最重 <1ms、
+  ui 侧长帧 ~2 个/5s（OS 底噪，丢 1 个 vsync tick 不可感知）、
+  首窗 render 侧 1~2 个 70~90ms（首帧 GLSL 编译，进程一次，不预热）。
 - **FFI 闭包陷阱**：`Arc<dyn Fn>` 是双字 fat pointer，user_data 只收单指针——
   先 `Box::into_raw(Box::new(arc))` 变 thin pointer，释放时按原型回收。
 - **销毁顺序**（全部在 GL current 线程，eframe `on_exit` 回调内，早于 App::drop）：

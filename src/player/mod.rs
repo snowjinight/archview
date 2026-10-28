@@ -237,7 +237,8 @@ impl PlayerService {
             .map_err(|e| format!("注册 zvf:// 协议失败: {e}"))?;
 
         // render API 模式（ARCHITECTURE.md 13）：vo=libmpv 必须在 create_render_context
-        // 之前设置；timing-offset=0 防 update 回调被 vsync 对齐阻塞
+        // 之前设置；timing-offset=0 配合 render_gl_render 的 BLOCK_FOR_TARGET_TIME=0
+        // （render.h 建议）：render 永不阻塞，帧节奏由 vsync 连续重绘保证
         s.opt("vo", "libmpv");
         s.opt("video-timing-offset", "0");
 
@@ -422,8 +423,11 @@ impl PlayerService {
         self.set_prop_str("mute", if muted { "no" } else { "yes" });
     }
 
-    /// 当前是否静音
+    /// 当前是否静音（打开窗口期短路，理由同上：避免 core 锁阻塞 UI）
     pub fn muted(&self) -> bool {
+        if self.opening() {
+            return false;
+        }
         mpv_ffi::get_property_flag(self.ctx, "mute")
             .ok()
             .flatten()
@@ -436,19 +440,37 @@ impl PlayerService {
         self.set_prop_str("mute", "no");
     }
 
+    /// 打开窗口期（load 后 → 首帧前，2s 兜底自限）。此时 mpv core 正被
+    /// demux 探测与 hwdec 设备逐个试探长时间占锁，任何 get_property 都会
+    /// 在 core 锁上阻塞 UI 线程（实测冻结 475ms + 多个长帧）。装载窗口
+    /// 只依赖原子标志（first_frame/load_mark），不进 mpv，故此窗口内
+    /// 属性轮询全部短路，界面维持 vsync 节拍。
+    fn opening(&self) -> bool {
+        self.load_mark.get().is_some() && !self.painted_since_load.get()
+    }
+
     pub fn time_pos(&self) -> Option<f64> {
+        if self.opening() {
+            return None;
+        }
         mpv_ffi::get_property_f64(self.ctx, "time-pos")
             .ok()
             .flatten()
     }
 
     pub fn duration(&self) -> Option<f64> {
+        if self.opening() {
+            return None;
+        }
         mpv_ffi::get_property_f64(self.ctx, "duration")
             .ok()
             .flatten()
     }
 
     pub fn paused(&self) -> bool {
+        if self.opening() {
+            return false;
+        }
         mpv_ffi::get_property_flag(self.ctx, "pause")
             .ok()
             .flatten()
@@ -456,6 +478,9 @@ impl PlayerService {
     }
 
     pub fn buffering(&self) -> bool {
+        if self.opening() {
+            return true;
+        }
         mpv_ffi::get_property_flag(self.ctx, "pause-for-cache")
             .ok()
             .flatten()

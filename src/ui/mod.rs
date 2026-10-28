@@ -416,8 +416,19 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // 播放中需要持续重绘刷新进度条
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // 视频播放中：逐 vsync 连续重绘，让 eframe 的 swap 成为节拍主钟。
+        // render() 已设 BLOCK_FOR_TARGET_TIME=0 不再阻塞到目标时刻，每次渲染
+        // "当前应显示"的帧，换帧时刻锁定 vsync 边界，消除"mpv 回调唤醒 →
+        // 事件循环调度"链路上 1~15ms 抖动导致的帧节奏不均（可感知卡顿）。
+        // 非播放/图片模式/暂停（含 keep-open EOF 粘滞）回落 100ms 慢节拍。
+        let video_live = self.playing.is_some()
+            && self.tex_image_key().is_none()
+            && self.player.as_ref().is_some_and(|p| !p.paused());
+        if video_live {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // 启动参数打开（SendTo「Archview player」/拖到 exe 上）：首帧触发一次
         if let Some(path) = self.initial_open.take() {

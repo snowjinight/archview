@@ -77,6 +77,10 @@ pub const MPV_RENDER_PARAM_API_TYPE: u32 = 1;
 pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: u32 = 2;
 pub const MPV_RENDER_PARAM_OPENGL_FBO: u32 = 3;
 pub const MPV_RENDER_PARAM_FLIP_Y: u32 = 4;
+/// render() 默认（=1）阻塞调用线程直到帧的目标显示时刻（render.h:317），
+/// 会把 UI 线程卡在 render 内部（mpv 看门狗报 "not being called or stuck"）。
+/// 传 0 禁用阻塞：每次渲染"当前应显示"的帧，帧呈现节奏交给 vsync swap。
+pub const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: u32 = 12;
 // mpv_render_update_flag：update 返回 FRAME 位 = 有新帧待渲染
 // （PaintCallback 闭包用它做真实首帧检出）
 pub const MPV_RENDER_UPDATE_FRAME: u64 = 1 << 0;
@@ -433,6 +437,9 @@ pub fn render_gl_render(ctx: *mut MpvRenderContext, fbo: c_int, w: c_int, h: c_i
     unsafe {
         let mut fbo_param = MpvOpenglFbo { fbo, w, h, internal_format: 0 };
         let mut flip_y: c_int = 1;
+        // 0：禁用"阻塞到目标时刻"，render() 立即返回（见常量注释）。
+        // 帧节奏由 vsync 连续重绘保证（ui/mod.rs video_live 分支）。
+        let mut block_for_target_time: c_int = 0;
         let mut params = [
             MpvRenderParam {
                 param_type: MPV_RENDER_PARAM_OPENGL_FBO,
@@ -441,6 +448,10 @@ pub fn render_gl_render(ctx: *mut MpvRenderContext, fbo: c_int, w: c_int, h: c_i
             MpvRenderParam {
                 param_type: MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip_y as *mut c_int as *mut c_void,
+            },
+            MpvRenderParam {
+                param_type: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &mut block_for_target_time as *mut c_int as *mut c_void,
             },
             MpvRenderParam {
                 param_type: MPV_RENDER_PARAM_INVALID,
