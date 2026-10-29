@@ -213,6 +213,9 @@ pub struct App {
     img_viewport: egui::Rect,
     // 落回"适应窗口"的闪现提示起点（右下角徽标显示约 1s；None=不在闪现期）
     img_fit_flash: Option<std::time::Instant>,
+    // 换画日志去重：上次选画 (key, 是否 full)。同 key 下档位翻转才打一条
+    // 换画日志；切图（新 key）静默重置，避免逐帧刷屏
+    img_pick_full: Option<(ImgKey, bool)>,
     // 非 solid 图片切换防闪：下一张解码期间原样重画上一张（快照见 HoldImg），
     // 超过 2s 仍未就绪才退回占位提示（避免无限解压时用户毫无感知）
     hold_img: Option<HoldImg>,
@@ -278,6 +281,12 @@ impl App {
         crate::vfs::set_codepage(&cfg.codepage);
         // 清理上次中断解压留下的 .part 半截文件
         cache::cleanup_partial(&cache::cache_dir(&cfg));
+        // 图片高清升级配置回显：改 config 调阈值/锐化后，启动即可确认生效
+        tracing::info!(
+            "图片高清升级: 阈值×{:.2} 锐化 {}",
+            cfg.ui.image_full_threshold,
+            if cfg.ui.image_full_sharpen { "开" } else { "关" }
+        );
         let img_cap = cfg.ui.image_cache_count.max(1);
         Self {
             cfg,
@@ -292,6 +301,7 @@ impl App {
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
             img_fit_flash: None,
+            img_pick_full: None,
             hold_img: None,
             img_source: None,
             dragging: false,
@@ -342,6 +352,7 @@ impl App {
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
             img_fit_flash: None,
+            img_pick_full: None,
             hold_img: None,
             img_source: None,
             dragging: false,

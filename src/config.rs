@@ -192,6 +192,15 @@ pub struct UiConfig {
     /// 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
     /// 升级资格判据同此值（见 imgview.rs resample 两档策略）
     pub image_max_dim: u32,
+    /// 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
+    /// （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过
+    /// 244% 滚轮档（×1.25⁴≈2.44）才升级——full 是 ×2 密度，采样比
+    /// （zoom×ppp/2）≥1 才有肉眼增益（195% 档实拍 A/B 无差）；调小
+    /// （如 1.4）更早升级对比，调大（如 3.0）基本关闭
+    pub image_full_threshold: f32,
+    /// 高清档 Lanczos 放大后叠加 unsharp mask 锐化（放大插值会把边缘
+    /// 坡度摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关闭可对比）
+    pub image_full_sharpen: bool,
 }
 
 impl Default for UiConfig {
@@ -206,6 +215,8 @@ impl Default for UiConfig {
             image_texture: true,
             image_cache_count: 3,
             image_max_dim: 4096,
+            image_full_threshold: 2.0,
+            image_full_sharpen: true,
         }
     }
 }
@@ -446,8 +457,17 @@ image_texture = true
 	# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
 image_cache_count = 3
 	# 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
-	# 升级资格判据同此值（详见 IMGVIEW_HANDOVER.md 两档策略）
+	# 升级资格判据同此值（详见 ARCHITECTURE.md 13.4 两档策略）
 image_max_dim = 4096
+	# 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
+	# （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244%
+	# 滚轮档（×1.25⁴≈2.44）才升级——full ×2 纹理采样比 ≥1 才有肉眼
+	# 增益，195% 档实拍 A/B 与 base 直放大无差；调小（如 1.4）可更早
+	# 升级对比，调大（如 3.0）基本关闭
+image_full_threshold = 2.0
+	# 高清档 Lanczos 放大后叠加 unsharp mask 锐化（放大插值把边缘坡度
+	# 摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关掉可对比）
+image_full_sharpen = true
 
 [extract]
 	# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件

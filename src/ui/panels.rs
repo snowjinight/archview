@@ -874,15 +874,20 @@ impl App {
         // ——恒等于原图 ≤ image_max_dim（阈值型预放大的图必有 base=
         // 原图×ppp ≤ 上限；超大图原尺寸直进后 base=原图 > 上限自动出
         // 局，二次解码秒级 + 180MB 级显存不值当）。触发判据与下方换画
-        // 判据一致（zoom×ppp > 1.05，死区防临界抖动）：100%（zoom×ppp=1，
-        // 纹素 1:1）附近基础纹理原样直出，轻微过扫由 GPU 双线性兜住，
-        // 更深才值得升级。
+        // 判据一致（zoom×ppp > image_full_threshold，config 可调、默认
+        // 2.0）：full 是 ×2 密度纹理，采样比（zoom×ppp/2）≥1 才有肉眼
+        // 增益——156%/195% 档它反被 0.78~0.98× 缩小采样，×2 Lanczos
+        // 的 ~2px 边缘坡与 base GPU 直放大等宽（195% 实拍 A/B 无差），
+        // 不为此白付解码+显存；滚轮/键盘 ×1.25 档位序列为
+        // 100/125/156/195/244/…%，死区取 2.0 落在 195% 档（×1.25³）与
+        // full 接管的 244% 档（×1.25⁴）之间，判据用 >，若恰取落地档值
+        // 会因浮点表示踩空，留余量防临界抖动。
         // 就绪后下帧无缝换画。img_source 由
         // play_image/load_extracted/heal 记录，切视频即清（见 extract）----
         let native_max = native.max_elem() as u32;
         let ppp = ui.ctx().pixels_per_point();
         if native_max <= self.cfg.ui.image_max_dim
-            && zoom * ppp > 1.05
+            && zoom * ppp > self.cfg.ui.image_full_threshold
             && self.img.is_static(key)
             && !self.img.has_full(key)
             && !self.img.is_full_pending(key)
@@ -891,8 +896,11 @@ impl App {
             if let Some((src_key, source, name)) = self.img_source.as_ref() {
                 if *src_key == key {
                     let (source, name) = (source.clone(), name.clone());
-                    // 预放大倍率（ppp×2）由 ImageService 按屏幕 DPI 内部取值
-                    self.img.request_full(key, source, &name);
+                    // 预放大倍率（ppp×2）由 ImageService 按屏幕 DPI 内部取值；
+                    // 锐化开关 = image_full_sharpen 配置（Lanczos 放大后叠加
+                    // unsharp mask 观感补偿）
+                    self.img
+                        .request_full(key, source, &name, self.cfg.ui.image_full_sharpen);
                 }
             }
         }
@@ -909,7 +917,8 @@ impl App {
         // 兜底病态小视口（fit < MIN_ZOOM）下永不触发的卡死
         if wheel_zoom != 0.0 {
             if let Some(pos) = wheel_anchor {
-                let factor = if wheel_zoom > 0.0 { 1.2 } else { 1.0 / 1.2 };
+                // ×1.25 与键盘 +/−（nav.rs）同档；1.25×0.8=1 一步精确抵消
+                let factor = if wheel_zoom > 0.0 { 1.25 } else { 1.0 / 1.25 };
                 if factor < 1.0 && (zoom * factor).max(MIN_ZOOM) <= fit {
                     self.img_view = ImgView::default();
                     self.img_fit_flash = Some(std::time::Instant::now());
@@ -941,6 +950,11 @@ impl App {
             }
         }
 
+        // 交互段（拖拽/滚轮/双击）刚更新过 self.img_view：此处必须重取
+        // zoom。函数开头取的局部 zoom 是交互前旧值，拿"旧 zoom × 新 pan"
+        // 绘制会几何错位一帧（每次缩放画面跳动一下的根因），下一帧才恢复
+        // （上方触发块用旧值仅晚一帧发起解码，无碍）
+        let zoom = self.img_view.zoom.unwrap_or(fit);
         // ---- 绘制：图像中心 clamp 在视口内（拖不丢，总有部分可见）----
         self.img_view.pan = clamp_pan(self.img_view.pan, native * zoom, video);
         if !visible {
@@ -948,17 +962,37 @@ impl App {
         }
         // full 纹理选画：矩形/UV 按基础纹理算（同宽高比 → 屏幕矩形与
         // 全图 UV 对两种分辨率通用，切换无缩放跳变）。仅当屏幕物理像素
-        // 超过基础纹理（zoom×ppp > 1.05，死区防临界抖动；与上方触发
-        // 判据一致）才用 full 纹理——浅放大区基础纹理近 1:1 双线性无
-        // 损，更深由 ×ppp×2 的 full 纹理接管（残余放大仍近 1:1）。
-        // 屏幕密度按物理像素算：DPI 缩放下 1 逻辑像素 = ppp 物理像素
+        // 超过基础纹理 image_full_threshold 倍（与上方触发判据一致）才换
+        // full 纹理——默认 2.0 即 244% 档（×1.25⁴）起由 ×ppp×2 的 full
+        // 接管，相对 full 采样比 ≥1.22× 纯放大（无 mipmap 直采无缩小带）；
+        // 更浅档（100%~195%）base GPU 直放大与之肉眼无差（195% 实拍 A/B
+        // 证实），不白付二次解码。屏幕密度按物理像素算：DPI 缩放下
+        // 1 逻辑像素 = ppp 物理像素
         let ppp = ui.ctx().pixels_per_point();
         let screen_px = (native * zoom * ppp).max_elem();
-        let tex = if screen_px > native.max_elem() * 1.05 {
-            self.img.full_tex(key).unwrap_or(tex)
-        } else {
-            tex
-        };
+        // 换画阈值同触发阈值：image_full_threshold 配置（默认 2.0 =
+        // 越过 244% 滚轮档），两处判据必须一致否则触发/换画错位
+        let want_full = screen_px > native.max_elem() * self.cfg.ui.image_full_threshold;
+        let full = want_full.then(|| self.img.full_tex(key)).flatten();
+        // 换画事件：同 key 下 base↔full 切换时才打印一条（切图时新 key
+        // 静默重置，不逐帧刷屏），与"发起高清解码/纹理上传 full"串联成链
+        let pick = (key, full.is_some());
+        if self.img_pick_full.is_some_and(|(k, _)| k == key)
+            && self.img_pick_full != Some(pick)
+        {
+            let desc = full.as_ref().map_or_else(
+                || "→ base".to_string(),
+                |t| format!("→ full {}x{}", t.size_vec2().x as i32, t.size_vec2().y as i32),
+            );
+            tracing::debug!(
+                "换画[{key:?}] badge={:.0}% base={}x{} {desc}",
+                zoom * ppp * 100.0,
+                native.x as i32,
+                native.y as i32
+            );
+        }
+        self.img_pick_full = Some(pick);
+        let tex = full.unwrap_or(tex);
         // 物理像素对齐：100%（纹素:物理像素 1:1）下矩形若落在分数物理
         // 坐标（逻辑坐标 ×ppp 常见 .5），双线性把每个输出像素变成相邻
         // 纹素的加权混合 → 整幅均匀发糊；尺寸的 f32 误差（如

@@ -58,6 +58,18 @@ pub const TEX_OPTS: TextureOptions = TextureOptions {
     mipmap_mode: Some(egui::TextureFilter::Linear),
 };
 
+/// full 档纹理上传参数：双线性、**无 mipmap**。full 的显示区间从 244%
+/// 起（默认阈值 2.0，相对 full 采样比 ≥1.22× 纯放大）——若开 mipmap，
+/// 三线性混合会让半分辨率 mip1 占大头，2× Lanczos 的锐度增益被打回
+/// base 水平；无 mipmap 的双线性在 ≥0.5× 缩小下仅轻微欠采样，静止图
+/// 无感。base 档保留 mipmap（fit 态大图深度缩小仍需要防摩尔纹）
+pub const TEX_OPTS_FULL: TextureOptions = TextureOptions {
+    magnification: egui::TextureFilter::Linear,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: None,
+};
+
 /// 缩放限制：下限足够小（贴纸/小图标也能看），上限 ~25600%（看图软件量级）
 pub const MIN_ZOOM: f32 = 0.05;
 pub const MAX_ZOOM: f32 = 256.0;
@@ -200,7 +212,7 @@ impl ImageService {
             // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
             // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_image(&source, max_dim, false, factor, &name)
+                decode_image(&source, max_dim, false, factor, &name, false)
             }));
             match r {
                 Ok(Ok(decoded)) => {
@@ -243,13 +255,22 @@ impl ImageService {
     /// 幂等：已就绪/解码中/已放弃直接返回；动图不升级（全帧原图显存
     /// 不可控，触发方已用 is_static 前置过滤，单帧动图落到这里按
     /// FullFailed 放弃即可）
-    pub fn request_full(&mut self, key: ImgKey, source: ImageSource, name: &str) {
+    /// sharpen 直传 image_full_sharpen 配置：Lanczos 放大后叠加
+    /// unsharp mask 锐化（观感补偿，见 sharpen_full）
+    pub fn request_full(
+        &mut self,
+        key: ImgKey,
+        source: ImageSource,
+        name: &str,
+        sharpen: bool,
+    ) {
         if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
             return;
         }
         tracing::debug!("发起高清解码 {name}");
-        // 高清档倍率 = ppp×2：基础纹理兜住 zoom 1~1.25 的双线性残余，
-        // 更深放大换 ×2 密度纹理接管（残余仍 ≤×1.25，近 1:1 无损）
+        // 高清档倍率 = ppp×2：默认阈值 2.0（244% 档）起由 ×2 密度纹理
+        // 接管，采样比 ≥1.22× 近 1:1 无损直到 ×2.5 屏幕倍率；更浅放大
+        // base GPU 直放大与之肉眼无差（195% 实拍 A/B），不白付二次解码
         let factor = (self.ctx.pixels_per_point() as f64).max(1.0) * 2.0;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
@@ -260,7 +281,7 @@ impl ImageService {
             .spawn(move || {
                 // 同 request：畸形文件可能 panic，捕获转 FullFailed 防死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image(&source, FULL_MAX_DIM, true, factor, &name)
+                    decode_image(&source, FULL_MAX_DIM, true, factor, &name, sharpen)
                 }));
                 let msg = match r {
                     Ok(Ok(Decoded::Static(img))) => ImgMsg::FullReady { key, img, name },
@@ -361,7 +382,7 @@ impl ImageService {
                         let tex = self.ctx.load_texture(
                             format!("img-full-{}-{}", key.0, key.1),
                             img,
-                            TEX_OPTS,
+                            TEX_OPTS_FULL,
                         );
                         tracing::debug!("纹理上传[{name}] full: {}ms", t.elapsed().as_millis());
                         self.full = Some((key, tex));
@@ -487,13 +508,15 @@ impl ImageService {
 
 /// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA。
 /// full=false 基础档（factor=ppp）/ true 高清档（factor=ppp×2），
-/// 两档策略见 resample；factor 由 ImageService 按屏幕 DPI 内部取值
+/// 两档策略见 resample；factor 由 ImageService 按屏幕 DPI 内部取值；
+/// sharpen = 高清档 Lanczos 放大后是否叠加锐化（配置 image_full_sharpen）
 fn decode_image(
     source: &ImageSource,
     max_dim: u32,
     full: bool,
     factor: f64,
     name: &str,
+    sharpen: bool,
 ) -> Result<Decoded, String> {
     match source {
         ImageSource::File(path) => {
@@ -501,7 +524,7 @@ fn decode_image(
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name)
+            decode_any(reader, max_dim, full, factor, name, sharpen)
         }
         ImageSource::Stream(vfs, entry) => {
             let mut vf = vfs
@@ -514,7 +537,7 @@ fn decode_image(
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name)
+            decode_any(reader, max_dim, full, factor, name, sharpen)
         }
     }
 }
@@ -528,6 +551,7 @@ fn decode_any<R: BufRead + Seek>(
     full: bool,
     factor: f64,
     name: &str,
+    sharpen: bool,
 ) -> Result<Decoded, String> {
     let fmt = reader.format();
     // 日志用短名（压缩包条目路径不含目录）
@@ -561,13 +585,17 @@ fn decode_any<R: BufRead + Seek>(
     // clamp 8192）。factor 由 ImageService 按屏幕 DPI 定
     let (w, h) = (img.width(), img.height());
     let out = resample(img, max_dim, full, factor);
+    // 锐化（配置 image_full_sharpen，仅高清档）：Lanczos 放大的边缘
+    // 补偿，见 sharpen_full
+    let out = if full && sharpen { sharpen_full(out) } else { out };
     // 尺寸命名日志：native_size 原图 / lru_size 基础纹理 / full_size
     // full 槽纹理（箭头一致 = 未触发重采样，尺寸原样直进）
     tracing::debug!(
-        "解码 {fmt:?} [{base}] native_size={w}x{h} {}_size={}x{}: {}ms",
+        "解码 {fmt:?} [{base}] native_size={w}x{h} {}_size={}x{}{}: {}ms",
         if full { "full" } else { "lru" },
         out.width(),
         out.height(),
+        if full && sharpen { " 锐化" } else { "" },
         t.elapsed().as_millis()
     );
     Ok(Decoded::Static(color_image(out)))
@@ -683,6 +711,26 @@ fn thumbnail_cap(img: image::DynamicImage, cap: u32) -> image::DynamicImage {
     let nw = ((w as f64 * scale).round() as u32).max(1);
     let nh = ((h as f64 * scale).round() as u32).max(1);
     img.thumbnail(nw, nh)
+}
+
+/// unsharp mask 锐化（仅高清档，配置 image_full_sharpen）：out = px +
+/// amount×(px − blur(px))——Lanczos 放大虽是"最诚实重建"，但插值本质
+/// 会把边缘坡度摊平（1px 边缘摊成 factor px 缓坡），锐化把坡度重新变
+/// 陡，深放大观感明显改善（信息量不变，纯观感补偿；强对比边缘可能有
+/// 轻微光晕，配置可关）。sigma 1.0 ≈ 2px 邻域 / amount 0.6 温和档；
+/// 仅 RGB，alpha 直通。O(n) 后台线程执行（千万像素级 ~几十 ms）
+fn sharpen_full(img: image::DynamicImage) -> image::DynamicImage {
+    const SIGMA: f32 = 1.0;
+    const AMOUNT: f32 = 0.6;
+    let mut rgba = img.to_rgba8();
+    let blurred = image::imageops::blur(&rgba, SIGMA);
+    for (p, b) in rgba.pixels_mut().zip(blurred.pixels()) {
+        for c in 0..3 {
+            let v = p[c] as f32 + AMOUNT * (p[c] as f32 - b[c] as f32);
+            p[c] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+    image::DynamicImage::ImageRgba8(rgba)
 }
 
 /// DynamicImage → egui ColorImage（RGBA，unmultiplied——egui 内部预乘）
@@ -851,6 +899,61 @@ mod tests {
         assert_eq!((out.width(), out.height()), (100, 80));
     }
 
+    #[test]
+    fn sharpen_full_锐化行为() {
+        // 纯色图：无边缘无细节，锐化不动（px 与 blur(px) 全等）
+        let flat = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+            16, 16, image::Luma([128]),
+        ));
+        let out = sharpen_full(flat).to_rgba8();
+        assert!(out.pixels().all(|p| p[0] == 128));
+        // 垂直阶跃：左 64 右 192（取中灰区间防 0/255 饱和掩盖效果），
+        // 边缘内侧低侧压暗、高侧提亮 = 坡度变陡
+        let mut img = image::GrayImage::new(16, 8);
+        for row in img.rows_mut() {
+            for (x, p) in row.enumerate() {
+                *p = image::Luma([if x < 8 { 64 } else { 192 }]);
+            }
+        }
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img)).to_rgba8();
+        assert!(out.get_pixel(7, 4)[0] < 64, "边缘低侧应压暗");
+        assert!(out.get_pixel(8, 4)[0] > 192, "边缘高侧应提亮");
+    }
+
+    #[test]
+    fn decode_锐化接线_解码链生效() {
+        // 垂直阶跃（左 64 右 192）同图开/关锐化各解一次，full 档下边缘
+        // 像素必须有差异——守卫"sharpen 参数传了但 decode_any 没用"的
+        // 接线回归（曾因编辑竞态断线且既有测试全绿，靠编译警告才暴露）
+        let mut img = image::GrayImage::new(64, 32);
+        for row in img.rows_mut() {
+            for (x, p) in row.enumerate() {
+                *p = image::Luma([if x < 32 { 64 } else { 192 }]);
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sharpen_wire.png");
+        std::fs::write(&p, buf.get_ref()).unwrap();
+        let decode = |sharpen| {
+            let out =
+                decode_image(&ImageSource::File(p.clone()), 8192, true, 1.0, "s.png", sharpen)
+                    .unwrap();
+            let Decoded::Static(img) = out else {
+                panic!("PNG 应走静态路径");
+            };
+            img
+        };
+        let (off, on) = (decode(false), decode(true));
+        std::fs::remove_file(&p).ok();
+        assert_eq!(off.size, on.size);
+        assert_ne!(off.pixels, on.pixels, "锐化开/关边缘像素应有差异");
+    }
+
     /// 内存中生成 PNG 字节
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
         let img = image::DynamicImage::new_rgb8(w, h);
@@ -898,7 +1001,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim.gif");
         std::fs::write(&p, gif_bytes_2帧(8, 6)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("2 帧 GIF 应解出 Anim");
@@ -941,7 +1044,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim_delay.gif");
         std::fs::write(&p, gif_bytes_delayed(8, 6, 80, 2)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("带真实延迟的 2 帧 GIF 应解出 Anim");
@@ -966,7 +1069,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("single.gif");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         assert!(matches!(out, Decoded::Static(_)), "单帧动画应归静态（免时钟开销）");
     }
@@ -982,7 +1085,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.webp");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(tex) = out else {
             panic!("静态 webp 应走静图路径");
@@ -1001,7 +1104,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("full.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
@@ -1019,7 +1122,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("full_dpi.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 1.5, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 1.5, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
@@ -1035,7 +1138,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");

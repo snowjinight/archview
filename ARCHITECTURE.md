@@ -266,7 +266,7 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 |---|---|
 | 翻页 | PgUp/PgDn、←/→ 切换上/下一个；滚轮在媒体区悬停时**模式感知**——视频或图片 fit 态 = 翻页（`ui.wheel_switch_secs` 节流），图片缩放态 = 锚光标缩放（缩小触底自动落 fit，13.4 交互）；文件列表区滚轮是正常滚动列表，不切换 |
 | 动图 | GIF 动画逐帧预解码 + egui 定时切帧（13.4 第 4 步）；webp 全按静图取首帧（动画 webp 罕见，且静态 webp 无 ANMF 块 `num_frames()==0`，逐帧路线解出空集误报失败，实测踩坑） |
-| 放大细节 | 两档纹理按屏幕密度（ppp）适配（13.4）：基础档 ×ppp 进 LRU（翻页即原生密度直出）；深放大（zoom×ppp>1.05）后台解 full 档 ×ppp×2（封顶 8192）无缝换画；100% = 1 纹素:1 物理像素（zoom=1/ppp）零重采样最锐点 |
+| 放大细节 | 两档纹理按屏幕密度（ppp）适配（13.4）：基础档 ×ppp 进 LRU（翻页即原生密度直出）；深放大（zoom×ppp>`image_full_threshold`，默认 2.0 即越过 244% 滚轮档（×2 密度采样比 ≥1 才有肉眼增益，195% 档实拍 A/B 无差））后台解 full 档 ×ppp×2（封顶 8192、无 mipmap 直采，`image_full_sharpen` 默认叠加 unsharp mask 锐化）无缝换画；100% = 1 纹素:1 物理像素（zoom=1/ppp）零重采样最锐点 |
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
 
@@ -295,7 +295,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume
-[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim（图片纹理直显，见 13.4）
+[ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
 [vartidy] # repo_dir / report_dir（CLI 整理子命令）
 ```
@@ -1023,12 +1023,12 @@ App::play → wants_texture(cfg, name)          # image_texture 开 && 图片扩
 |---|---|---|
 | fit | `fit_scale(viewport, tex)` | 适应窗口（zoom=None 实时值），**不封顶**——小图 fit>1（fit 态即放大铺满） |
 | **100%** | **`z100 = 1.0 / ppp`**（150% 屏 ≈ 0.667） | 1 纹素 = 1 物理像素，零重采样最锐点 |
-| full 触发/换画判据 | `zoom × ppp > 1.05` | 100% 恰在分界（=1.0 不触发），死区防临界抖动 |
+| full 触发/换画判据 | `zoom × ppp > image_full_threshold`（默认 2.0，config 可调） | 100%~195% 档基础纹理 GPU 直放大即可（full ×2 纹理在此区间反被 0.78–0.98× 缩小采样，其 ~2px 边缘坡与 base 双线性等宽，195% 实拍 A/B 无差）；越过 244% 档（×1.25⁴=2.441）才换 full，相对 full 采样比 ≥1.22× 纯放大有真增益——死区取 2.0 而非恰等档位的 2.441，防 `>` 判据浮点踩空与临界抖动；调小（如 1.4）更早升级对比，调大（如 3.0）基本关闭 |
 
 基础纹理本就按屏幕密度（×ppp）预放大，"1 纹素 = 1 物理像素" 即原生 1:1 点，
 不需要知道原图尺寸、解码链零透传。曾评估"往 Cached 存原图尺寸、100% 定义为
 原图 1:1（zoom=1）"的方案，已推翻：需 ImgMsg/闭包全链透传 native 尺寸，且
-zoom=1 时 `zoom×ppp = ppp > 1.05` 会误触 full 升级，判据不自洽。⚠️ 高 DPI 屏
+zoom=1 时 `zoom×ppp = ppp > image_full_threshold` 会误触 full 升级，判据不自洽。⚠️ 高 DPI 屏
 写 `Some(1.0)` 冒充 100% 是 bug：物理过扫 ×ppp 且误触 full（LOG2 事故根因）；
 换算在双击与 `img_zoom_to` 两处，漏一处即翻车。
 
@@ -1054,15 +1054,27 @@ factor, name)` 同一解码函数两档复用，factor 由 ImageService 按屏�
 
 ```rust
 native_max <= image_max_dim      // 升级资格（见级联放大禁令）
-&& zoom * ppp > 1.05             // 深放大（100% 附近基础纹理原样直出）
+&& zoom * ppp > image_full_threshold  // 越过 244% 滚轮档才升级（默认 2.0 config 可调；更浅档 base 直放大肉眼等价，不为此白付二次解码）
 && img.is_static(key)            // 动图不升级
 && !has_full && !is_full_pending && !is_full_failed   // 幂等/失败不重试
 ```
 
-- 换画判据（绘制时）：`screen_px = native×zoom×ppp > native.max_elem()×1.05`
-  才用 full 纹理，否则基础纹理（浅放大区双线性近 1:1 无损）；
+- 换画判据（绘制时）：`screen_px = native×zoom×ppp > native.max_elem()×image_full_threshold`
+  才用 full 纹理，否则基础纹理（100%~195% 档 base GPU 直放大与 full 肉眼
+  等价——195% 实拍 A/B 无差；判据与触发同配置，两处必须一致否则触发/换画
+  错位）。full 上传用 TEX_OPTS_FULL **无 mipmap**：默认阈值 2.0 下 full
+  工作区采样比 >1.0（244% 档起 ≥1.22×）纯放大，LOD 恒 ≤0 用不到 mip 链；
+  若调低阈值让 full 落入缩小区（如 195% 档 0.98×），开 mipmap 三线性会
+  混入半分辨率 mip1 把 2× Lanczos 增益打回 base 水平，无 mipmap 直采仅
+  轻微欠采样，静止图无感。base 档保留 mipmap（fit 态深缩小防摩尔纹）；
 - ×ppp×2 的密度保证放大到 ×4 原图尺寸前残余重采样 ≤×1.25（近 1:1）；再深
   交给 GPU 双线性（继续升级收益 <×1.4，不值二次解码秒级 + 180MB 级显存）；
+- 锐化（`image_full_sharpen` 配置，默认开，仅高清档）：Lanczos 放大后叠加
+  unsharp mask——`out = px + 0.6×(px − blur_σ1.0(px))`，仅 RGB、alpha 直通。
+  插值本质会把边缘坡度摊平（1px 边缘摊成 factor px 缓坡），锐化把坡度
+  重新变陡，深放大观感明显改善（信息量不变，纯观感补偿；强对比边缘可能
+  有轻微光晕，关配置可 A/B）。后台线程 O(n) 执行不卡 UI，解码日志带
+  "锐化"标记即本帧已叠加；
 - 无缝换画：full 与基础纹理同宽高比，屏幕矩形/UV 一律按**基础纹理**几何算
   （UV 0..1 对两种分辨率通用）→ 只换 `tex.id()`
   （`full_tex().unwrap_or(基础纹理)`），解码期间基础纹理照常显示，无消失/
@@ -1083,14 +1095,19 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
   `poll()` 上传纹理；
 - 两档密度适配（策略见上表，`resample` 单测钉死三种形态：基础档按密度预
   放大 / 高清档 clamp 放大 / 病态图 8192 兜底）——翻页即原生密度直出、
-  100% 零重采样；mipmap（TEX_OPTS，仅 glow 后端有效）补缩小质量；
+  100% 零重采样；mipmap 仅 base 档（TEX_OPTS，补 fit 态深缩小质量），full 档
+  TEX_OPTS_FULL 无 mipmap（见换画判据：mip 混合会抹掉 2× Lanczos 增益）；
 - ±1 张预取的 LRU 纹理缓存（容量 = `image_cache_count`；逐出跳过刚推入与
   正在显示（`shown`）两个 key，都不堪逐时允许临时超容、下次推入再收缩）：
   连续翻页即显，看过的图翻回秒开；
 - 调试日志（debug 级，按链路时序）：`发起解码`（request）/ `发起高清解码`
   （request_full——出现即深放大触发）/ `解码 {fmt} native_size=WxH
-  {lru|full}_size=WxH: Xms`（lru 尺寸 == native 即原样直进未重采样）/
-  `纹理上传[..] lru|full: Xms` / `原图解码超时（>10s）放弃`（full 看门狗）；
+  {lru|full}_size=WxH[ 锐化]: Xms`（lru 尺寸 == native 即原样直进未重采样；
+  "锐化"标记 = 本帧叠加了 unsharp mask，A/B 对比看这个；启动 info 级
+  `图片高清升级: 阈值×N 锐化 开|关` 回显两配置生效值）/
+  `纹理上传[..] lru|full: Xms` / `换画[(id, idx)] badge=N% base=WxH → full
+  WxH|→ base`（同 key 档位翻转时才一条，切图新 key 静默重置）/ `原图解码超时
+  （>10s）放弃`（full 看门狗）；
 - 防死局三件套：pending 看门狗 10s 剔除可重试、`catch_unwind`
   捕获 worker panic 转 Failed 走回退（否则线程静默死亡，pending 永久泄漏 →
   幂等检查拦截 → 永久占位死局）、`heal_current_image()` 每帧自愈（当前图
