@@ -924,8 +924,9 @@ egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
 - **帧节奏探针（常驻诊断，panels.rs `Cadence` thread_local）**：每 5s 汇总
   paints/avg/max/长帧归因（render 侧 = 本帧 render>10ms，撞 core 锁或首帧 GLSL
   编译；ui 侧 = egui 布局/驱动 swap/OS 调度）/mpv 换帧数/render 最重耗时。
-  `debug` 级默认静默，诊断时
-  `$env:RUST_LOG="info,archview::ui::panels=debug"; cargo run`。
+  `debug` 级默认静默，诊断时 RUST_LOG 环境变量或 config.toml
+  `log_level = "info,archview::ui::panels=debug"`（优先级 RUST_LOG > config > info，
+  见 main.rs 启动序）。
   基线（release，60Hz/30fps）：avg=16.7ms 恒定、render最重 <1ms、
   ui 侧长帧 ~2 个/5s（OS 底噪，丢 1 个 vsync tick 不可感知）、
   首窗 render 侧 1~2 个 70~90ms（首帧 GLSL 编译，进程一次，不预热）。

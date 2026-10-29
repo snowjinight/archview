@@ -498,7 +498,7 @@ impl App {
                 j.done = 0;
                 j.stage = String::new();
             }
-            tracing::info!(
+            tracing::debug!(
                 "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项，窗口 {win}",
                 click_pos.unwrap_or(usize::MAX),
                 sess_focus.unwrap_or(usize::MAX),
@@ -524,7 +524,7 @@ impl App {
                 j.done = 0;
                 j.stage = String::new();
             }
-            tracing::info!(
+            tracing::debug!(
                 "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
                 sess_focus,
                 self.playing
@@ -621,20 +621,20 @@ impl App {
                     j.started = std::time::Instant::now();
                 }
                 if cached {
-                    tracing::info!(
+                    tracing::debug!(
                         "缓存命中: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
                         sess_focus.unwrap_or(usize::MAX),
                         self.playing
                     );
                     self.load_extracted(&dest, entry_idx);
                 } else if was_pending {
-                    tracing::info!(
+                    tracing::debug!(
                         "批内切换目标: {name}（窗口滑动至 {win_summary}）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}",
                         sess_focus.unwrap_or(usize::MAX),
                         self.playing
                     );
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         "会话重定向: {name}（新批 {win_summary}，解码流续跑）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}",
                         sess_focus.unwrap_or(usize::MAX),
                         self.playing
@@ -649,7 +649,7 @@ impl App {
         // 缓存命中也照常起会话——窗口围绕已播目标继续预取，连续观看缓存
         // 内容时跨出窗口同样无感滑动
         if cached {
-            tracing::info!(
+            tracing::debug!(
                 "缓存命中（预取会话启动）: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，新窗 {win_summary}",
                 sess_focus.unwrap_or(usize::MAX),
                 self.playing
@@ -689,7 +689,7 @@ impl App {
             .ok();
 
         if !cached {
-            tracing::info!(
+            tracing::debug!(
                 "后台解压: {name} → {}（顺带预取 {} 项）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
                 dest.display(),
                 batch_len - 1,
@@ -786,7 +786,7 @@ impl App {
                     // 缓存命中点击会走 ⑤d 重新拉起预取会话并重写锚点——
                     // 没有这条日志，该转折在日志流里完全不可见
                     let (focus, win) = self.session_snapshot();
-                    tracing::info!(
+                    tracing::debug!(
                         "会话解净空闲退出（窗口清空）: 最后目标 [{entry_name}]｜锚点 focus={focus:?}，当前窗口 {win}，playing={:?}",
                         self.playing
                     );

@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use toml_edit::{DocumentMut, Table};
 
 const CONFIG_FILE: &str = "config.toml";
 
@@ -29,6 +30,10 @@ pub struct Config {
     pub passwords: Vec<String>,
     /// VarTidy（`archview tidy` CLI 子命令）配置
     pub vartidy: VarTidyConfig,
+    /// 主程序日志级别：error/warn/info/debug/trace，也支持 EnvFilter 指令
+    /// 语法（如 "info,archview::ui::panels=debug" 只开某模块 debug 诊断）。
+    /// RUST_LOG 环境变量优先生效
+    pub log_level: String,
 }
 
 /// VarTidy 配置：仓库与报告路径集中此处，代码零硬编码（ARCHITECTURE.md 12.6）
@@ -179,14 +184,13 @@ pub struct UiConfig {
     /// 超过该时长仍未解完才隐藏视频窗口并显示进度覆盖层——快速解压
     /// （缓存命中/小文件）全程不打扰播放，避免窗口闪烁
     pub extract_overlay_delay_ms: u64,
-    /// 静态图片 egui 纹理直显（后台 image crate 解码 → 纹理，跳过 mpv；
-    /// 动图 gif/webp 始终走 mpv，解码失败自动回退 mpv）
+    /// 图片 egui 纹理直显（后台 image crate 解码 → 纹理，跳过 mpv；静图
+    /// 与动图 gif 均走此链路，解码失败自动回退 mpv）
     pub image_texture: bool,
     /// 图片纹理 LRU 缓存张数（含当前张）：±1 相邻页预解码，翻页零等待
     pub image_cache_count: usize,
-    /// 图片纹理上传前最大边长（像素）：超过则等比降采样——超大图（高清照片）
-    /// 解码后直接上传会受 GPU 纹理尺寸上限与显存约束，降采样后配合 mipmap
-    /// 缩小显示仍平滑
+    /// 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
+    /// 升级资格判据同此值（见 imgview.rs resample 两档策略）
     pub image_max_dim: u32,
 }
 
@@ -217,6 +221,7 @@ impl Default for Config {
             codepage: "gbk".into(),
             passwords: Vec::new(),
             vartidy: VarTidyConfig::default(),
+            log_level: "info".into(),
         }
     }
 }
@@ -241,19 +246,34 @@ impl Config {
             if path.exists() {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| format!("读取配置失败 {}: {e}", path.display()))?;
-                return toml::from_str(&text).map_err(|e| {
+                let cfg: Config = toml::from_str(&text).map_err(|e| {
                     format!(
                         "解析配置失败 {}: {e}\n（TOML：字符串必须双引号；路径写正斜杠 D:/dir 或双反斜杠 D:\\\\dir）",
                         path.display()
                     )
-                });
+                })?;
+                Self::backfill(path, &text);
+                return Ok(cfg);
             }
         }
         let cfg = Config::default();
         let dst = &candidates[0];
-        std::fs::write(dst, DEFAULT_TOML)
+        // trim_start：模板字面量 r#" 后的换行只为源码排版，生成文件不带首行空行
+        std::fs::write(dst, DEFAULT_TOML.trim_start())
             .map_err(|e| format!("写入配置失败 {}: {e}", dst.display()))?;
         Ok(cfg)
+    }
+
+    /// 用户 config 缺失键补全：以默认模板为底档，把用户文档缺的键（含注释）
+    /// 补上并写回。已有键值/注释/键序原样保留（toml_edit 逐项编辑保留格式）。
+    /// 失败静默——本次启动配置已经 serde(default) 兜底默认值，
+    /// 补全只影响文件内容（便于用户下次查看/手动编辑）
+    fn backfill(path: &std::path::Path, user_text: &str) {
+        let Ok(mut doc) = user_text.parse::<DocumentMut>() else { return };
+        let Ok(def) = DEFAULT_TOML.parse::<DocumentMut>() else { return };
+        if backfill_table(doc.as_table_mut(), def.as_table()) > 0 {
+            let _ = std::fs::write(path, doc.to_string());
+        }
     }
 
     pub fn is_video_ext(&self, name: &str) -> bool {
@@ -311,110 +331,141 @@ impl Config {
     }
 }
 
+/// 递归把 src（默认模板）里 dst（用户文档）缺失的键补进 dst，返回补全项数。
+/// 克隆的 Item 自带前置注释；已有键一律不动（用户的值和注释优先）；
+/// 数组不逐项合并（用户存在即整用用户的）
+fn backfill_table(dst: &mut Table, src: &Table) -> usize {
+    let mut n = 0;
+    for (key, src_item) in src.iter() {
+        if !dst.contains_key(key) {
+            dst.insert(key, src_item.clone());
+            n += 1;
+        } else if let (Some(st), Some(dt)) = (
+            src_item.as_table(),
+            dst.get_mut(key).and_then(|i| i.as_table_mut()),
+        ) {
+            // 双方都是子表：递归补子键（根级新叶子键即使 append 到文档末尾，
+            // toml_edit 序列化时叶子先于子表输出，仍会出现在第一个 [表] 之前）
+            n += backfill_table(dt, st);
+        }
+    }
+    n
+}
+
 /// 默认配置模板（带中文注释，写入全新安装的 config.toml）。
 /// 约束：解析结果必须与 Config::default() 完全一致——
 /// 防漂移测试 default_template_matches_config_default 钉死，改默认值须同步改模板。
-const DEFAULT_TOML: &str = r#"# =============================================================
-# Archview 配置文件（TOML）
-# 启动时按「exe 同目录 → 当前工作目录」查找 config.toml，不存在则生成本文件。
-# 通用规则：
-#   * 字符串一律用双引号；含 # 、空格等特殊字符的值（尤其密码）更必须双引号
-#   * 路径推荐正斜杠 "D:/dir"；反斜杠必须双写 "D:\\dir"（TOML 转义）
-#   * "auto" 表示自动探测；相对路径相对启动时工作目录，建议绝对路径
-# =============================================================
+const DEFAULT_TOML: &str = r#"
+	# =============================================================
+	# Archview 配置文件（TOML）
+	# 启动时按「exe 同目录 → 当前工作目录」查找 config.toml，不存在则生成本文件。
+	# 已有配置缺新版本新增的键时，启动自动按默认值补全并写回
+	# （已有键值与注释原样保留）。
+	# 通用规则：
+	#   * 字符串一律用双引号；含 # 、空格等特殊字符的值（尤其密码）更必须双引号
+	#   * 路径推荐正斜杠 "D:/dir"；反斜杠必须双写 "D:\\dir"（TOML 转义）
+	#   * "auto" 表示自动探测；相对路径相对启动时工作目录，建议绝对路径
+	# =============================================================
 
-# 非 UTF-8 字节兜底代码页：老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，
-# 密码与 zip 文件名同源编码。用于密码候选追加 + zip 文件名解码兜底
-# （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
-# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只用 UTF-8
+	# 非 UTF-8 字节兜底代码页：老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，
+	# 密码与 zip 文件名同源编码。用于密码候选追加 + zip 文件名解码兜底
+	# （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
+	# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只用 UTF-8
 codepage = "gbk"
 
-# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
-# 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
-# 密码框、VarTidy 记失败跳包。密码始终用双引号包裹；仅用于解压，不写入日志/报告
+	# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
+	# 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
+	# 密码框、VarTidy 记失败跳包。密码始终用双引号包裹；仅用于解压，不写入日志/报告
 passwords = []
 
+	# 主程序日志级别：error / warn / info / debug / trace。
+	# 也支持按模块指令（EnvFilter 语法）只开某模块的诊断日志，如帧节奏探针：
+	#   log_level = "info,archview::ui::panels=debug"
+	# RUST_LOG 环境变量优先生效
+log_level = "info"
+
 [cache]
-# libmpv-2.dll 搜索目录；"auto" = exe 同目录
+	# libmpv-2.dll 搜索目录；"auto" = exe 同目录
 dll_dir = "auto"
-# 7Z/RAR 解压缓存目录；"auto" = %TEMP%\archview_cache
-# 可指向 RAM Disk 提速（见 README「RAM Disk 缓存」）；目录不存在会自动创建
+	# 7Z/RAR 解压缓存目录；"auto" = %TEMP%\archview_cache
+	# 可指向 RAM Disk 提速（见 README「RAM Disk 缓存」）；目录不存在会自动创建
 dir = "auto"
-# 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
+	# 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
 max_size_mb = 8192
-# 解码块大小（MB）
+	# 解码块大小（MB）
 chunk_size_mb = 4
-# 解码块 LRU 缓存块数
+	# 解码块 LRU 缓存块数
 chunk_cache_blocks = 64
-# 退出程序时自动清空解压缓存
+	# 退出程序时自动清空解压缓存
 clean_on_exit = false
-# 切换压缩包时自动清理上一个包的解压缓存（false = 保留以便切回命中）
+	# 切换压缩包时自动清理上一个包的解压缓存（false = 保留以便切回命中）
 clean_on_switch = false
 
 [media]
-# 视频 / 图片的文件扩展名识别列表（不区分大小写）
+	# 视频 / 图片的文件扩展名识别列表（不区分大小写）
 video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
 image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
 
 [player]
-# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
+	# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
 hwdec = "auto"
-# mpv 缓存秒数（拖回刚看过的片段直接命中缓存，零成本）
+	# mpv 缓存秒数（拖回刚看过的片段直接命中缓存，零成本）
 cache_secs = 30
-# mpv demuxer 最大缓存（MB）
+	# mpv demuxer 最大缓存（MB）
 demuxer_max_mb = 512
-# 初始音量（0-100）
+	# 初始音量（0-100）
 volume = 100
-# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
-# 排查切换卡顿时设为 "v"，配合主程序日志定位耗时环节；平时保持 "no"
+	# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
+	# 诊断 mpv 内部行为（demux 探测/hwdec/解码链路）时临时设 "v"——
+	# 量极大，转发到主程序日志；平时保持 "no"
 mpv_log_level = "no"
 
 [ui]
-# CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
-# 也可指定单个字体文件的绝对路径
+	# CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
+	# 也可指定单个字体文件的绝对路径
 font_path = "auto"
-# 图片自动播放（PPT 式翻页）间隔秒数
+	# 图片自动播放（PPT 式翻页）间隔秒数
 slideshow_secs = 1.0
-# 视频区滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+	# 视频区滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
 wheel_switch_secs = 0.3
-# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
+	# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
 ask_next_archive = true
-# 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
-# false（默认）= 保持压缩包内部顺序：固态包下内部顺序 == 物理码流顺序，
-#   预取直接命中物理相邻文件（翻页性能最优）。
-#   注意：7-Zip 工具打的包内部本来就是字典序，关闭排序对这类包显示无变化。
-# true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10，
-#   而非字典序的 1/10/2）
+	# 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
+	# false（默认）= 保持压缩包内部顺序：固态包下内部顺序 == 物理码流顺序，
+	#   预取直接命中物理相邻文件（翻页性能最优）。
+	#   注意：7-Zip 工具打的包内部本来就是字典序，关闭排序对这类包显示无变化。
+	# true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10，
+	#   而非字典序的 1/10/2）
 sort_files = false
-# 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
-# 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
+	# 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
+	# 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
 extract_overlay_delay_ms = 500
-# 静态图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；动图 gif/webp
-# 仍走 mpv）。解码失败的图片自动回退 mpv
+	# 图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均
+	# 走此链路）。解码失败的图片自动回退 mpv
 image_texture = true
-# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
+	# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
 image_cache_count = 3
-# 图片纹理上传前最大边长（像素）：超过等比降采样（超大高清图显存可控，
-# 缩小显示配合 mipmap 仍平滑）
+	# 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
+	# 升级资格判据同此值（详见 IMGVIEW_HANDOVER.md 两档策略）
 image_max_dim = 4096
 
 [extract]
-# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件
-# （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
-# 翻页直接命中，摊薄固态包定位成本
+	# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件
+	# （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
+	# 翻页直接命中，摊薄固态包定位成本
 prefetch_downstream_mb = 512
-# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
-# （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
-# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
-# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
+	# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+	# （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
+	# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
+	# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
 prefetch_upstream_mb = 512
 
 [vartidy]
-# VarTidy（"archview.exe tidy" CLI 子命令）配置
-# var 仓库根目录。必须已存在——整理器绝不修改/移动/删除仓库已有内容，
-# 仅新建作者子目录并写入仓库没有的新 var。空 = 未配置（CLI 需 -o 指定）
+	# VarTidy（"archview.exe tidy" CLI 子命令）配置
+	# var 仓库根目录。必须已存在——整理器绝不修改/移动/删除仓库已有内容，
+	# 仅新建作者子目录并写入仓库没有的新 var。空 = 未配置（CLI 需 -o 指定）
 repo_dir = ""
-# 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
+	# 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
 report_dir = "auto"
 "#;
 
@@ -467,5 +518,44 @@ report_dir = "auto"
             cfg.passwords,
             ["p@ss #1", "中文密码 2026", "特!@#$%^&*()殊"]
         );
+    }
+
+    /// 缺失键补全：用户 config 缺根级键与 [ui] 子键时从默认模板补齐（带注释）；
+    /// 已有键值/注释原样保留；补全结果是合法 TOML 且根级新键落在第一个
+    /// [表] 之前（不被错误归属到末尾的表）
+    #[test]
+    fn backfill_missing_keys() {
+        let user = r#"
+# 我的配置
+codepage = "big5"   # 用户注释保留
+
+[ui]
+slideshow_secs = 2.0
+"#;
+        let mut doc: DocumentMut = user.parse().unwrap();
+        let def: DocumentMut = DEFAULT_TOML.parse().unwrap();
+        assert!(backfill_table(doc.as_table_mut(), def.as_table()) > 0);
+        let out = doc.to_string();
+        // 已有键的值与注释原样保留
+        assert!(out.contains("# 我的配置"));
+        assert!(out.contains("codepage = \"big5\"   # 用户注释保留"));
+        assert!(out.contains("slideshow_secs = 2.0"));
+        // 缺失键按默认值补上
+        assert!(out.contains("log_level = \"info\""));
+        assert!(out.contains("image_max_dim = 4096"));
+        // 根级新键必须在第一个 [表] 头之前（否则会归属到最后一个表）
+        let key_pos = out.find("log_level").expect("log_level 已补全");
+        let tbl_pos = out.find("\n[").expect("存在表头");
+        assert!(key_pos < tbl_pos, "根级补全键应出现在首个表头之前");
+        // 补全结果语义正确：用户值优先 + 缺失项取默认
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.codepage, "big5");
+        assert_eq!(cfg.ui.slideshow_secs, 2.0);
+        assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.ui.image_max_dim, 4096);
+        // 幂等：再跑一遍补全 0 项，输出不变
+        let mut doc2: DocumentMut = out.parse().unwrap();
+        assert_eq!(backfill_table(doc2.as_table_mut(), def.as_table()), 0);
+        assert_eq!(doc2.to_string(), out);
     }
 }

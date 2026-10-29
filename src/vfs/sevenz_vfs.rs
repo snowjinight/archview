@@ -499,7 +499,7 @@ impl ArchiveVFS for SevenzVFS {
             if !interrupted && landed == 0 {
                 let cur_gen = session.lock().unwrap().gen;
                 if cur_gen != round_gen {
-                    tracing::info!(
+                    tracing::debug!(
                         "7z 会话本轮零落地但检测到重定向（gen {round_gen}→{cur_gen}），重新规划续跑"
                     );
                     continue;

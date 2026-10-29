@@ -16,6 +16,9 @@ raw-window-handle = "0.6"
 winit = { version = "0.30", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# config.toml 缺失键补全回写：保留用户注释/键序，需逐项编辑 TOML 文档
+# （toml 0.9 序列化只产生裸 TOML，会抹掉注释）
+toml_edit = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sevenz-rust = { version = "0.6.1", features = ["aes256"] }

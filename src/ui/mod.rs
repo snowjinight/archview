@@ -14,7 +14,7 @@ use crate::cache;
 use crate::config::Config;
 use crate::imgview::{
     clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView,
-    FULL_MAX_DIM, FULL_UPSCALE_MAX, MAX_ZOOM, MIN_ZOOM,
+    MAX_ZOOM, MIN_ZOOM,
 };
 use crate::player::mpv_ffi;
 use crate::player::stream_cb;

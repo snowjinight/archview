@@ -9,8 +9,9 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
 // ---- 帧呈现节奏探针（常驻诊断，debug 级默认静默） ----
 // PaintCallback 闭包每帧重建，跨帧状态放 thread_local（回调恒在 UI/GL 线程）。
 // 每 5s 汇总：绘制次数与间隔 avg/max、>25ms 长帧归因（render 侧/UI 侧）、
-// mpv 换帧数、render 单次最重耗时。诊断时开启：
-//   PowerShell: $env:RUST_LOG="info,archview::ui::panels=debug"; cargo run
+// mpv 换帧数、render 单次最重耗时。诊断时开启（二选一）：
+//   RUST_LOG 环境变量：$env:RUST_LOG="info,archview::ui::panels=debug"
+//   config.toml：log_level = "info,archview::ui::panels=debug"
 // 判读：
 //   avg≈16.7ms 且 gaps=0  → 连续重绘成立，卡顿在呈现之外（如刷新率不整除 fps）
 //   avg 正常但 gaps 多（ui侧）→ UI 偶发长帧（debug 构建/布局/OS 调度底噪，~2 个/5s 属正常）
@@ -104,7 +105,8 @@ impl App {
                         ("PgUp / PgDn", "上一个 / 下一个"),
                         ("N", "打开下一个压缩包（连续看包）"),
                         ("B", "回到锚点（最后一次解压位置）"),
-                        ("鼠标滚轮", "上一个 / 下一个（图片放大时=缩放）"),
+                        ("鼠标滚轮", "上一个 / 下一个（恒翻页）"),
+                        ("右键+滚轮", "图片缩放（锚光标）"),
                         ("+ / -", "图片缩放步进（锚视口中心）"),
                         ("0", "图片 100% 显示"),
                         ("Home", "图片适应窗口"),
@@ -780,28 +782,29 @@ impl App {
         self.img_viewport = video;
         // ---- 滚轮先于 frame() 处理：占位期间（解码中/缓存被挤）必须仍可翻页，
         // 否则异常态下滚轮失灵，只能靠文件列表救回 ----
-        // 适应窗口=翻页（与视频同款节流），放大=锚光标缩放（上滚放大）
+        // 裸滚轮=翻页（任意缩放态，与视频同款节流；翻页落地即回 fit）；
+        // 右键按住+滚轮=锚光标缩放（上滚放大）。缩放需基础纹理落地当前
+        // 倍率（fit 态），推迟到下方交互段处理
+        let mut wheel_zoom = 0.0_f32;
+        let mut wheel_anchor = None;
         if resp.hovered() {
-            let (dy, cursor) = ui.input(|i| {
+            let (dy, cursor, right) = ui.input(|i| {
                 let dy = i.events.iter().fold(0.0_f32, |acc, e| match e {
                     egui::Event::MouseWheel { delta, .. } => acc + delta.y,
                     _ => acc,
                 });
-                (dy, i.pointer.latest_pos())
+                (dy, i.pointer.latest_pos(), i.pointer.secondary_down())
             });
             if dy != 0.0 {
-                if self.img_view.zoom.is_none() {
+                if right {
+                    wheel_zoom = dy;
+                    wheel_anchor = cursor.filter(|p| video.contains(*p));
+                } else {
                     let now = ui.input(|i| i.time);
                     if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
                         self.wheel_last = now;
                         let dir = if dy > 0.0 { -1 } else { 1 }; // 上滚=上一个
                         self.play_adjacent(dir, dir > 0);
-                    }
-                } else if let Some(pos) = cursor {
-                    if video.contains(pos) {
-                        let factor = if dy > 0.0 { 1.2 } else { 1.0 / 1.2 };
-                        // 放大态下 zoom 即 img_view.zoom（Some 分支，unwrap 安全）
-                        self.img_zoom_at(self.img_view.zoom.unwrap(), factor, pos, video);
                     }
                 }
             }
@@ -865,18 +868,20 @@ impl App {
         let native = tex.size_vec2();
         let fit = fit_scale(video, native);
         let zoom = self.img_view.zoom.unwrap_or(fit);
-        // ---- 高清纹理升级：静态图放大到接近 1:1 时按需解码加强纹理——
-        // 仅在有望增益时请求：被降采样的大图（基础纹理顶格 image_max_dim）
-        // 取原图；≤2560 中小图（含 2K 级）×2 Lanczos 预放大补齐 4K 屏
-        // 密度。中间区间（2560, image_max_dim）基础即原图且不放大，请求
-        // 了也无增益（白解码一次 + 单槽显存翻倍），跳过。上限
-        // FULL_MAX_DIM（顶到它再升无意义甚至降级）。就绪后下帧无缝换画。
-        // img_source 由 play_image/load_extracted/heal 记录，切视频即清
-        // （见 extract）----
+        // ---- 高清纹理升级（full 单槽，×ppp×2 clamp 8192）：深放大时从
+        // 原图二次解码换高密度纹理。资格：基础纹理最长边 ≤ image_max_dim
+        // ——恒等于原图 ≤ image_max_dim（阈值型预放大的图必有 base=
+        // 原图×ppp ≤ 上限；超大图原尺寸直进后 base=原图 > 上限自动出
+        // 局，二次解码秒级 + 180MB 级显存不值当）。触发判据与下方换画
+        // 判据一致（zoom×ppp > 1.05，死区防临界抖动）：100%（zoom×ppp=1，
+        // 纹素 1:1）附近基础纹理原样直出，轻微过扫由 GPU 双线性兜住，
+        // 更深才值得升级。
+        // 就绪后下帧无缝换画。img_source 由
+        // play_image/load_extracted/heal 记录，切视频即清（见 extract）----
         let native_max = native.max_elem() as u32;
-        if native_max < FULL_MAX_DIM
-            && (native_max >= self.cfg.ui.image_max_dim || native_max <= FULL_UPSCALE_MAX)
-            && zoom >= 0.95
+        let ppp = ui.ctx().pixels_per_point();
+        if native_max <= self.cfg.ui.image_max_dim
+            && zoom * ppp > 1.05
             && self.img.is_static(key)
             && !self.img.has_full(key)
             && !self.img.is_full_pending(key)
@@ -885,6 +890,7 @@ impl App {
             if let Some((src_key, source, name)) = self.img_source.as_ref() {
                 if *src_key == key {
                     let (source, name) = (source.clone(), name.clone());
+                    // 预放大倍率（ppp×2）由 ImageService 按屏幕 DPI 内部取值
                     self.img.request_full(key, source, &name);
                 }
             }
@@ -895,16 +901,28 @@ impl App {
         if resp.dragged() {
             self.img_view.pan += resp.drag_delta();
         }
+        // 右键+滚轮缩放（上滚放大；fit 态先落地为当前倍率再乘，与快捷键
+        // 缩放同款语义——zoom 已 unwrap_or(fit)；锚光标）
+        if wheel_zoom != 0.0 {
+            if let Some(pos) = wheel_anchor {
+                let factor = if wheel_zoom > 0.0 { 1.2 } else { 1.0 / 1.2 };
+                self.img_zoom_at(zoom, factor, pos, video);
+            }
+        }
         // 双击：适应窗口 ↔ 100%（锚光标；非全屏——全屏走回车/Esc）
         if resp.double_clicked() {
             let cursor = ui
                 .input(|i| i.pointer.latest_pos())
                 .unwrap_or_else(|| video.center());
             match self.img_view.zoom {
-                // fit → 100%：光标下的图像点保持不动
+                // fit → 100%：光标下的图像点保持不动。
+                // 100% = 纹素:物理像素 1:1（zoom=1/ppp）——zoom 是相对
+                // 基础纹理像素的倍率，显示物理尺寸 = 纹理×zoom×ppp；
+                // 写 1.0 会在高 DPI 屏过扫 ×ppp 且误触 full 升级
                 None => {
-                    let pan = zoom_pan(self.img_view.pan, fit, 1.0, cursor - video.center());
-                    self.img_view = ImgView { zoom: Some(1.0), pan };
+                    let z100 = 1.0 / ppp;
+                    let pan = zoom_pan(self.img_view.pan, fit, z100, cursor - video.center());
+                    self.img_view = ImgView { zoom: Some(z100), pan };
                 }
                 // 100%（或任意倍率）→ 适应窗口
                 Some(_) => self.img_view = ImgView::default(),
@@ -916,9 +934,19 @@ impl App {
         if !visible {
             return;
         }
-        // 原图就绪即换画：矩形按基础纹理算（同宽高比 → 同屏幕矩形），
-        // UV 全图映射对两种分辨率通用——纯分辨率升级，无缩放跳变
-        let tex = self.img.full_tex(key).unwrap_or(tex);
+        // full 纹理选画：矩形/UV 按基础纹理算（同宽高比 → 屏幕矩形与
+        // 全图 UV 对两种分辨率通用，切换无缩放跳变）。仅当屏幕物理像素
+        // 超过基础纹理（zoom×ppp > 1.05，死区防临界抖动；与上方触发
+        // 判据一致）才用 full 纹理——浅放大区基础纹理近 1:1 双线性无
+        // 损，更深由 ×ppp×2 的 full 纹理接管（残余放大仍近 1:1）。
+        // 屏幕密度按物理像素算：DPI 缩放下 1 逻辑像素 = ppp 物理像素
+        let ppp = ui.ctx().pixels_per_point();
+        let screen_px = (native * zoom * ppp).max_elem();
+        let tex = if screen_px > native.max_elem() * 1.05 {
+            self.img.full_tex(key).unwrap_or(tex)
+        } else {
+            tex
+        };
         let rect =
             egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
         let mut mesh = egui::Mesh::with_texture(tex.id());
@@ -967,7 +995,8 @@ impl App {
         self.img_zoom_at(cur, factor, viewport.center(), viewport);
     }
 
-    /// 快捷键直接设倍率：Some(z) = 100%（z=1.0，锚视口中心）；None = 适应窗口
+    /// 快捷键直接设倍率：Some(z)=逻辑倍率（1.0=100%，锚视口中心。内部
+    /// 换算为纹素 1:1 的 1/ppp，与双击同语义）；None = 适应窗口
     pub(super) fn img_zoom_to(&mut self, target: Option<f32>) {
         let Some(key) = self.tex_image_key() else { return };
         let viewport = self.img_viewport;
@@ -978,6 +1007,7 @@ impl App {
             None => self.img_view = ImgView::default(),
             Some(z) => {
                 let Some((tex, _)) = self.img.frame(key) else { return };
+                let z = z / self.img.ppp();
                 let fit = fit_scale(viewport, tex.size_vec2());
                 let cur = self.img_view.zoom.unwrap_or(fit);
                 self.img_view.pan = zoom_pan(

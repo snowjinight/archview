@@ -6,15 +6,15 @@
 //! spawn 解码线程（zip/dir 用 VFS 虚拟文件读取；7z/RAR 读已落盘缓存）→
 //! 降采样/上采样 → mpsc 回 UI 线程 → [`ImageService::poll`] 上传纹理进 LRU。
 //!
-//! - 大图：超过 `image_max_dim`（默认 4096）等比降采样——GPU 纹理尺寸有上限
-//!   且显存有限；缩小显示配合 mipmap 仍平滑。
-//! - 小图：最长边 ≤ 512 的图 Lanczos3 ×2 上采样（封顶 max_dim），减轻 100%
-//!   缩放下的双线性模糊（看图软件对低分辨率图的锐化放大惯例）。动图不上采样
-//!   （多帧 ×4 显存不值当，播放态模糊不显眼）。
+//! - 尺寸适配两档（见 [`resample`]）：基础档 = 原图×ppp 预放大（阈值型，
+//!   native×ppp ≤ `image_max_dim` 才升，翻页即 100% 密度直出；超限原尺寸
+//!   直进）；full 高清档 = 原图×ppp×2（clamp 型，封顶 [`FULL_MAX_DIM`]，
+//!   深放大按需二次解码）。病态图（>8192）一律降采样兜底
 //! - 动图：gif 经 `AnimationDecoder::into_frames` 全帧预解码（单帧 gif 解出
-//!   1 帧自动归静态）。帧延迟 < 20ms 按浏览器惯例钳到 100ms（坏帧疯闪）；
-//!   帧数封顶 [`MAX_ANIM_FRAMES`] 防内存失控。逐帧纹理 + `tick` 推进，
-//!   UI 每帧取当前帧并 `request_repaint_after(帧延迟)` 驱动播放。
+//!   1 帧自动归静态；动图不做预放大——多帧 ×factor² 爆显存）。帧延迟 < 20ms
+//!   按浏览器惯例钳到 100ms（坏帧疯闪）；帧数封顶 [`MAX_ANIM_FRAMES`] 防内存
+//!   失控。逐帧纹理 + `tick` 推进，UI 每帧取当前帧并
+//!   `request_repaint_after(帧延迟)` 驱动播放。
 //! - webp：全部按静图取首帧——image-webp 对静态文件 `num_frames()==0`，
 //!   `into_frames` 解出空集（实测踩坑）；动画 webp 罕见，不值得为逐帧
 //!   引入分流复杂度。
@@ -41,17 +41,10 @@ const MAX_ANIM_FRAMES: usize = 512;
 /// 超过视为线程卡死或消息丢失，剔除 pending 允许重新发起
 const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 高清纹理解码上限（放大到 1:1 附近时按需升级纹理用）：防病态大图
+/// 纹理尺寸硬上限（病态图兜底 + full 槽封顶）：防病态大图
 /// （30000×30000 像素图等）撑爆显存——8192²×4B=256MB 封顶，
 /// 绝大多数"原图"不受影响仍全分辨率。pub 供 UI 层判断升级触发条件
 pub const FULL_MAX_DIM: u32 = 8192;
-
-/// 高清路径 ×2 预放大门槛：最长边 ≤ 此值才升（含经典 2K=2560，×2 后
-/// ≤5120，覆盖 4K 屏密度）。更大图纹理密度已足不再升——再 ×2 到
-/// 6~8K 显存 96~256MB、Lanczos 重采样秒级，仅深放大时略优于 GPU
-/// 双线性，得不偿失。pub 供 UI 层判断升级触发条件（中间区间请求了
-/// 也无增益，直接跳过）
-pub const FULL_UPSCALE_MAX: u32 = 2560;
 
 /// 缓存键 = 压缩包 id + 条目下标（目录模式 id 同样有效，见 ArchiveState）
 pub type ImgKey = (u64, usize);
@@ -69,7 +62,9 @@ pub const TEX_OPTS: TextureOptions = TextureOptions {
 pub const MIN_ZOOM: f32 = 0.05;
 pub const MAX_ZOOM: f32 = 256.0;
 
-/// 图片视图状态：zoom=None=适应窗口，Some(z)=相对纹理原生像素的倍率（1.0=100%）。
+/// 图片视图状态：zoom=None=适应窗口，Some(z)=相对基础纹理像素的倍率
+/// （显示物理尺寸 = 纹理尺寸×z×ppp；"100%"落点 = 1/ppp，纹素:物理像素
+/// 1:1 零重采样，见 panels.rs 双击处理）。
 /// pan = 图像中心相对视口中心的偏移（像素）
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ImgView {
@@ -112,15 +107,18 @@ enum ImgMsg {
     Ready {
         key: ImgKey,
         decoded: Decoded,
+        /// 文件短名：仅供上传日志标注
+        name: String,
     },
     Failed {
         key: ImgKey,
         error: String,
     },
-    /// 原图（不降采样）解码完成（大图放大升级，见 request_full）
+    /// full 槽纹理就绪（原图二次解码 ×ppp×2，见 request_full）
     FullReady {
         key: ImgKey,
         img: egui::ColorImage,
+        name: String,
     },
     /// 原图解码失败/放弃：UI 保持降采样纹理
     FullFailed {
@@ -188,20 +186,29 @@ impl ImageService {
         if self.pending.contains_key(&key) || self.pos(key).is_some() {
             return;
         }
-        tracing::info!("发起解码 {name} (在途 {})", self.pending.len());
+        tracing::debug!("发起解码 {name} (在途 {})", self.pending.len());
+        // 基础档预放大倍率 = 屏幕 DPI（ppp）：150% 缩放屏 ×1.5。低密屏
+        // （ppp<1）钳 1.0 免无谓缩小重采样。取发起时刻值；跨屏迁移后
+        // 已缓存纹理不回炉（LRU 深度浅，翻几页即换血）
+        let factor = (self.ctx.pixels_per_point() as f64).max(1.0);
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let name = name.to_owned();
         self.pending.insert(key, Instant::now());
         let r = std::thread::Builder::new().name("imgdec".into()).spawn(move || {
             // 解码对畸形文件可能 panic（坏图触发 codec 内部越界等）：
             // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
             // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_image(&source, max_dim, false)
+                decode_image(&source, max_dim, false, factor, &name)
             }));
             match r {
                 Ok(Ok(decoded)) => {
-                    let _ = tx.send(ImgMsg::Ready { key, decoded });
+                    let _ = tx.send(ImgMsg::Ready {
+                        key,
+                        decoded,
+                        name,
+                    });
                 }
                 Ok(Err(e)) => {
                     let _ = tx.send(ImgMsg::Failed { key, error: e });
@@ -223,10 +230,14 @@ impl ImageService {
         }
     }
 
-    /// 请求解码高清纹理（上限 FULL_MAX_DIM）：大图放大到 1:1 附近时按需
-    /// 升级——被降采样的大图取原图；未被降采样的中小图（最长边 ≤
-    /// FULL_UPSCALE_MAX=2560，含 2K 级）×2 Lanczos 预放大补齐 4K 屏
-    /// 密度，放大区间细节优于 GPU 双线性（更大图密度已足不再升）。
+    /// 请求解码高清纹理（full 单槽，clamp FULL_MAX_DIM）：深放大按需
+    /// 升级，从原图重新解码 Lanczos ×(ppp×2)（150% 缩放屏 ×3）——绝不
+    /// 在基础纹理（已 ×ppp）上级联再放大（两级重采样抹锐边）。倍率内
+    /// 部按屏幕 DPI 取值，调用方无需传参。
+    /// 升级资格由触发方保证：仅 native ≤ image_max_dim 的图（即基础
+    /// 纹理走了预放大）值得升级；超大图原尺寸直进 LRU、深放大交给 GPU
+    /// 双线性（二次解码秒级 + Lanczos 秒级 + 180MB 级显存，增益 <×1.4
+    /// 不值当）。
     /// 就绪后无缝换画
     /// （几何不变：屏幕矩形按基础纹理算，UV 全图映射对两种分辨率通用）。
     /// 幂等：已就绪/解码中/已放弃直接返回；动图不升级（全帧原图显存
@@ -236,23 +247,27 @@ impl ImageService {
         if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
             return;
         }
-        tracing::info!("发起高清解码 {name}");
+        tracing::debug!("发起高清解码 {name}");
+        // 高清档倍率 = ppp×2：基础纹理兜住 zoom 1~1.25 的双线性残余，
+        // 更深放大换 ×2 密度纹理接管（残余仍 ≤×1.25，近 1:1 无损）
+        let factor = (self.ctx.pixels_per_point() as f64).max(1.0) * 2.0;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let name = name.to_owned();
         self.full_pending = Some((key, Instant::now()));
         let r = std::thread::Builder::new()
             .name("imgfull".into())
             .spawn(move || {
                 // 同 request：畸形文件可能 panic，捕获转 FullFailed 防死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image(&source, FULL_MAX_DIM, true)
+                    decode_image(&source, FULL_MAX_DIM, true, factor, &name)
                 }));
                 let msg = match r {
-                    Ok(Ok(Decoded::Static(img))) => ImgMsg::FullReady { key, img },
+                    Ok(Ok(Decoded::Static(img))) => ImgMsg::FullReady { key, img, name },
                     // 单帧动图取唯一帧当静态原图
                     Ok(Ok(Decoded::Anim(mut a))) if a.len() == 1 => {
                         let (img, _) = a.pop().expect("len==1");
-                        ImgMsg::FullReady { key, img }
+                        ImgMsg::FullReady { key, img, name }
                     }
                     Ok(_) | Err(_) => ImgMsg::FullFailed { key },
                 };
@@ -291,7 +306,11 @@ impl ImageService {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                ImgMsg::Ready { key, decoded } => {
+                ImgMsg::Ready {
+                    key,
+                    decoded,
+                    name,
+                } => {
                     self.pending.remove(&key);
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
@@ -320,14 +339,22 @@ impl ImageService {
                             next_at: None,
                         },
                     );
-                    tracing::info!("纹理上传 {} 帧: {}ms", n, t.elapsed().as_millis());
+                    tracing::debug!(
+                        "纹理上传[{name}] lru {} 帧: {}ms",
+                        n,
+                        t.elapsed().as_millis()
+                    );
                     out.push(ImgEvent::Ready(key));
                 }
                 ImgMsg::Failed { key, error } => {
                     self.pending.remove(&key);
                     out.push(ImgEvent::Failed(key, error));
                 }
-                ImgMsg::FullReady { key, img } => {
+                ImgMsg::FullReady {
+                    key,
+                    img,
+                    name,
+                } => {
                     // 只认当前 pending 的 key：槽已换条目/超时判死的迟到消息丢弃
                     if self.full_pending.take().is_some_and(|(k, _)| k == key) {
                         let t = std::time::Instant::now();
@@ -336,7 +363,7 @@ impl ImageService {
                             img,
                             TEX_OPTS,
                         );
-                        tracing::info!("原图纹理上传: {}ms", t.elapsed().as_millis());
+                        tracing::debug!("纹理上传[{name}] full: {}ms", t.elapsed().as_millis());
                         self.full = Some((key, tex));
                     }
                 }
@@ -431,6 +458,11 @@ impl ImageService {
             .map(|(_, t)| t.clone())
     }
 
+    /// 屏幕密度（发起解码与 UI"100%"落点共用同一取值来源）
+    pub fn ppp(&self) -> f32 {
+        self.ctx.pixels_per_point()
+    }
+
     fn pos(&self, key: ImgKey) -> Option<usize> {
         self.cache.iter().position(|(k, _)| *k == key)
     }
@@ -454,15 +486,22 @@ impl ImageService {
 }
 
 /// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA。
-/// full=true 走高清路径（放大升级纹理用，上采样策略见 decode_any）
-fn decode_image(source: &ImageSource, max_dim: u32, full: bool) -> Result<Decoded, String> {
+/// full=false 基础档（factor=ppp）/ true 高清档（factor=ppp×2），
+/// 两档策略见 resample；factor 由 ImageService 按屏幕 DPI 内部取值
+fn decode_image(
+    source: &ImageSource,
+    max_dim: u32,
+    full: bool,
+    factor: f64,
+    name: &str,
+) -> Result<Decoded, String> {
     match source {
         ImageSource::File(path) => {
             let reader = image::ImageReader::open(path)
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full)
+            decode_any(reader, max_dim, full, factor, name)
         }
         ImageSource::Stream(vfs, entry) => {
             let mut vf = vfs
@@ -475,7 +514,7 @@ fn decode_image(source: &ImageSource, max_dim: u32, full: bool) -> Result<Decode
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full)
+            decode_any(reader, max_dim, full, factor, name)
         }
     }
 }
@@ -487,14 +526,25 @@ fn decode_any<R: BufRead + Seek>(
     reader: image::ImageReader<R>,
     max_dim: u32,
     full: bool,
+    factor: f64,
+    name: &str,
 ) -> Result<Decoded, String> {
     let fmt = reader.format();
+    // 日志用短名（压缩包条目路径不含目录）
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
     if fmt == Some(image::ImageFormat::Gif) {
         let t = std::time::Instant::now();
         let dec = image::codecs::gif::GifDecoder::new(reader.into_inner())
             .map_err(|e| format!("打开 GIF 失败: {e}"))?;
         let frames = collect_frames(dec.into_frames(), max_dim)?;
-        tracing::info!("解码 gif {} 帧: {}ms", frames.len(), t.elapsed().as_millis());
+        tracing::debug!(
+            "解码 gif [{base}] {} 帧: {}ms",
+            frames.len(),
+            t.elapsed().as_millis()
+        );
         return Ok(if frames.len() == 1 {
             let (img, _) = frames.into_iter().next().expect("len==1");
             Decoded::Static(img)
@@ -506,18 +556,21 @@ fn decode_any<R: BufRead + Seek>(
     let img = reader
         .decode()
         .map_err(|e| format!("解码图片失败: {e}"))?;
-    tracing::info!(
-        "解码 {fmt:?} {}x{}: {}ms",
-        img.width(),
-        img.height(),
+    // 两档尺寸适配（策略见 resample）：基础档 LRU 存 native×ppp（翻页
+    // 即 100% 密度直出）；高清档 full 槽存 native×ppp×2（深放大用，
+    // clamp 8192）。factor 由 ImageService 按屏幕 DPI 定
+    let (w, h) = (img.width(), img.height());
+    let out = resample(img, max_dim, full, factor);
+    // 尺寸命名日志：native_size 原图 / lru_size 基础纹理 / full_size
+    // full 槽纹理（箭头一致 = 未触发重采样，尺寸原样直进）
+    tracing::debug!(
+        "解码 {fmt:?} [{base}] native_size={w}x{h} {}_size={}x{}: {}ms",
+        if full { "full" } else { "lru" },
+        out.width(),
+        out.height(),
         t.elapsed().as_millis()
     );
-    // ×2 预放大门槛：基础路径仅 ≤512 小图（保 100% = 原尺寸语义，开销
-    // 小）；高清路径 ≤2560 中小图（含 2K 级）补齐 4K 屏密度——1080P/2K
-    // 放大时 GPU 双线性发糊，Lanczos 预放大显著保细节；更大图密度已足
-    // 不再升（代价见 FULL_UPSCALE_MAX 注释）
-    let up_max = if full { FULL_UPSCALE_MAX } else { 512 };
-    Ok(Decoded::Static(color_image(resample(img, max_dim, up_max))))
+    Ok(Decoded::Static(color_image(out)))
 }
 
 /// 帧迭代收集：逐帧尺寸适配 + 延迟钳正 + 帧数封顶
@@ -529,10 +582,12 @@ fn collect_frames(
     for fr in frames {
         let fr = fr.map_err(|e| format!("动画帧解码失败: {e}"))?;
         let delay = anim_delay(fr.delay());
-        let img = resample(
+        // 动图不预放大（多帧全驻显存，×factor² 爆炸）；超限降采样
+        // ——全帧常驻，6000px 级 GIF ×几十帧会爆显存，静图的"原尺寸
+        // 直进"不适用；cap 同样受 8192 硬上限约束（防超大配置+病图）
+        let img = thumbnail_cap(
             image::DynamicImage::ImageRgba8(fr.into_buffer()),
-            max_dim,
-            0, // 动图多帧 ×4 显存不值当，不预放大
+            max_dim.min(FULL_MAX_DIM),
         );
         out.push((color_image(img), delay));
         if out.len() >= MAX_ANIM_FRAMES {
@@ -561,33 +616,73 @@ fn anim_delay(d: image::Delay) -> Duration {
     }
 }
 
-/// 尺寸适配：超限降采样（快速 box 采样，mipmap 补偿质量）；
-/// 最长边 ≤ upscale_max 时 Lanczos3 ×2 上采样、封顶 max_dim
-/// （0 = 关闭）——比运行时 GPU 双线性放大锐
-fn resample(img: image::DynamicImage, max_dim: u32, upscale_max: u32) -> image::DynamicImage {
+/// 尺寸适配（静图两档，尺寸命名：native_size 原图 / lru_size 基础纹理
+/// / full_size full 槽纹理）：
+/// - 病态兜底（两档共用）：最长边 > FULL_MAX_DIM(8192) 一律降采样，
+///   防 30000×30000 级病图撑爆显存
+/// - 基础档（full=false，LRU 缓存纹理）：阈值型——native×factor ≤
+///   max_dim 才 Lanczos ×factor 预放大（factor=ppp：翻页即 100% 密度
+///   直出，不再"先糊后锐"换画）；×factor 超限的原尺寸直进（超大图
+///   纹理密度已足，深放大交给 GPU 双线性，免降采样损失与秒级重采样）
+/// - 高清档（full=true，full 单槽）：clamp 型——无条件 Lanczos ×factor
+///   封顶 FULL_MAX_DIM（factor=ppp×2；native ≤ image_max_dim 资格由
+///   调用方保证，从原图重新解码，绝不在已放大的纹理上级联再放大）
+fn resample(
+    img: image::DynamicImage,
+    max_dim: u32,
+    full: bool,
+    factor: f64,
+) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
     if w == 0 || h == 0 {
         return img;
     }
     let longest = w.max(h);
-    if longest > max_dim {
-        // 等比降到 max_dim 内
-        let scale = max_dim as f64 / longest as f64;
-        let nw = ((w as f64 * scale).round() as u32).max(1);
-        let nh = ((h as f64 * scale).round() as u32).max(1);
-        img.thumbnail(nw, nh)
-    } else if upscale_max > 0 && longest <= upscale_max {
-        // ×2 上采样（封顶 max_dim）：Lanczos3 比运行时双线性放大锐
-        let nw = (w.saturating_mul(2)).min(max_dim);
-        let nh = (h.saturating_mul(2)).min(max_dim);
-        if nw != w || nh != h {
-            img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+    if longest > FULL_MAX_DIM {
+        return thumbnail_cap(img, FULL_MAX_DIM);
+    }
+    if !full {
+        // 阈值型：放大后不超 max_dim 才升（×factor 全图等比，最长边
+        // 判定即可），超限原尺寸直进
+        if (longest as f64 * factor).round() <= max_dim as f64 {
+            upscale(img, factor, max_dim)
         } else {
             img
         }
     } else {
+        // clamp 型：无条件 ×factor、封顶 FULL_MAX_DIM
+        upscale(img, factor, FULL_MAX_DIM)
+    }
+}
+
+/// Lanczos3 ×factor 等比上采样、最长边封顶 cap（按最长边等比缩，
+/// 触顶不畸变——逐边独立 clamp 会让非方形图比例失调；尺寸不变时原样返回）
+fn upscale(img: image::DynamicImage, factor: f64, cap: u32) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    // 目标最长边：×factor 后封顶 cap（≥1 防零图/极端 factor 归零）
+    let target = ((longest as f64 * factor).round() as u32).min(cap).max(1);
+    let scale = target as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+    if nw != w || nh != h {
+        img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+    } else {
         img
     }
+}
+
+/// 等比降到 cap 内（快速 box 采样，缩小超一倍时 mipmap 消摩尔纹）
+fn thumbnail_cap(img: image::DynamicImage, cap: u32) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    if longest <= cap {
+        return img;
+    }
+    let scale = cap as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+    img.thumbnail(nw, nh)
 }
 
 /// DynamicImage → egui ColorImage（RGBA，unmultiplied——egui 内部预乘）
@@ -707,46 +802,53 @@ mod tests {
     }
 
     #[test]
-    fn resample_超限降采样() {
-        let img = image::DynamicImage::new_rgb8(100, 80);
-        let out = resample(img, 32, 0);
-        assert_eq!((out.width(), out.height()), (32, 26)); // 80*32/100 = 25.6 → 26
-    }
-
-    #[test]
-    fn resample_小图上采样两倍() {
-        let img = image::DynamicImage::new_rgb8(20, 10);
-        let out = resample(img, 4096, 512);
+    fn resample_基础档按密度预放大() {
+        // 阈值型：native×factor ≤ max_dim 才 Lanczos ×factor（factor=ppp，
+        // 150% 屏 ×1.5）——翻页即 100% 密度直出
+        let out = resample(image::DynamicImage::new_rgb8(20, 10), 4096, false, 2.0);
         assert_eq!((out.width(), out.height()), (40, 20));
-        // 动图不上采样（多帧 ×4 显存不值当）
-        let out = resample(image::DynamicImage::new_rgb8(20, 10), 4096, 0);
-        assert_eq!((out.width(), out.height()), (20, 10));
-    }
-
-    #[test]
-    fn resample_高清路径小中图两倍预放大() {
-        // 高清路径门槛 FULL_UPSCALE_MAX（补齐 4K 屏密度）：≤门槛 ×2
-        // Lanczos 预放大（2K 级 2560→5120）；更大图密度已足不再升
-        // （再 ×2 到 6~8K 显存 96~256MB、重采样秒级，得不偿失）
-        let out = resample(image::DynamicImage::new_rgb8(1920, 1080), 8192, FULL_UPSCALE_MAX);
-        assert_eq!((out.width(), out.height()), (3840, 2160));
-        let out = resample(image::DynamicImage::new_rgb8(2560, 1440), 8192, FULL_UPSCALE_MAX);
-        assert_eq!((out.width(), out.height()), (5120, 2880), "2K 级边界内 ×2");
-        let out = resample(image::DynamicImage::new_rgb8(4096, 3072), 8192, FULL_UPSCALE_MAX);
-        assert_eq!((out.width(), out.height()), (4096, 3072), "超门槛不再升");
-        let out = resample(image::DynamicImage::new_rgb8(1920, 1080), 8192, 512);
-        assert_eq!(
-            (out.width(), out.height()),
-            (1920, 1080),
-            "基础路径门槛内不放大"
-        );
-    }
-
-    #[test]
-    fn resample_中间尺寸不动() {
-        let img = image::DynamicImage::new_rgb8(800, 600);
-        let out = resample(img, 4096, 512);
+        let out = resample(image::DynamicImage::new_rgb8(2000, 1000), 4096, false, 1.5);
+        assert_eq!((out.width(), out.height()), (3000, 1500));
+        // 超阈值：原尺寸直进（超大图免降采样损失，深放大交给 GPU 双线性）
+        let out = resample(image::DynamicImage::new_rgb8(3000, 2000), 4096, false, 1.5);
+        assert_eq!((out.width(), out.height()), (3000, 2000), "×1.5 超 4096 原图直进");
+        // ppp=1.0 屏（factor=1）：不无谓重采样
+        let out = resample(image::DynamicImage::new_rgb8(800, 600), 4096, false, 1.0);
         assert_eq!((out.width(), out.height()), (800, 600));
+    }
+
+    #[test]
+    fn resample_高清档clamp放大() {
+        // clamp 型：无条件 ×factor、按最长边等比封顶 FULL_MAX_DIM
+        // （factor=ppp×2；native ≤ image_max_dim 资格由触发方保证）
+        let out = resample(image::DynamicImage::new_rgb8(1920, 1080), 8192, true, 2.0);
+        assert_eq!((out.width(), out.height()), (3840, 2160));
+        let out = resample(image::DynamicImage::new_rgb8(4096, 3072), 8192, true, 2.0);
+        assert_eq!((out.width(), out.height()), (8192, 6144), "×2 恰顶格");
+        let out = resample(image::DynamicImage::new_rgb8(2000, 1500), 8192, true, 4.0);
+        assert_eq!((out.width(), out.height()), (8000, 6000), "×4 未触顶整体放大");
+        let out = resample(image::DynamicImage::new_rgb8(4096, 1000), 8192, true, 4.0);
+        // 最长边 16384→8192 等比缩（scale=2），短边随比例 1000→2000
+        //（逐边独立 clamp 会畸变成 8192×4000）
+        assert_eq!((out.width(), out.height()), (8192, 2000));
+    }
+
+    #[test]
+    fn resample_病态图8192兜底() {
+        // 两档共用兜底：>8192 病图等比降到 8192（快速 box 采样 + mipmap）
+        let out = resample(image::DynamicImage::new_rgb8(9000, 7000), 4096, false, 1.0);
+        assert_eq!((out.width(), out.height()), (8192, 6372)); // 7000×8192/9000=6371.6→6372
+        let out = resample(image::DynamicImage::new_rgb8(10000, 8000), 8192, true, 3.0);
+        assert_eq!((out.width(), out.height()), (8192, 6554), "高清档同样先兜底"); // 8000×0.8192=6553.6
+    }
+
+    #[test]
+    fn thumbnail_cap_动图降采样() {
+        // 动图帧：不预放大，超 cap 降采样（全帧驻显存）；限内原样
+        let out = thumbnail_cap(image::DynamicImage::new_rgb8(6000, 4000), 4096);
+        assert_eq!((out.width(), out.height()), (4096, 2731)); // 4000×4096/6000=2730.7
+        let out = thumbnail_cap(image::DynamicImage::new_rgb8(100, 80), 4096);
+        assert_eq!((out.width(), out.height()), (100, 80));
     }
 
     /// 内存中生成 PNG 字节
@@ -796,7 +898,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim.gif");
         std::fs::write(&p, gif_bytes_2帧(8, 6)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("2 帧 GIF 应解出 Anim");
@@ -839,7 +941,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim_delay.gif");
         std::fs::write(&p, gif_bytes_delayed(8, 6, 80, 2)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("带真实延迟的 2 帧 GIF 应解出 Anim");
@@ -864,7 +966,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("single.gif");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         assert!(matches!(out, Decoded::Static(_)), "单帧动画应归静态（免时钟开销）");
     }
@@ -880,7 +982,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.webp");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(tex) = out else {
             panic!("静态 webp 应走静图路径");
@@ -891,19 +993,38 @@ mod tests {
 
     #[test]
     fn decode_高清路径中图两倍预放大() {
-        // 800×600：基础路径不动（见 decode_file_从临时文件解码），高清路径
-        // 按余量 ×2（800 ≤ 8192/2）——放大区间 Lanczos 细节优于 GPU 双线性
+        // 800×600：基础档阈值内升 ×factor（见 decode_file_从临时文件解码），
+        // 高清档 clamp 型同样 ×2（800×2=1600 ≤8192 未触顶）——深放大
+        // 区间 Lanczos 细节优于 GPU 双线性
         let png = png_bytes(800, 600);
         let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("full.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 8192, true).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
         };
         assert_eq!(img.size, [1600, 1200]);
+    }
+
+    #[test]
+    fn decode_高清路径按屏幕密度预放大() {
+        // 800×600 ×1.5（150% DPI 屏 100% 查看密度）→ 1200×900：恰好 1:1
+        // 物理像素、单级 Lanczos 直出（固定 ×2 再被 mip 缩回是两级重采样，
+        // 锐边被抹——用户实测 100% 查看发糊的根因）
+        let png = png_bytes(800, 600);
+        let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("full_dpi.png");
+        std::fs::write(&p, &png).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 1.5, "t.png").unwrap();
+        std::fs::remove_file(&p).ok();
+        let Decoded::Static(img) = out else {
+            panic!("PNG 应走静态路径");
+        };
+        assert_eq!(img.size, [1200, 900]);
     }
 
     #[test]
@@ -914,17 +1035,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png").unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
         };
-        assert_eq!(img.size, [600, 400]);
+        assert_eq!(img.size, [1200, 800]);
     }
 
     /// 直接塞一帧进服务缓存（跳过后台线程，同步可控）
-    fn feed(svc: &mut ImageService, key: ImgKey, decoded: Decoded) {
-        let _ = svc.tx.send(ImgMsg::Ready { key, decoded });
+    fn feed(svc: &mut ImageService, key: ImgKey, decoded: Decoded, name: &str) {
+        let _ = svc.tx.send(ImgMsg::Ready {
+            key,
+            decoded,
+            name: name.to_owned(),
+        });
         svc.poll();
     }
 
@@ -940,6 +1065,7 @@ mod tests {
                     [4, 4],
                     vec![egui::Color32::WHITE; 16],
                 )),
+                "t.png",
             );
         };
         // 依次就绪 3 张：cap=2 应逐出最早的 (1,0)，保留 (1,1) 与当前 (1,5)
@@ -969,6 +1095,7 @@ mod tests {
                     [4, 4],
                     vec![egui::Color32::WHITE; 16],
                 )),
+                "t.png",
             );
         };
         // 显示中（frame 标记 shown）
@@ -997,6 +1124,7 @@ mod tests {
                 (frame(20), Duration::from_millis(30)),
                 (frame(30), Duration::from_millis(30)),
             ]),
+            "t.gif",
         );
         // 首次取帧：第 0 帧，给出起播时长
         let (tex, rest) = svc.frame(key).expect("命中");
@@ -1029,6 +1157,7 @@ mod tests {
             &mut svc,
             key,
             Decoded::Static(egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16])),
+            "t.png",
         );
         let (tex, rest) = svc.frame(key).unwrap();
         assert_eq!(tex.name(), "img-3-0-f0");
