@@ -211,6 +211,8 @@ pub struct App {
     img_view: ImgView,
     // 上帧图片绘制区域（滚轮缩放锚点 / 拖拽限位用；未绘制过 = NOTHING）
     img_viewport: egui::Rect,
+    // 落回"适应窗口"的闪现提示起点（右下角徽标显示约 1s；None=不在闪现期）
+    img_fit_flash: Option<std::time::Instant>,
     // 非 solid 图片切换防闪：下一张解码期间原样重画上一张（快照见 HoldImg），
     // 超过 2s 仍未就绪才退回占位提示（避免无限解压时用户毫无感知）
     hold_img: Option<HoldImg>,
@@ -289,6 +291,7 @@ impl App {
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
+            img_fit_flash: None,
             hold_img: None,
             img_source: None,
             dragging: false,
@@ -338,6 +341,7 @@ impl App {
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
+            img_fit_flash: None,
             hold_img: None,
             img_source: None,
             dragging: false,

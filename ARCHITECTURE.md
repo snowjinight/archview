@@ -53,7 +53,7 @@
 | 7Z 读取 | `sevenz-rust` | 纯 Rust；`BlockDecoder` 支持固态 folder 直达解压（见 11.1） |
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
 | 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 20 符号：核心 + stream_cb + render API）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
-| 图片渲染 | `image` crate | 静态图（含全部 webp）与 GIF 动图走 egui 纹理直显（13.4）：全帧预解码/降采样/小图上采样/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
+| 图片渲染 | `image` crate | 静态图（含全部 webp）与 GIF 动图走 egui 纹理直显（13.4）：两档纹理按屏幕密度适配（基础 ×ppp / 深放大 full ×ppp×2）/全帧预解码/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
 | GL 后端 | `eframe` (glow) | 渲染器显式指定 glow（0.34 起 eframe 默认 wgpu，glow 才能拿到 `GL` 上下文喂给 mpv render API） |
 | 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
@@ -264,9 +264,9 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 
 | 功能 | 说明 |
 |---|---|
-| 翻页 | PgUp/PgDn 切换上/下一个；滚轮仅在**视频区**悬停时切换（`ui.wheel_switch_secs` 节流）——文件列表区滚轮是正常滚动列表，不切换 |
+| 翻页 | PgUp/PgDn、←/→ 切换上/下一个；滚轮在媒体区悬停时**模式感知**——视频或图片 fit 态 = 翻页（`ui.wheel_switch_secs` 节流），图片缩放态 = 锚光标缩放（缩小触底自动落 fit，13.4 交互）；文件列表区滚轮是正常滚动列表，不切换 |
 | 动图 | GIF 动画逐帧预解码 + egui 定时切帧（13.4 第 4 步）；webp 全按静图取首帧（动画 webp 罕见，且静态 webp 无 ANMF 块 `num_frames()==0`，逐帧路线解出空集误报失败，实测踩坑） |
-| 放大细节 | ≥1:1 显示时按需高清纹理无缝换画：被降采样的大图取原图、≤2560 中小图（含 2K 级）×2 Lanczos 预放大补齐 4K 密度（13.4 高清纹理升级） |
+| 放大细节 | 两档纹理按屏幕密度（ppp）适配（13.4）：基础档 ×ppp 进 LRU（翻页即原生密度直出）；深放大（zoom×ppp>1.05）后台解 full 档 ×ppp×2（封顶 8192）无缝换画；100% = 1 纹素:1 物理像素（zoom=1/ppp）零重采样最锐点 |
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
 
@@ -317,7 +317,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | 4 | 加密 | 头加密阻止列目录 → 打开阶段自动探测密码（无密码 → config 列表），耗尽才弹密码框；密码仅内存传递不落盘 |
 | 5 | libmpv 嵌入渲染 | 已迁移 mpv render API 纹理渲染（glow 后端 + PaintCallback，见 13）；原生子窗口双平面问题连根移除，剩余风险为 FFI 生命周期顺序（on_exit 释放 render ctx 先于 mpv terminate） |
 | 6 | mpv dll 分发 | 仓库不含（超 GitHub 单文件限制），build.rs 从 `deps\mpv-dev` 复制，README 提供下载指引 |
-| 7 | 大图解码阻塞 UI | 已消解：图片统一走 mpv 渲染，无独立解码线程（见第 6 章） |
+| 7 | 大图解码阻塞 UI | 已消解：图片后台线程 image crate 解码 + mpsc 回 UI 线程上传纹理（13.4）；超 8192 病态图兜底降采样；解码失败自动回退 mpv |
 
 ---
 
@@ -332,7 +332,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | 追加 | VarTidy CLI 子命令（第 12 章）：var 资源包增量整理 | `archview.exe tidy` + 「发送到」 | ✅ |
 | 追加 | 解压会话化（11.4）：extract_session 持久解码会话，跳转零取消 | 固态包随机跳看重定向不重起 | ✅ |
 | 追加 | 渲染架构迁移（13）：wid 原生子窗口 → mpv render API + glow 后端 + PaintCallback blit，删除全部窗口叠放绕路代码 | egui 单平面，视频画面缩放质量随窗口实时重采样 | ✅ |
-| 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + 动图逐帧 | 纹理路径与 mpv 路径并存互兜底；mpv 收缩为纯视频 | 🔶 1-4 步已落地，5（PSD/HEIC/AVIF）按需 |
+| 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + 动图逐帧 + 两档高清纹理（×ppp/×ppp×2）+ 模式感知滚轮 | 纹理路径与 mpv 路径并存互兜底；mpv 收缩为纯视频 | 🔶 1-4 步已落地（含物理像素对齐修复与交互改版），5（PSD/HEIC/AVIF）按需 |
 
 ---
 
@@ -345,7 +345,7 @@ player      : 自研 mpv_ffi（libloading 动态加载 libmpv-2.dll，含 stream
 archive/zip : zip
 archive/7z  : sevenz-rust (BlockDecoder 固态直达)
 archive/rar : unrar (UnRAR.dll)
-image       : 无独立解码库（mpv 统一渲染）
+image       : image 0.25（jpeg/png/webp/gif/bmp/tiff/ico/tga 解码 → egui 纹理直显，见 13.4；webp 全按静图）
 config      : serde + toml (config.toml)
 logging     : tracing
 sort        : alphanumeric-sort (file list natural order, optional mode for comic/image collections)
@@ -956,17 +956,22 @@ egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
 render API 迁移已完成（13.3），GL 上下文与 PaintCallback 机制就绪，本节从"预留
 扩展"（6.4）升级为实施计划。能力收益对照见 6.4 表格；这里是落地方案与实况。
 
-**动机**：图片目前与视频同走 mpv loadfile，首帧带 50~200ms 的 demuxer/GL 管线
+**动机**：图片曾与视频同走 mpv loadfile，首帧带 50~200ms 的 demuxer/GL 管线
 初始化（翻页体感顿挫）；且 mpv 不支持的格式（PSD/HEIC/AVIF）永久缺位。图片
 不走 mpv、直接解码进 egui 纹理，可与 mpv 路径零成本并存。
 
 **数据流**（VFS 层零改动——两条路径只是同一 VirtualFile 流的不同消费者）：
 
 ```
-VirtualFile 流（复用 VFS 快慢路径 + 缓存）
-  → 解码器（内置格式 image crate；扩展格式专用库）
-  → 解码即降采样到显示尺寸（≤ 视口 2x）
-  → egui ColorImage → TextureHandle 直显
+App::play → wants_texture(cfg, name)          # image_texture 开 && 图片扩展名
+  → img_source = (key, source, name) 记录      # extract.rs（full 升级回查数据源）
+  → ImageService::request(key, source, max_dim, name)
+      spawn "imgdec" 线程 → decode_image(_, full=false, ppp, &name)
+      → mpsc ImgMsg::Ready → poll() 上传纹理进 LRU → ImgEvent::Ready → UI 换画
+深放大时（panels.rs 触发判据见下）
+  → ImageService::request_full(key, source, name)
+      spawn "imgfull" 线程 → decode_image(_, full=true, ppp×2, &name)
+      → mpsc ImgMsg::FullReady → poll() 上传 full 槽 → 下帧无缝换画
 ```
 
 **路由**（✅）：play() 顶部统一密码检查后按扩展名分流（`imgview::wants_texture`：
@@ -988,35 +993,84 @@ VirtualFile 流（复用 VFS 快慢路径 + 缓存）
 
 **交互**（✅，参考 Honeyview 等主流看图软件）：
 - 绘制：`Mesh::with_texture + add_rect_with_uv` + `painter_at(媒体区)` 裁剪；
-  mpv PaintCallback 以 `tex_image_key().is_none()` 互斥；
-- 缩放状态 `ImgView { zoom: Option<f32>, pan }`：None=适应窗口；纯几何函数
+  mpv PaintCallback 以 `tex_image_key().is_none()` 互斥；绘制矩形做**物理像素
+  对齐**（13.5 坑 8——自绘 mesh 不 snap 时 100% 也会整幅混糊）；
+- 缩放状态 `ImgView { zoom: Option<f32>, pan }`：None=适应窗口；zoom 范围
+  `MIN_ZOOM` 0.05 ~ `MAX_ZOOM` 256；纯几何函数
   `fit_scale`/`zoom_pan`/`clamp_pan` 独立单测（clamp 语义：大图不露边、小图归零居中）；
-- 拖拽平移；滚轮分层——fit 模式滚轮=翻页（沿用节流），缩放中锚光标 ±1.2×；
-  双击 = 适应窗口 ↔ 100%（锚光标），**全屏不再绑双击**（Enter/Esc 照旧）；
-- 键盘：←/→ 上一张/下一张；`+`/`−` 1.25× 步进（锚视口中心）；`0`=100%；
-  `Home`=适应窗口。
+- 拖拽平移（图像中心 clamp 在视口内，拖不丢）；滚轮**模式感知**：fit 态 = 翻页（`ui.wheel_switch_secs` 节流）；缩放态 =
+  锚光标 ±1.2×（上滚放大），**缩小触底自动落 fit**（判据
+  `(zoom×factor).max(MIN_ZOOM) <= fit`；fit_scale 不封顶，小图 fit>1 同样
+  成立），落 fit 后继续滚即翻页，无需双击退出；**Ctrl+滚轮**任意态（含 fit）
+  直接起缩放。⚠️ 触底判据仅存在于滚轮缩小路径——双击/键盘 100% 无条件写
+  zoom，不会被拉回 fit；
+- 双击 = 适应窗口 ↔ 100%（锚光标），**100% 写 `z100 = 1.0/ppp`**（zoom=1.0
+  ≠ 100%，高 DPI 屏写 1.0 会过扫 + 误触 full 升级，见下「zoom 语义」）；
+  **全屏不再绑双击**（Enter/Esc 照旧）；
+- 键盘：←/→ 上一张/下一张；`+`/`−` 1.25× 步进（锚视口中心）；`0`=100%
+  （`img_zoom_to(Some(1.0))` 内部 `z/ppp` 换算）；`Home`=适应窗口；
+- 模式徽标（媒体区右下角 `paint_badge`，半透明黑底圆角）：缩放态常驻
+  `NNN%`（`zoom×ppp×100` 取整，100% = 纹素:物理 1:1 基准）；任何路径落回
+  fit（滚轮触底/双击/Home）闪现"适应窗口"约 1s（`img_fit_flash` +
+  `request_repaint_after` 驱动消失），fit 阅读态无徽标；
+- 滚轮在 `frame()` **之前**处理（13.5 坑 6：占位期间也要能翻页逃生），缩放
+  推迟到交互段（需基础纹理落地后的 zoom/fit 值）。
 
-**高清纹理升级（放大按需解码，✅）**：GPU 固定管线放大只有双线性，>100% 显示
-细节受限。静态图**显示比例 ≥ 95%**（放大态即 zoom；fit 模式 = fit 倍率——窗口
-大于图片时本就在 ≥1:1 放大显示，立即受益）即后台解码高清版、就绪后无缝换画：
-- 两条收益路径合一（`decode_image(full=true)`）：被降采样的大图（基础纹理
-  顶格 `image_max_dim`）取原图；未被降采样的中小图（最长边 ≤
-  `FULL_UPSCALE_MAX`=2560，含 2K 级）×2 Lanczos3 预放大补齐 4K 屏密度
-  （1080P→4K、2K→5K）——放大区间细节显著优于运行时双线性；更大图纹理
-  密度已足不再升——再 ×2 到 6~8K 显存 96~256MB、重采样秒级，仅深放大
-  时略优于双线性，得不偿失；
-- 上限 `FULL_MAX_DIM`=8192（8192²×4B=256MB 封顶防病态大图；基础纹理已达
-  8192 再升无增益甚至降级）；触发仅在有望增益时——基础纹理顶格
-  `image_max_dim`（可能被降采样，取原图有增益）或 ≤2560（可预放大），
-  中间区间（2560, image_max_dim）基础即原图且不放大，请求了也无增益
-  （白解码 + 单槽显存翻倍），跳过；
-- 无缝换画：屏幕矩形按**基础纹理**几何计算，高清纹理同纵横比、UV 0..1 对
-  两种分辨率通用 → 只换 `tex.id()`（`full_tex().unwrap_or(基础纹理)`），
-  解码期间基础纹理照常显示，无消失/闪烁/几何跳变；
+**zoom 语义（定稿，勿回退）**：显示物理尺寸 = 基础纹理 × zoom × ppp（ppp =
+屏幕像素密度，150% 屏 = 1.5）。由此：
+
+| 概念 | 值 | 含义 |
+|---|---|---|
+| fit | `fit_scale(viewport, tex)` | 适应窗口（zoom=None 实时值），**不封顶**——小图 fit>1（fit 态即放大铺满） |
+| **100%** | **`z100 = 1.0 / ppp`**（150% 屏 ≈ 0.667） | 1 纹素 = 1 物理像素，零重采样最锐点 |
+| full 触发/换画判据 | `zoom × ppp > 1.05` | 100% 恰在分界（=1.0 不触发），死区防临界抖动 |
+
+基础纹理本就按屏幕密度（×ppp）预放大，"1 纹素 = 1 物理像素" 即原生 1:1 点，
+不需要知道原图尺寸、解码链零透传。曾评估"往 Cached 存原图尺寸、100% 定义为
+原图 1:1（zoom=1）"的方案，已推翻：需 ImgMsg/闭包全链透传 native 尺寸，且
+zoom=1 时 `zoom×ppp = ppp > 1.05` 会误触 full 升级，判据不自洽。⚠️ 高 DPI 屏
+写 `Some(1.0)` 冒充 100% 是 bug：物理过扫 ×ppp 且误触 full（LOG2 事故根因）；
+换算在双击与 `img_zoom_to` 两处，漏一处即翻车。
+
+**两档纹理体系（resample 策略）**：`decode_image(source, max_dim, full,
+factor, name)` 同一解码函数两档复用，factor 由 ImageService 按屏幕 DPI 内部
+取值、调用方不传：
+
+| | 基础档（full=false） | 高清档（full=true） |
+|---|---|---|
+| 去处 | LRU 缓存（多张，±1 预取） | full 单槽（一张，切条目即弃） |
+| 倍率 | ×ppp（低密屏钳 1.0） | ×ppp×2（150% 屏 = ×3） |
+| 类型 | **阈值型**：native×ppp ≤ `image_max_dim`(4096) 才 Lanczos 预放大；**超限原尺寸直进**（超大图密度已足，免降采样损失与秒级重采样） | **clamp 型**：无条件 ×factor，封顶 `FULL_MAX_DIM`(8192) |
+| 病态兜底 | 最长边 > 8192 一律降采样（两档共用） | 同左 |
+| 动图 | 不预放大（多帧 ×factor² 爆显存）；超限降采样、8192 硬上限同样约束 | **不升级**（`is_static` 前置过滤） |
+
+**级联放大禁令（不可违反）**：full 档必须**从原图重新解码** Lanczos ×(ppp×2)，
+绝不在基础纹理（已 ×ppp）上级联再放大——两级重采样抹锐边。升级资格判据
+`native ≤ image_max_dim` 与基础档阈值恒等价（预放大的图 base=原图×ppp ≤ 上限；
+直进的图 base=原图 > 上限自动出局），无需额外状态。
+
+**高清升级（深放大按需解码，✅）**：GPU 固定管线放大只有双线性，深放大细节
+受限。触发判据（panels.rs 每帧检查，幂等由 ImageService 保证）：
+
+```rust
+native_max <= image_max_dim      // 升级资格（见级联放大禁令）
+&& zoom * ppp > 1.05             // 深放大（100% 附近基础纹理原样直出）
+&& img.is_static(key)            // 动图不升级
+&& !has_full && !is_full_pending && !is_full_failed   // 幂等/失败不重试
+```
+
+- 换画判据（绘制时）：`screen_px = native×zoom×ppp > native.max_elem()×1.05`
+  才用 full 纹理，否则基础纹理（浅放大区双线性近 1:1 无损）；
+- ×ppp×2 的密度保证放大到 ×4 原图尺寸前残余重采样 ≤×1.25（近 1:1）；再深
+  交给 GPU 双线性（继续升级收益 <×1.4，不值二次解码秒级 + 180MB 级显存）；
+- 无缝换画：full 与基础纹理同宽高比，屏幕矩形/UV 一律按**基础纹理**几何算
+  （UV 0..1 对两种分辨率通用）→ 只换 `tex.id()`
+  （`full_tex().unwrap_or(基础纹理)`），解码期间基础纹理照常显示，无消失/
+  闪烁/几何跳变；
 - 单槽 `full: Option<(key, tex)>` 切条目即弃（×2 显存 ×4，不进 LRU）；三态
-  防重入（就绪/在途/已放弃）+ 专属看门狗——zoom 在触发边界来回变化不重复
-  解码；动图不升级（`is_static` 前置过滤）；`img_source` 由 play_image/
-  load_extracted/heal 记录、切视频即清。
+  防重入（就绪/在途/已放弃）+ 专属看门狗（10s 迟到判死）——zoom 在触发
+  边界来回变化不重复解码；`img_source` 由 play_image/load_extracted/heal
+  记录、切视频即清（full 升级要回查数据源）。
 
 **切图防闪烁（HoldImg 快照，✅）**：非 solid 大图解压+解码可达数秒，切换期间
 `frame()=None` 时**优先原样重画上一张快照**（`hold_img { tex, rect, since }`，
@@ -1027,17 +1081,19 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
 **内存控制**（✅，`src/imgview.rs` ImageService）：
 - 后台线程解码（zip/dir 走 VFS 流读、7z/RAR 读落盘缓存），mpsc 回 UI 线程
   `poll()` 上传纹理；
-- 解码即降采样：超 `image_max_dim`（默认 4096）等比缩——GPU 纹理上限/显存友好，
-  mipmap（TEX_OPTS）补缩小质量；
-- 上采样门槛参数化（`resample(img, max_dim, upscale_max)`，0=关闭）：基础
-  路径小图（最长边 ≤ 512）Lanczos3 ×2 上采样——首帧即锐、随 LRU 常驻翻回
-  即锐，减轻 100% 下双线性模糊；动图关闭（多帧 ×4 显存不值当）；高清路径
-  见下节；
+- 两档密度适配（策略见上表，`resample` 单测钉死三种形态：基础档按密度预
+  放大 / 高清档 clamp 放大 / 病态图 8192 兜底）——翻页即原生密度直出、
+  100% 零重采样；mipmap（TEX_OPTS，仅 glow 后端有效）补缩小质量；
 - ±1 张预取的 LRU 纹理缓存（容量 = `image_cache_count`；逐出跳过刚推入与
   正在显示（`shown`）两个 key，都不堪逐时允许临时超容、下次推入再收缩）：
   连续翻页即显，看过的图翻回秒开；
-- 防死局三件套（13.5 坑 8/9）：pending 看门狗 10s 剔除可重试、`catch_unwind`
-  捕获 worker panic 转 Failed 走回退、`heal_current_image()` 每帧自愈（当前图
+- 调试日志（debug 级，按链路时序）：`发起解码`（request）/ `发起高清解码`
+  （request_full——出现即深放大触发）/ `解码 {fmt} native_size=WxH
+  {lru|full}_size=WxH: Xms`（lru 尺寸 == native 即原样直进未重采样）/
+  `纹理上传[..] lru|full: Xms` / `原图解码超时（>10s）放弃`（full 看门狗）；
+- 防死局三件套：pending 看门狗 10s 剔除可重试、`catch_unwind`
+  捕获 worker panic 转 Failed 走回退（否则线程静默死亡，pending 永久泄漏 →
+  幂等检查拦截 → 永久占位死局）、`heal_current_image()` 每帧自愈（当前图
   不在缓存且无在途解码就补发请求）——杜绝任何形态的"永久占位"；
 - TextureHandle 随 LRU 淘汰自动释放，切包/退出随 App 释放。
 
@@ -1135,3 +1191,17 @@ click 天然是单次事件）。修复：改用真实 `Event::MouseWheel` 事�
 码依赖全部无优化。修法：`[profile.dev.package."*"] opt-level = 2`——依赖走
 O2、自身 UI 代码保持可调试；另在 worker 发送后 `ctx.request_repaint()` 唤醒
 UI 立即 poll（否则空闲时解码完成要等下一次重绘，实测多等 50~130ms）。
+
+**坑 8：自绘 mesh 无物理像素对齐 → 100% 仍发糊（真根因，2026-10-29 修复）。**
+100% 纹素 1:1 只是"尺寸"1:1，矩形**原点**落在分数物理坐标（逻辑坐标 ×ppp
+常见 .5）时，双线性仍会把整幅图混糊；尺寸 f32 误差（3392/1.5×1.5=3391.9995）
+还致 LOD 微偏混 mip1。egui 只对文字自动对齐。修复：绘制矩形在物理空间
+round 到整像素再换回逻辑坐标（panels.rs 换画段 `(raw.min×ppp).round()/ppp`）。
+注意 **DPI 感知无需 manifest**——winit 0.30 默认调
+SetProcessDpiAwarenessContext(PerMonitorV2)，ppp 能读到 1.5 即证明进程已感知
+（不感知会被虚拟化成 96 DPI、ppp=1.0、全局字体同步糊），勿走"声明 DPI
+敏感"弯路。
+
+**坑 9（流程）：IDE 旧缓冲覆盖磁盘编辑。**编辑器开着源文件时保存旧缓冲会
+静默覆盖 AI 已写入磁盘的编辑（本项目实际发生多次，表现为编译报"缺字段"）。
+AI 协作改代码前先 reload 编辑器 / 关掉相关文件。

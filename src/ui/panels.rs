@@ -105,8 +105,8 @@ impl App {
                         ("PgUp / PgDn", "上一个 / 下一个"),
                         ("N", "打开下一个压缩包（连续看包）"),
                         ("B", "回到锚点（最后一次解压位置）"),
-                        ("鼠标滚轮", "上一个 / 下一个（恒翻页）"),
-                        ("右键+滚轮", "图片缩放（锚光标）"),
+                        ("鼠标滚轮", "翻页；图片缩放态=缩放（触底回适应）"),
+                        ("Ctrl+滚轮", "图片缩放（任意状态，锚光标）"),
                         ("+ / -", "图片缩放步进（锚视口中心）"),
                         ("0", "图片 100% 显示"),
                         ("Home", "图片适应窗口"),
@@ -782,21 +782,22 @@ impl App {
         self.img_viewport = video;
         // ---- 滚轮先于 frame() 处理：占位期间（解码中/缓存被挤）必须仍可翻页，
         // 否则异常态下滚轮失灵，只能靠文件列表救回 ----
-        // 裸滚轮=翻页（任意缩放态，与视频同款节流；翻页落地即回 fit）；
-        // 右键按住+滚轮=锚光标缩放（上滚放大）。缩放需基础纹理落地当前
-        // 倍率（fit 态），推迟到下方交互段处理
+        // 模式感知：fit 态裸滚轮=翻页（与视频同款节流）；缩放态（或按住
+        // Ctrl 任意态）=锚光标缩放（上滚放大），缩小触底自动落回 fit——
+        // 继续滚即翻页，无需先双击退出。缩放需基础纹理落地当前倍率
+        // （fit 态），推迟到下方交互段处理
         let mut wheel_zoom = 0.0_f32;
         let mut wheel_anchor = None;
         if resp.hovered() {
-            let (dy, cursor, right) = ui.input(|i| {
+            let (dy, cursor, ctrl) = ui.input(|i| {
                 let dy = i.events.iter().fold(0.0_f32, |acc, e| match e {
                     egui::Event::MouseWheel { delta, .. } => acc + delta.y,
                     _ => acc,
                 });
-                (dy, i.pointer.latest_pos(), i.pointer.secondary_down())
+                (dy, i.pointer.latest_pos(), i.modifiers.ctrl)
             });
             if dy != 0.0 {
-                if right {
+                if ctrl || self.img_view.zoom.is_some() {
                     wheel_zoom = dy;
                     wheel_anchor = cursor.filter(|p| video.contains(*p));
                 } else {
@@ -901,12 +902,20 @@ impl App {
         if resp.dragged() {
             self.img_view.pan += resp.drag_delta();
         }
-        // 右键+滚轮缩放（上滚放大；fit 态先落地为当前倍率再乘，与快捷键
-        // 缩放同款语义——zoom 已 unwrap_or(fit)；锚光标）
+        // 滚轮缩放（上滚放大；fit 态先落地为当前倍率再乘，与快捷键缩放
+        // 同款语义——zoom 已 unwrap_or(fit)；锚光标）。缩小方向触底落地：
+        // 下一步倍率 ≤ fit 直接回适应窗口并闪现提示。fit_scale 不封顶
+        // （小图 fit>1 放大铺满）→ 判据对任何图统一成立；max(MIN_ZOOM)
+        // 兜底病态小视口（fit < MIN_ZOOM）下永不触发的卡死
         if wheel_zoom != 0.0 {
             if let Some(pos) = wheel_anchor {
                 let factor = if wheel_zoom > 0.0 { 1.2 } else { 1.0 / 1.2 };
-                self.img_zoom_at(zoom, factor, pos, video);
+                if factor < 1.0 && (zoom * factor).max(MIN_ZOOM) <= fit {
+                    self.img_view = ImgView::default();
+                    self.img_fit_flash = Some(std::time::Instant::now());
+                } else {
+                    self.img_zoom_at(zoom, factor, pos, video);
+                }
             }
         }
         // 双击：适应窗口 ↔ 100%（锚光标；非全屏——全屏走回车/Esc）
@@ -925,7 +934,10 @@ impl App {
                     self.img_view = ImgView { zoom: Some(z100), pan };
                 }
                 // 100%（或任意倍率）→ 适应窗口
-                Some(_) => self.img_view = ImgView::default(),
+                Some(_) => {
+                    self.img_view = ImgView::default();
+                    self.img_fit_flash = Some(std::time::Instant::now());
+                }
             }
         }
 
@@ -947,8 +959,23 @@ impl App {
         } else {
             tex
         };
-        let rect =
-            egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
+        // 物理像素对齐：100%（纹素:物理像素 1:1）下矩形若落在分数物理
+        // 坐标（逻辑坐标 ×ppp 常见 .5），双线性把每个输出像素变成相邻
+        // 纹素的加权混合 → 整幅均匀发糊；尺寸的 f32 误差（如
+        // 3392/1.5×1.5=3391.9995）还会让 LOD 微偏混入 mip1。egui 只对
+        // 文字自动像素对齐，自绘 mesh 必须自己 snap：物理空间取整换回
+        // 逻辑坐标——100% 即严格 1 纹素 = 1 物理像素；其余倍率仅产生
+        // <0.5px 偏移（顺带消除拖拽时的亚像素爬动）。
+        let raw = egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
+        let snapped = egui::Rect::from_min_max(
+            (raw.min * ppp).round() / ppp,
+            (raw.max * ppp).round() / ppp,
+        );
+        let rect = if snapped.width() > 0.0 && snapped.height() > 0.0 {
+            snapped
+        } else {
+            raw
+        };
         let mut mesh = egui::Mesh::with_texture(tex.id());
         mesh.add_rect_with_uv(
             rect,
@@ -964,6 +991,37 @@ impl App {
             rect,
             since: std::time::Instant::now(),
         });
+        // ---- 模式指示徽标（媒体区右下角）：缩放态常驻倍率百分比（100% =
+        // 纹素:物理像素 1:1 基准，故乘 ppp）；落回适应窗口闪现"适应窗口"
+        // 约 1s（提示"再滚=翻页"）；fit 阅读态无徽标。闪现期内驱动重绘，
+        // 到期徽标才消失
+        if let Some(z) = self.img_view.zoom {
+            self.paint_badge(ui, video, &format!("{}%", (z * ppp * 100.0).round()));
+        } else if let Some(t) = self.img_fit_flash {
+            if t.elapsed() < std::time::Duration::from_secs(1) {
+                self.paint_badge(ui, video, "适应窗口");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// 媒体区右下角小徽标（黑底半透明圆角 + 白字）：缩放模式指示用
+    fn paint_badge(&self, ui: &egui::Ui, area: egui::Rect, text: &str) {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.to_string(), font, egui::Color32::WHITE);
+        let pad = 6.0;
+        let size = galley.size() + egui::vec2(pad * 2.0, pad);
+        let margin = 8.0;
+        let rect = egui::Rect::from_min_size(
+            area.right_bottom() - size - egui::vec2(margin, margin),
+            size,
+        );
+        let painter = ui.painter_at(area);
+        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(160));
+        painter.galley(rect.left_top() + egui::vec2(pad, pad * 0.5), galley, egui::Color32::WHITE);
     }
 
     /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。
@@ -1004,7 +1062,10 @@ impl App {
             return;
         }
         match target {
-            None => self.img_view = ImgView::default(),
+            None => {
+                self.img_view = ImgView::default();
+                self.img_fit_flash = Some(std::time::Instant::now());
+            }
             Some(z) => {
                 let Some((tex, _)) = self.img.frame(key) else { return };
                 let z = z / self.img.ppp();
