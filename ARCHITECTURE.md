@@ -138,6 +138,42 @@
 **架构不变量**：播放器与 VarTidy 整理器是 VFS 层的两个并列消费者，互不感知。
 未来扩展（音频播放、文本预览等）只需新增消费者，VFS 不动 —— 这是本设计的核心扩展点。
 
+**线程模型**（全进程 5 类线程，边界即数据流边界）：
+
+| 线程 | 职责 | 与 UI 线程的通信 |
+|---|---|---|
+| UI 线程 | egui 渲染、快捷键、mpv 命令下发、全部状态机 | —（mpv handle 线程安全，但仅 UI 线程持有） |
+| 打开线程（OpenJob） | 每包一条：解析压缩包头 + 列目录 + 密码探测 | mpsc channel 交 UI 应用；带代际号（gen），快速连续切换时旧结果丢弃 |
+| mpv 事件泵线程 | 常驻：`wait_event(0.2)` 消费 mpv 事件（EOF / 文件切换 / 属性订阅推送）写入原子缓存 | 原子变量——UI 帧内零锁读（见 13.2 订阅缓存） |
+| mpv 内部线程 | demux / decode / playloop，经 stream_cb 回调读压缩包数据 | 仅通过 REGISTRY（`Arc<dyn VirtualFile>`）共享 |
+| 解压会话线程 | 每包一条持久解码会话（targets / focus 经 `Arc<Mutex<SessionState>>` 共享）；跳转 = 重定向目标、永不重启解码 | mpsc 报告进度 / 结果 / FileDone，UI 每帧轮询（见 11.4） |
+
+**模块清单**（`src/`，职责以各文件头注释为准）：
+
+| 模块 | 职责 |
+|---|---|
+| `main.rs` | 入口：日志初始化、配置加载、libmpv 动态库加载、启动 eframe |
+| `config.rs` | config.toml 加载 + 默认值生成（唯一配置来源，§7） |
+| `cache.rs` | 缓存目录管理：LRU 驱逐（按 mtime）、`.part` 半截文件清理、全量 / 按包清理 |
+| `ui/mod.rs` | UI 帧循环主体：文件列表（标签页/搜索/状态行）+ 播放区 + 控制栏 + 滚轮模式感知 |
+| `ui/panels.rs` | 各面板绘制：顶栏、虚拟化文件列表、媒体区（视频 blit / 解压覆盖层 / 图片纹理）、控制栏与进度条 |
+| `ui/nav.rs` | 快捷键与导航：全屏、mpv 风格按键、上/下一个、幻灯片自动翻页 |
+| `ui/extract.rs` | 播放与后台解压链路：mpv 播放器管理、批次计算与磁盘预检、solid 会话任务提交/轮询、密码重放与已解压文件装载 |
+| `ui/open.rs` | 打开链路：文件/目录对话框、拖放入口、密码分支、后台打开任务轮询与视图重建 |
+| `ui/dialogs.rs` | 弹窗：密码输入（加密头/内容加密两阶段）与「下一个压缩包」选择 |
+| `ui/tests.rs` | UI 层单元测试（滑动窗口冒烟等，DEVLOG §5.2） |
+| `imgview.rs` | 图片纹理直显服务 ImageService：后台解码、两档纹理、LRU、动图时钟（13.4） |
+| `player/mod.rs` | mpv 播放服务：命令封装、常驻事件泵、属性订阅缓存、render context 管理；headless e2e 测试 |
+| `player/mpv_ffi.rs` | mpv 最小 FFI 绑定：libloading 运行时动态加载 libmpv-2.dll（核心 + stream_cb + render API 符号） |
+| `player/stream_cb.rs` | zvf:// 自定义流协议：mpv 回调 ↔ VirtualFile 桥接与 REGISTRY（见 §4 约束） |
+| `vfs/mod.rs` | `ArchiveVFS` / `VirtualFile` trait 定义、按扩展名分发打开、密码探测链 |
+| `vfs/zip_vfs.rs` | ZIP：自研 deflate 流式 seek（下游跳读、上游重开）+ CD 原始字节文件名解码（4.1） |
+| `vfs/sevenz_vfs.rs` | 7Z：BlockDecoder folder 直达（11.1）+ 解码会话（11.4） |
+| `vfs/rar_vfs.rs` | RAR：unrar crate（内嵌编译 UnRAR 源码），分卷支持 |
+| `vfs/dir_vfs.rs` | 目录媒体集合 DirVFS（4.2） |
+| `vartidy/mod.rs` | VarTidy CLI：输入展开 → 规划（分类 + 两级去重）→ 批量抽取直写仓库 → 报告；`tidy` 参数解析（§12） |
+| `vartidy/classify.rs` | var 文件名分类规则（class_var.py 移植：作者.内容.版本.var 四段校验） |
+
 ---
 
 ## 4. 核心抽象：VFS 层
@@ -162,6 +198,13 @@ trait VirtualFile: Read + Seek {
 
 播放侧注册 mpv 自定义协议（`zvf://archive_idx/entry_idx`），open/read/seek 三个回调
 直接转发给 `VirtualFile` —— **mpv 的 seek 就是 VirtualFile 的 seek**，快/慢两条通路对播放器完全透明。
+两个关键约束（stream_cb.rs）：
+
+- 回调在 mpv 内部线程执行，**回调内禁止调用任何 mpv API**（死锁）；跨线程状态
+  经全局 REGISTRY（`Arc<dyn VirtualFile>`）传递，回调只做纯转发；
+- cookie **双重装箱**：`Box<dyn VirtualFile>` 是胖指针（数据指针 + vtable），直接
+  `as *mut c_void` 会丢 vtable 导致回调内崩溃——须先 `Box::new(vfile)` 再
+  `Box::into_raw`，close 回调按同原型回收。
 
 ### 4.1 zip 老包文件名编码（GBK 等）
 
@@ -177,6 +220,12 @@ GBK 字节失配，`open_entry` 报"entry 不存在"（列表能显示但点开�
 自建「显示名 → crate 下标」表（`open_entry`/`verify_password` 查找，替代按名字节
 查 crate 内部表的 `index_for_name`）。密码与文件名共用同一 `codepage`——老工具
 打包时两者同按系统 ANSI 编码，本就同源。VarTidy 同链受益：GBK 名 var 入库不再乱码。
+
+**密码字节的编码约定**（与文件名同源问题）：各格式密码编码约定不一——
+7z = UTF-16LE、RAR5 与跨平台工具打的包 = UTF-8、Windows 老工具创建的
+zip / RAR4 = 系统 ANSI 代码页。探测时对每个候选密码生成「UTF-8 + 配置码页
+（默认 GBK）」两个字节序列依次验证。密码仅存内存，会话内按包路径记忆
+（`HashMap<PathBuf, String>`），切换压缩包再切回无需重输，退出即丢。
 
 ### 4.2 目录 = 媒体集合（DirVFS）
 

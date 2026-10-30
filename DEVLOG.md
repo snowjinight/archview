@@ -1,9 +1,10 @@
 # DEVLOG — 修复记录 / 需求变更细节 / 踩坑手册
 
 > 定位：[ARCHITECTURE.md](ARCHITECTURE.md) 的**细节篇**。架构文档只保留宏观内容
-> （机制设计、技术决策、数据流、不变量）；本文承接三类细节：
+> （机制设计、技术决策、数据流、不变量）；本文承接四类细节：
 > **修复记录**（现象 → 根因 → 修复 → 教训）、**踩坑点**（带回归测试钉死）、
-> **排查手册**（日志关键词对照，现场 grep 对号入座）。
+> **排查手册**（日志关键词对照，现场 grep 对号入座）、
+> **测试方法**（运行方式、覆盖矩阵、headless e2e 原理）。
 >
 > 交叉引用约定：架构文档引本文用 `DEVLOG §N`，本文引架构用 `ARCHITECTURE §N`。
 > 维护约定：新的修复/坑点先落本文档对应专题（无则新增专题），架构文档只在机制
@@ -18,6 +19,7 @@
 | §3 | 播放流畅性专项：mpv core 锁三轮攻坚（打开冻结 → 切换卡顿 → seek 卡顿） | ARCHITECTURE §13.2 |
 | §4 | 点击状态机排查手册（start_extract 分支链与日志对照） | ARCHITECTURE §11.4 |
 | §5 | 解压会话化回归测试细节（单测 + UI 冒烟） | ARCHITECTURE §11.4 |
+| §6 | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
 
 ---
 
@@ -174,6 +176,9 @@ SetProcessDpiAwarenessContext(PerMonitorV2)，ppp 能读到 1.5 即证明进程�
 编辑器开着源文件时保存旧缓冲会静默覆盖 AI 已写入磁盘的编辑（本项目实际发生
 多次，表现为编译报"缺字段"）。AI 协作改代码前先 reload 编辑器 / 关掉相关文件。
 
+**附：egui 0.36 API 备忘**——无 `allocate_ui_at_rect`，「视频矩形 + 底部进度条」
+用 `allocate_rect` 顺序布局实现。
+
 ---
 
 ## 3. 播放流畅性专项：mpv core 锁三轮攻坚（player/mod.rs）
@@ -192,6 +197,14 @@ SetProcessDpiAwarenessContext(PerMonitorV2)，ppp 能读到 1.5 即证明进程�
 
 **修复总纲**：帧路径零 FFI 属性读取——全部状态经 `observe_property` 订阅推送
 进原子缓存，UI 帧内纯原子读；`get_property` 仅保留在测试与非帧路径。
+
+附：mpv 属性 / 行为备忘（早期踩过、e2e 均有回归钉死）：
+
+- `pause` / `mute` / `eof-reached` 等 bool 属性必须以 `MPV_FORMAT_FLAG` 读——
+  用 INT64 格式读**恒失败**（返回错误码，不做类型转换）；
+- `keep-open=always` 在 EOF 时置 `pause=yes` 且 **loadfile 不清除**——切换视频前
+  必须显式恢复 `pause=no`，否则新视频停在第一帧（e2e「EOF 后切换视频续播」
+  用例钉死此行为）。
 
 ### 3.1 第一轮：打开瞬间 UI 冻结 475ms → opening() 门控
 
@@ -507,3 +520,50 @@ core 忙的时机（换文件、缓冲、字幕轨切换）还会复发；按成
   （新 cancel 句柄）；整窗已落地不重定向（空 targets 防误杀空闲线程）；
 - 终态 6 文件逐字节与源数据比对（防落地错位）+ 会话干净退出。1MB 文件解码为
   百 ms 级而断言紧跟落地事件（μs 级），窗口期约千倍差，时序不抖。
+
+---
+
+## 6. 测试运行方式与覆盖矩阵
+
+> 从 README 迁入（用户向文档只保留用法与配置）。会话化专项断言明细见本文 §5。
+
+### 6.1 运行方式
+
+```bat
+run_tests.bat
+```
+
+或直接：
+
+```bat
+cargo test -- --nocapture
+```
+
+### 6.2 覆盖矩阵
+
+| 测试 | 验证内容 |
+|---|---|
+| VFS 单元测试 | ZIP / 7Z / RAR 各自的列表、读取、seek 正确性；7Z 测试包由 sevenz-rust 纯代码构造，无外部依赖 |
+| DirVFS 单元测试 | 目录媒体集合：递归收集与字典序确定性（跳过压缩包/非媒体）、条目读取与 seek 正确性、未知条目报错与空目录空集合、根不可读报错 |
+| 目录模式集成（UI 层） | spawn_open 目录分支真实线程链路（DirVFS::open → stream_cb 注册 → Done 消息）、打开终态状态迁移（FastSeek→stream 标志/视图重建）与空目录统一提示 |
+| e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证下游 / 上游 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归，见 §3.0 备忘） |
+| e2e 解压播放 | 构造 7Z 包 → 后台解压 → headless mpv 播放本地文件全链路 |
+| flag 属性循环 | pause / mute 属性经 flag 格式读 → 翻转 → 写 → 读，覆盖空格暂停、静音按钮的行为路径（FLAG 格式约定见 §3.0 备忘） |
+| VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头与内容加密 / 同批次多包各不同密码乱序命中 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
+| 滑动窗口冒烟（UI 层） | 模拟用户批内来回跳动 0→1→0→2→（解净空闲）→5→0：断言解码线程全程不重启（cancel 句柄同一性）、预取窗口随观看位置滑动、缓存命中立即播放、全部落地文件逐字节内容校验（明细见 §5.2） |
+| config | TOML 默认模板与代码默认值防漂移、序列化往返、特殊字符密码（`#`/空格/中文）引号保留 |
+
+### 6.3 headless e2e 原理与外部依赖
+
+e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time-pos` / `pause` /
+`eof-reached` 等属性断言播放状态，`cache=no` 强制 seek 请求打到 VFS 层，能真实
+暴露流实现缺陷。
+
+外部依赖两条：
+
+- **RAR 测试**需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
+  Program Files 常见路径，找不到自动跳过，不算失败）；
+- **VarTidy 本地冒烟环境**：`test_tidy\setup.bat`（目录已 gitignore）一键全链路
+  ——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包
+  （明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run →
+  实际整理（加密包打开期即锁定密码）→ 幂等重跑。

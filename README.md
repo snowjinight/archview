@@ -15,25 +15,49 @@
 | 连续看包 | N 键直接弹出同目录压缩包列表；或翻到本包最后一项再往后翻（PgDn / 视频区滚轮 / ">" 按钮）时弹出。默认选中下一个，末包循环回第一个；分卷 RAR 只列首卷，点选任意包打开；本会话看过的包灰色显示；`ui.ask_next_archive` 可关。目录集合模式没有"下一个压缩包"概念，翻到末尾仅顶栏提示 |
 | 播放控制 | mpv 风格快捷键、底部全宽进度条拖动 seek、音量调节、静音提示 |
 | 图片自动播放 | PPT 式自动翻页（控制栏播放/暂停按钮或空格切换） |
-| 全屏 | 双击画面或回车进入，Esc 退出，全屏内快捷键照常可用 |
+| 全屏 | 回车进入，Esc 退出，全屏内快捷键照常可用（双击画面留给图片缩放，不再触发全屏） |
 | 缓存管理 | 手动清理/打开目录按钮 + 可配置的退出/切换清理 + LRU 容量上限；缓存按包路径稳定命名，切回重开均可命中 |
 | VarTidy 整理 | `archview.exe tidy` CLI 子命令：var 资源包分类后增量合入 var 仓库（零全量解压、包内/仓库两级去重、仓库只读绝不覆盖；详见下文「VarTidy」小节） |
 | 配置集中 | 所有可变项集中在 config.toml，代码零硬编码路径 |
 
 ## 快捷键
 
+**通用（视频 / 图片两模式）**
+
 | 按键 | 功能 |
 |---|---|
-| 空格 | 暂停 / 播放（图片播放中 = 自动翻页开关） |
-| ← / → | 快退 / 快进 5 秒 |
-| Shift + ← / → | 快退 / 快进 1 秒（精确） |
+| 空格 | 视频 = 暂停 / 播放；图片 = 自动翻页（PPT 式播放）开关 |
 | ↑ / ↓ | 音量 ±5（调整时自动解除静音） |
 | M | 静音切换（静音时音量条旁显示红色"静音"标识，点击可解除） |
-| PgUp / PgDn 或 鼠标滚轮（视频区） | 上一个 / 下一个媒体（同类型内导航，滚轮有节流间隔） |
-| 回车 或 双击画面 | 全屏切换 |
+| PgUp / PgDn | 上一个 / 下一个媒体（同类型内导航） |
+| N | 直接弹出「下一个压缩包」选择窗（连续看包；翻到本包末项再往后也会弹） |
+| B | 回到锚点（最近一次跳看 / 解压前的出发条目，与列表底部悬浮按钮一致） |
+| 回车 | 全屏切换 |
 | Esc | 退出全屏 |
 
-搜索框等文本输入框聚焦时，快捷键自动失效，不会误触发。
+**视频模式**
+
+| 按键 | 功能 |
+|---|---|
+| ← / → | 快退 / 快进 5 秒 |
+| Shift + ← / → | 快退 / 快进 1 秒（精确） |
+| L | 播放模式切换：列表播放 ↔ 单视频循环（图片模式不响应） |
+| 鼠标滚轮（视频区） | 上一个 / 下一个媒体（上滚 = 上一个；节流间隔 `ui.wheel_switch_secs`，防触控板惯性连跳） |
+
+**图片模式**
+
+| 按键 | 功能 |
+|---|---|
+| ← / → | 上一张 / 下一张（视频模式下才是 seek） |
+| + / = 、 − | 放大 / 缩小（×1.25 步进，锚视口中心） |
+| 0 | 100% 原始尺寸 |
+| Home | 适应窗口 |
+| 鼠标拖拽 | 平移已放大的图片 |
+| 双击图片 | 适应窗口 ↔ 100% 切换（Honeyview 等看图软件习惯；全屏只走回车 / Esc，双击不再触发全屏） |
+| 鼠标滚轮（图片区） | **一轮两用（按缩放状态分层）**：适应窗口态 = 翻上/下一张（与视频区同款节流）；缩放态 = 以光标为锚缩放（上滚放大），缩小触底自动落回适应窗口——继续滚即翻页，无需先退出缩放 |
+| Ctrl + 滚轮（图片区） | 任意状态都以光标为锚缩放 |
+
+滚轮按区域区分：媒体区（视频 / 图片）如上表，文件列表区的滚轮是普通滚动列表。搜索框等文本输入框聚焦时，快捷键自动失效，不会误触发。
 
 ## 使用方法
 
@@ -110,43 +134,11 @@ package.bat no-mpv     rem 精简包（不含 mpv，自行下载放 exe 同目�
 - `ARCHVIEW_MPV_DIR`：libmpv-2.dll 所在目录（默认 `deps\mpv-dev`）
 - `ARCHVIEW_DIST`：输出目录（默认 `dist`）
 
-## 测试方法
-
-### 运行全部测试
-
-```bat
-run_tests.bat
-```
-
-或直接：
-
-```bat
-cargo test -- --nocapture
-```
-
-### 测试覆盖说明
-
-| 测试 | 验证内容 |
-|---|---|
-| VFS 单元测试 | ZIP / 7Z / RAR 各自的列表、读取、seek 正确性；7Z 测试包由 sevenz-rust 纯代码构造，无外部依赖 |
-| DirVFS 单元测试 | 目录媒体集合：递归收集与字典序确定性（跳过压缩包/非媒体）、条目读取与 seek 正确性、未知条目报错与空目录空集合、根不可读报错 |
-| 目录模式集成（UI 层） | spawn_open 目录分支真实线程链路（DirVFS::open → stream_cb 注册 → Done 消息）、打开终态状态迁移（FastSeek→stream 标志/视图重建）与空目录统一提示 |
-| e2e 流式播放 | headless mpv（vo=null ao=null cache=no）经 zvf:// 协议真实播放 deflate ZIP 内的 mp4，验证下游 / 上游 seek，以及 EOF 后切换视频能正常续播（keep-open 暂停粘滞回归） |
-| e2e 解压播放 | 构造 7Z 包 → 后台解压 → headless mpv 播放本地文件全链路 |
-| flag 属性循环 | pause / mute 属性经 flag 格式读 → 翻转 → 写 → 读，覆盖空格暂停、静音按钮的行为路径 |
-| VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头与内容加密 / 同批次多包各不同密码乱序命中 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
-| 滑动窗口冒烟（UI 层） | 模拟用户批内来回跳动 0→1→0→2→（解净空闲）→5→0：断言解码线程全程不重启（cancel 句柄同一性）、预取窗口随观看位置滑动、缓存命中立即播放、全部落地文件逐字节内容校验 |
-| config | TOML 默认模板与代码默认值防漂移、序列化往返、特殊字符密码（`#`/空格/中文）引号保留 |
-
-e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time-pos` / `pause` / `eof-reached` 等属性断言播放状态，`cache=no` 强制 seek 请求打到 VFS 层，能真实暴露流实现缺陷。
-
-RAR 测试需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或 Program Files 常见路径，找不到自动跳过，不算失败）。
-
-VarTidy 另有本地冒烟环境：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包（明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run → 实际整理（加密包打开期即锁定密码）→ 幂等重跑。
-
 ## 配置文件 config.toml
 
-启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则生成一份**带中文注释**的默认配置。所有路径均可为绝对路径，`"auto"` 表示自动探测。
+启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则生成一份**带中文注释**的默认配置；已有配置缺失新版本新增的键时，启动时自动按默认值补全并写回（已有键值与注释原样保留）。所有路径均可为绝对路径，`"auto"` 表示自动探测。
+
+完整默认模板（各项含义见下表；生成的 config.toml 内含逐键中文注释）：
 
 ```toml
 # 非 UTF-8 字节兜底代码页：老工具按系统 ANSI 代码页打包，密码与 zip 文件名同源编码。
@@ -157,6 +149,9 @@ codepage = "gbk"
 # 打开压缩包阶段即自动探测；密码始终用双引号包裹
 passwords = []
 
+# 主程序日志级别：error / warn / info / debug / trace
+log_level = "info"
+
 [cache]
 # libmpv-2.dll 搜索目录；"auto" = exe 同目录
 dll_dir = "auto"
@@ -164,7 +159,7 @@ dll_dir = "auto"
 dir = "auto"
 # 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
 max_size_mb = 8192
-# 解码块大小（MB）与解码块 LRU 缓存块数
+# 解码块大小（MB）与解码块 LRU 缓存块数（ZIP 流式播放的内存占用）
 chunk_size_mb = 4
 chunk_cache_blocks = 64
 # 退出程序时自动清空解压缓存
@@ -183,22 +178,37 @@ hwdec = "auto"
 # mpv 缓存秒数与 demuxer 最大缓存（MB）
 cache_secs = 30
 demuxer_max_mb = 512
+# demux 探测字节/时长预算：压缩包内流逐字节解压，预算直接换算成打开耗时
+demuxer_probesize = "2MiB"
+demuxer_analyzeduration = "1"
 # 初始音量（0-100）
 volume = 100
+# mpv 内部日志（诊断打开慢/解码链路时临时设 "v"，平时 "no"）
+mpv_log_level = "no"
 
 [ui]
 # CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
 font_path = "auto"
 # 图片自动播放（PPT 式翻页）间隔秒数
 slideshow_secs = 1.0
-# 视频区滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+# 媒体区滚轮切换的最小间隔秒数（防惯性/触控板连跳）
 wheel_switch_secs = 0.3
 # 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
 ask_next_archive = true
-# 文件列表是否按文件名排序（false = 保持压缩包内部顺序，漫画包场景用）
-sort_files = true
+# 文件列表是否按自然序排序（false = 保持压缩包内部顺序，漫画包场景开 true）
+sort_files = false
 # 解压进度覆盖层显示前的宽限期（毫秒）：快速解压全程不打扰播放
 extract_overlay_delay_ms = 500
+# 图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；解码失败自动回退 mpv）
+image_texture = true
+# 图片纹理 LRU 缓存张数（含当前张）：预解码相邻页，翻页零等待
+image_cache_count = 3
+# 基础纹理档尺寸上限；高清档升级资格判据同此值
+image_max_dim = 4096
+# 高清档触发阈值：zoom×ppp 超过此值才解码 full 级纹理
+image_full_threshold = 2.0
+# 高清档放大后叠加 unsharp mask 锐化
+image_full_sharpen = true
 
 [extract]
 # solid 包解压时顺带预取后续文件的总大小上限（MB，下游预取），0 = 关闭
@@ -218,21 +228,39 @@ report_dir = "auto"
 
 | 配置项 | 说明 |
 |---|---|
+| `codepage` | 非 UTF-8 字节兜底代码页（老工具按系统 ANSI 编码密码与 zip 文件名），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只用 UTF-8。密码侧追加候选；文件名侧解码无 UTF-8 标志且非合法 UTF-8 的 zip 条目名（GBK 名老包） |
+| `passwords` | 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）：打开阶段自动探测（无密码优先 → 列表依次），全不匹配播放器才弹密码框、CLI 才记失败。密码必须双引号包裹，仅用于解压，不写入日志/报告 |
+| `log_level` | 主程序日志级别 `error` / `warn` / `info` / `debug` / `trace`；支持 EnvFilter 按模块指令只开某模块的诊断日志（如 `"info,archview::ui::panels=debug"`）；RUST_LOG 环境变量优先 |
 | `cache.dll_dir` | libmpv-2.dll 搜索目录，`auto` = exe 同目录 |
-| `cache.dir` | 7Z/RAR 解压缓存目录，`auto` = `%TEMP%\archview_cache`；可指向 RAM Disk 提速（见下文"进阶：RAM Disk 缓存"） |
-| `cache.max_size_mb` | 缓存总量上限，超出按 LRU（最久未访问）驱逐 |
-| `cache.clean_on_exit` | 退出时是否自动清空缓存（默认 false） |
+| `cache.dir` | 7Z/RAR 解压缓存目录，`auto` = `%TEMP%\archview_cache`；可指向 RAM Disk 提速（见下文"进阶：RAM Disk 缓存"）；目录不存在会自动创建 |
+| `cache.max_size_mb` | 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐 |
+| `cache.chunk_size_mb` | ZIP 流式播放的解码块大小（MB） |
+| `cache.chunk_cache_blocks` | 解码块 LRU 缓存块数；ZIP 流式播放的内存占用 ≈ 两者乘积（默认 4 × 64 = 256MB） |
+| `cache.clean_on_exit` | 退出程序时自动清空解压缓存（默认 false） |
 | `cache.clean_on_switch` | 切换压缩包时是否清理上一个包的缓存（默认 false，保留以便切回时命中） |
-| `media.*_extensions` | 视频 / 图片的文件扩展名识别列表 |
+| `media.*_extensions` | 视频 / 图片的文件扩展名识别列表（不区分大小写） |
 | `player.hwdec` | 硬件解码（`auto` / `no` / `d3d11va` 等 mpv 取值） |
+| `player.cache_secs` | mpv 缓存秒数，拖回刚看过的片段直接命中缓存，零成本 |
+| `player.demuxer_max_mb` | mpv demuxer 最大缓存（MB） |
+| `player.demuxer_probesize` | demux 探测字节预算（打开阶段识别容器格式的读取上限）。压缩包内流 = 逐字节解压，预算直接换算成打开耗时，调小即提速；`auto` = mpv 原生默认 ≈5MB；过小可能识别不了冷门容器 |
+| `player.demuxer_analyzeduration` | demux 探测时长预算（秒，确定各流参数的分析上限）。`auto` = mpv 原生默认 ≈5s；过小可能漏识别延迟出现的音轨/字幕流 |
+| `player.volume` | 初始音量（0-100），播放中 ↑/↓ 调整（步进 5） |
+| `player.mpv_log_level` | mpv 内部日志级别（`no` / `fatal` / `error` / `warn` / `info` / `status` / `v` / `debug` / `trace`）。诊断 mpv 内部行为（打开慢 / 解码链路）时临时设 `v`——量极大，转发到主程序日志；平时保持 `no` |
 | `ui.font_path` | CJK 字体路径，`auto` 加载系统中/日/韩候选字体链（msyh / simhei / simsun + YuGoth / Meiryo / MS Gothic + Malgun，同族按序补字形，支持中日韩文件名显示）；也可指定单个字体文件的绝对路径 |
 | `ui.slideshow_secs` | 图片自动播放（PPT 式翻页）间隔秒数 |
-| `ui.wheel_switch_secs` | 视频区滚轮切换媒体的最小间隔秒数 |
+| `ui.wheel_switch_secs` | 媒体区滚轮切换的最小间隔秒数（防惯性 / 触控板连跳）：视频区滚轮换媒体与图片适应窗口态滚轮翻页共用此节流 |
 | `ui.ask_next_archive` | 翻到本包最后一项再往后导航时，是否弹窗选择打开同目录其它压缩包（默认 true；列表默认选中循环意义上的下一个，末包绕回第一个；目录内没有其它包时仅顶栏提示） |
 | `ui.sort_files` | 文件列表是否按自然序排序（数字段按数值比较、不区分大小写，默认 false）。false = 保持压缩包内部顺序——7z/RAR 固态包下内部顺序即物理码流顺序，预取直接命中相邻文件（性能最优）；注意 7-Zip 工具打的包内部本来就是字典序，关排序对这类包显示无变化。true = 自然序（`1/2/10`，而非字典序 `1/10/2`），看漫画/图集时开启 |
-| `codepage` | 非 UTF-8 字节兜底代码页（老工具按系统 ANSI 编码密码与 zip 文件名），如 `gbk` / `big5` / `shift_jis` / `euc-kr`；`none` 只用 UTF-8。密码侧追加候选；文件名侧解码无 UTF-8 标志且非合法 UTF-8 的 zip 条目名（GBK 名老包） |
-| `passwords` | 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）：打开阶段自动探测（无密码优先 → 列表依次），全不匹配播放器才弹密码框、CLI 才记失败 |
-| `vartidy.repo_dir` | VarTidy（`archview.exe tidy` CLI 子命令）的 var 仓库目录；详见 ARCHITECTURE.md 第 12 章 |
+| `ui.extract_overlay_delay_ms` | 解压进度覆盖层的宽限期（毫秒）：播放中切到需解压的条目，超过该时长仍未解完才隐藏视频显示进度；快速解压全程不打扰播放 |
+| `ui.image_texture` | 图片走 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均走此链路）。解码失败的图片自动回退 mpv |
+| `ui.image_cache_count` | 图片纹理 LRU 缓存张数（含当前张），预解码 ±1 相邻页，翻页零等待 |
+| `ui.image_max_dim` | 基础纹理档尺寸上限（预放大 ×ppp 后超过则原尺寸直进）；full 高清档升级资格判据同此值（详见 ARCHITECTURE.md 13.4 两档策略） |
+| `ui.image_full_threshold` | 高清档触发/换画阈值：屏幕物理像素超过基础纹理该倍数（zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244% 滚轮档（×1.25⁴ ≈ 2.44）才升级；调小（如 1.4）更早升级对比，调大（如 3.0）基本关闭 |
+| `ui.image_full_sharpen` | 高清档 Lanczos 放大后叠加 unsharp mask 锐化（补偿插值摊平的边缘坡度；强对比边缘可能有轻微光晕，可关闭对比） |
+| `extract.prefetch_downstream_mb` | 下游预取上限（MB），0 = 关闭：solid 包（7z / solid RAR）解压时顺带预取下标更大的后续文件，一次顺序解压流解出一批，翻页直接命中 |
+| `extract.prefetch_upstream_mb` | 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目顺带写盘，随机跳看后回看直接命中缓存（旧键名 `prefetch_mb` / `prefetch_prev_mb` 仍可读取） |
+| `vartidy.repo_dir` | VarTidy（`archview.exe tidy` CLI 子命令）的 var 仓库目录，必须已存在（整理器绝不修改仓库已有内容）；空 = 未配置，CLI 需 `-o` 指定；详见 ARCHITECTURE.md 第 12 章 |
+| `vartidy.report_dir` | 报告输出目录，`auto` = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净） |
 
 ### 路径写法（cache.dir 等所有路径项）
 
@@ -275,106 +303,16 @@ clean_on_switch = false
 
 缓存按压缩包路径稳定命名：同一包 A→B→A 切回（或程序重启后重开）缓存直接命中，无需重新解压。
 
-## 软件设计
-
-### 总体架构
-
-```
-┌─────────────────────────────────────────────┐
-│ UI 层 (ui.rs, egui)                          │
-│  文件列表(标签页/搜索) · 播放区布局 · 快捷键    │
-├──────────────────┬──────────────────────────┤
-│ PlayerService     │ 后台解压线程 (ExtractJob)  │
-│ (player/mod.rs)   │ 进度消息 → UI 轮询         │
-│ mpv 命令封装       │                          │
-├──────────────────┴──────────────────────────┤
-│ VFS 抽象层 (vfs/)                            │
-│  ArchiveVFS trait + ZIP/7Z/RAR/Dir 四种实现   │
-├─────────────────────────────────────────────┤
-│ mpv stream_cb (zvf://) │ cache.rs (LRU缓存)  │
-└─────────────────────────────────────────────┘
-```
-
-### 模块划分
-
-| 模块 | 职责 |
-|---|---|
-| `src/main.rs` | 入口：日志初始化、配置加载、libmpv 动态库初始化、启动 eframe |
-| `src/ui.rs` | 全部 UI：顶栏（打开/清理缓存）、文件列表标签页、播放区（mpv 子窗口嵌入 + 底部全宽进度条）、控制栏、快捷键分发、全屏管理、后台解压任务轮询 |
-| `src/config.rs` | config.toml 的加载 / 默认值生成 / 扩展名与路径探测（唯一配置来源） |
-| `src/cache.rs` | 缓存目录管理：LRU 驱逐、部分解压清理、全量 / 按包清理 |
-| `src/player/mod.rs` | mpv 播放服务：加载、seek、暂停、音量等命令封装；headless e2e 测试 |
-| `src/player/mpv_ffi.rs` | mpv 最小 FFI 绑定：libloading 运行时动态加载 libmpv-2.dll |
-| `src/player/stream_cb.rs` | zvf:// 自定义流协议：mpv 回调 ↔ VirtualFile 的桥接与注册表 |
-| `src/vfs/mod.rs` | `ArchiveVFS` / `VirtualFile` trait 定义 + 按扩展名分发打开 |
-| `src/vfs/zip_vfs.rs` | ZIP 实现：自研 deflate 流式 seek（下游跳读、上游重开） |
-| `src/vfs/sevenz_vfs.rs` | 7Z 实现：sevenz-rust 纯 Rust 解压（无外部 exe 依赖） |
-| `src/vfs/rar_vfs.rs` | RAR 实现：unrar crate（内嵌编译 UnRAR 源码），分卷支持 |
-| `src/vartidy/mod.rs` | VarTidy CLI：输入展开 → 规划（分类+两级去重）→ 批量抽取直写仓库 → 报告；`tidy` 子命令参数解析 |
-| `src/vartidy/classify.rs` | var 文件名分类规则（class_var.py 移植：作者.内容.版本.var 四段校验） |
-| `examples/make_smoke_fixtures.rs` | VarTidy 冒烟测试源生成器（构造明文/加密 zip/7z 测试包与既有仓库） |
-
-### 核心设计决策
-
-**1. VFS 抽象层。** 所有压缩格式实现统一接口：
-
-```rust
-trait ArchiveVFS {
-    fn list(&self) -> &[VirtualEntry];        // 媒体文件清单（含子目录平铺）
-    fn open_entry(&self, idx: usize) -> Result<Box<dyn VirtualFile>>;
-    fn access_mode(&self) -> AccessMode;      // Stream(流式) / Extract(需解压)
-    fn extract_entry(&self, idx: usize, dest: &Path) -> Result<u64>;
-}
-```
-
-播放器和缓存层只面向 trait 编程，新增格式（如分卷 ZIP）只需加一个实现。
-
-**2. 双路径播放。**
-
-- **ZIP 快路径**：mp4 demuxer 需要随机读（读头部元数据 + seek 到尾部索引），ZIP 的 deflate 流可以按块重解压实现廉价下游 seek，因此走 `zvf://` 流式协议直接播压缩包内数据，零解压等待。
-- **7Z/RAR 慢路径**：这两种格式多为 solid 压缩（中间任何字节都依赖前面全部数据），随机 seek 代价极高，所以走后台解压：UI 发起 ExtractJob → 子线程解压到缓存目录（.part 临时名 + rename 原子化）→ 完成后 mpv 播本地文件。解压期间界面保持响应并显示进度。
-
-**3. mpv stream_cb 桥接。** 通过 `mpv_stream_cb_add_ro` 注册 `zvf://<archive_id>/<entry_idx>` 协议，read/seek/size/close 四个回调直接对接 `VirtualFile`。关键约束：
-
-- 回调在 mpv 内部线程执行，**回调内禁止调用任何 mpv API**（死锁），跨线程状态经全局 REGISTRY 传递。
-- cookie 使用「双重装箱」：`Box<dyn VirtualFile>` 是胖指针，直接 as `*mut c_void` 会丢 vtable 导致崩溃，须先 `Box::new(vfile)` 再 `Box::into_raw`。
-
-**4. libmpv 动态加载。** shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了；因此用 libloading 运行时加载 dll，FFI 绑定按需手写（约 15 个符号），换 mpv 版本无需重新编译。
-
-**5. 子窗口嵌入与坐标同步。** mpv 以 `wid=<hwnd>` 渲染进 egui 画的占位矩形对应的原生子窗口；每帧把 egui 逻辑坐标乘 pixels_per_point 换算成物理像素后 SetWindowPos。全屏即隐藏全部 egui 面板、子窗口随中央面板铺满，退出时恢复。
-
-**6. 加密包密码链路 + 老包文件名编码。** 密码在**打开阶段即探测并锁定**：无密码优先 → 会话记忆/用户输入 → config 顶层 `passwords` 列表依次尝试，全不匹配才弹密码框（播放器）/记失败跳包（VarTidy）。内容加密包对包内最小的加密条目做校验（ZIP 读 1 字节验密码校验值、RAR5 头带 PswCheck、7z 解压最小加密条目验 CRC），不必等到播放/解压才暴露错误。密码字节序列各格式编码约定不一（7z=UTF-16LE、RAR5/跨平台工具=UTF-8、Windows 老工具创建的 zip/RAR4=系统 ANSI 代码页），尝试时生成 `UTF-8 + 配置代码页（默认 GBK）` 两个候选依次验证（config 项 `codepage`）；密码仅存内存，会话内按包路径记忆（`HashMap<PathBuf, String>`），切换压缩包再切回无需重输，退出即丢。同源的 zip 文件名问题：老工具打的包文件名无 UTF-8 标志、按系统 ANSI（简中即 GBK）存字节，按规范只能按 CP437 解（显示乱码且条目查不到）；打开时扫 CD 原始字节自行解码——UTF-8 标志/合法 UTF-8 → UTF-8，否则用 `codepage`（GBK 名老包正确显示、可播放、VarTidy 正确入库），码页也解不出才 lossy 兜底。
-
-**7. 稳定缓存命名与并发解压防护。** 缓存文件名中的 archive_id 取压缩包路径哈希（带注册表内防碰撞探测），同一路径的包切走再切回、甚至程序重启后重开，缓存均可命中；解压走"临时文件（`part{pid}_{seq}` 防多实例/同进程并发踩踏）+ 原子改名"，同一任务在跑时去重不再起新线程。
-
-**8. 已知坑位备忘。**
-
-- `keep-open=always` 在 EOF 时置 `pause=yes` 且 `loadfile` 不清除——切换视频前必须显式恢复 `pause=no`，否则新视频停在第一帧。
-- `pause` / `mute` / `eof-reached` 是 flag(bool) 属性，必须用 `MPV_FORMAT_FLAG` 读；用 INT64 读恒失败。
-- egui 0.36 无 `allocate_ui_at_rect`，用 `allocate_rect` 顺序布局实现「视频矩形 + 底部进度条」。
-
-**9. 大压缩包性能设计。** 针对万级条目、数十 GB 的包（尤其存放于网络盘/NAS）做了多层优化：
-
-- **打开后台化**：打开压缩包（解析头 + 列目录 + 密码探测）在后台线程执行，顶栏与视频区显示阶段进度（zip 的目录遍历为真实百分比进度条；crate 内部解析阶段为旋转动画），窗口不再冻结。
-- **列表虚拟化**：文件列表用 `ScrollArea::show_viewport` 按可视区渲染（上下各 3 行余量），行标签与计数在排序后一次性缓存，万级条目下滚动保持流畅；超长文件名截断显示，完整文件名在悬停时显示于面板底部状态行（不用悬浮气泡——气泡会被 mpv 原生子窗口遮挡），行高均匀保证虚拟化数学成立。
-- **I/O 降次**：ZIP 的 central directory 打开时只解析一次并缓存元数据（`unsafe_new_with_metadata` 复用）；列表通过顺序遍历 CD 生成（一次几 MB 顺序读），避免逐条目 `by_index_raw` 引发的上万次本地文件头随机读（NAS 上是分钟级开销）。CD 遍历与 crate 条目数不一致时自动回退逐条模式。7z 头同样在打开时缓存，`list()` 不再重复解析。
-- **7z folder 直达**：7z 的 folder（固态块）彼此独立，pack 流偏移记录在头里。解压用 `BlockDecoder` 按目标所在 folder 直接 seek 定位，只顺序解压目标 folder 内目标之前的少量数据——不再像 crate 的 `for_each_entries` 那样从 folder 0 开始解压全部前置 folder（56G solid 包里目标排第 400 位时会无谓解压几十 GB 无关数据，约 10 分钟级、CPU 持续满载）。
-- **滑动窗口预取**：solid 包定位目标本就需顺序解压一段数据，一次解压流顺带解出目标之后的若干条目（`extract.prefetch_downstream_mb` 控制下游预取总量，默认 512MB，0 关闭）。解码会话常驻（见下文线程模型）：任何跳转只重定向目标、不重启解压；预取窗口以当前观看位置为中心随每次切换重算——连续翻页跨过窗口边界无感续解、看过的条目再点秒开。`extract.prefetch_upstream_mb` 另有上游预取：定位目标时反正要顺序解掉丢弃的前置数据顺带写盘（解码零增量），随机跳看后往回翻直接命中缓存。
-
-### 线程模型
-
-- **UI 线程**：egui 渲染、快捷键、mpv 命令（mpv handle 线程安全，但仅 UI 线程持有）。
-- **打开线程**：每个 OpenJob 一条线程，负责解析压缩包头与生成文件清单，完成后经 mpsc channel 交 UI 线程应用；与 ExtractJob 同样带代际号（gen），快速连续切换时旧结果丢弃。
-- **mpv 内部线程**：demux/decode，经 stream_cb 回调读压缩包数据，与 UI 仅通过 REGISTRY（Arc<dyn VirtualFile>）共享。
-- **解压线程**：每包一条持久解码会话线程（targets/focus 经 `Arc<Mutex<SessionState>>` 与 UI 共享），通过 mpsc channel 报告进度/结果/单文件完成（FileDone），UI 每帧轮询。任何跳转（批内切换/批外跳转/缓存命中）都走同一条重定向路径：UI 以新目标为中心重算预取窗口（受 `extract.prefetch_downstream_mb` / `extract.prefetch_upstream_mb` 限制）持锁替换 targets，解码线程在规划轮动态消费——**跳转永不取消解码流**；7z 侧 focus 所在 folder 抢道最先落地、focus 漂移自动中断当前 folder 重排。targets 解空则线程空闲退出，下次跳转重新拉起；`AtomicBool` cancel 只在切换压缩包时置位终止线程。进度分两阶段上报：跳过前置文件阶段显示阶段文字与已解压字节数（媒体区居中覆盖层，含旋转动画），写出目标文件阶段显示字节进度条。
-
 ## 已知限制与规划
 
 - 分卷 ZIP：暂不支持（分卷 RAR 已支持）。
 - 兜底代码页只用一个配置编码（默认 GBK/简中）：密码侧只追加一个候选；zip 文件名侧 UTF-8 校验失败后也只用它解码。包若在日文等其它代码页系统上创建，需把 `codepage` 改为对应编码（如 `shift_jis`）。GBK/Shift-JIS 等双字节编码之间无法从字节层自动区分。
 - 视频缩略图、播放进度记忆：规划中。
 
-更多实现细节见 `ARCHITECTURE.md`（架构设计：VFS 抽象层、双路径播放、密码链路、缓存策略）。
+## 更多文档
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)：架构设计——VFS 抽象层、双路径播放、密码链路、缓存策略、线程模型、模块清单、大包性能设计。
+- [DEVLOG.md](DEVLOG.md)：修复记录 / 踩坑手册 / 日志排查对照 / 测试运行方式与覆盖矩阵。
 
 ## 开源协议
 
