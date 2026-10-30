@@ -96,36 +96,83 @@ impl App {
                     ui.set_min_width(280.0);
                     ui.strong("快捷键");
                     ui.separator();
-                    for (k, v) in [
-                        ("空格", "暂停 / 播放（图片=自动翻页开关）"),
-                        ("← / →", "视频 seek ±5 秒；图片 = 上/下一张"),
-                        ("← / →（视频暂停时）", "上一帧 / 下一帧"),
-                        ("↑ / ↓", "音量 ±5"),
-                        ("M", "静音切换"),
-                        ("PgUp / PgDn", "上一个 / 下一个"),
-                        ("L", "播放模式切换（视频：列表 ↔ 单视频循环）"),
-                        ("N", "打开下一个压缩包（连续看包）"),
-                        ("B", "回到锚点（最后一次解压位置）"),
-                        ("鼠标滚轮", "翻页；图片缩放态=缩放（触底回适应）"),
-                        ("Ctrl+滚轮", "图片缩放（任意状态，锚光标）"),
-                        ("+ / -", "图片缩放步进（锚视口中心）"),
-                        ("0", "图片 100% 显示"),
-                        ("Home", "图片适应窗口"),
-                        ("鼠标拖拽", "平移已放大的图片"),
-                        ("双击图片", "适应窗口 ↔ 100%"),
-                        ("回车", "全屏切换"),
-                        ("Esc", "退出全屏"),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.strong(k);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(v);
-                                },
-                            );
+                    // 分三组：通用在前，视频 / 图片专属各成一块
+                    let groups: &[(&str, &[(&str, &str)])] = &[
+                        (
+                            "通用",
+                            &[
+                                ("PgUp / PgDn", "上一个 / 下一个"),
+                                ("鼠标滚轮（预览窗口内）", "上一个 / 下一个媒体"),
+                                ("N", "打开下一个压缩包（连续看包）"),
+                                ("B", "回到锚点（最后一次解压位置）"),
+                                ("回车", "全屏切换"),
+                                ("Esc", "退出全屏"),
+                            ],
+                        ),
+                        (
+                            "视频",
+                            &[
+                                ("← / →", "seek ±5 秒"),
+                                ("← / →（暂停时）", "上一帧 / 下一帧"),
+                                ("↑ / ↓", "音量 ±5"),
+                                ("M", "静音切换"),
+                                ("L", "播放模式：列表 ↔ 单视频循环"),
+                            ],
+                        ),
+                        (
+                            "图片",
+                            &[
+                                ("← / →", "上一张 / 下一张"),
+                                ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
+                                ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
+                                ("+ / -", "缩放步进（锚视口中心）"),
+                                ("0", "100% 显示"),
+                                ("Home", "适应窗口"),
+                                ("鼠标拖拽", "平移已放大的图片"),
+                                ("双击图片", "适应窗口 ↔ 100%"),
+                            ],
+                        ),
+                    ];
+                    // 分组配色：通用原色，视频金黄，图片亮蓝（蓝取应用
+                    // 现有 ACCENT，黄与对话框提示同款）
+                    const HELP_YELLOW: egui::Color32 = egui::Color32::from_rgb(232, 178, 72);
+                    const HELP_BLUE: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
+                    let colors = [None, Some(HELP_YELLOW), Some(HELP_BLUE)];
+                    // 单一 Grid 渲染三组：列宽全表统一（键列 = 全部组里
+                    // 最宽的键），三组描述垂直对齐；组间用空行分隔
+                    egui::Grid::new("help_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 2.0])
+                        .show(ui, |ui| {
+                            for (gi, (title, rows)) in groups.iter().enumerate() {
+                                let color = colors[gi];
+                                if gi > 0 {
+                                    // 组间空行分隔（两格都占，保持列数）
+                                    ui.label("");
+                                    ui.label("");
+                                    ui.end_row();
+                                }
+                                // 组标题：专属组着色，通用保持默认
+                                let mut t = egui::RichText::new(*title).strong();
+                                if let Some(c) = color {
+                                    t = t.color(c);
+                                }
+                                ui.label(t);
+                                ui.label("");
+                                ui.end_row();
+                                for (k, v) in rows.iter().copied() {
+                                    let mut key = egui::RichText::new(k).strong();
+                                    let mut val = egui::RichText::new(v);
+                                    if let Some(c) = color {
+                                        key = key.color(c);
+                                        val = val.color(c);
+                                    }
+                                    ui.label(key);
+                                    ui.label(val);
+                                    ui.end_row();
+                                }
+                            }
                         });
-                    }
                 });
             if let Some(n) = &self.notice {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, n);

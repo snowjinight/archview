@@ -180,7 +180,7 @@ pub struct UiConfig {
     pub font_path: String,
     /// 图片自动播放（PPT 式翻页）间隔秒数
     pub slideshow_secs: f64,
-    /// 视频区滚轮切换最小间隔秒数（防惯性/触控板连跳）
+    /// 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
     pub wheel_switch_secs: f64,
     /// 翻到本包最后一个媒体项再往后导航时，是否询问打开同目录下一个压缩包
     pub ask_next_archive: bool,
@@ -454,7 +454,7 @@ mpv_log_level = "no"
 font_path = "auto"
 	# 图片自动播放（PPT 式翻页）间隔秒数
 slideshow_secs = 1.0
-	# 视频区滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+	# 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
 wheel_switch_secs = 0.3
 	# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
 ask_next_archive = true
