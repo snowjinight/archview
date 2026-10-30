@@ -115,6 +115,14 @@ pub struct PlayerConfig {
     pub hwdec: String,
     pub cache_secs: u64,
     pub demuxer_max_mb: u64,
+    /// demux 探测字节预算（mpv demuxer-lavf-probesize，如 "2MiB"）。
+    /// "auto" = 不设置，走 mpv/FFmpeg 原生默认（≈5MB）。压缩包内流每读
+    /// 一字节都要解压，调小直接缩短打开耗时；过小可能识别不了冷门容器
+    pub demuxer_probesize: String,
+    /// demux 探测时长预算秒（mpv demuxer-lavf-analyzeduration）。
+    /// "auto" = 不设置，走 mpv/FFmpeg 原生默认（≈5s）。过小可能漏识别
+    /// 延迟出现的流（TS/mkv 多音轨场景）
+    pub demuxer_analyzeduration: String,
     pub volume: i64,
     /// 订阅 mpv 内部日志（"no" 关闭；诊断切换延迟时可设 "v"）
     pub mpv_log_level: String,
@@ -157,6 +165,8 @@ impl Default for PlayerConfig {
             hwdec: "auto".into(),
             cache_secs: 30,
             demuxer_max_mb: 512,
+            demuxer_probesize: "2MiB".into(),
+            demuxer_analyzeduration: "1".into(),
             volume: 100,
             mpv_log_level: "no".into(),
         }
@@ -424,6 +434,13 @@ hwdec = "auto"
 cache_secs = 30
 	# mpv demuxer 最大缓存（MB）
 demuxer_max_mb = 512
+	# demux 探测字节预算（打开阶段识别容器格式的读取上限）。
+	# 压缩包内流=逐字节解压，预算直接换算成打开耗时，调小即提速；
+	# "auto" = mpv 原生默认（≈5MB）；过小可能识别不了冷门容器
+demuxer_probesize = "2MiB"
+	# demux 探测时长预算（秒，确定各流参数的分析上限）。
+	# "auto" = mpv 原生默认（≈5s）；过小可能漏识别延迟出现的音轨/字幕流
+demuxer_analyzeduration = "1"
 	# 初始音量（0-100）
 volume = 100
 	# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。

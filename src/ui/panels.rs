@@ -1122,28 +1122,31 @@ impl App {
             step: i32,
             toggle: bool,
             slide: bool,
+            loop_toggle: bool,
         }
         let mut act = Act::default();
 
         // 顶部：进度条（点击/拖动 seek）
         self.seek_bar(ui);
 
-        // 下部：三按钮组（水平居中）+ 右侧音量条
+        // 下部：按钮组（水平居中）+ 右侧音量条
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            let icon_btn = |ui: &mut egui::Ui, txt: &str, tip: &str| {
-                ui.add(
-                    egui::Button::new(egui::RichText::new(txt).size(20.0))
-                        .min_size(egui::vec2(48.0, 34.0)),
-                )
-                .on_hover_text(tip)
-                .clicked()
+            // selected=true 时图标着色加粗（激活态高亮，如循环播放中）
+            let icon_btn = |ui: &mut egui::Ui, txt: &str, tip: &str, selected: bool| {
+                let mut rt = egui::RichText::new(txt).size(20.0);
+                if selected {
+                    rt = rt.color(ACCENT).strong();
+                }
+                ui.add(egui::Button::new(rt).min_size(egui::vec2(48.0, 34.0)))
+                    .on_hover_text(tip)
+                    .clicked()
             };
             // 按钮组整体居中：左侧弹性留白 = 右侧(音量+留白)宽度
             let side_w = ui.available_width() / 2.0;
             let vol_w = 150.0;
-            ui.add_space((side_w - vol_w / 2.0 - 60.0).max(0.0)); // 60≈三个按钮组一半宽
+            ui.add_space((side_w - vol_w / 2.0 - 84.0).max(0.0)); // 84≈四个按钮组一半宽
 
-            if icon_btn(ui, "<", "上一个") {
+            if icon_btn(ui, "<", "上一个", false) {
                 act.step = -1;
             }
             if self.playing_is_image() {
@@ -1153,7 +1156,7 @@ impl App {
                 } else {
                     ("▶", "自动播放（翻页）")
                 };
-                if icon_btn(ui, txt, tip) {
+                if icon_btn(ui, txt, tip, self.slideshow_on) {
                     act.slide = true;
                 }
             } else if let Some(p) = &self.player {
@@ -1162,15 +1165,28 @@ impl App {
                 } else {
                     ("||", "暂停")
                 };
-                if icon_btn(ui, txt, tip) {
+                if icon_btn(ui, txt, tip, false) {
                     act.toggle = true;
                 }
-            } else if icon_btn(ui, "▶", "播放（从第一项开始）") {
+            } else if icon_btn(ui, "▶", "播放（从第一项开始）", false) {
                 // 未播放：播放按钮=开始当前标签页第一项
                 act.step = 1;
             }
-            if icon_btn(ui, ">", "下一个") {
+            if icon_btn(ui, ">", "下一个", false) {
                 act.step = 1;
+            }
+            // 播放模式（仅视频，图片不显示——图片用各自的自动翻页开关）：
+            // 列表播放（默认，播完自动下一个）↔ 单视频循环；循环中高亮。
+            // 未播放时也显示，允许预设模式
+            if !self.playing_is_image() {
+                let (icon, tip) = if self.video_loop {
+                    ("↻", "循环播放中：点击切为列表播放（L）")
+                } else {
+                    ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
+                };
+                if icon_btn(ui, icon, tip, self.video_loop) {
+                    act.loop_toggle = true;
+                }
             }
 
             // 右侧：音量条（右对齐，固定宽度；始终显示，播放器未就绪时只存配置）
@@ -1217,6 +1233,9 @@ impl App {
         }
         if act.slide {
             self.slideshow_on = !self.slideshow_on;
+        }
+        if act.loop_toggle {
+            self.toggle_video_loop();
         }
     }
 

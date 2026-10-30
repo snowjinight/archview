@@ -240,6 +240,13 @@ pub struct App {
     slideshow_on: bool,
     slideshow_idx: Option<usize>,
     slideshow_anchor: f64,
+    // 视频播放模式（两态，图片不适用——图片用 slideshow）：false=列表播放
+    //（默认，播完自动切下一个，见 nav.rs video_eof_tick）；true=单视频循环
+    //（mpv loop-file=inf 原生循环）。L 键/控制栏按钮切换
+    video_loop: bool,
+    // 列表播放 EOF 推进防重入：已处理过 EOF 的条目。推进无效果时（列表
+    // 末尾停住/目标需先解压）防每帧重复触发；eof 复位时自动清空
+    eof_handled: Option<usize>,
     // 后台解压（7z/RAR）
     extract: Option<ExtractJob>,
     // 后台打开（大包/网络盘：打开+列表移出 UI 线程）
@@ -315,6 +322,8 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
+            video_loop: false,
+            eof_handled: None,
             extract: None,
             open_job: None,
             open_progress: None,
@@ -366,6 +375,8 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
+            video_loop: false,
+            eof_handled: None,
             extract: None,
             open_job: None,
             open_progress: None,
@@ -429,8 +440,26 @@ impl App {
 }
 
 impl eframe::App for App {
+    // #[allow]：帧探针 st 在全屏早退路径的末次赋值无人读
+    #[allow(unused_assignments)]
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // —— 帧探针（常驻条件诊断，debug 级）——
+        // 分段 ≥30ms 打点、帧总 ≥50ms 两个出口打点，平时零输出。
+        // segments 覆盖每帧属性读：eof_tick=eof_reached、top/controls=
+        // time_pos/duration/buffering
+        let t0 = std::time::Instant::now();
+        let mut st = t0;
+        macro_rules! probe {
+            ($name:expr) => {{
+                let now = std::time::Instant::now();
+                let d = now.duration_since(st).as_secs_f64() * 1000.0;
+                if d >= 30.0 {
+                    tracing::debug!("[帧探针] {} {d:.1}ms", $name);
+                }
+                st = now;
+            }};
+        }
         // 视频播放中：逐 vsync 连续重绘，让 eframe 的 swap 成为节拍主钟。
         // render() 已设 BLOCK_FOR_TARGET_TIME=0 不再阻塞到目标时刻，每次渲染
         // "当前应显示"的帧，换帧时刻锁定 vsync 边界，消除"mpv 回调唤醒 →
@@ -444,44 +473,69 @@ impl eframe::App for App {
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-
+        probe!("repaint决策");
         // 启动参数打开（SendTo「Archview player」/拖到 exe 上）：首帧触发一次
         if let Some(path) = self.initial_open.take() {
             self.open_path(path);
         }
+        probe!("initial_open");
         // 拖放：压缩包文件拖入窗口即打开
         self.handle_dropped_files(&ctx);
+        probe!("dropped");
         // 后台打开任务轮询（大包/网络盘）
         self.poll_open();
+        probe!("poll_open");
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
+        probe!("poll_extract");
         // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
         self.poll_img();
+        probe!("poll_img");
         // 键盘快捷键（mpv 风格）
         self.handle_shortcuts(&ctx, frame);
+        probe!("shortcuts");
         // 图片自动翻页（PPT 式）
         self.slideshow_tick(&ctx);
+        probe!("slideshow");
+        // 列表播放：视频 EOF 自动切下一个（循环模式/图片不动作）
+        self.video_eof_tick();
+        probe!("eof_tick");
         // 密码输入弹窗（加密压缩包：加密头=打开阶段 / 加密条目=播放阶段）
         self.password_dialog(&ctx);
+        probe!("pw_dialog");
         // 末项后询问打开同目录下一个压缩包
         self.next_archive_dialog(&ctx);
+        probe!("next_archive");
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.video_area(ui, &ctx));
+            probe!("video_area");
+            let tot = t0.elapsed().as_secs_f64() * 1000.0;
+            if tot >= 50.0 {
+                tracing::debug!("[帧探针] 全屏帧总 {tot:.1}ms");
+            }
             return;
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        probe!("top");
         egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui));
+        probe!("controls");
         // 文件列表放左侧（视频区在右）；悬停行显示完整包内路径气泡
         //（路径/文件名分色）。render API 单平面后气泡不再被 mpv 原生
         // 子窗口遮挡，hover 已恢复（wid 时代曾因此禁用）
         egui::Panel::left("files")
             .default_size(300.0)
             .show(ui, |ui| self.file_list(ui));
+        probe!("files");
         egui::CentralPanel::default().show(ui, |ui| self.video_area(ui, &ctx));
+        probe!("video_area");
+        let tot = t0.elapsed().as_secs_f64() * 1000.0;
+        if tot >= 50.0 {
+            tracing::debug!("[帧探针] 帧总 {tot:.1}ms");
+        }
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {

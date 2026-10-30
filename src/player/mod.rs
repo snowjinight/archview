@@ -7,9 +7,9 @@ pub mod stream_cb;
 use crate::config::Config;
 use glow::HasContext as _;
 use std::cell::Cell;
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_int, c_void, CStr};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -110,6 +110,40 @@ pub struct PlayerService {
     /// 后者在"提交绘制"时置位会早于真实帧就绪 → 16ms 高频轮询过早停止，
     /// 首帧实际呈现回落到 100ms 慢节拍 ≈ 200ms 切换延迟（LOG 实测）
     first_frame: Arc<AtomicBool>,
+    /// 打开完成标志（事件泵线程收到 PLAYBACK_RESTART 时置位，load 时重置）。
+    /// 首帧 ≠ 打开完成：首帧实测 7~20ms 即到，但音频初始化/cache 填充还要
+    /// 占 core 锁 ~0.5s，此窗口内 UI 属性读（paused/time_pos/eof/buffering）
+    /// 每次都要等锁——帧探针实测切换后连续长帧合计 ~0.5s，即卡顿主体。
+    /// opening() 门控因此持续到本标志置位而非首帧
+    playback_ready: Arc<AtomicBool>,
+    /// mute 本地缓存（observe_property 订阅，事件泵收到 PROPERTY_CHANGE 更新）。
+    /// muted() 从此只读原子标志、不进 mpv——每帧一次的静音按钮状态查询不再
+    /// 受打开窗口期 core 锁长占影响，稳态也省一次跨 FFI 属性读
+    muted_cache: Arc<AtomicBool>,
+    /// pause 本地缓存（同 muted_cache 机制）。变更源：toggle_pause 的 cycle
+    /// 命令、EOF 时 keep-open 置 pause=yes——推送同步比门控读更及时准确
+    paused_cache: Arc<AtomicBool>,
+    /// time-pos 本地缓存（f64 位模式存 AtomicU64，DOUBLE 推送）。变更源：
+    /// playloop 每迭代推进、seek 后跳变。推送速率 ≈ 帧率（每迭代每属性
+    /// 至多 1 条），泵线程纯字节比较 + 原子写，消费能力高出生产上限数个
+    /// 数量级，无洪流风险
+    time_pos_cache: Arc<AtomicU64>,
+    /// duration 本地缓存（DOUBLE 推送；每文件装载时 1~2 条）。0.0 = 不可用
+    duration_cache: Arc<AtomicU64>,
+    /// eof-reached 本地缓存（FLAG 推送）。seek 卡顿实证：seek 后首帧的
+    /// get_property 在 core 锁上等 ~194ms（core 完成 seek 才放锁），故改订阅
+    eof_cache: Arc<AtomicBool>,
+    /// pause-for-cache 本地缓存（FLAG 推送；缓冲暂停翻转时推）
+    buffering_cache: Arc<AtomicBool>,
+    /// 配置原文 hwdec："auto" 时启用探测记忆（hwdec_fixed），其余取值原样生效
+    hwdec_cfg: String,
+    /// hwdec 探测记忆：首次成功解码后 hwdec-current 的取值（如 "d3d11va-copy"）。
+    /// 配置为 auto 时，后续装载以 loadfile 的 per-file 选项固定该方法，跳过
+    /// auto 试探链（每次试探都要创建解码设备、占 core 锁）。方法取决于
+    /// GPU/驱动而非文件，进程内记忆即可；遇到该方法不支持的编码 mpv 会
+    /// 自动回落软解，无失败风险。不能运行时 set 属性下发——旧视频还在播，
+    /// 改属性会立即重建旧解码器（实测白耗 60ms）
+    hwdec_fixed: std::cell::RefCell<Option<String>>,
 }
 
 // mpv client API 线程安全；回调线程只走全局注册表，不触碰此 handle。
@@ -155,71 +189,157 @@ impl PlayerService {
             load_mark: Cell::new(None),
             painted_since_load: Cell::new(true),
             first_frame: Arc::new(AtomicBool::new(true)),
+            playback_ready: Arc::new(AtomicBool::new(true)),
+            muted_cache: Arc::new(AtomicBool::new(false)),
+            paused_cache: Arc::new(AtomicBool::new(false)),
+            time_pos_cache: Arc::new(AtomicU64::new(0.0f64.to_bits())),
+            duration_cache: Arc::new(AtomicU64::new(0.0f64.to_bits())),
+            eof_cache: Arc::new(AtomicBool::new(false)),
+            buffering_cache: Arc::new(AtomicBool::new(false)),
+            hwdec_cfg: cfg.player.hwdec.clone(),
+            hwdec_fixed: std::cell::RefCell::new(None),
         };
         // 播放器参数全部来自 config.toml
-        // mpv 日志泵：wait_event 同一 client 只能单线程消费（此处是进程内唯一消费者），
-        // LOG_MESSAGE 立即转 owned 字符串后走 tracing，带相对时间戳，形成
-        // "UI loadfile → mpv 内部事件 → egui 首渲染" 完整时间线（诊断切换延迟）
-        if cfg.player.mpv_log_level != "no" {
-            match mpv_ffi::request_log_messages(ctx, &cfg.player.mpv_log_level) {
-                Ok(()) => {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let stop2 = stop.clone();
-                    // 裸指针以 usize 过线程边界（mpv client API 线程安全）
-                    let ctx_addr = ctx as usize;
-                    let t0 = Instant::now();
-                    s.log_thread = Some(std::thread::spawn(move || {
-                        let c = ctx_addr as *mut mpv_ffi::MpvHandle;
-                        loop {
-                            if stop2.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            let ev = unsafe { mpv_ffi::wait_event(c, 0.2) };
-                            if ev.is_null() {
-                                continue;
-                            }
-                            let ev = unsafe { &*ev };
-                            match ev.event_id {
-                                mpv_ffi::MPV_EVENT_NONE => {}
-                                mpv_ffi::MPV_EVENT_SHUTDOWN => break,
-                                mpv_ffi::MPV_EVENT_LOG_MESSAGE => {
-                                    // 字符串指针归 mpv 所有、仅当次事件有效：先转 owned 再格式化
-                                    let m = unsafe {
-                                        &*(ev.data as *mut mpv_ffi::MpvEventLogMessage)
-                                    };
-                                    let (prefix, text) = unsafe {
-                                        (
-                                            CStr::from_ptr(m.prefix).to_string_lossy().into_owned(),
-                                            CStr::from_ptr(m.text).to_string_lossy().into_owned(),
-                                        )
-                                    };
-                                    tracing::info!(
-                                        "[mpv {:>8.3}] {}: {}",
-                                        t0.elapsed().as_secs_f64(),
-                                        prefix,
-                                        text.trim_end()
-                                    );
+        // 常驻事件泵线程：不随日志级别启停（此前 level=no 时整线程不跑，
+        // PLAYBACK_RESTART 收不到）。wait_event 同一 client 只能单线程消费
+        // （此处是进程内唯一消费者）。
+        // 职责 1（恒定）：PLAYBACK_RESTART → playback_ready 置位。这是
+        //   "打开完成、core 空闲"的准确信号（音频已起、cache 就绪），opening
+        //   门控据此解除——首帧远早于它，详见 playback_ready 字段注释
+        // 职责 2（level != no）：LOG_MESSAGE 转 owned 后走 tracing（带相对
+        //   时间戳），与生命周期事件打点对齐成完整时间线（诊断切换延迟）
+        let log_on = cfg.player.mpv_log_level != "no";
+        if log_on {
+            if let Err(e) = mpv_ffi::request_log_messages(ctx, &cfg.player.mpv_log_level) {
+                tracing::warn!("订阅 mpv 日志失败（事件泵仍启动）: {e}");
+            }
+        }
+        {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop2 = stop.clone();
+            let ready_flag = s.playback_ready.clone();
+            let muted_flag = s.muted_cache.clone();
+            let paused_flag = s.paused_cache.clone();
+            let eof_flag = s.eof_cache.clone();
+            let buffering_flag = s.buffering_cache.clone();
+            let time_pos_flag = s.time_pos_cache.clone();
+            let duration_flag = s.duration_cache.clone();
+            // 裸指针以 usize 过线程边界（mpv client API 线程安全）
+            let ctx_addr = ctx as usize;
+            let t0 = Instant::now();
+            s.log_thread = Some(std::thread::spawn(move || {
+                let c = ctx_addr as *mut mpv_ffi::MpvHandle;
+                loop {
+                    if stop2.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let ev = unsafe { mpv_ffi::wait_event(c, 0.2) };
+                    if ev.is_null() {
+                        continue;
+                    }
+                    let ev = unsafe { &*ev };
+                    match ev.event_id {
+                        mpv_ffi::MPV_EVENT_NONE => {}
+                        mpv_ffi::MPV_EVENT_SHUTDOWN => break,
+                        // 打开完成：opening 门控解除信号（常驻泵的核心职责）
+                        mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
+                            ready_flag.store(true, Ordering::Relaxed);
+                        }
+                        // 属性订阅推送：更新本地缓存（FLAG: mute/pause/eof-reached/
+                        // pause-for-cache，DOUBLE: time-pos/duration）。变更源含
+                        // cycle 命令、set_volume 的 mute=no、EOF 时 keep-open 置
+                        // pause=yes、seek 后 time-pos 跳变、缓冲翻转等一切内外部
+                        // 变化，统一经此同步。name/data 指针仅当次事件内有效，
+                        // 此处即时取值，不外传裸指针。处理保持零分配（字节比较 +
+                        // 原子写）：time-pos 推送速率 ≈ 帧率，泵消费能力高出生产
+                        // 上限数个数量级。属性不可用时 mpv 推 format=NONE 且
+                        // data=null（如装载前的 time-pos），自然被 data 判空跳过
+                        mpv_ffi::MPV_EVENT_PROPERTY_CHANGE => {
+                            if !ev.data.is_null() {
+                                let p = unsafe {
+                                    &*(ev.data as *mut mpv_ffi::MpvEventProperty)
+                                };
+                                if !p.name.is_null() && !p.data.is_null() {
+                                    let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
+                                    if p.format == mpv_ffi::MPV_FORMAT_FLAG {
+                                        let v = unsafe { *(p.data as *const c_int) } != 0;
+                                        match name {
+                                            b"mute" => muted_flag.store(v, Ordering::Relaxed),
+                                            b"pause" => paused_flag.store(v, Ordering::Relaxed),
+                                            b"eof-reached" => {
+                                                eof_flag.store(v, Ordering::Relaxed)
+                                            }
+                                            b"pause-for-cache" => {
+                                                buffering_flag.store(v, Ordering::Relaxed)
+                                            }
+                                            _ => {}
+                                        }
+                                    } else if p.format == mpv_ffi::MPV_FORMAT_DOUBLE {
+                                        let v = unsafe { *(p.data as *const f64) };
+                                        match name {
+                                            b"time-pos" => {
+                                                time_pos_flag.store(v.to_bits(), Ordering::Relaxed)
+                                            }
+                                            b"duration" => {
+                                                duration_flag.store(v.to_bits(), Ordering::Relaxed)
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                 }
-                                // 关键生命周期事件也打点：与日志行对齐成时间线
-                                mpv_ffi::MPV_EVENT_START_FILE
-                                | mpv_ffi::MPV_EVENT_END_FILE
-                                | mpv_ffi::MPV_EVENT_FILE_LOADED
-                                | mpv_ffi::MPV_EVENT_VIDEO_RECONFIG
-                                | mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
-                                    tracing::info!(
-                                        "[mpv {:>8.3}] == 事件 {} ==",
-                                        t0.elapsed().as_secs_f64(),
-                                        ev.event_id
-                                    );
-                                }
-                                _ => {}
                             }
                         }
-                    }));
-                    s.log_stop = Some(stop);
-                    tracing::info!("mpv 日志泵已启动 (level={})", cfg.player.mpv_log_level);
+                        mpv_ffi::MPV_EVENT_LOG_MESSAGE if log_on => {
+                            // 字符串指针归 mpv 所有、仅当次事件有效：先转 owned 再格式化
+                            let m = unsafe {
+                                &*(ev.data as *mut mpv_ffi::MpvEventLogMessage)
+                            };
+                            let (prefix, text) = unsafe {
+                                (
+                                    CStr::from_ptr(m.prefix).to_string_lossy().into_owned(),
+                                    CStr::from_ptr(m.text).to_string_lossy().into_owned(),
+                                )
+                            };
+                            tracing::debug!(
+                                "[mpv {:>8.3}] {}: {}",
+                                t0.elapsed().as_secs_f64(),
+                                prefix,
+                                text.trim_end()
+                            );
+                        }
+                        // 关键生命周期事件也打点：与日志行对齐成时间线
+                        mpv_ffi::MPV_EVENT_START_FILE
+                        | mpv_ffi::MPV_EVENT_END_FILE
+                        | mpv_ffi::MPV_EVENT_FILE_LOADED
+                        | mpv_ffi::MPV_EVENT_VIDEO_RECONFIG => {
+                            tracing::debug!(
+                                "[mpv {:>8.3}] == 事件 {} ==",
+                                t0.elapsed().as_secs_f64(),
+                                ev.event_id
+                            );
+                        }
+                        _ => {}
+                    }
                 }
-                Err(e) => tracing::warn!("订阅 mpv 日志失败: {e}"),
+            }));
+            s.log_stop = Some(stop);
+            if log_on {
+                tracing::debug!("mpv 日志泵已启动 (level={})", cfg.player.mpv_log_level);
+            }
+        }
+        // 每帧读取的属性全部走 observe_property 订阅（须在泵线程消费前注册；
+        // 事件会在 mpv 侧排队，泵起来即可收到含初始值在内的全部推送）。
+        // 帧路径纯原子读，不再进 mpv——seek 后 core 忙窗口（实测 ~194ms）
+        // 里任何 get_property 都会在 core 锁上阻塞 UI。time-pos/duration 为
+        // DOUBLE，其余 FLAG
+        for prop in ["mute", "pause", "eof-reached", "pause-for-cache"] {
+            if let Err(e) = mpv_ffi::observe_property_flag(ctx, prop) {
+                tracing::warn!("订阅 {prop} 属性失败（缓存将停在初始值 false）: {e}");
+            }
+        }
+        for prop in ["time-pos", "duration"] {
+            if let Err(e) = mpv_ffi::observe_property_double(ctx, prop) {
+                tracing::warn!("订阅 {prop} 属性失败（缓存将停在初始值 0）: {e}");
             }
         }
         s.opt("hwdec", &cfg.player.hwdec);
@@ -228,6 +348,18 @@ impl PlayerService {
             "demuxer-max-bytes",
             &format!("{}MiB", cfg.player.demuxer_max_mb),
         );
+        // demux 探测预算（打开阶段的字节/时长上限）：压缩包内流每读一字节都
+        // 要解压，预算直接换算成打开耗时，调小即提速。"auto" = 不设置，
+        // 走 mpv/FFmpeg 原生默认（probesize≈5MB、analyzeduration≈5s）
+        if cfg.player.demuxer_probesize != "auto" {
+            s.opt("demuxer-lavf-probesize", &cfg.player.demuxer_probesize);
+        }
+        if cfg.player.demuxer_analyzeduration != "auto" {
+            s.opt(
+                "demuxer-lavf-analyzeduration",
+                &cfg.player.demuxer_analyzeduration,
+            );
+        }
         s.opt("keep-open", "always"); // 播完停在末帧，不触发退出
         s.opt("osc", "no"); // 禁用 mpv 内置 OSC（预览窗口里的白条进度条），进度条由 UI 提供
         s.opt("osd-level", "0"); // 不在预览窗口里弹 OSD 提示
@@ -322,9 +454,33 @@ impl PlayerService {
         }
     }
 
+    /// hwdec 探测记忆的 per-file 选项片段：配置为 auto 且已探得方法时返回
+    /// `hwdec=<method>`（拼进 loadfile 第四参数 options），否则空串。
+    /// per-file 是 mpv 官方的按文件选项下发方式：不影响全局属性、不触发
+    /// 旧视频解码器重建（运行时 set 属性会，实测白耗 60ms）
+    fn hwdec_file_opt(&self) -> String {
+        if self.hwdec_cfg == "auto" {
+            if let Some(h) = self.hwdec_fixed.borrow().as_ref() {
+                return format!("hwdec={h}");
+            }
+        }
+        String::new()
+    }
+
     pub fn load(&self, archive_id: u64, entry_idx: usize) {
+        // 重置打开完成标志（必须先于 loadfile 提交：快文件 PLAYBACK_RESTART
+        // 可在数十 ms 内到达泵线程，若先提交后重置，会被泵线程抢先置位再
+        // 被抹掉，门控将卡到 2s 兜底）
+        self.playback_ready.store(false, Ordering::Relaxed);
+        let hwdec_opt = self.hwdec_file_opt();
         let uri = stream_cb::entry_uri(archive_id, entry_idx);
-        if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("loadfile {uri} replace")) {
+        let cmd = if hwdec_opt.is_empty() {
+            format!("loadfile {uri} replace")
+        } else {
+            // 第四参数 options：index 占位 -1
+            format!("loadfile {uri} replace -1 {hwdec_opt}")
+        };
+        if let Err(e) = mpv_ffi::command_string(self.ctx, &cmd) {
             tracing::error!("loadfile 失败: {e}");
         }
         // keep-open=always 在 EOF 时会把 pause 置为 yes，且 loadfile 不清除它——
@@ -338,8 +494,16 @@ impl PlayerService {
 
     /// 播放本地文件路径（7z/RAR 后台解压完成后的慢路径）
     pub fn load_path(&self, path: &std::path::Path) {
+        // 同 load()：重置时机必须先于 loadfile 提交
+        self.playback_ready.store(false, Ordering::Relaxed);
+        let hwdec_opt = self.hwdec_file_opt();
         let url = to_file_url(path);
-        if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("loadfile {url} replace")) {
+        let cmd = if hwdec_opt.is_empty() {
+            format!("loadfile {url} replace")
+        } else {
+            format!("loadfile {url} replace -1 {hwdec_opt}")
+        };
+        if let Err(e) = mpv_ffi::command_string(self.ctx, &cmd) {
             tracing::error!("loadfile {url} 失败: {e}");
         }
         self.set_prop_str("pause", "no"); // 同 load()：清除 EOF 粘滞的暂停态
@@ -358,10 +522,23 @@ impl PlayerService {
         if !self.painted_since_load.get() && self.first_frame.load(Ordering::Relaxed) {
             self.painted_since_load.set(true);
             if let Some(t0) = self.load_mark.get() {
-                tracing::info!(
+                tracing::debug!(
                     "mpv 首帧真实渲染 距loadfile {:.3}s",
                     t0.elapsed().as_secs_f64()
                 );
+            }
+            // 首视频探得 hwdec 方法后记忆（进程内仅一次）：后续装载跳过 auto
+            // 试探链。hwdec-current 为空/"no"（纯音频、软解回退）不记忆
+            if self.hwdec_fixed.borrow().is_none() && self.hwdec_cfg == "auto" {
+                let cur = mpv_ffi::get_property_string(self.ctx, "hwdec-current")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let cur = cur.trim().to_owned();
+                if !cur.is_empty() && cur != "no" {
+                    tracing::debug!("hwdec 探测记忆: {cur}（后续视频跳过试探）");
+                    *self.hwdec_fixed.borrow_mut() = Some(cur);
+                }
             }
         }
         if self.painted_since_load.get() {
@@ -370,6 +547,9 @@ impl PlayerService {
         match self.load_mark.get() {
             Some(t0) if t0.elapsed() > std::time::Duration::from_secs(2) => {
                 self.painted_since_load.set(true);
+                // ready 同步兜底置位：坏文件永远等不来 PLAYBACK_RESTART，
+                // 不置位的话 opening 门控会一直拦住属性轮询
+                self.playback_ready.store(true, Ordering::Relaxed);
                 tracing::warn!("2s 未见视频帧（纯音频或解码失败？），停止高频轮询");
                 true
             }
@@ -390,19 +570,43 @@ impl PlayerService {
     }
 
     pub fn toggle_pause(&self) {
-        // pause 是 flag 类型属性，必须用 MPV_FORMAT_FLAG 读；
-        // 用 INT64 读会失败（mpv 不做跨格式转换），导致永远读到"未暂停"、恢复不了播放
-        let paused = mpv_ffi::get_property_flag(self.ctx, "pause")
-            .ok()
-            .flatten()
-            .unwrap_or(false);
-        self.set_prop_str("pause", if paused { "no" } else { "yes" });
+        // 打开窗口期短路：core 锁长占，提交命令会阻塞 UI；且新文件即将
+        // 起播，此刻切换暂停无意义
+        if self.opening() {
+            return;
+        }
+        // cycle 由 mpv 内部翻转布尔，无需先读当前值：读（get_property）
+        // 在 core 忙时会阻塞 UI 线程，读-改-写还有竞态。
+        // 注：若改回读属性，pause 必须用 MPV_FORMAT_FLAG——INT64 读会
+        // 失败（mpv 不做跨格式转换）
+        if let Err(e) = mpv_ffi::command_string(self.ctx, "no-osd cycle pause") {
+            tracing::error!("切换暂停失败: {e}");
+        }
+    }
+
+    /// 显式设置暂停（toggle_pause 的绝对值版：EOF 后复活播放用）
+    pub fn set_paused(&self, on: bool) {
+        self.set_prop_str("pause", if on { "yes" } else { "no" });
+    }
+
+    /// 单视频循环开关（loop-file=inf）：mpv 原生循环，EOF 不触发（播完无缝
+    /// 回到开头继续），eof-reached 也永远为 false。运行时设置即生效，
+    /// 但 EOF 已经发生时不会回溯重启——复活由调用方 seek(0)+解除暂停处理
+    pub fn set_loop(&self, on: bool) {
+        self.set_prop_str("loop-file", if on { "inf" } else { "no" });
     }
 
     pub fn seek(&self, sec: f64) {
-        // no-osd 前缀：不在预览窗口里闪现 mpv 的 OSD 进度条
+        // no-osd 前缀：不在预览窗口里闪现 mpv 的 OSD 进度条。
+        // 条件探针（提交 ≥5ms 才打点，debug 级）：同步命令需等 core 完成
+        // demuxer seek（cache 未命中时 zip VFS = 重开 entry 从头解压丢弃）
+        let t0 = std::time::Instant::now();
         if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("no-osd seek {sec} absolute")) {
             tracing::error!("seek 失败: {e}");
+        }
+        let d = t0.elapsed().as_secs_f64() * 1000.0;
+        if d >= 5.0 {
+            tracing::debug!("[seek探针] 命令提交 → {sec:.1}s 耗时 {d:.1}ms");
         }
     }
 
@@ -416,22 +620,17 @@ impl PlayerService {
 
     /// 静音切换
     pub fn toggle_mute(&self) {
-        let muted = mpv_ffi::get_property_flag(self.ctx, "mute")
-            .ok()
-            .flatten()
-            .unwrap_or(false);
-        self.set_prop_str("mute", if muted { "no" } else { "yes" });
+        // 同 toggle_pause：cycle 内部翻转，按键路径无属性读。
+        // 此处不短路——打开期静音是有效需求，最多等一次命令提交
+        if let Err(e) = mpv_ffi::command_string(self.ctx, "no-osd cycle mute") {
+            tracing::error!("切换静音失败: {e}");
+        }
     }
 
-    /// 当前是否静音（打开窗口期短路，理由同上：避免 core 锁阻塞 UI）
+    /// 当前是否静音：observe_property 本地缓存，纯原子读。不进 mpv，故无需
+    /// opening 门控——打开窗口期 core 锁长占也不受影响
     pub fn muted(&self) -> bool {
-        if self.opening() {
-            return false;
-        }
-        mpv_ffi::get_property_flag(self.ctx, "mute")
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+        self.muted_cache.load(Ordering::Relaxed)
     }
 
     pub fn set_volume(&self, v: i64) {
@@ -440,51 +639,65 @@ impl PlayerService {
         self.set_prop_str("mute", "no");
     }
 
-    /// 打开窗口期（load 后 → 首帧前，2s 兜底自限）。此时 mpv core 正被
-    /// demux 探测与 hwdec 设备逐个试探长时间占锁，任何 get_property 都会
-    /// 在 core 锁上阻塞 UI 线程（实测冻结 475ms + 多个长帧）。装载窗口
-    /// 只依赖原子标志（first_frame/load_mark），不进 mpv，故此窗口内
-    /// 属性轮询全部短路，界面维持 vsync 节拍。
+    /// 打开窗口期（loadfile → 首帧 && PLAYBACK_RESTART，2s 兜底自限）。
+    /// 此时 mpv core 被 demux 探测、hwdec 设备试探、音频初始化、cache
+    /// 填充长时间占锁，任何 get_property 都会在 core 锁上阻塞 UI 线程。
+    /// 窗口不能止于首帧——首帧（实测 7~20ms）远早于打开完成（音频/cache
+    /// 余段还要 ~0.5s），首帧后各帧属性轮询逐次等锁，帧探针实测
+    /// repaint决策/eof_tick/controls 段连续长帧合计 ~0.5s（切换卡顿主体），
+    /// 故窗口延至 playback_ready（事件泵收 PLAYBACK_RESTART 置位 = 打开
+    /// 完成、core 空闲）。窗口判定只依赖原子标志，不进 mpv，界面维持
+    /// vsync 节拍
     fn opening(&self) -> bool {
-        self.load_mark.get().is_some() && !self.painted_since_load.get()
+        self.load_mark.get().is_some()
+            && !(self.painted_since_load.get()
+                && self.playback_ready.load(Ordering::Relaxed))
     }
 
+    /// 当前播放位置：observe_property 本地缓存，纯原子读。seek 卡顿实证：
+    /// seek 后 core 完成 seek 前，任何 get_property 都在 core 锁上阻塞
+    /// （实测首读 ~194ms = seek 全程），帧路径不得再进 mpv
     pub fn time_pos(&self) -> Option<f64> {
         if self.opening() {
             return None;
         }
-        mpv_ffi::get_property_f64(self.ctx, "time-pos")
-            .ok()
-            .flatten()
+        Some(f64::from_bits(self.time_pos_cache.load(Ordering::Relaxed)))
     }
 
+    /// 总时长：observe_property 本地缓存（每文件装载推 1~2 条）。0.0 = 不可用
     pub fn duration(&self) -> Option<f64> {
         if self.opening() {
             return None;
         }
-        mpv_ffi::get_property_f64(self.ctx, "duration")
-            .ok()
-            .flatten()
+        let d = f64::from_bits(self.duration_cache.load(Ordering::Relaxed));
+        (d > 0.0).then_some(d)
     }
 
+    /// 当前是否暂停：observe_property 本地缓存，纯原子读。不进 mpv，故无需
+    /// opening 门控——toggle 的 cycle、EOF 时 keep-open 置 pause=yes 等一切
+    /// 变更都经泵线程推送同步
     pub fn paused(&self) -> bool {
-        if self.opening() {
-            return false;
-        }
-        mpv_ffi::get_property_flag(self.ctx, "pause")
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+        self.paused_cache.load(Ordering::Relaxed)
     }
 
+    /// 是否缓冲暂停（pause-for-cache）：observe_property 本地缓存，纯原子读
     pub fn buffering(&self) -> bool {
         if self.opening() {
             return true;
         }
-        mpv_ffi::get_property_flag(self.ctx, "pause-for-cache")
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+        self.buffering_cache.load(Ordering::Relaxed)
+    }
+
+    /// 是否已播到末尾（keep-open=always 下停末帧且 pause 被置 yes）。
+    /// observe_property 本地缓存，纯原子读——seek 卡顿实测：seek 后首帧的
+    /// eof-reached get_property 在 core 锁上等了 seek 全程（两次操作各
+    /// ~194ms），seek 后无 opening 门控保护正是中招原因。打开窗口期短路
+    /// false：新文件装载时 eof 已复位，窗口期查询无意义
+    pub fn eof_reached(&self) -> bool {
+        if self.opening() {
+            return false;
+        }
+        self.eof_cache.load(Ordering::Relaxed)
     }
 }
 
@@ -849,6 +1062,157 @@ mod tests {
         mpv_ffi::destroy(ctx);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("7z 解压播放端到端测试通过 ✓");
+    }
+
+    /// FFI 层 observe_property 实证：订阅即推送初始值（idle 静默玩家收到的
+    /// 事件即 PROPERTY_CHANGE），cycle mute 后推送变更值。同时钉死
+    /// MPV_EVENT_PROPERTY_CHANGE 精确值与 MpvEventProperty 解析——
+    /// muted_cache 帧路径正确性依赖这两者
+    #[test]
+    fn ffi_observe_property() {
+        let Some(dll_dir) = find_mpv_dll_dir() else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
+        let ctx = mpv_ffi::create().unwrap();
+        mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "ao", "null").unwrap();
+
+        // 收一个 PROPERTY_CHANGE(prop) 且 FLAG 值等于 want（5s 超时）
+        let recv_flag = |prop: &[u8], want: bool| -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
+                if !ev.is_null() {
+                    let ev = unsafe { &*ev };
+                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
+                        && !ev.data.is_null()
+                    {
+                        let p =
+                            unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
+                        if !p.name.is_null()
+                            && p.format == mpv_ffi::MPV_FORMAT_FLAG
+                            && !p.data.is_null()
+                        {
+                            let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
+                            let v =
+                                unsafe { *(p.data as *const std::ffi::c_int) } != 0;
+                            if name == prop && v == want {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+            }
+        };
+
+        // 1) 订阅后 mpv 立即推送当前值（idle 未静音 → false）。
+        //    若常量值错（非 22），这里收不到事件直接失败
+        mpv_ffi::observe_property_flag(ctx, "mute").expect("订阅 mute");
+        assert!(
+            recv_flag(b"mute", false),
+            "订阅后应立即收到初始值 mute=false 推送"
+        );
+
+        // 2) cycle 翻转 → 推送 true；再翻回 → false（toggle_mute 与 set_volume
+        //    两条生产变更路径的缓存同步由此覆盖）
+        mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
+        assert!(recv_flag(b"mute", true), "cycle 后应收到 mute=true 推送");
+        mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
+        assert!(recv_flag(b"mute", false), "再次 cycle 后应收到 mute=false 推送");
+
+        // 3) 同一 ctx 二路订阅互不干扰：pause 的初始推送与 cycle 翻转都
+        //    准确送达（生产泵线程按 name 分发到各自缓存依赖此点）
+        mpv_ffi::observe_property_flag(ctx, "pause").expect("订阅 pause");
+        assert!(
+            recv_flag(b"pause", false),
+            "订阅 pause 后应立即收到初始值 false 推送"
+        );
+        mpv_ffi::command_string(ctx, "no-osd cycle pause").unwrap();
+        assert!(recv_flag(b"pause", true), "cycle 后应收到 pause=true 推送");
+
+        // 4) DOUBLE 订阅实证：播放中 time-pos 以 DOUBLE 推送且推进、duration
+        //    装载即推——钉死 MPV_FORMAT_DOUBLE=5 与 f64 解码（time_pos_cache/
+        //    duration_cache 帧路径正确性依赖此点）。无 ffmpeg 时跳过
+        if have_ffmpeg() {
+            let mp4 = std::env::temp_dir().join(format!("zvf_dbl_{}.mp4", std::process::id()));
+            let st = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=duration=3:size=320x180:rate=15",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&mp4)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "ffmpeg 生成失败");
+            // 3) 末尾把 pause 翻成了 true，先解除再起播（否则 time-pos 不推进）
+            mpv_ffi::command_string(ctx, "no-osd cycle pause").unwrap();
+            assert!(recv_flag(b"pause", false), "解除暂停应收到 pause=false 推送");
+
+            // 收一个 PROPERTY_CHANGE(prop) 且 DOUBLE 值满足 pred（10s 超时）
+            let recv_double = |prop: &[u8], pred: &dyn Fn(f64) -> bool| -> Option<f64> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
+                    if !ev.is_null() {
+                        let ev = unsafe { &*ev };
+                        if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
+                            && !ev.data.is_null()
+                        {
+                            let p = unsafe {
+                                &*(ev.data as *mut mpv_ffi::MpvEventProperty)
+                            };
+                            if !p.name.is_null()
+                                && p.format == mpv_ffi::MPV_FORMAT_DOUBLE
+                                && !p.data.is_null()
+                            {
+                                let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
+                                if name == prop {
+                                    let v = unsafe { *(p.data as *const f64) };
+                                    if pred(v) {
+                                        return Some(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return None;
+                    }
+                }
+            };
+            // 起播前 time-pos 不可用：mpv 推 format=NONE 且 data=null 的变更，
+            // 生产泵按 data 判空跳过（缓存不被污染），此处只等 DOUBLE 值
+            mpv_ffi::observe_property_double(ctx, "time-pos").expect("订阅 time-pos");
+            mpv_ffi::command_string(ctx, &format!("loadfile {}", to_file_url(&mp4))).unwrap();
+            assert!(
+                recv_double(b"time-pos", &|v| v > 0.5).is_some(),
+                "播放中应收到 time-pos DOUBLE 推送且值推进"
+            );
+            mpv_ffi::observe_property_double(ctx, "duration").expect("订阅 duration");
+            assert!(
+                recv_double(b"duration", &|v| v > 2.0 && v < 4.0).is_some(),
+                "装载后应收到 duration DOUBLE 推送（3s 视频）"
+            );
+            let _ = std::fs::remove_file(&mp4);
+        } else {
+            eprintln!("跳过 DOUBLE 订阅段：无 ffmpeg");
+        }
+
+        mpv_ffi::destroy(ctx);
     }
 
     /// 诊断：webp 起播 ~5 秒延迟的卡点定位。同一 mpv 实例三场景对比：

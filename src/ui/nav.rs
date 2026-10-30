@@ -21,6 +21,7 @@ impl App {
 
     /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张），Shift+←/→=±1s，
     /// ↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
+    /// L=视频播放模式切换（列表播放↔单视频循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -37,6 +38,8 @@ impl App {
         let mut seek_rel = 0.0f64;
         let mut vol_delta = 0i64;
         let (mut do_pause, mut do_mute, mut step_entry) = (false, false, 0i32);
+        // L=视频播放模式切换（列表播放↔单视频循环）
+        let mut loop_toggle = false;
         // 回车=切换全屏；Esc=退出全屏（仅全屏时消费，避免抢其它控件的 Esc）
         let mut fs_toggle = false;
         let mut fs_exit = false;
@@ -56,6 +59,11 @@ impl App {
                 if let egui::Event::Text(t) = e {
                     if t == "m" || t == "M" {
                         do_mute = true;
+                        return false;
+                    }
+                    // L 同理（仅视频模式；图片有自己的自动翻页开关）
+                    if (t == "l" || t == "L") && !img_mode {
+                        loop_toggle = true;
                         return false;
                     }
                     return true;
@@ -123,6 +131,11 @@ impl App {
                         do_mute = true;
                         false
                     }
+                    // L=视频播放模式切换（图片模式不响应）
+                    egui::Key::L if m.is_none() && !img_mode => {
+                        loop_toggle = true;
+                        false
+                    }
                     egui::Key::PageUp if m.is_none() => {
                         step_entry = -1;
                         false
@@ -158,6 +171,10 @@ impl App {
             } else if let Some(p) = &self.player {
                 p.toggle_pause();
             }
+        }
+        // L：视频播放模式切换（列表播放↔单视频循环）
+        if loop_toggle {
+            self.toggle_video_loop();
         }
         if let Some(p) = &self.player {
             if seek_rel != 0.0 {
@@ -282,6 +299,49 @@ impl App {
         }
         if now - self.slideshow_anchor >= self.cfg.ui.slideshow_secs {
             // 自动翻页不触发"打开下一个压缩包"询问（到最后一张停住）
+            self.play_adjacent(1, false);
+        }
+    }
+
+    /// 切换视频播放模式（两态）：列表播放（默认，播完自动下一个）↔
+    /// 单视频循环（mpv loop-file=inf 原生循环，EOF 不触发）。
+    /// 切到循环时若已停在末帧（keep-open EOF 粘滞暂停），回开头复活继续
+    pub(super) fn toggle_video_loop(&mut self) {
+        self.video_loop = !self.video_loop;
+        let on = self.video_loop;
+        if let Some(p) = &self.player {
+            p.set_loop(on);
+            if on && p.eof_reached() {
+                // loop-file 不回溯已发生的 EOF：手动回开头并解除粘滞暂停
+                p.seek(0.0);
+                p.set_paused(false);
+            }
+        }
+        self.notice = Some(if on {
+            "单视频循环".into()
+        } else {
+            "列表播放（播完自动下一个）".into()
+        });
+        tracing::info!("视频播放模式: {}", if on { "循环" } else { "列表" });
+    }
+
+    /// 列表播放：视频播到末尾自动切下一个（每帧轮询，EOF 后 keep-open
+    /// 粘滞暂停使节拍回落 100ms，推进延迟 ≤100ms 不可感知）。
+    /// eof_handled 防重入：推进无效果时（列表末尾停住/目标需先解压等
+    /// 装载）不每帧重复触发；eof 复位（新文件开播/手动回拖）自动清空。
+    /// 循环模式下 eof-reached 恒 false（mpv 原生循环不触发 EOF），天然互斥
+    pub(super) fn video_eof_tick(&mut self) {
+        if self.video_loop || self.playing.is_none() || self.playing_is_image() {
+            return;
+        }
+        let eof = self.player.as_ref().is_some_and(|p| p.eof_reached());
+        if !eof {
+            self.eof_handled = None;
+            return;
+        }
+        if self.eof_handled.is_none() {
+            self.eof_handled = self.playing;
+            // 自动推进不触发"打开下一个压缩包"询问（到最后一个停住）
             self.play_adjacent(1, false);
         }
     }

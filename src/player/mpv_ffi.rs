@@ -13,15 +13,18 @@ pub const MPV_ERROR_UNSUPPORTED: c_int = -18;
 // 属性格式
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
-// mpv_event_id（client.h 精确值）
+pub const MPV_FORMAT_STRING: c_int = 1;
+// mpv_event_id（client.h 精确值；PROPERTY_CHANGE 由 ffi_observe_property
+// 测试钉死，生命周期常量与之同枚举、且 SHUTDOWN/LOG/RESTART 早已实证可用）
 pub const MPV_EVENT_NONE: c_int = 0;
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;
 pub const MPV_EVENT_LOG_MESSAGE: c_int = 2;
-pub const MPV_EVENT_START_FILE: c_int = 5;
-pub const MPV_EVENT_END_FILE: c_int = 6;
-pub const MPV_EVENT_FILE_LOADED: c_int = 7;
-pub const MPV_EVENT_VIDEO_RECONFIG: c_int = 15;
+pub const MPV_EVENT_START_FILE: c_int = 6;
+pub const MPV_EVENT_END_FILE: c_int = 7;
+pub const MPV_EVENT_FILE_LOADED: c_int = 8;
+pub const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
 pub const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
+pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
 pub type MpvHandle = c_void;
 
@@ -65,6 +68,15 @@ pub struct MpvEventLogMessage {
     pub level: *const c_char,
     pub text: *const c_char,
     pub log_level: c_int,
+}
+
+/// MPV_EVENT_PROPERTY_CHANGE 的 data：name 与 data 内的值仅当次事件内有效，
+/// 需在下次 wait_event 前取走
+#[repr(C)]
+pub struct MpvEventProperty {
+    pub name: *const c_char,
+    pub format: c_int,
+    pub data: *mut c_void,
 }
 
 // ---------- render API（render.h，用于 egui 单平面纹理渲染，ARCHITECTURE.md 13）----------
@@ -138,9 +150,17 @@ struct MpvApi {
         out: *mut c_void,
     ) -> c_int,
     error_string: unsafe extern "C" fn(err: c_int) -> *const c_char,
+    /// 释放 mpv_get_property(STRING) 等分配的缓冲（client.h mpv_free）
+    mpv_free: unsafe extern "C" fn(data: *mut c_char),
     request_log_messages:
         unsafe extern "C" fn(ctx: *mut MpvHandle, min_level: *const c_char) -> c_int,
     wait_event: unsafe extern "C" fn(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent,
+    observe_property: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        reply_userdata: u64,
+        name: *const c_char,
+        format: c_int,
+    ) -> c_int,
     stream_cb_add_ro: unsafe extern "C" fn(
         ctx: *mut MpvHandle,
         protocol: *const c_char,
@@ -196,8 +216,10 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             set_property_string: *lib.get(b"mpv_set_property_string").map_err(load_err)?,
             get_property: *lib.get(b"mpv_get_property").map_err(load_err)?,
             error_string: *lib.get(b"mpv_error_string").map_err(load_err)?,
+            mpv_free: *lib.get(b"mpv_free").map_err(load_err)?,
             request_log_messages: *lib.get(b"mpv_request_log_messages").map_err(load_err)?,
             wait_event: *lib.get(b"mpv_wait_event").map_err(load_err)?,
+            observe_property: *lib.get(b"mpv_observe_property").map_err(load_err)?,
             stream_cb_add_ro: *lib.get(b"mpv_stream_cb_add_ro").map_err(load_err)?,
             render_context_create: *lib.get(b"mpv_render_context_create").map_err(load_err)?,
             render_context_free: *lib.get(b"mpv_render_context_free").map_err(load_err)?,
@@ -289,7 +311,9 @@ pub fn set_property_string(ctx: *mut MpvHandle, name: &str, data: &str) -> Resul
     }
 }
 
-/// 读 f64 属性（time-pos / duration 等），属性不存在返回 None
+/// 读 f64 属性（time-pos / duration 等），属性不存在返回 None。
+/// 生产帧路径已全部 observe 化，仅测试的属性轮询在用
+#[cfg(test)]
 pub fn get_property_f64(ctx: *mut MpvHandle, name: &str) -> Result<Option<f64>, String> {
     let a = api()?;
     let name = CString::new(name).map_err(|e| e.to_string())?;
@@ -309,7 +333,9 @@ pub fn get_property_f64(ctx: *mut MpvHandle, name: &str) -> Result<Option<f64>, 
     }
 }
 
-/// 读 flag 属性（pause / eof-reached / idle-active 等），返回 0/1
+/// 读 flag 属性（pause / eof-reached / idle-active 等），返回 0/1。
+/// 生产帧路径已全部 observe 化，仅测试的属性轮询在用
+#[cfg(test)]
 pub fn get_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<Option<bool>, String> {
     let a = api()?;
     let name = CString::new(name).map_err(|e| e.to_string())?;
@@ -326,6 +352,52 @@ pub fn get_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<Option<bool>
         Ok(Some(out != 0))
     } else {
         Ok(None)
+    }
+}
+
+/// 读 string 属性（hwdec-current 等）。缓冲由 mpv 分配，拷贝为 owned
+/// String 后立即 mpv_free；属性不可用返回 None
+pub fn get_property_string(ctx: *mut MpvHandle, name: &str) -> Result<Option<String>, String> {
+    let a = api()?;
+    let name = CString::new(name).map_err(|e| e.to_string())?;
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let r = unsafe {
+        (a.get_property)(
+            ctx,
+            name.as_ptr(),
+            MPV_FORMAT_STRING,
+            &mut out as *mut *mut c_char as *mut c_void,
+        )
+    };
+    if r != MPV_ERROR_SUCCESS || out.is_null() {
+        return Ok(None);
+    }
+    let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+    unsafe { (a.mpv_free)(out) };
+    Ok(Some(s))
+}
+
+/// 订阅属性变更（client.h mpv_observe_property，FLAG 格式）。成功后 mpv 立即
+/// 推送一次当前值，此后每次变更推送 MPV_EVENT_PROPERTY_CHANGE——消费侧
+/// （事件泵）据此维护本地缓存，帧路径不再进 mpv 读属性
+pub fn observe_property_flag(ctx: *mut MpvHandle, name: &str) -> Result<(), String> {
+    observe_property_fmt(ctx, name, MPV_FORMAT_FLAG)
+}
+
+/// 同上，DOUBLE 格式（time-pos/duration 等数值属性）
+pub fn observe_property_double(ctx: *mut MpvHandle, name: &str) -> Result<(), String> {
+    observe_property_fmt(ctx, name, MPV_FORMAT_DOUBLE)
+}
+
+fn observe_property_fmt(ctx: *mut MpvHandle, name: &str, fmt: c_int) -> Result<(), String> {
+    let a = api()?;
+    let name = CString::new(name).map_err(|e| e.to_string())?;
+    // 成功返回 reply_userdata（>0），失败返回负错误码
+    let r = unsafe { (a.observe_property)(ctx, 0, name.as_ptr(), fmt) };
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
     }
 }
 
