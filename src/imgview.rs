@@ -15,9 +15,9 @@
 //!   按浏览器惯例钳到 100ms（坏帧疯闪）；帧数封顶 [`MAX_ANIM_FRAMES`] 防内存
 //!   失控。逐帧纹理 + `tick` 推进，UI 每帧取当前帧并
 //!   `request_repaint_after(帧延迟)` 驱动播放。
-//! - webp：全部按静图取首帧——image-webp 对静态文件 `num_frames()==0`，
-//!   `into_frames` 解出空集（实测踩坑）；动画 webp 罕见，不值得为逐帧
-//!   引入分流复杂度。
+//! - webp：`has_animation()`（VP8X 头 ANIM 位）先验分流——动画走 gif 同款
+//!   逐帧解码；静态走单帧 decode（image-webp 静态文件 `num_frames()==0`，
+//!   `into_frames` 解出空集，实测踩坑，不可盲目逐帧）。
 //! - 失败：解码错误经 [`ImgEvent::Failed`] 回传，UI 回退 mpv 播放该条目。
 //!
 //! 缩放/平移的纯几何函数（[`fit_scale`]/[`zoom_pan`]/[`clamp_pan`]）也放在这里，
@@ -85,8 +85,8 @@ pub struct ImgView {
 }
 
 /// 该条目是否走纹理直显 + 配置开关。
-/// 静态图（含全部 webp）与 gif 动图都走：gif 由 image crate `into_frames`
-/// 逐帧解码、egui 定时 repaint 播放；webp 按静图取首帧（13.4 第 4 步）。
+/// 静态图与动图（gif / 动画 webp）都走：由 image crate `into_frames`
+/// 逐帧解码、egui 定时 repaint 播放（13.4 第 4 步）。
 /// mpv 只保留视频职责与解码失败兜底
 pub fn wants_texture(cfg: &crate::config::Config, name: &str) -> bool {
     cfg.ui.image_texture && cfg.is_image_ext(name)
@@ -542,9 +542,9 @@ fn decode_image(
     }
 }
 
-/// 按格式分流：gif 走逐帧解码（单帧 gif 归静态）；webp 及其余格式走单帧
-/// decode（webp 全按静图取首帧——image-webp 静态文件 num_frames()==0，
-/// into_frames 解出空集，实测踩坑；动画 webp 罕见不做逐帧）
+/// 按格式分流：gif 与动画 webp 走逐帧解码（单帧归静态）；静态 webp 与其余
+/// 格式走单帧 decode。webp 经 `has_animation()`（VP8X 头 ANIM 位）先验分流：
+/// 静态文件 `num_frames()==0`、`into_frames` 解出空集（LOG2 踩坑），不可盲目逐帧
 fn decode_any<R: BufRead + Seek>(
     reader: image::ImageReader<R>,
     max_dim: u32,
@@ -577,9 +577,33 @@ fn decode_any<R: BufRead + Seek>(
         });
     }
     let t = std::time::Instant::now();
-    let img = reader
-        .decode()
-        .map_err(|e| format!("解码图片失败: {e}"))?;
+    // webp 分流：动画（VP8X ANIM 位置位）复用 gif 全套逐帧机制——帧迭代
+    // 产画布尺寸合成帧 + 毫秒延迟，与 gif 帧完全同构；静态走 ImageDecoder
+    // 直解（read_image 自带 seek 回图像数据块），接下方共享尾部
+    let img = if fmt == Some(image::ImageFormat::WebP) {
+        let dec = image::codecs::webp::WebPDecoder::new(reader.into_inner())
+            .map_err(|e| format!("打开 WebP 失败: {e}"))?;
+        if dec.has_animation() {
+            let t = std::time::Instant::now();
+            let frames = collect_frames(dec.into_frames(), max_dim)?;
+            tracing::debug!(
+                "解码 webp 动画 [{base}] {} 帧: {}ms",
+                frames.len(),
+                t.elapsed().as_millis()
+            );
+            return Ok(if frames.len() == 1 {
+                let (img, _) = frames.into_iter().next().expect("len==1");
+                Decoded::Static(img)
+            } else {
+                Decoded::Anim(frames)
+            });
+        }
+        image::DynamicImage::from_decoder(dec).map_err(|e| format!("解码图片失败: {e}"))?
+    } else {
+        reader
+            .decode()
+            .map_err(|e| format!("解码图片失败: {e}"))?
+    };
     // 两档尺寸适配（策略见 resample）：基础档 LRU 存 native×ppp（翻页
     // 即 100% 密度直出）；高清档 full 槽存 native×ppp×2（深放大用，
     // clamp 8192）。factor 由 ImageService 按屏幕 DPI 定
@@ -1092,6 +1116,31 @@ mod tests {
         };
         // 8x6 ≤512 触发小图 ×2 上采样（resample 既有行为）
         assert_eq!(tex.size, [16, 12]);
+    }
+
+    #[test]
+    fn decode_动画webp逐帧() {
+        // 夹具：ffmpeg libwebp 生成的 2 帧动画（红/蓝 20×14，100ms/帧，
+        // VP8X ANIM 位置位 + ANIM/ANMF 块）——has_animation 路由进 gif
+        // 同款逐帧机制；动图不预放大，帧为画布原尺寸
+        let bytes = include_bytes!("testdata/anim2.webp");
+        let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("anim2.webp");
+        std::fs::write(&p, bytes).unwrap();
+        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "anim2.webp", false).unwrap();
+        std::fs::remove_file(&p).ok();
+        let Decoded::Anim(frames) = out else {
+            panic!("动画 webp 应走逐帧路径（Decoded::Anim）");
+        };
+        assert_eq!(frames.len(), 2, "两个 ANMF 帧都应解出");
+        assert_eq!(frames[0].0.size, [20, 14], "动图帧为画布原尺寸（不预放大）");
+        assert_eq!(frames[0].1, Duration::from_millis(100));
+        // 帧序与颜色：首帧红、次帧蓝（lavfi 纯色 + VP8L 无损，通道优势明显）
+        let (r, g, b, _) = frames[0].0.pixels[0].to_tuple();
+        assert!(r > 200 && g < 60 && b < 60, "首帧应为红色，实为 ({r},{g},{b})");
+        let (r, g, b, _) = frames[1].0.pixels[0].to_tuple();
+        assert!(b > 200 && r < 60 && g < 60, "次帧应为蓝色，实为 ({r},{g},{b})");
     }
 
     #[test]

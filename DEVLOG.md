@@ -130,6 +130,12 @@ click 天然是单次事件）。修复：改用真实 `Event::MouseWheel` 事�
 教训：只对 GIF 做过内存编码的单测（image crate 能编 GIF），webp 分支零覆盖——
 引入新格式的特殊路径前，先用 `cargo tree`/源码确认该格式解码器的实际行为。
 
+后记（后续演进）：webp 后改为 `has_animation()`（VP8X ANIM 位）先验分流——
+动画 webp 走 gif 同款逐帧、静态仍单帧；本坑根因（静态 `num_frames()==0`
+空集）正是分流不可省的前提（ARCHITECTURE §13.4，回归测试
+`decode_动画webp逐帧`，夹具经 ffmpeg libwebp 生成——image-webp 0.2.4
+encoder 不支持动画编码）。
+
 ### 坑 5：LRU 只保护刚推入的 key → 滚轮连翻把正在显示的图挤出 → 永久占位
 
 现象：滚轮来回切换几次后回到某 jpg，画面永久停在"正在解码图片…"，且只有

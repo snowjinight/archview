@@ -40,7 +40,7 @@
 | 压缩包格式 | ZIP、7Z、RAR（含 RAR4/RAR5、分卷） |
 | 媒体类型 | 视频（播放）、图片（预览），文件分散在压缩包任意子目录 |
 | 播放能力 | 内嵌播放、拖动进度条 seek、暂停/音量等常规控制 |
-| 图片预览 | 缩放/平移/适应窗口、上一张/下一张、动图(GIF；webp 全按静图) |
+| 图片预览 | 缩放/平移/适应窗口、上一张/下一张、动图(GIF/动画 webp 按帧逐帧播) |
 | 加密包 | 支持密码输入（不落盘） |
 | 配置 | 所有可变项集中在单一 JSON 配置文件，与代码解耦 |
 
@@ -57,7 +57,7 @@
 | 7Z 读取 | `sevenz-rust` | 纯 Rust；`BlockDecoder` 支持固态 folder 直达解压（见 11.1） |
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
 | 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 20 符号：核心 + stream_cb + render API）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
-| 图片渲染 | `image` crate | 静态图（含全部 webp）与 GIF 动图走 egui 纹理直显（13.4）：两档纹理按屏幕密度适配（基础 ×ppp / 深放大 full ×ppp×2）/全帧预解码/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
+| 图片渲染 | `image` crate | 静态图与 GIF/动画 webp 动图走 egui 纹理直显（13.4）：两档纹理按屏幕密度适配（基础 ×ppp / 深放大 full ×ppp×2）/全帧预解码/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
 | GL 后端 | `eframe` (glow) | 渲染器显式指定 glow（0.34 起 eframe 默认 wgpu，glow 才能拿到 `GL` 上下文喂给 mpv render API） |
 | 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
@@ -308,7 +308,7 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 
 ```
 选中图片 → ZipVFS 流式（zvf://）或固态包后台解压 → 缓存文件
-        → image crate 解码 → egui 纹理直显（静态图含全部 webp / GIF 动图逐帧，13.4）
+        → image crate 解码 → egui 纹理直显（静态图 / GIF·动画 webp 动图逐帧，13.4）
         → 解码失败自动回退 mpv loadfile（旧链路保留为兜底；回退过的条目直接走 mpv）
         → PPT 式自动翻页（ui.slideshow_secs 间隔，空格/播放按钮开关）
 ```
@@ -318,7 +318,7 @@ egui 一个平面**，视频/图片帧经 PaintCallback blit 进 egui 画布，�
 | 功能 | 说明 |
 |---|---|
 | 翻页 | PgUp/PgDn、←/→ 切换上/下一个；滚轮在媒体区悬停时**模式感知**——视频或图片 fit 态 = 翻页（`ui.wheel_switch_secs` 节流），图片缩放态 = 锚光标缩放（缩小触底自动落 fit，13.4 交互）；文件列表区滚轮是正常滚动列表，不切换 |
-| 动图 | GIF 动画逐帧预解码 + egui 定时切帧（13.4 第 4 步）；webp 全按静图取首帧（动画 webp 罕见，且静态 webp 无 ANMF 块 `num_frames()==0`，逐帧路线解出空集误报失败，实测踩坑） |
+| 动图 | GIF / 动画 webp 逐帧预解码 + egui 定时切帧（13.4 第 4 步）；webp 经 `has_animation()`（VP8X ANIM 位）先验分流——静态 webp 无 ANMF 块 `num_frames()==0`，盲走逐帧解出空集误报失败（实测踩坑），故静态走单帧 decode |
 | 放大细节 | 两档纹理按屏幕密度（ppp）适配（13.4）：基础档 ×ppp 进 LRU（翻页即原生密度直出）；深放大（zoom×ppp>`image_full_threshold`，默认 2.0 即越过 244% 滚轮档（×2 密度采样比 ≥1 才有肉眼增益，195% 档实拍 A/B 无差））后台解 full 档 ×ppp×2（封顶 8192、无 mipmap 直采，`image_full_sharpen` 默认叠加 unsharp mask 锐化）无缝换画；100% = 1 纹素:1 物理像素（zoom=1/ppp）零重采样最锐点 |
 | 自动播放 | PPT 式自动翻页，间隔 `ui.slideshow_secs` 可配 |
 | 分类 | 视频/图片标签页按扩展名分栏（config.toml `media.*_extensions`） |
@@ -399,7 +399,7 @@ player      : 自研 mpv_ffi（libloading 动态加载 libmpv-2.dll，含 stream
 archive/zip : zip
 archive/7z  : sevenz-rust (BlockDecoder 固态直达)
 archive/rar : unrar (UnRAR.dll)
-image       : image 0.25（jpeg/png/webp/gif/bmp/tiff/ico/tga 解码 → egui 纹理直显，见 13.4；webp 全按静图）
+image       : image 0.25（jpeg/png/webp/gif/bmp/tiff/ico/tga 解码 → egui 纹理直显，见 13.4；动画 webp 经 has_animation 分流逐帧）
 config      : serde + toml (config.toml)
 logging     : tracing
 sort        : alphanumeric-sort (file list natural order, optional mode for comic/image collections)
@@ -854,13 +854,16 @@ App::play → wants_texture(cfg, name)          # image_texture 开 && 图片扩
 ```
 
 **路由**（✅）：play() 顶部统一密码检查后按扩展名分流（`imgview::wants_texture`：
-静态图（**含全部 webp**——动画 webp 也只取首帧）+ GIF 动图 + `ui.image_texture`
+静态图 + GIF / 动画 webp 动图 + `ui.image_texture`
 开关；**动图也走纹理直显，mpv 收缩为纯视频播放器**）——流式 zip/目录图走
 `play_image()`（不解压、不 ensure_player），7z/RAR 图照常解压会话，FileDone/
-缓存命中经 `load_extracted()` 分流纹理解码。纹理路径解码失败（格式不支持/数据
+缓存命中经 `load_extracted()` 分流纹理解码。webp 动/静在 `decode_any` 内经
+`WebPDecoder::has_animation()`（VP8X ANIM 位）分流：动画走 gif 同款 `into_frames`
+逐帧（帧迭代产画布尺寸合成帧 + 毫秒延迟，与 gif 完全同构），静态走单帧
+decode（不可盲目逐帧——静态 `num_frames()==0` 空集误报，DEVLOG §2 坑 4）；
+`new()` 时头已解析，检查零额外成本。纹理解码失败（格式不支持/数据
 损坏）经 `ImgEvent::Failed` **自动落回 mpv**（流式 load 流 URL / 落盘 load_path），
-两条路径互为兜底；config `ui.image_texture` 开关一键整体回退。曾评估过"压缩包内
-读 webp 头部 VP8X ANIM 位区分动/静"的路由细化，放弃：为路由而读头增加复杂度。
+两条路径互为兜底；config `ui.image_texture` 开关一键整体回退。
 
 **回退链路**（✅）：纹理解码失败回退 mpv 时，`img_fallback: HashSet<ImgKey>`
 记入 + `tex_image_key()` 剔除 + `prefetch_images()` 跳过——否则 mpv 已解出首帧
@@ -993,13 +996,14 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
 1. ✅ 静态图纹理路径 + 路由 + 失败回退（核心收益：翻页零延迟）；
 2. ✅ 滚轮缩放（锚定光标）/ 拖拽平移 / 双击 fit↔100% + 快捷键（+/−/0/Home）；
 3. ✅ ±1 预取 LRU；
-4. ✅ GIF 动图逐帧解码接管（image crate `AnimationDecoder::into_frames`
+4. ✅ GIF / 动画 webp 逐帧解码接管（image crate `AnimationDecoder::into_frames`
    全帧预解码 + 逐帧纹理；mpv 图片链路的 5s 黑屏/200ms 空洞问题随之整体消失；
    **预取对动图生效**——mpv 路线动图走 loadfile 无法进 LRU，这是决定性差距）：
-   - **webp 不走逐帧**：静态 webp 无 ANMF 块，image-webp `num_frames()==0`，
-     `into_frames()` 解出空集 → 误报"动画无有效帧"回退 mpv（LOG2 实测踩坑，
-     回归测试 `decode_静态webp归静态`）；动画 webp 罕见，全按静图取首帧——
-     `decode_any` 仅 GIF 走逐帧，webp 及其余格式走单帧 `decode()`；
+   - **webp 经 has_animation 分流**：VP8X ANIM 位置位走 gif 同款逐帧，
+     静态走单帧 decode——不可盲走逐帧：静态 webp 无 ANMF 块，image-webp
+     `num_frames()==0`，`into_frames()` 解出空集 → 误报"动画无有效帧"
+     回退 mpv（LOG2 实测踩坑，DEVLOG §2 坑 4）；回归测试
+     `decode_静态webp归静态` / `decode_动画webp逐帧` 各锁一路径；
    - 静态归一：解出 1 帧自动归 `Decoded::Static`（零时钟开销），判定依据是
      解码结果而非扩展名/头部；
    - 播放：`Cached { frames, delays, cur, next_at }` 状态机，UI 层取帧时推进
