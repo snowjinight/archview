@@ -19,7 +19,7 @@ impl App {
         tracing::info!("全屏: {on}");
     }
 
-    /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张），Shift+←/→=±1s，
+    /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张；视频暂停时=上一帧/下一帧），
     /// ↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
     /// L=视频播放模式切换（列表播放↔单视频循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
@@ -38,6 +38,8 @@ impl App {
         let mut seek_rel = 0.0f64;
         let mut vol_delta = 0i64;
         let (mut do_pause, mut do_mute, mut step_entry) = (false, false, 0i32);
+        // 视频暂停时的方向键 = 逐帧步进（上一帧/下一帧）
+        let mut frame_dir = 0i32;
         // L=视频播放模式切换（列表播放↔单视频循环）
         let mut loop_toggle = false;
         // 回车=切换全屏；Esc=退出全屏（仅全屏时消费，避免抢其它控件的 Esc）
@@ -49,6 +51,8 @@ impl App {
         let mut ask_next_key = false;
         // 图片模式缩放：+/−=步进，0=100%，Home=适应窗口
         let img_mode = self.tex_image_key().is_some();
+        // 视频暂停态（进 mpv 前读本地原子缓存，不阻塞）
+        let vid_paused = !img_mode && self.player.as_ref().is_some_and(|p| p.paused());
         let (mut zoom_in, mut zoom_out, mut zoom_100, mut zoom_fit) = (false, false, false, false);
         // 从事件流里直接消费按键（过滤按住重复触发）：
         // 移除后同帧内其它控件（如聚焦的按钮）不会再响应，避免双重触发
@@ -94,11 +98,20 @@ impl App {
                         false
                     }
                     egui::Key::ArrowLeft => {
-                        seek_rel = if m.shift { -1.0 } else { -5.0 };
+                        // 暂停时=上一帧（逐帧），播放中=快退 5s
+                        if vid_paused {
+                            frame_dir = -1;
+                        } else {
+                            seek_rel = -5.0;
+                        }
                         false
                     }
                     egui::Key::ArrowRight => {
-                        seek_rel = if m.shift { 1.0 } else { 5.0 };
+                        if vid_paused {
+                            frame_dir = 1;
+                        } else {
+                            seek_rel = 5.0;
+                        }
                         false
                     }
                     // 缩放键（图片模式）：+/=/− 步进，0=100%，Home=适应窗口。
@@ -179,6 +192,9 @@ impl App {
         if let Some(p) = &self.player {
             if seek_rel != 0.0 {
                 p.seek_relative(seek_rel);
+            }
+            if frame_dir != 0 {
+                p.frame_step(frame_dir);
             }
             if do_mute {
                 p.toggle_mute();

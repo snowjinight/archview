@@ -618,6 +618,23 @@ impl PlayerService {
         }
     }
 
+    /// 逐帧步进：dir>0 = frame-step（下一帧），dir<0 = frame-back-step（上一帧）。
+    /// mpv 语义：播放中调 frame-step 会自动暂停；UI 侧只在暂停时映射方向键，
+    /// 播放中误触发也安全（等效暂停 + 步进）。opening 短路同 toggle_pause
+    pub fn frame_step(&self, dir: i32) {
+        if self.opening() {
+            return;
+        }
+        let cmd = if dir >= 0 {
+            "no-osd frame-step"
+        } else {
+            "no-osd frame-back-step"
+        };
+        if let Err(e) = mpv_ffi::command_string(self.ctx, cmd) {
+            tracing::error!("逐帧步进失败: {e}");
+        }
+    }
+
     /// 静音切换
     pub fn toggle_mute(&self) {
         // 同 toggle_pause：cycle 内部翻转，按键路径无属性读。
