@@ -124,6 +124,9 @@ pub struct PlayerConfig {
     /// 延迟出现的流（TS/mkv 多音轨场景）
     pub demuxer_analyzeduration: String,
     pub volume: i64,
+    /// 静音状态（唯一真相，持久化）：未播放/无播放器时也可预设，
+    /// 播放器创建时与 volume 一起应用
+    pub muted: bool,
     /// 订阅 mpv 内部日志（"no" 关闭；诊断切换延迟时可设 "v"）
     pub mpv_log_level: String,
 }
@@ -168,6 +171,7 @@ impl Default for PlayerConfig {
             demuxer_probesize: "2MiB".into(),
             demuxer_analyzeduration: "1".into(),
             volume: 100,
+            muted: false,
             mpv_log_level: "no".into(),
         }
     }
@@ -443,6 +447,8 @@ demuxer_probesize = "2MiB"
 demuxer_analyzeduration = "1"
 	# 初始音量（0-100）
 volume = 100
+	# 静音（重启保持；未播放时也可预先设置，播放器创建时生效）
+muted = false
 	# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
 	# 诊断 mpv 内部行为（demux 探测/hwdec/解码链路）时临时设 "v"——
 	# 量极大，转发到主程序日志；平时保持 "no"

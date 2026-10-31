@@ -526,8 +526,9 @@ impl eframe::App for App {
         // 文件列表放左侧（视频区在右）；悬停行显示完整包内路径气泡
         //（路径/文件名分色）。render API 单平面后气泡不再被 mpv 原生
         // 子窗口遮挡，hover 已恢复（wid 时代曾因此禁用）
+        // 默认宽度 220：列表只显示文件名（目录段在悬停气泡），不需要 300 宽
         egui::Panel::left("files")
-            .default_size(300.0)
+            .default_size(220.0)
             .show(ui, |ui| self.file_list(ui));
         probe!("files");
         egui::CentralPanel::default().show(ui, |ui| self.video_area(ui, &ctx));

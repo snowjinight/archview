@@ -125,7 +125,7 @@ impl App {
                                 ("← / →", "上一张 / 下一张"),
                                 ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
                                 ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
-                                ("+ / -", "缩放步进（锚视口中心）"),
+                                ("+ / - / ↑ / ↓", "缩放步进（锚视口中心）"),
                                 ("0", "100% 显示"),
                                 ("Home", "适应窗口"),
                                 ("鼠标拖拽", "平移已放大的图片"),
@@ -227,7 +227,7 @@ impl App {
             )
             .on_hover_text(a.path.display().to_string());
         } else {
-            ui.weak("未打开压缩包");
+            ui.weak("未打开压缩包或目录");
         }
         ui.horizontal(|ui| {
             ui.label("Search:");
@@ -1175,8 +1175,19 @@ impl App {
         }
         let mut act = Act::default();
 
-        // 顶部：进度条（点击/拖动 seek）
-        self.seek_bar(ui);
+        // 顶部：进度条（仅视频模式——图片无进度概念，但位置照常占位留空，
+        // 控制栏高度与视频模式一致，按钮组/媒体区零位移；未播放仍画空轨道，
+        // 允许点击预设位置）
+        if !self.playing_is_image() {
+            self.seek_bar(ui);
+        } else {
+            // 图片模式：同尺寸隐形占位（不可见、不响应交互），进度条位置空着
+            let rect = egui::Rect::from_min_size(
+                ui.max_rect().min,
+                egui::vec2(ui.available_width(), 18.0),
+            );
+            ui.allocate_rect(rect, egui::Sense::hover());
+        }
 
         // 下部：按钮组（水平居中）+ 右侧音量条
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1236,39 +1247,75 @@ impl App {
                 if icon_btn(ui, icon, tip, self.video_loop) {
                     act.loop_toggle = true;
                 }
+            } else {
+                // 图片模式占同尺寸隐形槽：按钮组宽度与视频模式（4 槽）一致，
+                // 切图↔视频零位移
+                ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
             }
 
-            // 右侧：音量条（右对齐，固定宽度；始终显示，播放器未就绪时只存配置）
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut vol = self.cfg.player.volume;
-                let resp = ui.add_sized(
-                    [vol_w, ui.available_height().max(20.0)],
-                    egui::Slider::new(&mut vol, 0..=100).text("音量"),
-                );
-                if resp.changed() {
-                    self.cfg.player.volume = vol;
-                    if let Some(p) = &self.player {
-                        p.set_volume(vol); // 内部会顺带解除静音
-                    }
-                }
-                // 静音时在音量条左侧显示红色提示（点击解除静音）
-                let muted = self.player.as_ref().map(|p| p.muted()).unwrap_or(false);
-                if muted {
-                    let m = ui
-                        .selectable_label(
-                            false,
-                            egui::RichText::new("静音")
-                                .color(egui::Color32::RED)
-                                .strong(),
-                        )
-                        .on_hover_text("已静音（M 键切换）；点击此处或调整音量可解除");
-                    if m.clicked() {
+            // 右侧：♪ 静音按钮 + 音量条（仅视频模式；右对齐固定宽度，播放器
+            // 未就绪时只写配置）。图片模式整块不画但左侧留白公式不变——
+            // 按钮组与视频模式零位移。♪ 用雅黑字形（🔊🔇 emoji 雅黑无字形
+            // 且 egui 不光栅化彩色 emoji → 豆腐块）。静音真相在 cfg.player.muted：
+            // 未播放/未开文件也可预设，播放器在场才下发、创建时统一应用；
+            // 静音时 ♪ 叠删除线，拖动滑条即解除
+            if !self.playing_is_image() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut vol = self.cfg.player.volume;
+                    // 右到左布局先加在最右：音量数字只读 label 占位（不可
+                    // 输入，文本在滑条更新后画到该槽，即滑条右侧）
+                    let (num_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(26.0, 18.0), egui::Sense::hover());
+                    let resp = ui.add_sized(
+                        [vol_w - 40.0 - 26.0, ui.available_height().max(20.0)],
+                        egui::Slider::new(&mut vol, 0..=100).show_value(false),
+                    );
+                    if resp.changed() {
+                        self.cfg.player.volume = vol;
                         if let Some(p) = &self.player {
-                            p.toggle_mute();
+                            p.set_volume(vol); // 内部会顺带解除静音
+                        }
+                        // 拖动即解除静音：cfg 真相同步清（set_volume 已对
+                        // mpv 下发 mute=no，此处只管 cfg 与 UI 图标一致）
+                        self.cfg.player.muted = false;
+                    }
+                    // 数字 label：只读展示（本帧最新值，无输入框交互）
+                    ui.painter().text(
+                        num_rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        vol.to_string(),
+                        egui::FontId::proportional(12.5),
+                        egui::Color32::GRAY,
+                    );
+                    // ♪ 独立 toggle 按钮（滑条左侧）：点击翻转静音，
+                    // 未播放也可用（只改 cfg，播放器创建时生效）。
+                    // fill 全透明：不显示按钮底色方框，只留字形
+                    let muted = self.cfg.player.muted;
+                    let mut icon = egui::RichText::new("♪").size(18.0);
+                    if muted {
+                        icon = icon.strikethrough();
+                    }
+                    let tip = if muted {
+                        "已静音：点击恢复声音（M）"
+                    } else {
+                        "静音（M）"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(icon)
+                                .fill(egui::Color32::TRANSPARENT)
+                                .min_size(egui::vec2(36.0, 34.0)),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.cfg.player.muted = !self.cfg.player.muted;
+                        if let Some(p) = &self.player {
+                            p.set_muted(self.cfg.player.muted);
                         }
                     }
-                }
-            });
+                });
+            }
         });
 
         // 闭包外应用动作（避免嵌套借用 self）

@@ -20,13 +20,45 @@ impl App {
     }
 
     /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张；视频暂停时=上一帧/下一帧），
-    /// ↑/↓=音量±5，M=静音，PgUp/PgDn=上一个/下一个，
+    /// ↑/↓=模式分治：图片=缩放步进、视频=音量±5；M=静音（仅视频；
+    /// 真相在 cfg，未播放/未开文件也可预设），
+    /// PgUp/PgDn=上一个/下一个，
     /// L=视频播放模式切换（列表播放↔单视频循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
-    /// 图片模式：+/−=缩放（锚视口中心），0=100%，Home=适应窗口
+    /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
         if self.player.is_none() && self.tex_image_key().is_none() {
+            // 未开任何文件时 M 仍可预设静音——真相在 cfg（与控制栏 ♪ 按钮一致），
+            // 播放器创建时统一应用；其余快捷键无作用对象，直接返回
+            if ctx.memory(|m| m.focused()) == Some(search_box_id()) {
+                return;
+            }
+            let mut do_mute = false;
+            ctx.input_mut(|i| {
+                i.events.retain(|e| match e {
+                    // IME 下字母键常只产 Text 事件（无 Key 事件），两种都要匹配
+                    egui::Event::Text(t) if t == "m" || t == "M" => {
+                        do_mute = true;
+                        false
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::M,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.is_none() => {
+                        do_mute = true;
+                        false
+                    }
+                    _ => true,
+                });
+            });
+            if do_mute {
+                // 播放器不在场只写 cfg（同 ♪ 按钮的未播放分支）
+                self.cfg.player.muted = !self.cfg.player.muted;
+            }
             return;
         }
         // 只有搜索框聚焦时才让出键盘（输入搜索词需要空格/字母/方向键）。
@@ -51,6 +83,8 @@ impl App {
         let mut ask_next_key = false;
         // 图片模式缩放：+/−=步进，0=100%，Home=适应窗口
         let img_mode = self.tex_image_key().is_some();
+        // 音量/静音仅视频模式生效（真视频；mpv 回退图虽走播放器但无声可调）
+        let vid_mode = !self.playing_is_image();
         // 视频暂停态（进 mpv 前读本地原子缓存，不阻塞）
         let vid_paused = !img_mode && self.player.as_ref().is_some_and(|p| p.paused());
         let (mut zoom_in, mut zoom_out, mut zoom_100, mut zoom_fit) = (false, false, false, false);
@@ -59,9 +93,9 @@ impl App {
         ctx.input_mut(|i| {
             i.events.retain(|e| {
                 // 中文输入法下字母键往往只产生 Text 事件（无 Key 事件）——
-                // M 静音必须同时匹配两种事件，否则在 IME 开启时失灵
+                // M 静音必须同时匹配两种事件，否则在 IME 开启时失灵（仅视频）
                 if let egui::Event::Text(t) = e {
-                    if t == "m" || t == "M" {
+                    if (t == "m" || t == "M") && vid_mode {
                         do_mute = true;
                         return false;
                     }
@@ -132,15 +166,25 @@ impl App {
                         zoom_fit = true;
                         false
                     }
+                    // ↑/↓ 模式分治：图片=缩放步进（与 +/− 同款），视频=音量±5；
+                    // mpv 回退图两不沾（无缩放 UI、无声可调）——消费掉防焦点漂移
                     egui::Key::ArrowUp if m.is_none() => {
-                        vol_delta = 5;
+                        if img_mode {
+                            zoom_in = true;
+                        } else if vid_mode {
+                            vol_delta = 5;
+                        }
                         false
                     }
                     egui::Key::ArrowDown if m.is_none() => {
-                        vol_delta = -5;
+                        if img_mode {
+                            zoom_out = true;
+                        } else if vid_mode {
+                            vol_delta = -5;
+                        }
                         false
                     }
-                    egui::Key::M if m.is_none() => {
+                    egui::Key::M if m.is_none() && vid_mode => {
                         do_mute = true;
                         false
                     }
@@ -189,6 +233,14 @@ impl App {
         if loop_toggle {
             self.toggle_video_loop();
         }
+        // M：静音翻转。真相在 cfg——未播放/未开文件也可预设，
+        // 播放器在场才下发 mpv（不在场则等创建时统一应用）
+        if do_mute {
+            self.cfg.player.muted = !self.cfg.player.muted;
+            if let Some(p) = &self.player {
+                p.set_muted(self.cfg.player.muted);
+            }
+        }
         if let Some(p) = &self.player {
             if seek_rel != 0.0 {
                 p.seek_relative(seek_rel);
@@ -196,13 +248,13 @@ impl App {
             if frame_dir != 0 {
                 p.frame_step(frame_dir);
             }
-            if do_mute {
-                p.toggle_mute();
-            }
             if vol_delta != 0 {
                 let v = (self.cfg.player.volume + vol_delta).clamp(0, 100);
                 p.set_volume(v);
                 self.cfg.player.volume = v;
+                // 调音量即解除静音（set_volume 已对 mpv 下发 mute=no，
+                // cfg 真相同步清除，UI 图标与持久化保持一致）
+                self.cfg.player.muted = false;
             }
         }
         if step_entry != 0 {

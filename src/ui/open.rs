@@ -392,10 +392,15 @@ impl App {
         self.list_rows = tab_items
             .into_iter()
             .enumerate()
-            .map(|(n, (idx, name))| ListRow {
-                idx,
+            .map(|(n, (idx, name))| {
+                // 行文本只显示文件名（目录段在悬停气泡双色展示）：内部键、排序、
+                // 播放/解压全走 entries[idx].name 完整路径，此处仅显示层剥离。
                 // 换行符清洗成空格：内嵌 \n 会把行撑成多行高，破坏虚拟化等高前提
-                label: format!("[{}/{}] {}", n + 1, total, name).replace(['\n', '\r'], " "),
+                let file = name.rsplit_once('/').map(|(_, f)| f).unwrap_or(name);
+                ListRow {
+                    idx,
+                    label: format!("[{}/{}] {}", n + 1, total, file).replace(['\n', '\r'], " "),
+                }
             })
             .collect();
         self.list_counts = counts;

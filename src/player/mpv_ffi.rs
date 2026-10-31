@@ -143,6 +143,14 @@ struct MpvApi {
         name: *const c_char,
         data: *const c_char,
     ) -> c_int,
+    /// 异步版本：入队即返回不拿 core 锁（client.h：data 会被 mpv 拷贝）
+    set_property_async: unsafe extern "C" fn(
+        ctx: *mut MpvHandle,
+        reply_userdata: u64,
+        name: *const c_char,
+        format: c_int,
+        data: *mut c_void,
+    ) -> c_int,
     get_property: unsafe extern "C" fn(
         ctx: *mut MpvHandle,
         name: *const c_char,
@@ -214,6 +222,7 @@ pub fn init(dll_dir: &Path) -> Result<(), String> {
             set_option_string: *lib.get(b"mpv_set_option_string").map_err(load_err)?,
             command_string: *lib.get(b"mpv_command_string").map_err(load_err)?,
             set_property_string: *lib.get(b"mpv_set_property_string").map_err(load_err)?,
+            set_property_async: *lib.get(b"mpv_set_property_async").map_err(load_err)?,
             get_property: *lib.get(b"mpv_get_property").map_err(load_err)?,
             error_string: *lib.get(b"mpv_error_string").map_err(load_err)?,
             mpv_free: *lib.get(b"mpv_free").map_err(load_err)?,
@@ -304,6 +313,38 @@ pub fn set_property_string(ctx: *mut MpvHandle, name: &str, data: &str) -> Resul
     let name = CString::new(name).map_err(|e| e.to_string())?;
     let data = CString::new(data).map_err(|e| e.to_string())?;
     let r = unsafe { (a.set_property_string)(ctx, name.as_ptr(), data.as_ptr()) };
+    if r < 0 {
+        Err(err_str(r))
+    } else {
+        Ok(())
+    }
+}
+
+/// 异步设置字符串属性：入队即返回，不等 core——同步版本与 get_property
+/// 同拿 core 锁，core 忙窗口（demux 探测等）内调用会阻塞 UI 线程。data 由
+/// mpv 拷贝（client.h 明示），调用返回后立即释放临时 CString 无碍。返回值
+/// 只反映入队成败；实际写入结果经 MPV_EVENT_SET_PROPERTY_REPLY 事件回报
+/// （当前泵不消费：静音/音量真相在 cfg，播放器创建时对齐）
+pub fn set_property_string_async(
+    ctx: *mut MpvHandle,
+    name: &str,
+    data: &str,
+) -> Result<(), String> {
+    let a = api()?;
+    let name = CString::new(name).map_err(|e| e.to_string())?;
+    let data = CString::new(data).map_err(|e| e.to_string())?;
+    // MPV_FORMAT_STRING 的 data 是指向 char* 的指针（二级），mpv 在调用内
+    // 拷贝字符串本体，调用返回后 CString 即可释放
+    let mut data_ptr = data.as_ptr();
+    let r = unsafe {
+        (a.set_property_async)(
+            ctx,
+            0, // reply_userdata：泵不消费回复事件，无需区分请求
+            name.as_ptr(),
+            MPV_FORMAT_STRING,
+            &mut data_ptr as *mut *const c_char as *mut c_void,
+        )
+    };
     if r < 0 {
         Err(err_str(r))
     } else {

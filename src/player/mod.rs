@@ -116,12 +116,10 @@ pub struct PlayerService {
     /// 每次都要等锁——帧探针实测切换后连续长帧合计 ~0.5s，即卡顿主体。
     /// opening() 门控因此持续到本标志置位而非首帧
     playback_ready: Arc<AtomicBool>,
-    /// mute 本地缓存（observe_property 订阅，事件泵收到 PROPERTY_CHANGE 更新）。
-    /// muted() 从此只读原子标志、不进 mpv——每帧一次的静音按钮状态查询不再
-    /// 受打开窗口期 core 锁长占影响，稳态也省一次跨 FFI 属性读
-    muted_cache: Arc<AtomicBool>,
-    /// pause 本地缓存（同 muted_cache 机制）。变更源：toggle_pause 的 cycle
-    /// 命令、EOF 时 keep-open 置 pause=yes——推送同步比门控读更及时准确
+    /// pause 本地缓存（observe_property 订阅，事件泵收到 PROPERTY_CHANGE 更新）。
+    /// 变更源：toggle_pause 的 cycle 命令、EOF 时 keep-open 置 pause=yes——
+    /// 推送同步比门控读更及时准确。mute 不走此机制：静音状态唯一真相在
+    /// cfg.player.muted（UI 直读写，播放器创建时应用），无 mpv 回读需求
     paused_cache: Arc<AtomicBool>,
     /// time-pos 本地缓存（f64 位模式存 AtomicU64，DOUBLE 推送）。变更源：
     /// playloop 每迭代推进、seek 后跳变。推送速率 ≈ 帧率（每迭代每属性
@@ -190,7 +188,6 @@ impl PlayerService {
             painted_since_load: Cell::new(true),
             first_frame: Arc::new(AtomicBool::new(true)),
             playback_ready: Arc::new(AtomicBool::new(true)),
-            muted_cache: Arc::new(AtomicBool::new(false)),
             paused_cache: Arc::new(AtomicBool::new(false)),
             time_pos_cache: Arc::new(AtomicU64::new(0.0f64.to_bits())),
             duration_cache: Arc::new(AtomicU64::new(0.0f64.to_bits())),
@@ -218,7 +215,6 @@ impl PlayerService {
             let stop = Arc::new(AtomicBool::new(false));
             let stop2 = stop.clone();
             let ready_flag = s.playback_ready.clone();
-            let muted_flag = s.muted_cache.clone();
             let paused_flag = s.paused_cache.clone();
             let eof_flag = s.eof_cache.clone();
             let buffering_flag = s.buffering_cache.clone();
@@ -245,9 +241,8 @@ impl PlayerService {
                         mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
                             ready_flag.store(true, Ordering::Relaxed);
                         }
-                        // 属性订阅推送：更新本地缓存（FLAG: mute/pause/eof-reached/
+                        // 属性订阅推送：更新本地缓存（FLAG: pause/eof-reached/
                         // pause-for-cache，DOUBLE: time-pos/duration）。变更源含
-                        // cycle 命令、set_volume 的 mute=no、EOF 时 keep-open 置
                         // pause=yes、seek 后 time-pos 跳变、缓冲翻转等一切内外部
                         // 变化，统一经此同步。name/data 指针仅当次事件内有效，
                         // 此处即时取值，不外传裸指针。处理保持零分配（字节比较 +
@@ -264,7 +259,6 @@ impl PlayerService {
                                     if p.format == mpv_ffi::MPV_FORMAT_FLAG {
                                         let v = unsafe { *(p.data as *const c_int) } != 0;
                                         match name {
-                                            b"mute" => muted_flag.store(v, Ordering::Relaxed),
                                             b"pause" => paused_flag.store(v, Ordering::Relaxed),
                                             b"eof-reached" => {
                                                 eof_flag.store(v, Ordering::Relaxed)
@@ -332,7 +326,7 @@ impl PlayerService {
         // 帧路径纯原子读，不再进 mpv——seek 后 core 忙窗口（实测 ~194ms）
         // 里任何 get_property 都会在 core 锁上阻塞 UI。time-pos/duration 为
         // DOUBLE，其余 FLAG
-        for prop in ["mute", "pause", "eof-reached", "pause-for-cache"] {
+        for prop in ["pause", "eof-reached", "pause-for-cache"] {
             if let Err(e) = mpv_ffi::observe_property_flag(ctx, prop) {
                 tracing::warn!("订阅 {prop} 属性失败（缓存将停在初始值 false）: {e}");
             }
@@ -364,6 +358,8 @@ impl PlayerService {
         s.opt("osc", "no"); // 禁用 mpv 内置 OSC（预览窗口里的白条进度条），进度条由 UI 提供
         s.opt("osd-level", "0"); // 不在预览窗口里弹 OSD 提示
         s.set_prop_str("volume", &cfg.player.volume.to_string());
+        // 静音状态唯一真相在 cfg（未播放时也可预设），播放器创建时统一应用
+        s.set_prop_str("mute", if cfg.player.muted { "yes" } else { "no" });
         // 核心：注册 zvf:// 自定义协议
         mpv_ffi::stream_cb_add_ro(ctx, "zvf", null_mut(), stream_cb::open_cb)
             .map_err(|e| format!("注册 zvf:// 协议失败: {e}"))?;
@@ -409,6 +405,18 @@ impl PlayerService {
     fn set_prop_str(&self, name: &str, value: &str) {
         if let Err(e) = mpv_ffi::set_property_string(self.ctx, name, value) {
             tracing::warn!("mpv 属性 {name}={value} 设置失败: {e}");
+        }
+    }
+
+    /// 运行时（播放器在场）的属性写入走异步版本：同步 set_property 与
+    /// get_property 同拿 core 锁，打开窗口（demux 探测等占锁，~0.5s）内
+    /// UI 线程调用会阻塞等锁、整帧冻结；异步入队即返回，core 空出手再
+    /// 应用（同 client 内写入顺序保持，volume 与 mute 交错不乱序）。
+    /// 写失败只经回复事件回报（泵不消费：真相在 cfg，创建时对齐）。
+    /// 创建期初始值仍走同步版——那时 core 空闲无竞争，还能即时报错
+    fn set_prop_str_async(&self, name: &str, value: &str) {
+        if let Err(e) = mpv_ffi::set_property_string_async(self.ctx, name, value) {
+            tracing::warn!("mpv 属性 {name}={value} 异步入队失败: {e}");
         }
     }
 
@@ -635,25 +643,16 @@ impl PlayerService {
         }
     }
 
-    /// 静音切换
-    pub fn toggle_mute(&self) {
-        // 同 toggle_pause：cycle 内部翻转，按键路径无属性读。
-        // 此处不短路——打开期静音是有效需求，最多等一次命令提交
-        if let Err(e) = mpv_ffi::command_string(self.ctx, "no-osd cycle mute") {
-            tracing::error!("切换静音失败: {e}");
-        }
-    }
-
-    /// 当前是否静音：observe_property 本地缓存，纯原子读。不进 mpv，故无需
-    /// opening 门控——打开窗口期 core 锁长占也不受影响
-    pub fn muted(&self) -> bool {
-        self.muted_cache.load(Ordering::Relaxed)
+    /// 静音状态设置（真相在 cfg.player.muted，UI 翻转后调用此处下发 mpv；
+    /// 未播放时只改 cfg，播放器创建时会统一应用）
+    pub fn set_muted(&self, on: bool) {
+        self.set_prop_str_async("mute", if on { "yes" } else { "no" });
     }
 
     pub fn set_volume(&self, v: i64) {
-        self.set_prop_str("volume", &v.to_string());
+        self.set_prop_str_async("volume", &v.to_string());
         // 主动调整音量即解除静音（含拖动音量条和方向键调音量）
-        self.set_prop_str("mute", "no");
+        self.set_prop_str_async("mute", "no");
     }
 
     /// 打开窗口期（loadfile → 首帧 && PLAYBACK_RESTART，2s 兜底自限）。
@@ -1135,8 +1134,8 @@ mod tests {
             "订阅后应立即收到初始值 mute=false 推送"
         );
 
-        // 2) cycle 翻转 → 推送 true；再翻回 → false（toggle_mute 与 set_volume
-        //    两条生产变更路径的缓存同步由此覆盖）
+        // 2) cycle 翻转 → 推送 true；再翻回 → false（FLAG 推送变更同步
+        //    机制实证，生产泵线程按值分发到缓存依赖此点）
         mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
         assert!(recv_flag(b"mute", true), "cycle 后应收到 mute=true 推送");
         mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
@@ -1228,6 +1227,66 @@ mod tests {
         } else {
             eprintln!("跳过 DOUBLE 订阅段：无 ffmpeg");
         }
+
+        mpv_ffi::destroy(ctx);
+    }
+
+    /// FFI 层 mpv_set_property_async 实证：入队即返回（不等 core，打开忙
+    /// 窗口内 UI 线程也不阻塞），写入由 core 异步完成——经 observe 推送
+    /// 验证 mute 真被置上；同时钉死 STRING data 拷贝语义（临时 CString
+    /// 释放后仍正确写入，client.h 承诺 data 会被拷贝）。运行时 mute/volume
+    /// 写入走异步（set_prop_str_async）的底层依据
+    #[test]
+    fn ffi_set_property_async() {
+        let Some(dll_dir) = find_mpv_dll_dir() else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
+        let ctx = mpv_ffi::create().unwrap();
+        mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "ao", "null").unwrap();
+
+        // 收一个 PROPERTY_CHANGE(mute) 且 FLAG 值等于 want（5s 超时）。
+        // 队列里混有 SET_PROPERTY_REPLY 回复事件，非目标事件自然跳过
+        let recv_mute = |want: bool| -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
+                if !ev.is_null() {
+                    let ev = unsafe { &*ev };
+                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
+                        && !ev.data.is_null()
+                    {
+                        let p =
+                            unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
+                        if !p.name.is_null()
+                            && p.format == mpv_ffi::MPV_FORMAT_FLAG
+                            && !p.data.is_null()
+                        {
+                            let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
+                            let v = unsafe { *(p.data as *const std::ffi::c_int) } != 0;
+                            if name == b"mute" && v == want {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+            }
+        };
+
+        mpv_ffi::observe_property_flag(ctx, "mute").expect("订阅 mute");
+        assert!(recv_mute(false), "订阅后应立即收到初始值 mute=false");
+
+        // 异步置 yes：入队调用立刻返回，随后 observe 推送 true 证明 core
+        // 已完成写入（写入成功与否也可看 SET_PROPERTY_REPLY 的 error 字段）
+        mpv_ffi::set_property_string_async(ctx, "mute", "yes").unwrap();
+        assert!(recv_mute(true), "异步 set mute=yes 后应收到 true 推送");
+        mpv_ffi::set_property_string_async(ctx, "mute", "no").unwrap();
+        assert!(recv_mute(false), "异步 set mute=no 后应收到 false 推送");
 
         mpv_ffi::destroy(ctx);
     }

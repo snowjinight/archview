@@ -347,7 +347,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions
-[player]  # hwdec / cache_secs / demuxer_max_mb / volume
+[player]  # hwdec / cache_secs / demuxer_max_mb / volume / muted
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
 [vartidy] # repo_dir / report_dir（CLI 整理子命令）
@@ -787,14 +787,21 @@ egui 绘制其余 UI（覆盖层/进度条天然与画面同平面叠放）
   vsync 边界，残余 judder 仅剩 fps 与刷新率的时钟漂移（ppm 级）。重复渲染同帧
   无害（mpv 重画上一帧）；A/V 同步误差 ≤1 个 vsync（低于感知阈值）。暂停/图片
   模式回落 100ms 慢节拍省功耗。
-- **播放状态全订阅缓存（observe_property，修复叙事见 DEVLOG §3）**：mute /
-  pause / eof-reached / pause-for-cache（FLAG → AtomicBool）+ time-pos /
-  duration（DOUBLE → AtomicU64 存 f64 位模式）共六属性经 `observe_property`
+- **播放状态全订阅缓存（observe_property，修复叙事见 DEVLOG §3）**：pause /
+  eof-reached / pause-for-cache（FLAG → AtomicBool）+ time-pos /
+  duration（DOUBLE → AtomicU64 存 f64 位模式）共五属性经 `observe_property`
   订阅推送，常驻事件泵 `MPV_EVENT_PROPERTY_CHANGE` 按格式分发（FLAG 读
   `*const c_int`、DOUBLE 读 `*const f64`）。**UI 帧路径零 `get_property`**——
   get_property 是同步 FFI（拿 mpv core 锁），core 忙窗口（seek/打开/hwdec 试探）
   排队可阻塞上百 ms（实测 seek 后 194ms 整帧冻结）；订阅缓存读取是纯原子操作
   纳秒级。订阅洪流上限 ≈ 帧率（time-pos ~60 条/s），泵消费百纳秒级/条。
+  mute 不走订阅：静音状态唯一真相在 `cfg.player.muted`（持久化，未播放/
+  未开文件也可预设），UI 直读写 cfg，播放器创建时与 volume 一起应用、
+  在场变更经 `set_muted` 走 `mpv_set_property_async` 异步下发——入队即
+  返回不拿 core 锁，打开忙窗口内点静音/拖音量 UI 线程零阻塞（同步
+  set_property 与 get_property 同锁，忙窗口内会阻塞 UI）；写失败只有
+  回复事件（泵不消费），cfg 是真相、下次创建对齐。无 mpv 回读需求，
+  还省一条订阅。
 - **装载窗口期门控（player/mod.rs `opening()`）**：`load_mark.is_some() &&
   !painted_since_load`（2s 兜底）——订阅化后其防冻结职责已消失（帧路径不再进
   mpv），保留的是正确性职责：装载期新文件的属性事件尚未到达，原子缓存里是
@@ -994,7 +1001,8 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
 
 **实施顺序**（每步独立可交付）：
 1. ✅ 静态图纹理路径 + 路由 + 失败回退（核心收益：翻页零延迟）；
-2. ✅ 滚轮缩放（锚定光标）/ 拖拽平移 / 双击 fit↔100% + 快捷键（+/−/0/Home）；
+2. ✅ 滚轮缩放（锚定光标）/ 拖拽平移 / 双击 fit↔100% + 快捷键（+/−/↑↓/0/Home，
+   ↑/↓ 图片=缩放、视频=音量，模式分治）；
 3. ✅ ±1 预取 LRU；
 4. ✅ GIF / 动画 webp 逐帧解码接管（image crate `AnimationDecoder::into_frames`
    全帧预解码 + 逐帧纹理；mpv 图片链路的 5s 黑屏/200ms 空洞问题随之整体消失；
