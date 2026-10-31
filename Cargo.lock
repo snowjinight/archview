@@ -223,6 +223,7 @@ dependencies = [
  "alphanumeric-sort",
  "eframe",
  "egui",
+ "egui_alignments",
  "encoding_rs",
  "glow",
  "image",
@@ -1045,6 +1046,15 @@ dependencies = [
  "smithay-clipboard",
  "web-time",
  "winit",
+]
+
+[[package]]
+name = "egui_alignments"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29e458ead1f3cac49e97eca70ffcdacc5795088e35b8586b7ef5c1c32dd409b9"
+dependencies = [
+ "egui",
 ]
 
 [[package]]

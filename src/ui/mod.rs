@@ -13,8 +13,8 @@
 use crate::cache;
 use crate::config::Config;
 use crate::imgview::{
-    clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView,
-    MAX_ZOOM, MIN_ZOOM,
+    clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView, MAX_ZOOM,
+    MIN_ZOOM,
 };
 use crate::player::mpv_ffi;
 use crate::player::stream_cb;
@@ -292,7 +292,11 @@ impl App {
         tracing::info!(
             "图片高清升级: 阈值×{:.2} 锐化 {}",
             cfg.ui.image_full_threshold,
-            if cfg.ui.image_full_sharpen { "开" } else { "关" }
+            if cfg.ui.image_full_sharpen {
+                "开"
+            } else {
+                "关"
+            }
         );
         let img_cap = cfg.ui.image_cache_count.max(1);
         Self {
@@ -521,7 +525,15 @@ impl eframe::App for App {
         }
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         probe!("top");
-        egui::Panel::bottom("controls").show(ui, |ui| self.controls(ui));
+        // controls 面板 frame：底内边距在默认(2)上 +10，行底到窗口底恒为
+        // 12px（bottom 面板锚定窗口底缘，行带是面板末元素，此间距不随内容
+        // 高度变化；原行尾 add_space 会实推 7px 且位置随行内分配漂移）；
+        // ♪ 的垂直居中由音量组 layout 交叉轴 Center 保证（见 panels.rs 注释）。
+        let mut frame = egui::Frame::side_top_panel(ui.style());
+        frame.inner_margin.bottom += 10;
+        egui::Panel::bottom("controls")
+            .frame(frame)
+            .show(ui, |ui| self.controls(ui));
         probe!("controls");
         // 文件列表放左侧（视频区在右）；悬停行显示完整包内路径气泡
         //（路径/文件名分色）。render API 单平面后气泡不再被 mpv 原生

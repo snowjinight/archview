@@ -62,10 +62,7 @@ impl RarVFS {
             Err(e) => return Err(VfsError::Archive(format!("打开 RAR 失败: {e}"))),
         }
         // solid 判定：主头 ROADF_SOLID 标志（`rar a -s`），在 open 阶段零成本读出
-        let solid = Self::detect_solid(
-            &first,
-            candidates.first().map(|p| p.as_slice()),
-        );
+        let solid = Self::detect_solid(&first, candidates.first().map(|p| p.as_slice()));
         Ok(Self {
             path: first.to_path_buf(),
             password: candidates,
@@ -727,7 +724,8 @@ mod tests {
     /// 返回 (包路径, 临时目录)
     fn make_rar(tag: &str, solid: bool) -> Option<(PathBuf, PathBuf)> {
         let rar = rar_exe()?;
-        let dir = std::env::temp_dir().join(format!("rar_mode_test_{}_{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rar_mode_test_{}_{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let arch = dir.join(if solid { "solid.rar" } else { "plain.rar" });
         let mut cmd = std::process::Command::new(&rar);
@@ -760,7 +758,11 @@ mod tests {
             return;
         };
         let vfs = RarVFS::open(&arch, None).unwrap();
-        assert_eq!(vfs.access_mode(), AccessMode::SingleFile, "rar 默认非固态，应走单文件按需");
+        assert_eq!(
+            vfs.access_mode(),
+            AccessMode::SingleFile,
+            "rar 默认非固态，应走单文件按需"
+        );
         assert_eq!(
             vfs.locate_start(0),
             None,

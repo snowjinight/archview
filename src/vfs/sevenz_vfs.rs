@@ -82,7 +82,8 @@ impl SevenzVFS {
             .copied()
             .collect();
         let mut folder_first = std::collections::HashMap::new();
-        let mut folder_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut folder_size: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for (i, f) in folder_of.iter().enumerate() {
             if let Some(f) = f {
                 folder_first.entry(*f).or_insert(i);
@@ -1061,7 +1062,11 @@ mod tests {
             .unwrap();
         w.finish().unwrap();
         let so = SevenzVFS::open(&so_arch, None).unwrap();
-        assert_eq!(so.access_mode(), AccessMode::Solid, "单 folder 顺序流应走滑窗会话");
+        assert_eq!(
+            so.access_mode(),
+            AccessMode::Solid,
+            "单 folder 顺序流应走滑窗会话"
+        );
         assert_eq!(
             so.locate_start(2),
             Some(0),

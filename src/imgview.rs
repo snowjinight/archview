@@ -207,35 +207,33 @@ impl ImageService {
         let ctx = self.ctx.clone();
         let name = name.to_owned();
         self.pending.insert(key, Instant::now());
-        let r = std::thread::Builder::new().name("imgdec".into()).spawn(move || {
-            // 解码对畸形文件可能 panic（坏图触发 codec 内部越界等）：
-            // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
-            // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_image(&source, max_dim, false, factor, &name, false)
-            }));
-            match r {
-                Ok(Ok(decoded)) => {
-                    let _ = tx.send(ImgMsg::Ready {
-                        key,
-                        decoded,
-                        name,
-                    });
+        let r = std::thread::Builder::new()
+            .name("imgdec".into())
+            .spawn(move || {
+                // 解码对畸形文件可能 panic（坏图触发 codec 内部越界等）：
+                // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
+                // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_image(&source, max_dim, false, factor, &name, false)
+                }));
+                match r {
+                    Ok(Ok(decoded)) => {
+                        let _ = tx.send(ImgMsg::Ready { key, decoded, name });
+                    }
+                    Ok(Err(e)) => {
+                        let _ = tx.send(ImgMsg::Failed { key, error: e });
+                    }
+                    Err(_) => {
+                        let _ = tx.send(ImgMsg::Failed {
+                            key,
+                            error: "解码线程 panic".into(),
+                        });
+                    }
                 }
-                Ok(Err(e)) => {
-                    let _ = tx.send(ImgMsg::Failed { key, error: e });
-                }
-                Err(_) => {
-                    let _ = tx.send(ImgMsg::Failed {
-                        key,
-                        error: "解码线程 panic".into(),
-                    });
-                }
-            }
-            // 唤醒 UI 立即 poll：否则要等下一次重绘（空闲时可迟 100ms+，
-            // 实测 LOG 解码完成→上帧间隔 50~130ms 全是这个）
-            ctx.request_repaint();
-        });
+                // 唤醒 UI 立即 poll：否则要等下一次重绘（空闲时可迟 100ms+，
+                // 实测 LOG 解码完成→上帧间隔 50~130ms 全是这个）
+                ctx.request_repaint();
+            });
         if r.is_err() {
             // 线程起不来（极端）：移除 pending 让后续请求可重试
             self.pending.remove(&key);
@@ -257,13 +255,7 @@ impl ImageService {
     /// FullFailed 放弃即可）
     /// sharpen 直传 image_full_sharpen 配置：Lanczos 放大后叠加
     /// unsharp mask 锐化（观感补偿，见 sharpen_full）
-    pub fn request_full(
-        &mut self,
-        key: ImgKey,
-        source: ImageSource,
-        name: &str,
-        sharpen: bool,
-    ) {
+    pub fn request_full(&mut self, key: ImgKey, source: ImageSource, name: &str, sharpen: bool) {
         if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
             return;
         }
@@ -327,11 +319,7 @@ impl ImageService {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                ImgMsg::Ready {
-                    key,
-                    decoded,
-                    name,
-                } => {
+                ImgMsg::Ready { key, decoded, name } => {
                     self.pending.remove(&key);
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
@@ -371,11 +359,7 @@ impl ImageService {
                     self.pending.remove(&key);
                     out.push(ImgEvent::Failed(key, error));
                 }
-                ImgMsg::FullReady {
-                    key,
-                    img,
-                    name,
-                } => {
+                ImgMsg::FullReady { key, img, name } => {
                     // 只认当前 pending 的 key：槽已换条目/超时判死的迟到消息丢弃
                     if self.full_pending.take().is_some_and(|(k, _)| k == key) {
                         let t = std::time::Instant::now();
@@ -600,9 +584,7 @@ fn decode_any<R: BufRead + Seek>(
         }
         image::DynamicImage::from_decoder(dec).map_err(|e| format!("解码图片失败: {e}"))?
     } else {
-        reader
-            .decode()
-            .map_err(|e| format!("解码图片失败: {e}"))?
+        reader.decode().map_err(|e| format!("解码图片失败: {e}"))?
     };
     // 两档尺寸适配（策略见 resample）：基础档 LRU 存 native×ppp（翻页
     // 即 100% 密度直出）；高清档 full 槽存 native×ppp×2（深放大用，
@@ -611,7 +593,11 @@ fn decode_any<R: BufRead + Seek>(
     let out = resample(img, max_dim, full, factor);
     // 锐化（配置 image_full_sharpen，仅高清档）：Lanczos 放大的边缘
     // 补偿，见 sharpen_full
-    let out = if full && sharpen { sharpen_full(out) } else { out };
+    let out = if full && sharpen {
+        sharpen_full(out)
+    } else {
+        out
+    };
     // 尺寸命名日志：native_size 原图 / lru_size 基础纹理 / full_size
     // full 槽纹理（箭头一致 = 未触发重采样，尺寸原样直进）
     tracing::debug!(
@@ -843,7 +829,10 @@ mod tests {
     #[test]
     fn zoom_pan_键盘缩放_锚点视口中心() {
         // pan=0 时中心锚点缩放保持 pan=0
-        assert_eq!(zoom_pan(egui::Vec2::ZERO, 2.0, 4.0, egui::Vec2::ZERO), egui::Vec2::ZERO);
+        assert_eq!(
+            zoom_pan(egui::Vec2::ZERO, 2.0, 4.0, egui::Vec2::ZERO),
+            egui::Vec2::ZERO
+        );
         // 锚点=中心（rel=0）：pan 按倍率比缩放
         let out = zoom_pan(egui::vec2(30.0, -10.0), 2.0, 4.0, egui::Vec2::ZERO);
         assert!((out.x - 60.0).abs() < 1e-4 && (out.y + 20.0).abs() < 1e-4);
@@ -861,7 +850,11 @@ mod tests {
     fn clamp_pan_大图不露边_小图居中() {
         let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         // 大幅拖拽 4000×3000 图：边缘恰好贴住视口右/下（不露边）
-        let p = clamp_pan(egui::vec2(10_000.0, -10_000.0), egui::vec2(4000.0, 3000.0), vp);
+        let p = clamp_pan(
+            egui::vec2(10_000.0, -10_000.0),
+            egui::vec2(4000.0, 3000.0),
+            vp,
+        );
         // x: 中心 clamp 到 [800-2000, 0+2000]=[-1200,2000] → 2000-400=1600
         // y: 中心 clamp 到 [600-1500, 0+1500]=[-900,1500] → -900-300=-1200
         assert_eq!(p, egui::vec2(1600.0, -1200.0));
@@ -883,7 +876,11 @@ mod tests {
         assert_eq!((out.width(), out.height()), (3000, 1500));
         // 超阈值：原尺寸直进（超大图免降采样损失，深放大交给 GPU 双线性）
         let out = resample(image::DynamicImage::new_rgb8(3000, 2000), 4096, false, 1.5);
-        assert_eq!((out.width(), out.height()), (3000, 2000), "×1.5 超 4096 原图直进");
+        assert_eq!(
+            (out.width(), out.height()),
+            (3000, 2000),
+            "×1.5 超 4096 原图直进"
+        );
         // ppp=1.0 屏（factor=1）：不无谓重采样
         let out = resample(image::DynamicImage::new_rgb8(800, 600), 4096, false, 1.0);
         assert_eq!((out.width(), out.height()), (800, 600));
@@ -898,7 +895,11 @@ mod tests {
         let out = resample(image::DynamicImage::new_rgb8(4096, 3072), 8192, true, 2.0);
         assert_eq!((out.width(), out.height()), (8192, 6144), "×2 恰顶格");
         let out = resample(image::DynamicImage::new_rgb8(2000, 1500), 8192, true, 4.0);
-        assert_eq!((out.width(), out.height()), (8000, 6000), "×4 未触顶整体放大");
+        assert_eq!(
+            (out.width(), out.height()),
+            (8000, 6000),
+            "×4 未触顶整体放大"
+        );
         let out = resample(image::DynamicImage::new_rgb8(4096, 1000), 8192, true, 4.0);
         // 最长边 16384→8192 等比缩（scale=2），短边随比例 1000→2000
         //（逐边独立 clamp 会畸变成 8192×4000）
@@ -911,7 +912,11 @@ mod tests {
         let out = resample(image::DynamicImage::new_rgb8(9000, 7000), 4096, false, 1.0);
         assert_eq!((out.width(), out.height()), (8192, 6372)); // 7000×8192/9000=6371.6→6372
         let out = resample(image::DynamicImage::new_rgb8(10000, 8000), 8192, true, 3.0);
-        assert_eq!((out.width(), out.height()), (8192, 6554), "高清档同样先兜底"); // 8000×0.8192=6553.6
+        assert_eq!(
+            (out.width(), out.height()),
+            (8192, 6554),
+            "高清档同样先兜底"
+        ); // 8000×0.8192=6553.6
     }
 
     #[test]
@@ -927,7 +932,9 @@ mod tests {
     fn sharpen_full_锐化行为() {
         // 纯色图：无边缘无细节，锐化不动（px 与 blur(px) 全等）
         let flat = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
-            16, 16, image::Luma([128]),
+            16,
+            16,
+            image::Luma([128]),
         ));
         let out = sharpen_full(flat).to_rgba8();
         assert!(out.pixels().all(|p| p[0] == 128));
@@ -964,9 +971,15 @@ mod tests {
         let p = dir.join("sharpen_wire.png");
         std::fs::write(&p, buf.get_ref()).unwrap();
         let decode = |sharpen| {
-            let out =
-                decode_image(&ImageSource::File(p.clone()), 8192, true, 1.0, "s.png", sharpen)
-                    .unwrap();
+            let out = decode_image(
+                &ImageSource::File(p.clone()),
+                8192,
+                true,
+                1.0,
+                "s.png",
+                sharpen,
+            )
+            .unwrap();
             let Decoded::Static(img) = out else {
                 panic!("PNG 应走静态路径");
             };
@@ -1025,7 +1038,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim.gif");
         std::fs::write(&p, gif_bytes_2帧(8, 6)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("2 帧 GIF 应解出 Anim");
@@ -1068,7 +1089,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim_delay.gif");
         std::fs::write(&p, gif_bytes_delayed(8, 6, 80, 2)).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("带真实延迟的 2 帧 GIF 应解出 Anim");
@@ -1093,9 +1122,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("single.gif");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(out, Decoded::Static(_)), "单帧动画应归静态（免时钟开销）");
+        assert!(
+            matches!(out, Decoded::Static(_)),
+            "单帧动画应归静态（免时钟开销）"
+        );
     }
 
     #[test]
@@ -1109,7 +1149,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.webp");
         std::fs::write(&p, buf.into_inner()).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(tex) = out else {
             panic!("静态 webp 应走静图路径");
@@ -1128,7 +1176,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim2.webp");
         std::fs::write(&p, bytes).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "anim2.webp", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "anim2.webp",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Anim(frames) = out else {
             panic!("动画 webp 应走逐帧路径（Decoded::Anim）");
@@ -1138,9 +1194,15 @@ mod tests {
         assert_eq!(frames[0].1, Duration::from_millis(100));
         // 帧序与颜色：首帧红、次帧蓝（lavfi 纯色 + VP8L 无损，通道优势明显）
         let (r, g, b, _) = frames[0].0.pixels[0].to_tuple();
-        assert!(r > 200 && g < 60 && b < 60, "首帧应为红色，实为 ({r},{g},{b})");
+        assert!(
+            r > 200 && g < 60 && b < 60,
+            "首帧应为红色，实为 ({r},{g},{b})"
+        );
         let (r, g, b, _) = frames[1].0.pixels[0].to_tuple();
-        assert!(b > 200 && r < 60 && g < 60, "次帧应为蓝色，实为 ({r},{g},{b})");
+        assert!(
+            b > 200 && r < 60 && g < 60,
+            "次帧应为蓝色，实为 ({r},{g},{b})"
+        );
     }
 
     #[test]
@@ -1153,7 +1215,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("full.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            8192,
+            true,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
@@ -1171,7 +1241,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("full_dpi.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 8192, true, 1.5, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            8192,
+            true,
+            1.5,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
@@ -1187,7 +1265,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.png");
         std::fs::write(&p, &png).unwrap();
-        let out = decode_image(&ImageSource::File(p.clone()), 4096, false, 2.0, "t.png", false).unwrap();
+        let out = decode_image(
+            &ImageSource::File(p.clone()),
+            4096,
+            false,
+            2.0,
+            "t.png",
+            false,
+        )
+        .unwrap();
         std::fs::remove_file(&p).ok();
         let Decoded::Static(img) = out else {
             panic!("PNG 应走静态路径");
@@ -1265,9 +1351,7 @@ mod tests {
     fn frame_动图推进状态机() {
         let mut svc = ImageService::new(egui::Context::default(), 2);
         let key = (2, 0);
-        let frame = |c: u8| {
-            egui::ColorImage::new([4, 4], vec![egui::Color32::from_gray(c); 16])
-        };
+        let frame = |c: u8| egui::ColorImage::new([4, 4], vec![egui::Color32::from_gray(c); 16]);
         feed(
             &mut svc,
             key,
@@ -1308,7 +1392,10 @@ mod tests {
         feed(
             &mut svc,
             key,
-            Decoded::Static(egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16])),
+            Decoded::Static(egui::ColorImage::new(
+                [4, 4],
+                vec![egui::Color32::WHITE; 16],
+            )),
             "t.png",
         );
         let (tex, rest) = svc.frame(key).unwrap();

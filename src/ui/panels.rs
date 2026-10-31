@@ -91,89 +91,88 @@ impl App {
             }
             // 快捷键帮助（弹出面板，不占常驻空间；egui 0.36 用 from_toggle_button_response 自管开关）
             let help_btn = ui.button("快捷键 ?");
-            egui::Popup::from_toggle_button_response(&help_btn)
-                .show(|ui| {
-                    ui.set_min_width(280.0);
-                    ui.strong("快捷键");
-                    ui.separator();
-                    // 分三组：通用在前，视频 / 图片专属各成一块
-                    let groups: &[(&str, &[(&str, &str)])] = &[
-                        (
-                            "通用",
-                            &[
-                                ("PgUp / PgDn", "上一个 / 下一个"),
-                                ("鼠标滚轮（预览窗口内）", "上一个 / 下一个媒体"),
-                                ("N", "打开下一个压缩包（连续看包）"),
-                                ("B", "回到锚点（最后一次解压位置）"),
-                                ("回车", "全屏切换"),
-                                ("Esc", "退出全屏"),
-                            ],
-                        ),
-                        (
-                            "视频",
-                            &[
-                                ("← / →", "seek ±5 秒"),
-                                ("← / →（暂停时）", "上一帧 / 下一帧"),
-                                ("↑ / ↓", "音量 ±5"),
-                                ("M", "静音切换"),
-                                ("L", "播放模式：列表 ↔ 单视频循环"),
-                            ],
-                        ),
-                        (
-                            "图片",
-                            &[
-                                ("← / →", "上一张 / 下一张"),
-                                ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
-                                ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
-                                ("+ / - / ↑ / ↓", "缩放步进（锚视口中心）"),
-                                ("0", "100% 显示"),
-                                ("Home", "适应窗口"),
-                                ("鼠标拖拽", "平移已放大的图片"),
-                                ("双击图片", "适应窗口 ↔ 100%"),
-                            ],
-                        ),
-                    ];
-                    // 分组配色：通用原色，视频金黄，图片亮蓝（蓝取应用
-                    // 现有 ACCENT，黄与对话框提示同款）
-                    const HELP_YELLOW: egui::Color32 = egui::Color32::from_rgb(232, 178, 72);
-                    const HELP_BLUE: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
-                    let colors = [None, Some(HELP_YELLOW), Some(HELP_BLUE)];
-                    // 单一 Grid 渲染三组：列宽全表统一（键列 = 全部组里
-                    // 最宽的键），三组描述垂直对齐；组间用空行分隔
-                    egui::Grid::new("help_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 2.0])
-                        .show(ui, |ui| {
-                            for (gi, (title, rows)) in groups.iter().enumerate() {
-                                let color = colors[gi];
-                                if gi > 0 {
-                                    // 组间空行分隔（两格都占，保持列数）
-                                    ui.label("");
-                                    ui.label("");
-                                    ui.end_row();
-                                }
-                                // 组标题：专属组着色，通用保持默认
-                                let mut t = egui::RichText::new(*title).strong();
-                                if let Some(c) = color {
-                                    t = t.color(c);
-                                }
-                                ui.label(t);
+            egui::Popup::from_toggle_button_response(&help_btn).show(|ui| {
+                ui.set_min_width(280.0);
+                ui.strong("快捷键");
+                ui.separator();
+                // 分三组：通用在前，视频 / 图片专属各成一块
+                let groups: &[(&str, &[(&str, &str)])] = &[
+                    (
+                        "通用",
+                        &[
+                            ("PgUp / PgDn", "上一个 / 下一个"),
+                            ("鼠标滚轮（预览窗口内）", "上一个 / 下一个媒体"),
+                            ("N", "打开下一个压缩包（连续看包）"),
+                            ("B", "回到锚点（最后一次解压位置）"),
+                            ("回车", "全屏切换"),
+                            ("Esc", "退出全屏"),
+                        ],
+                    ),
+                    (
+                        "视频",
+                        &[
+                            ("← / →", "seek ±5 秒"),
+                            ("← / →（暂停时）", "上一帧 / 下一帧"),
+                            ("↑ / ↓", "音量 ±5"),
+                            ("M", "静音切换"),
+                            ("L", "播放模式：列表 ↔ 单视频循环"),
+                        ],
+                    ),
+                    (
+                        "图片",
+                        &[
+                            ("← / →", "上一张 / 下一张"),
+                            ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
+                            ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
+                            ("+ / - / ↑ / ↓", "缩放步进（锚视口中心）"),
+                            ("0", "100% 显示"),
+                            ("Home", "适应窗口"),
+                            ("鼠标拖拽", "平移已放大的图片"),
+                            ("双击图片", "适应窗口 ↔ 100%"),
+                        ],
+                    ),
+                ];
+                // 分组配色：通用原色，视频金黄，图片亮蓝（蓝取应用
+                // 现有 ACCENT，黄与对话框提示同款）
+                const HELP_YELLOW: egui::Color32 = egui::Color32::from_rgb(232, 178, 72);
+                const HELP_BLUE: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
+                let colors = [None, Some(HELP_YELLOW), Some(HELP_BLUE)];
+                // 单一 Grid 渲染三组：列宽全表统一（键列 = 全部组里
+                // 最宽的键），三组描述垂直对齐；组间用空行分隔
+                egui::Grid::new("help_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        for (gi, (title, rows)) in groups.iter().enumerate() {
+                            let color = colors[gi];
+                            if gi > 0 {
+                                // 组间空行分隔（两格都占，保持列数）
+                                ui.label("");
                                 ui.label("");
                                 ui.end_row();
-                                for (k, v) in rows.iter().copied() {
-                                    let mut key = egui::RichText::new(k).strong();
-                                    let mut val = egui::RichText::new(v);
-                                    if let Some(c) = color {
-                                        key = key.color(c);
-                                        val = val.color(c);
-                                    }
-                                    ui.label(key);
-                                    ui.label(val);
-                                    ui.end_row();
-                                }
                             }
-                        });
-                });
+                            // 组标题：专属组着色，通用保持默认
+                            let mut t = egui::RichText::new(*title).strong();
+                            if let Some(c) = color {
+                                t = t.color(c);
+                            }
+                            ui.label(t);
+                            ui.label("");
+                            ui.end_row();
+                            for (k, v) in rows.iter().copied() {
+                                let mut key = egui::RichText::new(k).strong();
+                                let mut val = egui::RichText::new(v);
+                                if let Some(c) = color {
+                                    key = key.color(c);
+                                    val = val.color(c);
+                                }
+                                ui.label(key);
+                                ui.label(val);
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
             if let Some(n) = &self.notice {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, n);
             }
@@ -383,10 +382,7 @@ impl App {
                                 // 目录段琥珀（文件夹联想）、文件名主题蓝（与进度条
                                 // ACCENT 同源）；深浅主题各配一档亮度保证对比度
                                 let (dir_c, file_c) = if ui.visuals().dark_mode {
-                                    (
-                                        egui::Color32::from_rgb(224, 172, 76),
-                                        ACCENT,
-                                    )
+                                    (egui::Color32::from_rgb(224, 172, 76), ACCENT)
                                 } else {
                                     (
                                         egui::Color32::from_rgb(146, 102, 12),
@@ -407,10 +403,7 @@ impl App {
                                 job.append(
                                     file,
                                     0.0,
-                                    egui::text::TextFormat::simple(
-                                        egui::FontId::default(),
-                                        file_c,
-                                    ),
+                                    egui::text::TextFormat::simple(egui::FontId::default(), file_c),
                                 );
                                 ui.label(job);
                             });
@@ -445,8 +438,7 @@ impl App {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
                     // 半透明底色：叠在列表上仍能透出底下内容
                     let bg = ui.visuals().window_fill;
-                    let fill =
-                        egui::Color32::from_rgba_premultiplied(bg.r(), bg.g(), bg.b(), 190);
+                    let fill = egui::Color32::from_rgba_premultiplied(bg.r(), bg.g(), bg.b(), 190);
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -780,8 +772,10 @@ impl App {
                             });
                         }
                     });
-                    ui.painter()
-                        .add(egui::PaintCallback { rect: video, callback: Arc::new(cb) });
+                    ui.painter().add(egui::PaintCallback {
+                        rect: video,
+                        callback: Arc::new(cb),
+                    });
                 }
             }
         }
@@ -989,7 +983,10 @@ impl App {
                 None => {
                     let z100 = 1.0 / ppp;
                     let pan = zoom_pan(self.img_view.pan, fit, z100, cursor - video.center());
-                    self.img_view = ImgView { zoom: Some(z100), pan };
+                    self.img_view = ImgView {
+                        zoom: Some(z100),
+                        pan,
+                    };
                 }
                 // 100%（或任意倍率）→ 适应窗口
                 Some(_) => {
@@ -1026,12 +1023,16 @@ impl App {
         // 换画事件：同 key 下 base↔full 切换时才打印一条（切图时新 key
         // 静默重置，不逐帧刷屏），与"发起高清解码/纹理上传 full"串联成链
         let pick = (key, full.is_some());
-        if self.img_pick_full.is_some_and(|(k, _)| k == key)
-            && self.img_pick_full != Some(pick)
-        {
+        if self.img_pick_full.is_some_and(|(k, _)| k == key) && self.img_pick_full != Some(pick) {
             let desc = full.as_ref().map_or_else(
                 || "→ base".to_string(),
-                |t| format!("→ full {}x{}", t.size_vec2().x as i32, t.size_vec2().y as i32),
+                |t| {
+                    format!(
+                        "→ full {}x{}",
+                        t.size_vec2().x as i32,
+                        t.size_vec2().y as i32
+                    )
+                },
             );
             tracing::debug!(
                 "换画[{key:?}] badge={:.0}% base={}x{} {desc}",
@@ -1050,10 +1051,8 @@ impl App {
         // 逻辑坐标——100% 即严格 1 纹素 = 1 物理像素；其余倍率仅产生
         // <0.5px 偏移（顺带消除拖拽时的亚像素爬动）。
         let raw = egui::Rect::from_center_size(video.center() + self.img_view.pan, native * zoom);
-        let snapped = egui::Rect::from_min_max(
-            (raw.min * ppp).round() / ppp,
-            (raw.max * ppp).round() / ppp,
-        );
+        let snapped =
+            egui::Rect::from_min_max((raw.min * ppp).round() / ppp, (raw.max * ppp).round() / ppp);
         let rect = if snapped.width() > 0.0 && snapped.height() > 0.0 {
             snapped
         } else {
@@ -1104,7 +1103,11 @@ impl App {
         );
         let painter = ui.painter_at(area);
         painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(160));
-        painter.galley(rect.left_top() + egui::vec2(pad, pad * 0.5), galley, egui::Color32::WHITE);
+        painter.galley(
+            rect.left_top() + egui::vec2(pad, pad * 0.5),
+            galley,
+            egui::Color32::WHITE,
+        );
     }
 
     /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。
@@ -1117,20 +1120,28 @@ impl App {
         viewport: egui::Rect,
     ) {
         let new_zoom = (cur_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        self.img_view.pan =
-            zoom_pan(self.img_view.pan, cur_zoom, new_zoom, anchor - viewport.center());
+        self.img_view.pan = zoom_pan(
+            self.img_view.pan,
+            cur_zoom,
+            new_zoom,
+            anchor - viewport.center(),
+        );
         self.img_view.zoom = Some(new_zoom);
     }
 
     /// 快捷键缩放一步（锚视口中心）：factor > 1 放大，< 1 缩小。
     /// fit 模式先落地为当前 fit 倍率再乘（视口变化时 fit 是实时值）
     pub(super) fn img_zoom_step(&mut self, factor: f32) {
-        let Some(key) = self.tex_image_key() else { return };
+        let Some(key) = self.tex_image_key() else {
+            return;
+        };
         let viewport = self.img_viewport;
         if !viewport.is_finite() || viewport.width() <= 0.0 || viewport.height() <= 0.0 {
             return;
         }
-        let Some((tex, _)) = self.img.frame(key) else { return };
+        let Some((tex, _)) = self.img.frame(key) else {
+            return;
+        };
         let fit = fit_scale(viewport, tex.size_vec2());
         let cur = self.img_view.zoom.unwrap_or(fit);
         self.img_zoom_at(cur, factor, viewport.center(), viewport);
@@ -1139,7 +1150,9 @@ impl App {
     /// 快捷键直接设倍率：Some(z)=逻辑倍率（1.0=100%，锚视口中心。内部
     /// 换算为纹素 1:1 的 1/ppp，与双击同语义）；None = 适应窗口
     pub(super) fn img_zoom_to(&mut self, target: Option<f32>) {
-        let Some(key) = self.tex_image_key() else { return };
+        let Some(key) = self.tex_image_key() else {
+            return;
+        };
         let viewport = self.img_viewport;
         if !viewport.is_finite() {
             return;
@@ -1150,7 +1163,9 @@ impl App {
                 self.img_fit_flash = Some(std::time::Instant::now());
             }
             Some(z) => {
-                let Some((tex, _)) = self.img.frame(key) else { return };
+                let Some((tex, _)) = self.img.frame(key) else {
+                    return;
+                };
                 let z = z / self.img.ppp();
                 let fit = fit_scale(viewport, tex.size_vec2());
                 let cur = self.img_view.zoom.unwrap_or(fit);
@@ -1189,134 +1204,175 @@ impl App {
             ui.allocate_rect(rect, egui::Sense::hover());
         }
 
-        // 下部：按钮组（水平居中）+ 右侧音量条
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            // selected=true 时图标着色加粗（激活态高亮，如循环播放中）
-            let icon_btn = |ui: &mut egui::Ui, txt: &str, tip: &str, selected: bool| {
-                let mut rt = egui::RichText::new(txt).size(20.0);
-                if selected {
-                    rt = rt.color(ACCENT).strong();
-                }
-                ui.add(egui::Button::new(rt).min_size(egui::vec2(48.0, 34.0)))
-                    .on_hover_text(tip)
-                    .clicked()
-            };
-            // 按钮组整体居中：左侧弹性留白 = 右侧(音量+留白)宽度
-            let side_w = ui.available_width() / 2.0;
-            let vol_w = 150.0;
-            ui.add_space((side_w - vol_w / 2.0 - 84.0).max(0.0)); // 84≈四个按钮组一半宽
-
-            if icon_btn(ui, "<", "上一个", false) {
-                act.step = -1;
-            }
-            if self.playing_is_image() {
-                // 图片：中间按钮=自动翻页开关（PPT 式）
-                let (txt, tip) = if self.slideshow_on {
-                    ("||", "停止自动播放")
-                } else {
-                    ("▶", "自动播放（翻页）")
-                };
-                if icon_btn(ui, txt, tip, self.slideshow_on) {
-                    act.slide = true;
-                }
-            } else if let Some(p) = &self.player {
-                let (txt, tip) = if p.paused() {
-                    ("▶", "播放")
-                } else {
-                    ("||", "暂停")
-                };
-                if icon_btn(ui, txt, tip, false) {
-                    act.toggle = true;
-                }
-            } else if icon_btn(ui, "▶", "播放（从第一项开始）", false) {
-                // 未播放：播放按钮=开始当前标签页第一项
-                act.step = 1;
-            }
-            if icon_btn(ui, ">", "下一个", false) {
-                act.step = 1;
-            }
-            // 播放模式（仅视频，图片不显示——图片用各自的自动翻页开关）：
-            // 列表播放（默认，播完自动下一个）↔ 单视频循环；循环中高亮。
-            // 未播放时也显示，允许预设模式
-            if !self.playing_is_image() {
-                let (icon, tip) = if self.video_loop {
-                    ("↻", "循环播放中：点击切为列表播放（L）")
-                } else {
-                    ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
-                };
-                if icon_btn(ui, icon, tip, self.video_loop) {
-                    act.loop_toggle = true;
-                }
-            } else {
-                // 图片模式占同尺寸隐形槽：按钮组宽度与视频模式（4 槽）一致，
-                // 切图↔视频零位移
-                ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
-            }
-
-            // 右侧：♪ 静音按钮 + 音量条（仅视频模式；右对齐固定宽度，播放器
-            // 未就绪时只写配置）。图片模式整块不画但左侧留白公式不变——
-            // 按钮组与视频模式零位移。♪ 用雅黑字形（🔊🔇 emoji 雅黑无字形
-            // 且 egui 不光栅化彩色 emoji → 豆腐块）。静音真相在 cfg.player.muted：
-            // 未播放/未开文件也可预设，播放器在场才下发、创建时统一应用；
-            // 静音时 ♪ 叠删除线，拖动滑条即解除
-            if !self.playing_is_image() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut vol = self.cfg.player.volume;
-                    // 右到左布局先加在最右：音量数字只读 label 占位（不可
-                    // 输入，文本在滑条更新后画到该槽，即滑条右侧）
-                    let (num_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(26.0, 18.0), egui::Sense::hover());
-                    let resp = ui.add_sized(
-                        [vol_w - 40.0 - 26.0, ui.available_height().max(20.0)],
-                        egui::Slider::new(&mut vol, 0..=100).show_value(false),
-                    );
-                    if resp.changed() {
-                        self.cfg.player.volume = vol;
-                        if let Some(p) = &self.player {
-                            p.set_volume(vol); // 内部会顺带解除静音
+        // 下部：按钮行——播放/暂停按钮在整行内水平居中（按钮中心=窗口中
+        // 线），音量组右对齐到行右缘。居中用 egui_alignments 的 Aligner +
+        // Bounds::max_rect()：以整行（max_rect）为参照居中，忽略行内已被
+        // 音量组占用的剩余空间——音量组先画也不影响按钮组落点。
+        //
+        // 居中原理＝egui 官方 sizing-pass 两遍布局（egui 面板/窗口自动定宽
+        // 的同款机制）：首帧隐形测量按钮组实际宽度并丢弃该帧，次帧起按实测
+        // 宽度精确定位；组宽变化（字体/DPI/按钮尺寸）时自动重测。无手估
+        // 像素、无逐帧反馈计算。
+        //
+        // ⚠ 行带用 allocate_ui_with_layout 固定 34px 高，而非 ui.horizontal：
+        // 自动高度面板的"当帧可用高度"来自上一帧面板高度，若行高放任自流，
+        // 会与 Aligner 的记忆尺寸形成收缩反馈（实测图片模式面板被压矮
+        // 8px、按钮溢出绘制）。行高固定后面板高度恒定（18+34）。
+        // 子项一律显式 34px 等高；行带交叉轴 Min/Center 对 rect 无影响
+        // （子项撑满行高），但子 ui 若自行指定交叉轴会传导给 Button 的
+        // 文本对齐（见音量组 ⚠ 注释）。
+        // 图片↔视频模式按钮组都保持五槽等宽（见组内注释），切模式零位移。
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 34.0),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |row| {
+                // selected=true 时图标着色加粗（激活态高亮，如循环播放中）
+                let icon_btn =
+                    |ui: &mut egui::Ui, txt: &str, tip: &str, selected: bool| -> egui::Response {
+                        let mut rt = egui::RichText::new(txt).size(20.0);
+                        if selected {
+                            rt = rt.color(ACCENT).strong();
                         }
-                        // 拖动即解除静音：cfg 真相同步清（set_volume 已对
-                        // mpv 下发 mute=no，此处只管 cfg 与 UI 图标一致）
-                        self.cfg.player.muted = false;
-                    }
-                    // 数字 label：只读展示（本帧最新值，无输入框交互）
-                    ui.painter().text(
-                        num_rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        vol.to_string(),
-                        egui::FontId::proportional(12.5),
-                        egui::Color32::GRAY,
-                    );
-                    // ♪ 独立 toggle 按钮（滑条左侧）：点击翻转静音，
-                    // 未播放也可用（只改 cfg，播放器创建时生效）。
-                    // fill 全透明：不显示按钮底色方框，只留字形
-                    let muted = self.cfg.player.muted;
-                    let mut icon = egui::RichText::new("♪").size(18.0);
-                    if muted {
-                        icon = icon.strikethrough();
-                    }
-                    let tip = if muted {
-                        "已静音：点击恢复声音（M）"
-                    } else {
-                        "静音（M）"
+                        ui.add(egui::Button::new(rt).min_size(egui::vec2(48.0, 34.0)))
+                            .on_hover_text(tip)
                     };
-                    if ui
-                        .add(
-                            egui::Button::new(icon)
-                                .fill(egui::Color32::TRANSPARENT)
-                                .min_size(egui::vec2(36.0, 34.0)),
-                        )
-                        .on_hover_text(tip)
-                        .clicked()
-                    {
-                        self.cfg.player.muted = !self.cfg.player.muted;
-                        if let Some(p) = &self.player {
-                            p.set_muted(self.cfg.player.muted);
+                let vol_w = 150.0;
+
+                // 右侧音量组先画（仅视频模式）：right_to_left 从行右缘向左排，
+                // 光标停在组左缘；Aligner 的 MaxRect 参照只看 max_rect 不看已占
+                // 空间，故不影响按钮组居中。播放器未就绪时只写配置。
+                // ⚠ 交叉轴必须 Center：egui 0.36 Button 内部文本对齐默认继承
+                // 所在 ui 的 layout 交叉轴（atom_layout.rs align2 回退）——用
+                // Min 会让 ♪ 在 34px 按钮内贴顶（字形上移 ~6px）。膨胀反馈
+                // 的真凶是行带不固定高，已由上方 34px 行带切断，Center 安全。
+                // ♪ 用雅黑字形（🔊🔇 emoji 雅黑无字形且 egui 不光栅化彩色
+                // emoji → 豆腐块）。静音真相在 cfg.player.muted：未播放/未开
+                // 文件也可预设，播放器在场才下发、创建时统一应用；静音时 ♪ 叠
+                // 删除线，拖动滑条即解除
+                if !self.playing_is_image() {
+                    row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut vol = self.cfg.player.volume;
+                        // 右到左布局先加在最右：音量数字只读 label 占位（不可
+                        // 输入，文本在滑条更新后画到该槽，即滑条右侧）
+                        // 高度 34 与行带等高（数字画在槽的 left_center，天然居中）
+                        let (num_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(26.0, 34.0), egui::Sense::hover());
+                        // 高度固定 34：不用 available_height()——它取自上一帧面板
+                        // 高度，自动高度面板下会反馈放大（同上 ⚠）；轨道在 34px
+                        // 槽内垂直居中，观感与按钮一致
+                        let resp = ui.add_sized(
+                            [vol_w - 40.0 - 26.0, 34.0],
+                            egui::Slider::new(&mut vol, 0..=100).show_value(false),
+                        );
+                        if resp.changed() {
+                            self.cfg.player.volume = vol;
+                            if let Some(p) = &self.player {
+                                p.set_volume(vol); // 内部会顺带解除静音
+                            }
+                            // 拖动即解除静音：cfg 真相同步清（set_volume 已对
+                            // mpv 下发 mute=no，此处只管 cfg 与 UI 图标一致）
+                            self.cfg.player.muted = false;
                         }
-                    }
-                });
-            }
-        });
+                        // 数字 label：只读展示（本帧最新值，无输入框交互）
+                        ui.painter().text(
+                            num_rect.left_center(),
+                            egui::Align2::LEFT_CENTER,
+                            vol.to_string(),
+                            egui::FontId::proportional(12.5),
+                            egui::Color32::GRAY,
+                        );
+                        // ♪ 独立 toggle 按钮（滑条左侧）：点击翻转静音，
+                        // 未播放也可用（只改 cfg，播放器创建时生效）。
+                        // fill 全透明：不显示按钮底色方框，只留字形
+                        let muted = self.cfg.player.muted;
+                        let mut icon = egui::RichText::new("♪").size(18.0);
+                        if muted {
+                            icon = icon.strikethrough();
+                        }
+                        let tip = if muted {
+                            "已静音：点击恢复声音（M）"
+                        } else {
+                            "静音（M）"
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(icon)
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .min_size(egui::vec2(36.0, 34.0)),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            self.cfg.player.muted = !self.cfg.player.muted;
+                            if let Some(p) = &self.player {
+                                p.set_muted(self.cfg.player.muted);
+                            }
+                        }
+                    });
+                }
+
+                // 按钮组：整行居中（默认 AllocateType::Content 只占实测组宽，不撑
+                // 行宽；首帧测量帧被 request_discard 丢弃，不可见）。
+                // 槽序 [隐形][<][播放][>][模式/隐形] 五槽等宽 48：播放键两侧各两
+                // 槽，恰为组的几何中心——Aligner 居组＝播放键中心落在窗口中线。
+                // 左端隐形槽与右端模式键配重（无笔画、无交互），两种模式下都在，
+                // 组宽恒定，切图↔视频零位移。
+                egui_alignments::Aligner::center()
+                    .bounds(egui_alignments::Bounds::max_rect())
+                    .show_horizontal(row, |ui| {
+                        ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
+                        if icon_btn(ui, "<", "上一个", false).clicked() {
+                            act.step = -1;
+                        }
+                        if self.playing_is_image() {
+                            // 图片：中间按钮=自动翻页开关（PPT 式）
+                            let (txt, tip) = if self.slideshow_on {
+                                ("||", "停止自动播放")
+                            } else {
+                                ("▶", "自动播放（翻页）")
+                            };
+                            if icon_btn(ui, txt, tip, self.slideshow_on).clicked() {
+                                act.slide = true;
+                            }
+                        } else if let Some(p) = &self.player {
+                            let (txt, tip) = if p.paused() {
+                                ("▶", "播放")
+                            } else {
+                                ("||", "暂停")
+                            };
+                            if icon_btn(ui, txt, tip, false).clicked() {
+                                act.toggle = true;
+                            }
+                        } else {
+                            // 未播放：播放按钮=开始当前标签页第一项
+                            if icon_btn(ui, "▶", "播放（从第一项开始）", false).clicked()
+                            {
+                                act.step = 1;
+                            }
+                        }
+                        if icon_btn(ui, ">", "下一个", false).clicked() {
+                            act.step = 1;
+                        }
+                        // 播放模式（仅视频，图片不显示——图片用各自的自动翻页开关）：
+                        // 列表播放（默认，播完自动下一个）↔ 单视频循环；循环中高亮。
+                        // 未播放时也显示，允许预设模式
+                        if !self.playing_is_image() {
+                            let (icon, tip) = if self.video_loop {
+                                ("↻", "循环播放中：点击切为列表播放（L）")
+                            } else {
+                                ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
+                            };
+                            if icon_btn(ui, icon, tip, self.video_loop).clicked() {
+                                act.loop_toggle = true;
+                            }
+                        } else {
+                            // 图片模式占同尺寸隐形槽（组末第五槽）：按钮组宽度
+                            // 与视频模式一致，切图↔视频零位移
+                            ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
+                        }
+                    });
+            },
+        );
 
         // 闭包外应用动作（避免嵌套借用 self）
         if act.step != 0 {

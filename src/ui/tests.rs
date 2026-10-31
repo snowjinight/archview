@@ -144,9 +144,8 @@ fn dir_mode_open_pipeline() {
     // 3) 空目录：DirVFS 打开成功但零条目 → 统一提示
     let empty = root.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
-        super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()]).unwrap(),
-    );
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()]).unwrap());
     let entries2 = vfs2.list();
     app.apply_open_done(empty, None, vfs2, 7, entries2, None);
     assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
@@ -218,9 +217,9 @@ fn virtual_list_scroll_to_row_and_fill() {
                         let step = h + spacing;
                         ui.set_height(step * total as f32 - spacing);
                         // 与 file_list 相同的手动行范围计算（含 3 行余量）
-                        let mut min_row =
-                            (((viewport.min.y / step).floor() as isize - 3).max(0) as usize)
-                                .min(total);
+                        let mut min_row = (((viewport.min.y / step).floor() as isize - 3).max(0)
+                            as usize)
+                            .min(total);
                         let mut max_row = (viewport.max.y / step).ceil() as usize + 3;
                         if max_row > total {
                             let diff = max_row - min_row;
@@ -238,8 +237,8 @@ fn virtual_list_scroll_to_row_and_fill() {
                                 // 修复后的换算：闭包 ui 的 max_rect.top 是
                                 // 内容顶 + min_row*step，行 pos 屏幕坐标 =
                                 // top + (pos - range.start) * step
-                                let y = ui.max_rect().top()
-                                    + (target_row - range.start) as f32 * step;
+                                let y =
+                                    ui.max_rect().top() + (target_row - range.start) as f32 * step;
                                 ui.scroll_to_rect(
                                     egui::Rect::from_min_size(
                                         egui::pos2(ui.max_rect().left(), y),
@@ -359,9 +358,8 @@ fn virtual_list_track_scroll_from_manually_scrolled_position() {
                 .auto_shrink([false, false])
                 .show_viewport(ui, |ui, viewport| {
                     ui.set_height(step * total as f32 - spacing);
-                    let mut min_row = (((viewport.min.y / step).floor() as isize - 3).max(0)
-                        as usize)
-                        .min(total);
+                    let mut min_row =
+                        (((viewport.min.y / step).floor() as isize - 3).max(0) as usize).min(total);
                     let mut max_row = (viewport.max.y / step).ceil() as usize + 3;
                     if max_row > total {
                         let diff = max_row - min_row;
@@ -371,8 +369,7 @@ fn virtual_list_track_scroll_from_manually_scrolled_position() {
                     let range = min_row..max_row;
                     let y_min = ui.max_rect().top() + min_row as f32 * step;
                     let y_max = ui.max_rect().top() + max_row as f32 * step;
-                    let rect =
-                        egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+                    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.skip_ahead_auto_ids(min_row);
                         if scroll_to {
@@ -388,10 +385,9 @@ fn virtual_list_track_scroll_from_manually_scrolled_position() {
                             );
                         }
                         for i in range.clone() {
-                            let resp =
-                                egui::Button::selectable(i == target, format!("[{i}] 短名"))
-                                    .truncate()
-                                    .ui(ui);
+                            let resp = egui::Button::selectable(i == target, format!("[{i}] 短名"))
+                                .truncate()
+                                .ui(ui);
                             if i == min_row {
                                 measured = resp.rect.height();
                             }
@@ -711,7 +707,11 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     // 缓存后一键跳回解压推进点（2）。锚点已落地 → 立即播放；下游 5
     // 尚未落地 → 重算预取窗口 [5] 并重 spawn 会话顺带补齐（秒开锚点
     // + 预取两不误）
-    assert_eq!(app.last_focus, Some(2), "会话退出后 last_focus 应保留（回到锚点的依据）");
+    assert_eq!(
+        app.last_focus,
+        Some(2),
+        "会话退出后 last_focus 应保留（回到锚点的依据）"
+    );
     assert_eq!(
         app.archive.as_ref().unwrap().session.lock().unwrap().focus,
         Some(2),
@@ -749,7 +749,10 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         if drained {
             break;
         }
-        assert!(std::time::Instant::now() <= deadline, "等待预取会话收尾超时");
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "等待预取会话收尾超时"
+        );
         if let Some(e) = &app.error {
             panic!("预取收尾阶段出错: {e}");
         }

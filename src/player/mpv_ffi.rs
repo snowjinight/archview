@@ -188,10 +188,8 @@ struct MpvApi {
         callback_ctx: *mut c_void,
     ),
     render_context_update: unsafe extern "C" fn(ctx: *mut MpvRenderContext) -> u64,
-    render_context_render: unsafe extern "C" fn(
-        ctx: *mut MpvRenderContext,
-        params: *mut MpvRenderParam,
-    ) -> c_int,
+    render_context_render:
+        unsafe extern "C" fn(ctx: *mut MpvRenderContext, params: *mut MpvRenderParam) -> c_int,
 }
 
 static API: OnceLock<MpvApi> = OnceLock::new();
@@ -413,7 +411,9 @@ pub fn get_property_string(ctx: *mut MpvHandle, name: &str) -> Result<Option<Str
     if r != MPV_ERROR_SUCCESS || out.is_null() {
         return Ok(None);
     }
-    let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
     unsafe { (a.mpv_free)(out) };
     Ok(Some(s))
 }
@@ -545,10 +545,20 @@ pub fn render_context_update(ctx: *mut MpvRenderContext) -> u64 {
 }
 
 /// 渲染一帧到指定 FBO。flip_y=1：GL FBO 原点在左下，让 mpv 翻转以匹配 GL 约定。
-pub fn render_gl_render(ctx: *mut MpvRenderContext, fbo: c_int, w: c_int, h: c_int) -> Result<(), String> {
+pub fn render_gl_render(
+    ctx: *mut MpvRenderContext,
+    fbo: c_int,
+    w: c_int,
+    h: c_int,
+) -> Result<(), String> {
     let a = api()?;
     unsafe {
-        let mut fbo_param = MpvOpenglFbo { fbo, w, h, internal_format: 0 };
+        let mut fbo_param = MpvOpenglFbo {
+            fbo,
+            w,
+            h,
+            internal_format: 0,
+        };
         let mut flip_y: c_int = 1;
         // 0：禁用"阻塞到目标时刻"，render() 立即返回（见常量注释）。
         // 帧节奏由 vsync 连续重绘保证（ui/mod.rs video_live 分支）。

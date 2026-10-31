@@ -28,6 +28,7 @@ alphanumeric-sort = "1.5"
 # 图片解码（静态图 egui 纹理直显）：只启用媒体配置里出现的格式，
 # 避免默认特性的 avif/openexr 等重依赖拖慢编译
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico", "tga"] }
+egui_alignments = "0.3.9"
 
 [build-dependencies]
 winresource = "0.1"

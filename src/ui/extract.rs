@@ -156,11 +156,15 @@ impl App {
     /// 占位符。补发幂等（已缓存/解码中直接返回），任何掉出一帧内重建；
     /// 与看门狗配合：pending 卡死 10s 剔除后也走这里重新发起
     fn heal_current_image(&mut self) {
-        let Some(key) = self.tex_image_key() else { return };
+        let Some(key) = self.tex_image_key() else {
+            return;
+        };
         if self.img.has(key) || self.img.is_pending(key) {
             return;
         }
-        let Some(arch) = self.archive.as_ref() else { return };
+        let Some(arch) = self.archive.as_ref() else {
+            return;
+        };
         let e = &arch.entries[key.1];
         let src = ImageSource::Stream(arch.vfs.clone(), e.clone());
         let name = e.name.clone();
@@ -178,9 +182,11 @@ impl App {
         if !self.ensure_player() {
             return;
         }
-        let Some((stream, archive_id, name)) = self.archive.as_ref().map(|a| {
-            (a.stream, a.id, a.entries[entry_idx].name.clone())
-        }) else {
+        let Some((stream, archive_id, name)) = self
+            .archive
+            .as_ref()
+            .map(|a| (a.stream, a.id, a.entries[entry_idx].name.clone()))
+        else {
             return;
         };
         self.img_fallback.insert((archive_id, entry_idx));
@@ -207,9 +213,13 @@ impl App {
     fn prefetch_images(&mut self) {
         // 阶段一（不可变借用）：收集邻居候选（位置 → key + 解码源 + 名）
         let cands: Vec<(ImgKey, ImageSource, String)> = {
-            let Some(arch) = self.archive.as_ref() else { return };
+            let Some(arch) = self.archive.as_ref() else {
+                return;
+            };
             let Some(cur) = self.playing else { return };
-            let Some(pos) = arch.view.iter().position(|&i| i == cur) else { return };
+            let Some(pos) = arch.view.iter().position(|&i| i == cur) else {
+                return;
+            };
             let dir = cache::cache_dir(&self.cfg);
             let mut v = Vec::with_capacity(2);
             for p in [pos.checked_sub(1), Some(pos + 1)].into_iter().flatten() {
@@ -222,7 +232,10 @@ impl App {
                     ImageSource::Stream(arch.vfs.clone(), e.clone())
                 } else {
                     let dest = cache::dest_path(&dir, arch.id, i, &e.name);
-                    if std::fs::metadata(&dest).map(|m| m.len() == e.size).unwrap_or(false) {
+                    if std::fs::metadata(&dest)
+                        .map(|m| m.len() == e.size)
+                        .unwrap_or(false)
+                    {
                         ImageSource::File(dest)
                     } else {
                         continue;
@@ -365,7 +378,11 @@ impl App {
     /// 本批写入后必被 LRU 驱逐的字节数 = min(占用, 占用+本批-上限)。
     /// 删除即释放磁盘，驱逐多少等效余量就多多少
     pub(super) fn evictable_bytes(usage: u64, batch_bytes: u64, quota_bytes: u64) -> u64 {
-        usage.min(usage.saturating_add(batch_bytes).saturating_sub(quota_bytes))
+        usage.min(
+            usage
+                .saturating_add(batch_bytes)
+                .saturating_sub(quota_bytes),
+        )
     }
 
     /// 当前解码会话快照：(锚点 focus, 窗口摘要)。摘要格式

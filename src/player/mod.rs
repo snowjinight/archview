@@ -58,10 +58,26 @@ fn make_fbo(gl: &glow::Context, w: i32, h: i32) -> (glow::NativeFramebuffer, glo
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
         let fbo = gl.create_framebuffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
@@ -251,18 +267,14 @@ impl PlayerService {
                         // data=null（如装载前的 time-pos），自然被 data 判空跳过
                         mpv_ffi::MPV_EVENT_PROPERTY_CHANGE => {
                             if !ev.data.is_null() {
-                                let p = unsafe {
-                                    &*(ev.data as *mut mpv_ffi::MpvEventProperty)
-                                };
+                                let p = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
                                 if !p.name.is_null() && !p.data.is_null() {
                                     let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
                                     if p.format == mpv_ffi::MPV_FORMAT_FLAG {
                                         let v = unsafe { *(p.data as *const c_int) } != 0;
                                         match name {
                                             b"pause" => paused_flag.store(v, Ordering::Relaxed),
-                                            b"eof-reached" => {
-                                                eof_flag.store(v, Ordering::Relaxed)
-                                            }
+                                            b"eof-reached" => eof_flag.store(v, Ordering::Relaxed),
                                             b"pause-for-cache" => {
                                                 buffering_flag.store(v, Ordering::Relaxed)
                                             }
@@ -285,9 +297,7 @@ impl PlayerService {
                         }
                         mpv_ffi::MPV_EVENT_LOG_MESSAGE if log_on => {
                             // 字符串指针归 mpv 所有、仅当次事件有效：先转 owned 再格式化
-                            let m = unsafe {
-                                &*(ev.data as *mut mpv_ffi::MpvEventLogMessage)
-                            };
+                            let m = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventLogMessage) };
                             let (prefix, text) = unsafe {
                                 (
                                     CStr::from_ptr(m.prefix).to_string_lossy().into_owned(),
@@ -666,8 +676,7 @@ impl PlayerService {
     /// vsync 节拍
     fn opening(&self) -> bool {
         self.load_mark.get().is_some()
-            && !(self.painted_since_load.get()
-                && self.playback_ready.load(Ordering::Relaxed))
+            && !(self.painted_since_load.get() && self.playback_ready.load(Ordering::Relaxed))
     }
 
     /// 当前播放位置：observe_property 本地缓存，纯原子读。seek 卡顿实证：
@@ -1102,18 +1111,14 @@ mod tests {
                 let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
                 if !ev.is_null() {
                     let ev = unsafe { &*ev };
-                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
-                        && !ev.data.is_null()
-                    {
-                        let p =
-                            unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
+                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE && !ev.data.is_null() {
+                        let p = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
                         if !p.name.is_null()
                             && p.format == mpv_ffi::MPV_FORMAT_FLAG
                             && !p.data.is_null()
                         {
                             let name = unsafe { CStr::from_ptr(p.name) }.to_bytes();
-                            let v =
-                                unsafe { *(p.data as *const std::ffi::c_int) } != 0;
+                            let v = unsafe { *(p.data as *const std::ffi::c_int) } != 0;
                             if name == prop && v == want {
                                 return true;
                             }
@@ -1139,7 +1144,10 @@ mod tests {
         mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
         assert!(recv_flag(b"mute", true), "cycle 后应收到 mute=true 推送");
         mpv_ffi::command_string(ctx, "no-osd cycle mute").unwrap();
-        assert!(recv_flag(b"mute", false), "再次 cycle 后应收到 mute=false 推送");
+        assert!(
+            recv_flag(b"mute", false),
+            "再次 cycle 后应收到 mute=false 推送"
+        );
 
         // 3) 同一 ctx 二路订阅互不干扰：pause 的初始推送与 cycle 翻转都
         //    准确送达（生产泵线程按 name 分发到各自缓存依赖此点）
@@ -1176,7 +1184,10 @@ mod tests {
             assert!(st.status.success(), "ffmpeg 生成失败");
             // 3) 末尾把 pause 翻成了 true，先解除再起播（否则 time-pos 不推进）
             mpv_ffi::command_string(ctx, "no-osd cycle pause").unwrap();
-            assert!(recv_flag(b"pause", false), "解除暂停应收到 pause=false 推送");
+            assert!(
+                recv_flag(b"pause", false),
+                "解除暂停应收到 pause=false 推送"
+            );
 
             // 收一个 PROPERTY_CHANGE(prop) 且 DOUBLE 值满足 pred（10s 超时）
             let recv_double = |prop: &[u8], pred: &dyn Fn(f64) -> bool| -> Option<f64> {
@@ -1185,12 +1196,8 @@ mod tests {
                     let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
                     if !ev.is_null() {
                         let ev = unsafe { &*ev };
-                        if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
-                            && !ev.data.is_null()
-                        {
-                            let p = unsafe {
-                                &*(ev.data as *mut mpv_ffi::MpvEventProperty)
-                            };
+                        if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE && !ev.data.is_null() {
+                            let p = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
                             if !p.name.is_null()
                                 && p.format == mpv_ffi::MPV_FORMAT_DOUBLE
                                 && !p.data.is_null()
@@ -1255,11 +1262,8 @@ mod tests {
                 let ev = unsafe { mpv_ffi::wait_event(ctx, 0.05) };
                 if !ev.is_null() {
                     let ev = unsafe { &*ev };
-                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE
-                        && !ev.data.is_null()
-                    {
-                        let p =
-                            unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
+                    if ev.event_id == mpv_ffi::MPV_EVENT_PROPERTY_CHANGE && !ev.data.is_null() {
+                        let p = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventProperty) };
                         if !p.name.is_null()
                             && p.format == mpv_ffi::MPV_FORMAT_FLAG
                             && !p.data.is_null()
@@ -1406,7 +1410,9 @@ mod tests {
         drain(300);
 
         mpv_ffi::destroy(ctx);
-        eprintln!("\n===== 汇总: A(zvf冷启)={t_a:.3}s  B(file直读)={t_b:.3}s  C(zvf切换)={t_c:.3}s");
+        eprintln!(
+            "\n===== 汇总: A(zvf冷启)={t_a:.3}s  B(file直读)={t_b:.3}s  C(zvf切换)={t_c:.3}s"
+        );
         eprintln!("A/C 慢而 B 快 → zvf 链路问题；三者都慢 → mpv/lavf 对 webp 本身的问题");
     }
 }

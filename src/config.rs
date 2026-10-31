@@ -294,8 +294,12 @@ impl Config {
     /// 失败静默——本次启动配置已经 serde(default) 兜底默认值，
     /// 补全只影响文件内容（便于用户下次查看/手动编辑）
     fn backfill(path: &std::path::Path, user_text: &str) {
-        let Ok(mut doc) = user_text.parse::<DocumentMut>() else { return };
-        let Ok(def) = DEFAULT_TOML.parse::<DocumentMut>() else { return };
+        let Ok(mut doc) = user_text.parse::<DocumentMut>() else {
+            return;
+        };
+        let Ok(def) = DEFAULT_TOML.parse::<DocumentMut>() else {
+            return;
+        };
         if backfill_table(doc.as_table_mut(), def.as_table()) > 0 {
             let _ = std::fs::write(path, doc.to_string());
         }

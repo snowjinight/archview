@@ -7,7 +7,7 @@
 //! （trait 默认实现的 `extract_*`/`verify_password` 永远不会被调用：条目
 //! 全部 `encrypted=false`，密码探测零成本直通）。
 
-use super::{ArchiveVFS, AccessMode, VirtualEntry, VirtualFile, VfsError};
+use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -69,7 +69,9 @@ impl DirVFS {
                     continue;
                 }
                 let Ok(md) = e.metadata() else { continue };
-                let Ok(rel) = p.strip_prefix(&self.root) else { continue };
+                let Ok(rel) = p.strip_prefix(&self.root) else {
+                    continue;
+                };
                 let name = rel.to_string_lossy().replace('\\', "/");
                 self.paths.insert(name.clone(), p);
                 self.entries.push(VirtualEntry {
@@ -141,11 +143,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "dirvfs_test_{}_{}",
-            std::process::id(),
-            n
-        ));
+        let root = std::env::temp_dir().join(format!("dirvfs_test_{}_{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&root);
         let files: Vec<(String, Vec<u8>)> = vec![
             ("a.mp4".into(), vec![1; 100]),
@@ -164,7 +162,10 @@ mod tests {
     }
 
     fn exts() -> Vec<String> {
-        ["mp4", "jpg", "mkv"].iter().map(|s| s.to_string()).collect()
+        ["mp4", "jpg", "mkv"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn find<'a>(files: &'a [(String, Vec<u8>)], rel: &str) -> &'a (String, Vec<u8>) {
