@@ -15,8 +15,8 @@
 | 专题 | 内容 | 对应架构章节 |
 |---|---|---|
 | §1 | 大包性能专项修复（Phase 2）：folder 直达 / ZIP 头 / 虚拟列表四坑 | ARCHITECTURE §11 |
-| §2 | 渲染迁移与图片浏览器踩坑（九坑） | ARCHITECTURE §13 / §13.4 |
-| §3 | 播放流畅性专项：mpv core 锁三轮攻坚（打开冻结 → 切换卡顿 → seek 卡顿） | ARCHITECTURE §13.2 |
+| §2 | 渲染迁移与图片浏览器踩坑（十坑） | ARCHITECTURE §13 / §13.4 |
+| §3 | 播放流畅性专项：mpv core 锁四轮攻坚（打开冻结 → 切换卡顿 → seek 卡顿 → 写路径 async） | ARCHITECTURE §13.2 |
 | §4 | 点击状态机排查手册（start_extract 分支链与日志对照） | ARCHITECTURE §11.4 |
 | §5 | 解压会话化回归测试细节（单测 + UI 冒烟） | ARCHITECTURE §11.4 |
 | §6 | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
@@ -182,15 +182,24 @@ SetProcessDpiAwarenessContext(PerMonitorV2)，ppp 能读到 1.5 即证明进程�
 编辑器开着源文件时保存旧缓冲会静默覆盖 AI 已写入磁盘的编辑（本项目实际发生
 多次，表现为编译报"缺字段"）。AI 协作改代码前先 reload 编辑器 / 关掉相关文件。
 
+### 坑 10（流程）：并行编辑同一文件 → 互相冲突，报成功实未落盘
+
+同一条消息里并行发多个编辑（SearchReplace）到**同一个文件**时，各编辑基于
+同一份磁盘快照，后写者会丢弃/覆盖先写者的结果——表现为"工具报成功、grep
+验证不存在"的**幻影落盘**（本项目实际发生：一次三连编辑丢三处，逐条重发
+才落盘）。**同一文件的编辑必须串行**：一次一条、验证落盘后再发下一条；
+不同文件的编辑才可并行。
+
 **附：egui 0.36 API 备忘**——无 `allocate_ui_at_rect`，「视频矩形 + 底部进度条」
 用 `allocate_rect` 顺序布局实现。
 
 ---
 
-## 3. 播放流畅性专项：mpv core 锁三轮攻坚（player/mod.rs）
+## 3. 播放流畅性专项：mpv core 锁四轮攻坚（player/mod.rs）
 
-> 三轮修复共用同一个根因模型（§3.0），症状不同只是 core 忙窗口出现的时机不同：
-> 打开（探测链）→ 切换（属性轮询）→ seek（执行期）。架构描述见 ARCHITECTURE §13.2。
+> 四轮修复共用同一个根因模型（§3.0），症状不同只是 core 忙窗口出现的时机不同：
+> 打开（探测链）→ 切换（属性轮询）→ seek（执行期）→ 写入（忙窗口内属性写）。
+> 架构描述见 ARCHITECTURE §13.2。
 
 ### 3.0 mpv 属性访问的成本模型（一切卡顿的根因框架）
 
@@ -198,6 +207,9 @@ SetProcessDpiAwarenessContext(PerMonitorV2)，ppp 能读到 1.5 即证明进程�
   实际工作（seek 换算、解码、换文件）在 core playloop 后台线程执行；
 - **属性读取是同步的**：`get_property` 是 FFI 调用，要拿 mpv core 锁才能读；
   core 正忙（demuxer 探测 / hwdec 试探 / seek 执行）时**阻塞到 core 忙完为止**；
+- **属性写入同样拿锁**：`set_property` 与 `get_property` 同一 core 锁——忙窗口内
+  UI 线程写属性（set mute/volume）同样阻塞整帧；异步版 `mpv_set_property_async`
+  只入队即返回，core 空出手再应用（§3.5）；
 - **推论**：UI 帧路径上任何 `get_property`，都会在 core 忙窗口把整帧 UI 卡住——
   哪怕读的只是 `eof-reached` 这种"便宜"标志。
 
@@ -263,6 +275,9 @@ zip VFS 重解丢弃）在 core 后台**持锁**进行；seek 后没有 opening(
 | `eof-reached` / `pause-for-cache` | FLAG | `AtomicBool` | mpv 播放推进（EOF / 缓冲） |
 | `time-pos` / `duration` | DOUBLE | `AtomicU64`（f64 位模式 `to_bits`/`from_bits`） | mpv 每帧 / 装载完成 |
 
+> 演进注记（2026-10-31）：`mute` 已退出订阅——静音真相迁至 `cfg.player.muted`
+> （mute 无 mpv 内部写入者，无回读需求，见 §3.5），现存五属性。
+
 - **泵分发**：事件泵 `MPV_EVENT_PROPERTY_CHANGE` 按属性格式分发——FLAG 读
   `*const c_int`、DOUBLE 读 `*const f64`（data 指针按格式重解释，双格式分发
   是本轮泵改造的核心）；
@@ -326,6 +341,61 @@ core 忙的时机（换文件、缓冲、字幕轨切换）还会复发；按成
 - **info**：用户动作与业务生命周期（后台解压、缓存命中、会话重定向等 §4
   手册所列日志——它们是排查手册的 grep 关键词，必须保持 info）；
 - 优先级：`RUST_LOG` 环境变量 > config.toml `log_level` > 默认 info（main.rs 启动序）。
+
+### 3.5 第四轮：mute/volume 写路径锁阻塞 → cfg 真相迁移 + 属性写 async 化（2026-10-31）
+
+**背景**：静音 UI 迭代——M 键改为翻转 `cfg.player.muted`（无播放器/未开文件也可
+预设）、新增 ♪ 删除线 toggle 按钮、音量滑条数字右置（egui Slider `show_value`
+默认开，渲染为 `[滑条][DragValue]`，右到左布局先加滑条数字即在最右）、调音量
+自动解除静音。`set_muted` 写入路径随之提上议程。
+
+**质询**（用户两连问，推动方案升级）：打开忙窗口（demux 探测 ~0.5s 占 core 锁）
+内 UI 线程 `set_property("mute")` 与 `get_property` 同拿一把锁——忙窗口内点静音
+照样整帧冻结？§3.0 成本模型此前只覆盖读路径，写路径同罪。
+
+**决策 1：mute 真相迁移到 `cfg.player.muted`**（muted_cache 原子缓存与 mute 订阅
+整体移除，订阅六属性 → 五属性）：
+
+- **为什么 mute 可以不订阅、pause 不行**：mute 无 mpv 内部写入者（osc=no、
+  osd-level=0、无外部遥控），UI 是唯一写入方——无回读需求就没有订阅需求；
+  pause 有内部写入者（keep-open EOF 置 pause=yes，§3.0 备忘），必须订阅对账；
+- **收益**：未播放/未开文件可预设、持久化（serde(default) 兼容旧配置）、帧路径
+  零 FFI（读 cfg 普通 bool，无锁无原子）、省一条订阅与一个 AtomicBool；
+- **读路径风险论证**：读 cfg 是普通字段访问，不沾成本模型任何卡顿形态。
+
+**决策 2：运行时属性写 async 化**（`mpv_set_property_async`）：
+
+- `set_muted` / `set_volume` 改走异步入队：入队即返回不拿 core 锁，core 空出手
+  再应用；**同 client 内写入顺序保持**，set_volume 连发的 volume + mute=no
+  不会乱序；data 会被 mpv 拷贝（client.h 明示），临时 CString 调用返回即可释放；
+- **创建期仍走同步版**（`PlayerService::new` 内 set volume/mute）：此刻在
+  loadfile（demuxer 启动）**之前**，core 空闲零竞争，且同步版能即时报错——
+  时机不同用不同版本，这是两段共存的依据；
+- 写失败只经 `MPV_EVENT_SET_PROPERTY_REPLY` 回报（泵不消费）：cfg 是真相，
+  下次创建对齐——订阅/回读全链路都不需要。
+
+**FFI 坑：`MPV_FORMAT_STRING` 的 data 是二级指针 → STATUS_ACCESS_VIOLATION**
+（与 §2 坑 1 同类风险：手写 FFI 无编译器保护）：
+
+- **现象**：新测试 `ffi_set_property_async` 崩溃 0xc0000005，cargo test 全量挂；
+- **定位**：eprintln 标记二分——"before async set" 打印后崩、"returned" 未打印，
+  崩点锁定在 `mpv_set_property_async` 调用内部；
+- **根因**：STRING 格式的 data 参数要传**指向 `char*` 的指针**（二级），误传
+  字符串本体一级指针 → mpv 多解一层引用 → 读野地址。证据：libmpv crate 的
+  `Format::String` SetData 传 `(&mut string.as_ptr()) as *mut *const c_char`；
+  `mpv_event_property` 文档 STRING 取值同为 `*(char**)data` 解引用模式；
+- **修复**（mpv_ffi.rs `set_property_string_async`）：
+  `let mut data_ptr = data.as_ptr();` 传
+  `&mut data_ptr as *mut *const c_char as *mut c_void`（CString 调用期间存活
+  即可，mpv 在调用内拷贝）；
+- **教训**：手写 FFI 的指针语义（"data 指向值本体还是指向值的指针"这一约定）
+  无编译器保护，必须对照 client.h 原文或成熟绑定源码核实；ACCESS_VIOLATION
+  类崩溃优先怀疑指针解引用层级，而非逻辑错误。
+
+**测试**（player/mod.rs `ffi_set_property_async`）：vo/ao null 的裸 ctx →
+observe mute 收到初始推送 false → 两次 `set_property_string_async` 置 yes/no，
+各断言 observe 推送到位——一条用例同时钉死二级指针写法与"异步写入确实被
+core 执行"两件事。全量 82 测试通过，clippy 改动文件零告警。
 
 ---
 
