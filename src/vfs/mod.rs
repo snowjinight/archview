@@ -50,6 +50,7 @@ fn extra_encoding() -> Option<&'static encoding_rs::Encoding> {
 /// - 7z：UTF-16LE（规范定义，SevenzVFS 的 Password::from 已按此转换，不走候选）
 /// - RAR5 / 跨平台工具（Python、Linux zip 命令）：UTF-8
 /// - Windows 老工具（WinRAR/7-Zip/Bandizip）创建 zip / RAR4 时按系统 ANSI 代码页（配置项，默认 GBK）
+///
 /// 故生成 UTF-8 + 配置代码页两个候选，解压时依次尝试；纯 ASCII 时两者相同只留一个。
 pub(crate) fn password_candidates(pw: &str) -> Vec<Vec<u8>> {
     let utf8 = pw.as_bytes().to_vec();
@@ -201,6 +202,7 @@ pub trait ArchiveVFS: Send + Sync {
     /// - `progress`：(字节数, 阶段文字)。阶段为空串 = 正在写目标文件（字节数
     ///   = 已写出）；非空 = 定位/跳过前置文件阶段（字节数 = 已顺序解压的字节数，
     ///   此阶段可能占总耗时 99%，必须上报让人看到进展，否则像卡死）。
+    ///
     /// 默认不支持；ZipVFS/SevenzVFS/RarVFS 各自实现。
     fn extract_entry(
         &self,
@@ -220,6 +222,7 @@ pub trait ArchiveVFS: Send + Sync {
     ///   （临时文件改名完成）时回调 i——UI 据此在目标就绪时立即播放，
     ///   不必等整批完成
     /// - 其余参数语义同 `extract_entry`
+    ///
     /// 默认实现逐条调用 extract_entry（zip 等无跳过成本的格式）；
     /// 7z/RAR 覆写为单次遍历批量解出。
     fn extract_batch(
@@ -337,6 +340,7 @@ pub trait ArchiveVFS: Send + Sync {
     /// 校验密码能否解密指定条目（打开阶段密码探测用，ARCHITECTURE.md 12.5）。
     /// - Ok(())：密码可用于该条目（或条目未加密，任意密码都通过）
     /// - Err(Password)：密码错误 / 加密但未提供密码
+    ///
     /// 实现成本与格式相关：zip 构造 reader 即验 2 字节校验值（零解压）；
     /// RAR5 头带 PswCheck、RAR4 无密码哈希，实现为解压该条目到临时文件；
     /// 7z 无存储校验值，实现为解压该条目到内存 sink、靠 CRC 校验判错。
@@ -385,6 +389,7 @@ fn probe_entry(entries: &[VirtualEntry]) -> Option<&VirtualEntry> {
 /// - 加密头包（7z/RAR）：open 即验密码，候选逐个重开
 /// - 内容加密包（zip AES / 7z / RAR 明文头）：open 恒成功，对最小加密条目
 ///   `verify_password` 逐候选校验，命中后带密码重开
+///
 /// 返回 (VFS, 锁定的密码)：密码 None = 包未加密。候选全不匹配返回 Err(Password)，
 /// 调用方（CLI 记失败 / UI 弹密码框）据此走兜底路径
 pub fn open_with_password_probe(

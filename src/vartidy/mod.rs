@@ -1126,7 +1126,7 @@ mod tests {
         };
 
         // ---- dry-run：不写任何文件 ----
-        let r = run_quiet(&[arch.clone()], &opts(true));
+        let r = run_quiet(std::slice::from_ref(&arch), &opts(true));
         assert_eq!(r.summary.crc_conflict, 1);
         assert_eq!(r.summary.in_archive_dup, 1);
         assert_eq!(
@@ -1140,7 +1140,7 @@ mod tests {
         assert!(r.report_path.is_some(), "dry-run 也应产出报告");
 
         // ---- 实际执行 ----
-        let r = run_quiet(&[arch.clone()], &opts(false));
+        let r = run_quiet(std::slice::from_ref(&arch), &opts(false));
         assert_eq!(r.summary.added, 1);
         assert_eq!(r.summary.added_bytes, content_x.len() as u64);
         // Alice 新增且内容一致（完整文件名进作者目录）
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(alice_files.len(), 1);
 
         // ---- 幂等重跑：全部命中仓库已有，零新增 ----
-        let r = run_quiet(&[arch.clone()], &opts(false));
+        let r = run_quiet(std::slice::from_ref(&arch), &opts(false));
         assert_eq!(r.summary.added, 0);
         assert_eq!(r.summary.repo_exists, 2, "Alice/Bob 两份均已有");
         let bob = std::fs::read(repo.join("Bob").join("Bob.scene.2.var")).unwrap();
@@ -1191,7 +1191,7 @@ mod tests {
             report_dir: Some(dir.clone()),
             passwords: vec![],
         };
-        let r = run_quiet(&[arch.clone()], &opts);
+        let r = run_quiet(std::slice::from_ref(&arch), &opts);
         assert_eq!(r.summary.added, 2);
         assert_eq!(r.summary.invalid, 1);
         // 完整文件名进作者目录（Cara/Cara.hair.3.var）
@@ -1227,7 +1227,7 @@ mod tests {
         std::fs::write(dir.join("x.part2.rar"), [0u8; 8]).unwrap();
         std::fs::write(dir.join("x.part10.rar"), [0u8; 8]).unwrap();
 
-        let mut got: Vec<String> = expand_inputs(&[dir.clone()])
+        let mut got: Vec<String> = expand_inputs(std::slice::from_ref(&dir))
             .into_iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();

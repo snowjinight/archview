@@ -192,7 +192,7 @@ impl RarVFS {
                         })?;
                         skipped += 1;
                         skipped_bytes += size;
-                        if skipped % 64 == 0 {
+                        if skipped.is_multiple_of(64) {
                             progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
                         }
                     }
@@ -271,7 +271,7 @@ impl RarVFS {
                 })?;
                 skipped += 1;
                 skipped_bytes += size;
-                if skipped % 64 == 0 {
+                if skipped.is_multiple_of(64) {
                     progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
                 }
                 continue;

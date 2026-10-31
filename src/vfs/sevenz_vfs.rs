@@ -75,12 +75,7 @@ impl SevenzVFS {
             .collect();
         // folder 布局（locate_start 的上游预取免费区判据）：条目 → 所在 folder、
         // folder → 首个条目（首个条目的 locate_start 即其自身，免费区为空）
-        let folder_of: Vec<Option<usize>> = archive
-            .stream_map
-            .file_folder_index
-            .iter()
-            .copied()
-            .collect();
+        let folder_of: Vec<Option<usize>> = archive.stream_map.file_folder_index.to_vec();
         let mut folder_first = std::collections::HashMap::new();
         let mut folder_size: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
@@ -95,11 +90,7 @@ impl SevenzVFS {
         let solid = folder_size.values().any(|&n| n >= 2);
         Ok(Self {
             path: path.to_path_buf(),
-            password: if password.is_some() {
-                Some(Password::from(password.unwrap()))
-            } else {
-                None
-            },
+            password: password.map(Password::from),
             entries,
             folder_of,
             folder_first,
@@ -254,7 +245,7 @@ impl ArchiveVFS for SevenzVFS {
                     std::io::copy(data, &mut std::io::sink()).map_err(sevenz_rust::Error::io)?;
                     skipped += 1;
                     skipped_bytes += e.size;
-                    if skipped % 64 == 0 {
+                    if skipped.is_multiple_of(64) {
                         progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
                     }
                     Ok(true)
@@ -457,7 +448,7 @@ impl ArchiveVFS for SevenzVFS {
                             .map_err(sevenz_rust::Error::io)?;
                         skipped += 1;
                         skipped_bytes += e.size;
-                        if skipped % 64 == 0 {
+                        if skipped.is_multiple_of(64) {
                             progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
                         }
                         Ok(true)

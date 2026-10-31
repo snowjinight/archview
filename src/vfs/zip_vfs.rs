@@ -460,22 +460,23 @@ impl Seek for SeekableZipFile {
             self.pos = target;
             return Ok(target);
         }
-        if target > self.pos && self.file.is_some() {
+        if target > self.pos {
             // 下游 seek：继续解压丢弃输出
-            let f = self.file.as_mut().unwrap();
-            skip(f, target - self.pos)?;
-            self.pos = target;
-        } else {
-            // 上游 seek 或无流：重开 entry 从头丢弃（加密条目带密码候选重开）
-            self.file = None;
-            let f = ZipVFS::by_index(&mut self.archive, self.index, &self.password)
-                .map_err(std::io::Error::other)?;
-            let f: zip::read::ZipFile<'static, File> = unsafe { std::mem::transmute(f) };
-            self.file = Some(f);
-            let f = self.file.as_mut().unwrap();
-            skip(f, target)?;
-            self.pos = target;
+            if let Some(f) = self.file.as_mut() {
+                skip(f, target - self.pos)?;
+                self.pos = target;
+                return Ok(self.pos);
+            }
         }
+        // 上游 seek 或无流：重开 entry 从头丢弃（加密条目带密码候选重开）
+        self.file = None;
+        let f = ZipVFS::by_index(&mut self.archive, self.index, &self.password)
+            .map_err(std::io::Error::other)?;
+        let f: zip::read::ZipFile<'static, File> = unsafe { std::mem::transmute(f) };
+        self.file = Some(f);
+        let f = self.file.as_mut().unwrap();
+        skip(f, target)?;
+        self.pos = target;
         Ok(self.pos)
     }
 }

@@ -160,7 +160,7 @@ fn dir_mode_open_pipeline() {
 #[test]
 fn natural_sort_pipeline_semantics() {
     fn sort(mut v: Vec<&str>) -> Vec<&str> {
-        v.sort_by(|a, b| alphanumeric_sort::compare_str(&a.to_lowercase(), &b.to_lowercase()));
+        v.sort_by(|a, b| alphanumeric_sort::compare_str(a.to_lowercase(), b.to_lowercase()));
         v
     }
     // 纯编号：1/2/9/10/12（字典序会给出 1/10/12/2/9）
@@ -315,11 +315,13 @@ fn virtual_list_track_scroll_from_manually_scrolled_position() {
     let total = 10_000usize;
     let target = 51usize;
     let ctx = egui::Context::default();
-    let mut raw = egui::RawInput::default();
-    raw.screen_rect = Some(egui::Rect::from_min_size(
-        egui::pos2(0.0, 0.0),
-        egui::vec2(400.0, 300.0),
-    ));
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(400.0, 300.0),
+        )),
+        ..Default::default()
+    };
     let mut row_h: Option<f32> = None;
     let mut offsets: Vec<f32> = Vec::new();
     let mut scroll_to = false;

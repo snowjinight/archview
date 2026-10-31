@@ -276,7 +276,7 @@ impl App {
         );
         // 空集合提示（目录里没有媒体 / 压缩包内没有媒体文件）——
         // 统一在此给出，各打开入口不必各自判断
-        if self.archive.as_ref().map_or(false, |a| a.view.is_empty()) {
+        if self.archive.as_ref().is_some_and(|a| a.view.is_empty()) {
             self.notice = Some("没有可播放的视频/图片".into());
         }
         // 取消并清掉旧包的解压任务：不清会导致旧包 FileDone 到来时

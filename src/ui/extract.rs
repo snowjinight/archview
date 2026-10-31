@@ -809,10 +809,12 @@ impl App {
                     );
                     // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 期望
                     // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播
-                    if !reviewing && gen == self.next_gen && self.playing != Some(entry_idx) {
-                        if std::fs::metadata(&dest).is_ok() {
-                            self.load_extracted(&dest, entry_idx);
-                        }
+                    if !reviewing
+                        && gen == self.next_gen
+                        && self.playing != Some(entry_idx)
+                        && std::fs::metadata(&dest).is_ok()
+                    {
+                        self.load_extracted(&dest, entry_idx);
                     }
                 }
                 ExtMsg::Failed(e, is_pwd) => {
