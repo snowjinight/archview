@@ -357,6 +357,28 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 > 格式选型：TOML（而非 JSON）——原生 `#` 注释 + 强制 UTF-8，默认配置带中文说明每个参数含义；
 > 字符串必须双引号，无 YAML 裸标量陷阱（`yes/no` 变布尔、`#` 误注释）。
 > 默认文件由手写模板生成（`config.rs` 的 `DEFAULT_TOML`），防漂移测试保证模板与代码默认值一致。
+>
+> 配置菜单与热重载（顶栏「配置」，免重启改配置）：
+> - 「编辑 config.toml」：内嵌编辑器（ui/config_editor.rs）——'#' 注释灰色高亮
+>   （自定义 layouter 逐行扫描，跳过双引号字符串内的 #；纯函数单测覆盖），
+>   Ctrl+C/V/A/Z 为 egui 原生（另加 Ctrl+S=保存）；「保存并生效」走与启动同一
+>   解析路径校验（toml::from_str::<Config>：语法与类型错均拦在写盘前），
+>   通过 → 写盘 → 关窗 → 复用「重载配置」热生效；失败窗口保留并显示带行列号
+>   错误（编辑内容不丢），用户删掉的键由 backfill 自动补全。
+> - 「打开 config 目录」：资源管理器打开 config.toml 所在目录（外部编辑器/
+>   查看备份等场景）；spawn 失败回退资源管理器定位并选中该文件。
+>   顶栏绿色提示（含"配置已重载"）显示 5 秒后自动消失（error 需人工处理则常驻）。
+> - 「重载配置」：重读 config.toml 后按生效时机分三档——
+>   ① 即时：media 扩展名与 ui.sort_files（`rebuild_view` 重建列表）、codepage
+>   （`vfs::set_codepage` 全局量）、ui.font_path（重装字体链）、
+>   ui.image_cache_count（`ImageService::set_cap`），以及一切使用点读
+>   `self.cfg` 的项（预取预算/图片阈值与锐化/幻灯片间隔等）；
+>   ② 下次播放：player.*——未播放时销毁播放器（`shutdown_render` 后置 None），
+>   下次播放按新配置重建；播放中不断流，仅 async 下发音量/静音；
+>   ③ 仅重启：log_level（tracing 订阅器启动后固定）、cache.dll_dir（dll 启动时
+>   动态加载一次）。
+>   解析失败保留旧配置继续运行（编辑出错不必杀进程）。passwords/codepage 对
+>   下次打开的压缩包生效（已开包的密码已锁定）。
 
 ---
 

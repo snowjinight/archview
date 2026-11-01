@@ -264,7 +264,17 @@ impl Config {
         v
     }
 
-    /// 启动时读取 config.toml；不存在则写入带中文注释的默认模板
+    /// 当前生效的 config.toml 路径（「配置」菜单：外部编辑器打开 / 热重载）。
+    /// 返回候选中第一个存在的；都不存在 = exe 同目录（启动时生成默认模板处）
+    pub fn config_path() -> PathBuf {
+        let cands = Self::config_candidates();
+        let fallback = cands[0].clone();
+        cands.into_iter().find(|p| p.exists()).unwrap_or(fallback)
+    }
+
+    /// 启动时读取 config.toml；不存在则写入带中文注释的默认模板。
+    /// 热重载（菜单「配置 → 重载配置」）复用本函数：文件被运行中删除时
+    /// 会重建默认模板，缺键补全（backfill）同样生效
     pub fn load_or_create() -> Result<Config, String> {
         let candidates = Self::config_candidates();
         for path in &candidates {

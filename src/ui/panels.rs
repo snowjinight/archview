@@ -89,6 +89,40 @@ impl App {
                 self.notice = Some(format!("已清理缓存 {:.1} MB", freed as f64 / 1048576.0));
                 tracing::info!("手动清理缓存: {:.1} MB", freed as f64 / 1048576.0);
             }
+            // ---- 「配置」菜单：内嵌编辑 / 外部编辑器打开 / 热重载 ----
+            let mut edit_config = false;
+            let mut open_config = false;
+            let mut reload_config = false;
+            ui.menu_button("配置", |ui| {
+                let edit = ui.button("编辑 config.toml");
+                if edit.clicked() {
+                    edit_config = true;
+                    ui.close();
+                }
+                edit.on_hover_text("内嵌编辑器：# 注释灰色，Ctrl+C/V/A/Z 可用，保存即热生效");
+                if ui.button("打开 config 目录").clicked() {
+                    open_config = true;
+                    ui.close();
+                }
+                let reload = ui.button("重载配置");
+                if reload.clicked() {
+                    reload_config = true;
+                    ui.close();
+                }
+                reload.on_hover_text(
+                    "重读 config.toml 即时生效（扩展名/排序/预取/图片参数/字体/密码等）。\n\
+                     播放中不断流：播放器参数下次播放生效；日志级别与 mpv dll 路径需重启",
+                );
+            });
+            if edit_config {
+                self.config_editor = Some(config_editor::ConfigEditor::load());
+            }
+            if open_config {
+                self.open_config_dir();
+            }
+            if reload_config {
+                self.reload_config();
+            }
             // 快捷键帮助（弹出面板，不占常驻空间；egui 0.36 用 from_toggle_button_response 自管开关）
             let help_btn = ui.button("快捷键 ?");
             egui::Popup::from_toggle_button_response(&help_btn).show(|ui| {
@@ -173,6 +207,17 @@ impl App {
                         }
                     });
             });
+            // 一次性提示（如"配置已重载"）5 秒后自动消失；新提示重新计时。
+            // error 需人工处理则常驻（只被下一次操作覆盖）
+            let now = ui.input(|i| i.time);
+            if let Some(t0) = self.notice_shown_at {
+                if now - t0 >= 5.0 {
+                    self.notice = None;
+                    self.notice_shown_at = None;
+                }
+            } else if self.notice.is_some() {
+                self.notice_shown_at = Some(now);
+            }
             if let Some(n) = &self.notice {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, n);
             }
@@ -214,6 +259,79 @@ impl App {
                 }
             }
         });
+    }
+
+    /// 「配置 → 打开 config 目录」：资源管理器打开 config.toml 所在目录。
+    /// spawn 失败回退：资源管理器定位并选中 config 文件
+    pub(super) fn open_config_dir(&mut self) {
+        let path = Config::config_path();
+        let dir = path
+            .parent()
+            .filter(|p| p.exists())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.clone());
+        if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+            let sel = format!("/select,{}", path.display());
+            if std::process::Command::new("explorer").arg(sel).spawn().is_err() {
+                self.notice = Some(format!("打开配置目录失败: {e}"));
+            }
+        }
+    }
+
+    /// 「配置 → 重载配置」：重读 config.toml，新值即时生效（不重启）。
+    /// 生效范围：
+    /// - 即时：media 扩展名与 ui.sort_files（重建视图）、codepage（zip 文件名/
+    ///   密码解码）、ui.font_path（重装字体链）、ui.image_cache_count（LRU 容量），
+    ///   以及一切使用点读 self.cfg 的项（预取预算/图片阈值与锐化/幻灯片间隔等）；
+    ///   passwords/codepage 对**下次打开**的压缩包生效（已开包的密码已锁定）
+    /// - 下次播放：player.*——未播放时此处销毁播放器，下次播放按新配置重建；
+    ///   播放中不打断（断流重建体验更差），仅把音量/静音即时下发
+    /// - 重启：log_level（tracing 订阅器启动后固定）、cache.dll_dir（dll 启动时
+    ///   动态加载一次）
+    /// 解析失败保留旧配置继续运行（编辑出错不必杀进程），错误显示在顶栏
+    pub(super) fn reload_config(&mut self) {
+        let new_cfg = match Config::load_or_create() {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_err(format!("重载配置失败（保留旧配置）: {e}"));
+                return;
+            }
+        };
+        // 全局 codepage：zip 老包文件名解码 + 密码候选编码
+        crate::vfs::set_codepage(&new_cfg.codepage);
+        // 字体链（ui.font_path 变化）：重装
+        Self::install_cjk_font(&new_cfg, &self.egui_ctx);
+        // 图片 LRU 容量：收缩在下次推入时生效
+        self.img.set_cap(new_cfg.ui.image_cache_count.max(1));
+        // 播放器：未播放时销毁 → 下次播放按新 player.* 重建；播放中只下发音量/
+        // 静音（set_* 走 async 入队即返回，不拿 mpv core 锁，不断流）
+        let had_player = self.player.is_some();
+        let playing = self.playing.is_some();
+        if playing {
+            if let Some(p) = self.player.as_ref() {
+                p.set_volume(new_cfg.player.volume);
+                p.set_muted(new_cfg.player.muted);
+            }
+        } else if had_player {
+            if let Some(gl) = self.gl.as_deref() {
+                if let Some(p) = self.player.as_mut() {
+                    p.shutdown_render(gl);
+                }
+                self.player = None;
+            }
+        }
+        self.cfg = new_cfg;
+        // 扩展名分类 / 排序变化 → 重建列表视图（含行缓存、两类计数）
+        self.rebuild_view();
+        let note = if playing {
+            "；播放中不断流，播放器参数未播放时重载或重启后生效"
+        } else if had_player {
+            "；播放器参数已更新（下次播放生效）"
+        } else {
+            ""
+        };
+        self.notice = Some(format!("配置已重载{note}"));
+        tracing::info!("配置已重载（菜单触发）{note}");
     }
 
     pub(super) fn file_list(&mut self, ui: &mut egui::Ui) {

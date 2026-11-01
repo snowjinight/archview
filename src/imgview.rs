@@ -191,6 +191,12 @@ impl ImageService {
         }
     }
 
+    /// 更新 LRU 容量（config 热重载同步 ui.image_cache_count）。
+    /// 收缩在下次推入时生效（逐出按本字段比较，已缓存内容不主动丢弃）
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+    }
+
     /// 请求解码（幂等：已缓存/解码中直接返回）。
     /// 调用方负责构造 source；max_dim 来自 cfg.ui.image_max_dim；
     /// name 仅用于日志（定位"发起了没/何时发起"）

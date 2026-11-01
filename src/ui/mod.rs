@@ -9,6 +9,7 @@
 //! - [`dialogs`]  弹窗（密码输入、下一个压缩包选择）
 //! - [`nav`]      快捷键与媒体导航（全屏、上一个/下一个、自动翻页）
 //! - [`panels`]   UI 面板（顶栏/文件列表/媒体区/控制栏）与进度条绘制
+//! - [`config_editor`] 内嵌 config.toml 编辑器（'#' 注释灰色高亮、保存即热生效）
 
 use crate::cache;
 use crate::config::Config;
@@ -30,6 +31,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
+mod config_editor;
 mod dialogs;
 mod extract;
 mod nav;
@@ -228,6 +230,8 @@ pub struct App {
     error: Option<String>,
     // 一次性提示（如缓存清理结果），显示在顶栏
     notice: Option<String>,
+    // notice 出现时刻（egui 秒）；顶栏渲染时超 5 秒自动清除（见 panels.rs top_bar）
+    notice_shown_at: Option<f64>,
     // 全屏播放中（隐藏所有面板，仅视频+进度条）
     fullscreen: bool,
     // 文件列表当前标签页（视频/图片）
@@ -276,6 +280,8 @@ pub struct App {
     next_archive_prompt: Option<NextArchivePrompt>,
     // 本会话打开过的压缩包路径（切包弹窗中灰色弱化标记"看过"）
     seen_archives: std::collections::HashSet<PathBuf>,
+    // 内嵌 config.toml 编辑器（「配置 → 编辑」打开；None = 关闭）
+    config_editor: Option<config_editor::ConfigEditor>,
     // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
     initial_open: Option<PathBuf>,
 }
@@ -319,6 +325,7 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
+            notice_shown_at: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -341,6 +348,7 @@ impl App {
             pw_memory: std::collections::HashMap::new(),
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
+            config_editor: None,
             initial_open: initial,
         }
     }
@@ -372,6 +380,7 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
+            notice_shown_at: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -394,6 +403,7 @@ impl App {
             pw_memory: std::collections::HashMap::new(),
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
+            config_editor: None,
             initial_open: None,
         }
     }
@@ -510,6 +520,9 @@ impl eframe::App for App {
         // 末项后询问打开同目录下一个压缩包
         self.next_archive_dialog(&ctx);
         probe!("next_archive");
+        // 内嵌 config.toml 编辑器窗口（「配置 → 编辑」）
+        self.config_editor_window(&ctx);
+        probe!("config_editor");
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条
