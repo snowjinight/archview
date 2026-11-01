@@ -107,6 +107,10 @@ pub struct CacheConfig {
 pub struct MediaConfig {
     pub video_extensions: Vec<String>,
     pub image_extensions: Vec<String>,
+    /// 单媒体文件入口（拖入文件/SendTo/命令行/「打开媒体文件」）对其所在
+    /// 目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
+    /// 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
+    pub file_open_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,6 +162,7 @@ impl Default for MediaConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            file_open_depth: 1,
         }
     }
 }
@@ -442,8 +447,12 @@ clean_on_switch = false
 
 [media]
 	# 视频 / 图片的文件扩展名识别列表（不区分大小写）
-video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
-image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
+	video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
+	image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
+	# 打开单个媒体文件（拖入文件/发送到/文件菜单「打开媒体文件」）时，对其
+	# 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
+	# 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
+	file_open_depth = 1
 
 [player]
 	# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值

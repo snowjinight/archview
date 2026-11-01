@@ -32,7 +32,11 @@ impl DirVFS {
     /// - 根目录不可读 → `Err(Io)`（定性失败）
     /// - 子目录不可读 / 条目 stat 失败 → 静默跳过（部分可读的树照常收集）
     /// - 无媒体文件 → `Ok`（空列表），由 UI 在打开完成时统一提示
-    pub fn open(root: &Path, exts: &[String]) -> Result<Self, VfsError> {
+    ///
+    /// `max_depth` = 递归收集深度：1 = 只收集目录直接子文件（单媒体文件
+    /// 入口的默认，防盘根/超大目录全盘扫描）；N = 向下 N 层；0 = 不限制
+    /// （「打开媒体目录」入口的默认，与 MAX_DEPTH 栈保险无关）
+    pub fn open(root: &Path, exts: &[String], max_depth: usize) -> Result<Self, VfsError> {
         // 根目录可读性在此定性：不可读直接失败，错误文案与压缩包打开一致
         std::fs::read_dir(root)?;
         let mut vfs = DirVFS {
@@ -40,12 +44,18 @@ impl DirVFS {
             entries: Vec::new(),
             paths: HashMap::new(),
         };
-        vfs.walk(root, exts, 0);
+        vfs.walk(root, exts, 0, max_depth);
         Ok(vfs)
     }
 
-    fn walk(&mut self, dir: &Path, exts: &[String], depth: usize) {
-        if depth > MAX_DEPTH {
+    fn walk(&mut self, dir: &Path, exts: &[String], depth: usize, max_depth: usize) {
+        // max_depth=0 不限制，否则与栈保险 MAX_DEPTH 取小
+        let limit = if max_depth == 0 {
+            MAX_DEPTH
+        } else {
+            max_depth.min(MAX_DEPTH)
+        };
+        if depth >= limit {
             return;
         }
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -57,7 +67,7 @@ impl DirVFS {
             let Ok(ft) = e.file_type() else { continue };
             let p = e.path();
             if ft.is_dir() {
-                self.walk(&p, exts, depth + 1);
+                self.walk(&p, exts, depth + 1, max_depth);
             } else if ft.is_file() {
                 // 扩展名过滤（小写比较）：压缩包/字幕等其它文件天然不在集合内
                 let ext = p
@@ -175,7 +185,7 @@ mod tests {
     #[test]
     fn walk_collects_media_recursively_deterministic_order_skips_non_media() {
         let (root, files) = make_tree();
-        let vfs = DirVFS::open(&root, &exts()).unwrap();
+        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
         let list = vfs.list();
         let names: Vec<&str> = list.iter().map(|e| e.name.as_str()).collect();
         // 字典序确定；相对路径 '/' 分隔；非媒体与压缩包均被过滤
@@ -191,7 +201,7 @@ mod tests {
     #[test]
     fn open_entry_reads_and_seeks_correct_file() {
         let (root, files) = make_tree();
-        let vfs = DirVFS::open(&root, &exts()).unwrap();
+        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
         let (rel, data) = find(&files, "sub/deep/d.mkv");
         let entry = VirtualEntry {
             name: rel.clone(),
@@ -217,7 +227,7 @@ mod tests {
     #[test]
     fn unknown_entry_errors_and_empty_dir_yields_empty_collection() {
         let (root, _) = make_tree();
-        let vfs = DirVFS::open(&root, &exts()).unwrap();
+        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
         let ghost = VirtualEntry {
             name: "ghost.mp4".into(),
             size: 0,
@@ -229,9 +239,38 @@ mod tests {
 
         let empty = root.join("empty_dir_不存在的子树");
         std::fs::create_dir_all(&empty).unwrap();
-        let vfs2 = DirVFS::open(&empty, &exts()).unwrap();
+        let vfs2 = DirVFS::open(&empty, &exts(), 0).unwrap();
         assert!(vfs2.list().is_empty());
         // empty 在 root 内部，随 root 一起删除
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 深度限制（单媒体文件入口的目录收集）：1 = 只收集直接子文件，
+    /// N = 向下 N 层，0 = 不限制（原递归行为）
+    #[test]
+    fn depth_limit_restricts_collection() {
+        let (root, _) = make_tree();
+        // make_tree: a.mp4 / b.MP4（root 直接子文件），sub/c.jpg（1 层），
+        // sub/deep/d.mkv（2 层）
+        let names = |d: usize| -> Vec<String> {
+            DirVFS::open(&root, &exts(), d)
+                .unwrap()
+                .list()
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+        assert_eq!(names(1), ["a.mp4", "b.MP4"], "depth=1 只收直接子文件");
+        assert_eq!(
+            names(2),
+            ["a.mp4", "b.MP4", "sub/c.jpg"],
+            "depth=2 向下一层"
+        );
+        assert_eq!(
+            names(0),
+            ["a.mp4", "b.MP4", "sub/c.jpg", "sub/deep/d.mkv"],
+            "depth=0 不限制"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -239,6 +278,6 @@ mod tests {
     fn unreadable_root_errors() {
         // 不存在的路径：read_dir 失败定性为打开失败（与压缩包路径不存在同待遇）
         let missing = std::env::temp_dir().join("dirvfs_missing_root_不存在");
-        assert!(DirVFS::open(&missing, &exts()).is_err());
+        assert!(DirVFS::open(&missing, &exts(), 0).is_err());
     }
 }

@@ -25,6 +25,29 @@ impl App {
         self.open_path(dir);
     }
 
+    /// 「文件 → 打开媒体文件…」：选中单个媒体文件 → 打开其所在目录的
+    /// 媒体集合并跳转播放该文件（与拖入媒体文件同一条分流，见 open_path）
+    pub(super) fn open_media_dialog(&mut self) {
+        // 过滤器 = 视频+图片扩展名并集（config 驱动，排序去重保证稳定）
+        let mut exts: Vec<&str> = self
+            .cfg
+            .media
+            .video_extensions
+            .iter()
+            .chain(self.cfg.media.image_extensions.iter())
+            .map(|s| s.as_str())
+            .collect();
+        exts.sort_unstable();
+        exts.dedup();
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("媒体文件", &exts)
+            .pick_file()
+        else {
+            return;
+        };
+        self.open_path(path);
+    }
+
     /// 处理本帧拖入的文件（egui dropped_files）：取第一个路径打开——
     /// 压缩包开包、目录开媒体集合（同一条规则，见 spawn_open 目录分支）
     pub(super) fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -41,6 +64,28 @@ impl App {
     }
 
     pub(super) fn open_path(&mut self, path: std::path::PathBuf) {
+        // 单媒体文件入口（拖入文件/SendTo/命令行/「打开媒体文件」）：文件
+        // 本身不是打开目标，改为打开其所在目录的媒体集合，并记下目标文件
+        // 名（pending_focus，打开完成时消费：预切标签页 + 跳转播放）。
+        // 每次打开先清零，防上一次的焦点串到本次
+        self.pending_focus = None;
+        let path = if path.is_file() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if self.cfg.is_video_ext(&name) || self.cfg.is_image_ext(&name) {
+                self.pending_focus = Some(name);
+                match path.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => path,
+                }
+            } else {
+                path
+            }
+        } else {
+            path
+        };
         // 会话内密码记忆：本会话输过密码的包直接带密码打开（不再弹框）
         let cached = self.pw_memory.get(&path).cloned();
         self.open_path_pw(path, cached.as_deref());
@@ -86,6 +131,14 @@ impl App {
             .chain(self.cfg.media.image_extensions.iter())
             .cloned()
             .collect();
+        // 单媒体文件入口（pending_focus 置位）对所在目录的收集深度取配置
+        // （默认 1 = 只收集目标文件同级，防盘根/超大目录全盘扫描）；
+        // 显式打开目录不限深（与既有递归行为一致）
+        let dir_depth = if self.pending_focus.is_some() {
+            self.cfg.media.file_open_depth
+        } else {
+            0
+        };
         let spawned = std::thread::Builder::new()
             .name("open_archive".into())
             .spawn(move || {
@@ -102,7 +155,7 @@ impl App {
                 // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
                 // ARCHITECTURE.md 4.2）——无加密概念，不走密码探测链；文件模式照旧
                 let opened = if path_t.is_dir() {
-                    DirVFS::open(&path_t, &media_exts)
+                    DirVFS::open(&path_t, &media_exts, dir_depth)
                         .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
                 } else {
                     // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：
@@ -264,6 +317,28 @@ impl App {
             })),
         });
         self.rebuild_view();
+        // 单媒体文件入口：目标文件所在目录打开完成（仅目录模式消费——
+        // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。
+        // 按目标扩展名预切标签页：混合内容目录下不预切的话目标在另一
+        // 标签页里，跳转落空；已在该页则不再多算一次行缓存
+        let focus = if path.is_dir() { self.pending_focus.take() } else { None };
+        if let Some(name) = &focus {
+            let want = if self.cfg.is_image_ext(name) {
+                Some(ListTab::Image)
+            } else if self.cfg.is_video_ext(name) {
+                Some(ListTab::Video)
+            } else {
+                None
+            };
+            let has_items = |t: ListTab| match t {
+                ListTab::Image => self.list_counts.1 > 0,
+                ListTab::Video => self.list_counts.0 > 0,
+            };
+            if let Some(t) = want.filter(|t| *t != self.list_tab && has_items(*t)) {
+                self.list_tab = t;
+                self.rebuild_view();
+            }
+        }
         let what = if path.is_dir() {
             "打开目录媒体集合"
         } else {
@@ -290,8 +365,19 @@ impl App {
         self.last_focus = None; // 旧包的锚点下标对新包无意义
         self.error = None;
         self.pw_prompt = None;
-        // 密码重试场景：恢复播放提交密码时想看的条目（返回调用方执行）
-        retry_play.map(|(entry_idx, _)| entry_idx)
+        // 密码重试场景：恢复播放提交密码时想看的条目（返回调用方执行）；
+        // 单媒体文件入口：跳转播放用户传入的目标文件（poll_open 执行 play，
+        // playing 置位后列表高亮滚动居中由既有机制接管）。名字比对不区分
+        // ASCII 大小写（Windows 文件系统不区分，收集名与拖入名可能不同写法）；
+        // 找不到同名条目则静默不播（视图照常打开）
+        let focus_idx = focus.and_then(|name| {
+            self.archive
+                .as_ref()?
+                .entries
+                .iter()
+                .position(|e| e.name.eq_ignore_ascii_case(&name))
+        });
+        retry_play.map(|(entry_idx, _)| entry_idx).or(focus_idx)
     }
 
     /// 重新计算过滤视图：搜索框子串匹配 + 只显示媒体文件（视频/图片按 config 分类），

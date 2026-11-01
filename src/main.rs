@@ -19,7 +19,6 @@ fn main() -> eframe::Result<()> {
         let code = vartidy::cli_main(&args[1..]);
         std::process::exit(code);
     }
-    let initial = initial_archive(&args);
 
     // config 需在 tracing 初始化前加载（日志级别来自配置）——此时日志管线
     // 尚未建立，失败信息走 eprintln 兜底
@@ -32,6 +31,8 @@ fn main() -> eframe::Result<()> {
             panic!("配置加载失败: {e}");
         }
     };
+    // 初始打开目标在 config 之后解析（媒体文件判定用 config 扩展名列表）
+    let initial = initial_archive(&args, &cfg);
     // 日志级别优先级：RUST_LOG 环境变量 > config.toml log_level > 默认 info。
     // 均走 EnvFilter 解析：级别名单（info/debug/…）或按模块指令都接受；
     // 非法值回退 info
@@ -69,10 +70,12 @@ fn main() -> eframe::Result<()> {
 }
 
 /// GUI 启动参数解析：压缩包文件直接打开；目录即媒体集合（递归收集图片/视频，
-/// 跳过压缩包——与拖放/打开目录对话框同一条规则，ARCHITECTURE.md 4.2）。
+/// 跳过压缩包——与拖放/打开目录对话框同一条规则，ARCHITECTURE.md 4.2）；
+/// 单个媒体文件（视频/图片，按 config 扩展名判定）也接受——open_path 会
+/// 分流为"其所在目录集合 + 跳转播放该文件"（ARCHITECTURE.md 4.2 单文件入口）。
 /// 混合多选（目录+压缩包同时"发送到"）按参数顺序取第一个有效项，其余忽略。
-/// 非路径/非压缩包参数忽略——保持无参数启动行为完全不变
-fn initial_archive(args: &[String]) -> Option<std::path::PathBuf> {
+/// 非路径/非压缩包/非媒体文件参数忽略——保持无参数启动行为完全不变
+fn initial_archive(args: &[String], cfg: &config::Config) -> Option<std::path::PathBuf> {
     let is_archive = |p: &std::path::Path| {
         p.extension()
             .and_then(|e| e.to_str())
@@ -81,7 +84,9 @@ fn initial_archive(args: &[String]) -> Option<std::path::PathBuf> {
     };
     for a in args {
         let p = std::path::Path::new(a);
-        if (p.is_file() && is_archive(p)) || p.is_dir() {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_media = cfg.is_video_ext(name) || cfg.is_image_ext(name);
+        if (p.is_file() && (is_archive(p) || is_media)) || p.is_dir() {
             return Some(p.to_path_buf());
         }
     }

@@ -235,6 +235,19 @@ zip / RAR4 = 系统 ANSI 代码页。探测时对每个候选密码生成「UTF-
 「打开目录」按钮，它们都汇聚到 `spawn_open` 的目录分支。混合多选（目录+压缩包同时
 「发送到」）按参数顺序取**第一个有效项**打开，其余忽略——语义可预期优先。
 
+**单媒体文件入口**（拖入/SendTo/命令行/「文件 → 打开媒体文件…」选中某个媒体文件）：
+文件本身不是打开目标——`open_path` 统一分流为"打开其所在目录的媒体集合 + 记下目标
+文件名（`pending_focus`）"。两点边界处理：
+
+- 递归深度默认 **1 层**（`media.file_open_depth`，0 = 不限制）：拖入的文件可能在盘根或
+  超大目录里（如 `E:\xxx.mp4`），全盘递归收集不可接受；显式「打开目录」入口仍不限制。
+  `DirVFS::open` 为此多了一个 `max_depth` 参数
+- 打开完成（`apply_open_done`）消费焦点：按目标扩展名**预切标签页**（混合内容目录下
+  目标可能在另一页）→ 按文件名定位条目（ASCII 大小写不敏感——Windows 文件系统语义，
+  收集名与拖入名可能写法不同）→ 经 `play()` 跳转播放，列表高亮滚动居中由既有机制接管；
+  找不到同名条目静默不播（视图照常打开）。焦点仅在目录模式 Done 时消费（压缩包打开
+  不吃焦点，防旧焦点串播）；每次 `open_path` 先重置，防上次残留
+
 实现（`dir_vfs.rs`）：`DirVFS` 实现 `ArchiveVFS`，`access_mode = FastSeek`——本地文件
 随机访问 O(1)，与 ZipVFS 同走 `zvf://` 流式快路径，**解压会话/滑窗/缓存/密码探测等
 慢路径机制零触碰**（条目全部 `encrypted=false`，密码探测零成本直通）。要点：
@@ -346,7 +359,7 @@ codepage = "gbk"            # 非 UTF-8 字节兜底代码页（密码候选追�
 passwords = []              # 加密包密码候选列表（播放器与 VarTidy 公用，打开阶段自动探测）
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
-[media]   # video_extensions / image_extensions
+[media]   # video_extensions / image_extensions / file_open_depth（单媒体文件入口的目录收集深度，默认 1=只收同级；0=不限，见 4.2）
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume / muted
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
@@ -700,7 +713,8 @@ shell 命令语法，快捷方式里不替换；选中文件由 Windows 自动�
 exe 所在目录，保证 config.toml 相对路径解析稳定。
 
 - **Archview player**：GUI 模式启动时解析命令行参数（main.rs `initial_archive`）——压缩包文件
-  直接打开；目录即媒体集合（递归收集图片/视频，跳过压缩包，见 4.2）。混合多选（目录+压缩包
+  直接打开；**单媒体文件走 4.2 单媒体文件入口分流（打开父目录媒体集合 + 跳转播放该文件）**；
+  目录即媒体集合（递归收集图片/视频，跳过压缩包，见 4.2）。混合多选（目录+压缩包+媒体文件
   同时选中）按参数顺序取第一个有效项，其余忽略。首帧经 `open_path` 触发，与拖放同链路
   （目录走 DirVFS、压缩包走密码探测/弹窗/播放全复用）；非路径参数忽略，无参数启动行为不变。
   该入口同样覆盖拖到 exe 上、文件关联等一切「带路径启动」场景

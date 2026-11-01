@@ -42,10 +42,11 @@ impl App {
 
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // ---- 「文件」菜单：打开压缩包 / 打开媒体目录 ----
+            // ---- 「文件」菜单：打开压缩包 / 打开媒体目录 / 打开媒体文件 ----
             // rfd 对话框阻塞 UI 线程，动作在菜单闭包外执行（闭包内只置标志）
             let mut open_file = false;
             let mut open_dir = false;
+            let mut open_media = false;
             ui.menu_button("文件", |ui| {
                 if ui.button("打开压缩包…").clicked() {
                     open_file = true;
@@ -55,12 +56,19 @@ impl App {
                     open_dir = true;
                     ui.close();
                 }
+                if ui.button("打开媒体文件…").clicked() {
+                    open_media = true;
+                    ui.close();
+                }
             });
             if open_file {
                 self.open_dialog();
             }
             if open_dir {
                 self.open_dir_dialog();
+            }
+            if open_media {
+                self.open_media_dialog();
             }
             // ---- 「缓存」菜单：打开缓存目录 / 清理缓存 ----
             let mut open_cache = false;

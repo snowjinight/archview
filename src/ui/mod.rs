@@ -176,7 +176,7 @@ struct ListRow {
 }
 
 /// 文件列表标签页
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ListTab {
     Video,
     Image,
@@ -284,6 +284,10 @@ pub struct App {
     config_editor: Option<config_editor::ConfigEditor>,
     // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
     initial_open: Option<PathBuf>,
+    // 单媒体文件入口（拖入/SendTo/命令行/「打开媒体文件」）的跳转目标文件名：
+    // open_path 分流置位（媒体文件 → 父目录集合），打开完成时 apply_open_done
+    // 消费——预切标签页 + 跳转播放该文件；每次 open_path 重置，防旧值残留
+    pending_focus: Option<String>,
 }
 
 impl App {
@@ -350,6 +354,7 @@ impl App {
             seen_archives: std::collections::HashSet::new(),
             config_editor: None,
             initial_open: initial,
+            pending_focus: None,
         }
     }
 
@@ -405,6 +410,7 @@ impl App {
             seen_archives: std::collections::HashSet::new(),
             config_editor: None,
             initial_open: None,
+            pending_focus: None,
         }
     }
 

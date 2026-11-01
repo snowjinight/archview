@@ -145,10 +145,126 @@ fn dir_mode_open_pipeline() {
     let empty = root.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
-        std::sync::Arc::new(super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()]).unwrap());
+        std::sync::Arc::new(super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()], 0).unwrap());
     let entries2 = vfs2.list();
     app.apply_open_done(empty, None, vfs2, 7, entries2, None);
     assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 单媒体文件入口（拖入文件/SendTo/命令行/「打开媒体文件」）回归：
+/// 1) open_path 分流：媒体文件 → 打开父目录 + 记 pending_focus（保留磁盘写法）
+/// 2) spawn_open 按 media.file_open_depth（默认 1）收集：只含目标同级条目
+/// 3) apply_open_done 焦点消费：返回目标 entry 下标（ASCII 大小写不敏感——
+///    Windows 文件系统不区分大小写，收集名与拖入名可能写法不同）；
+///    图片目标预切图片标签页（混合内容目录否则跳转落空）；
+///    找不到同名条目静默不播；压缩包路径不吃焦点（防旧焦点串播）
+#[test]
+fn media_file_entry_focus_jump() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root =
+        std::env::temp_dir().join(format!("ui_media_focus_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    let media = root.join("media");
+    let deep = media.join("sub");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(media.join("X.MP4"), b"v").unwrap(); // 拖入目标（大写扩展名）
+    std::fs::write(media.join("a.jpg"), b"i").unwrap(); // 同级图片
+    std::fs::write(deep.join("d.mp4"), b"v").unwrap(); // depth=1 收不到
+
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = root.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+
+    // 1) 分流：媒体文件 → 父目录 + 焦点
+    app.open_path(media.join("X.MP4"));
+    assert_eq!(app.pending_focus.as_deref(), Some("X.MP4"));
+    let super::OpenJob { path, rx, .. } = app.open_job.take().expect("open_job 应已建立");
+    assert_eq!(path, media, "打开目标应为父目录");
+
+    // 2) 后台线程：file_open_depth=1 → 只收集同级媒体（sub/d.mp4 不进）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (vfs, entries, id, pw) = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(super::OpenMsg::Progress { .. }) => continue,
+            Ok(super::OpenMsg::Done {
+                vfs,
+                id,
+                entries,
+                pw,
+            }) => break (vfs, entries, id, pw),
+            Ok(super::OpenMsg::NeedPw { .. }) => panic!("目录打开不应要求密码"),
+            Ok(super::OpenMsg::Failed(e)) => panic!("目录打开失败: {e}"),
+            Err(e) => panic!("打开线程消息异常: {e}"),
+        }
+    };
+    assert_eq!(pw, None);
+    let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["X.MP4", "a.jpg"], "depth=1 只收集同级媒体");
+
+    // 3) 焦点消费（视频目标）：返回 X.MP4 的 entry 下标、留在视频页、焦点清零
+    let idx_v = entries
+        .iter()
+        .position(|e| e.name.eq_ignore_ascii_case("x.mp4"))
+        .unwrap();
+    assert_eq!(
+        app.apply_open_done(media.clone(), None, vfs, id, entries, pw),
+        Some(idx_v)
+    );
+    assert_eq!(app.pending_focus, None, "焦点消费后应清零");
+    assert_eq!(app.list_tab, super::ListTab::Video, "视频目标应留在视频页");
+
+    // 4) 图片目标 + 大小写变体：预切图片页、行缓存只含图片行
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let entries2 = vfs2.list();
+    let idx_i = entries2
+        .iter()
+        .position(|e| e.name.eq_ignore_ascii_case("a.jpg"))
+        .unwrap();
+    app.pending_focus = Some("A.JPG".into()); // 模拟分流置位（写法与收集名不同）
+    assert_eq!(
+        app.apply_open_done(media.clone(), None, vfs2, 9, entries2, None),
+        Some(idx_i),
+        "大小写不同写法应命中同名条目"
+    );
+    assert_eq!(app.list_tab, super::ListTab::Image, "图片目标应预切图片页");
+    assert_eq!(app.list_rows.len(), 1, "图片页行缓存只含图片行");
+    assert!(app.list_rows[0].label.contains("a.jpg"));
+
+    // 5) 找不到同名条目：静默不播（视图照常），无报错无空集合提示
+    let vfs3: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let entries3 = vfs3.list();
+    app.pending_focus = Some("nope.mp4".into());
+    assert_eq!(
+        app.apply_open_done(media.clone(), None, vfs3, 10, entries3, None),
+        None,
+        "找不到目标应静默不播"
+    );
+    assert!(app.notice.is_none(), "视图非空不应有空集合提示");
+    assert!(app.error.is_none());
+
+    // 6) 压缩包路径不吃焦点：pending_focus 保留待后续目录打开消费/重置
+    //    （竞态防线：焦点未消费时用户又开了个压缩包，不得误播同名条目）
+    let vfs4: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let entries4 = vfs4.list();
+    app.pending_focus = Some("a.jpg".into());
+    assert_eq!(
+        app.apply_open_done(media.join("X.MP4"), None, vfs4, 11, entries4, None),
+        None,
+        "非目录路径不应消费焦点"
+    );
+    assert_eq!(
+        app.pending_focus.as_deref(),
+        Some("a.jpg"),
+        "压缩包打开应保留待消费焦点"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
