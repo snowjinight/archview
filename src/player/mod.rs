@@ -158,6 +158,11 @@ pub struct PlayerService {
     /// 自动回落软解，无失败风险。不能运行时 set 属性下发——旧视频还在播，
     /// 改属性会立即重建旧解码器（实测白耗 60ms）
     hwdec_fixed: std::cell::RefCell<Option<String>>,
+    /// END_FILE(ERROR) 回显通道（方案 §4.6）：泵线程发 (mpv 错误码, 最近
+    /// 一条 error 级日志行)，UI 每帧 poll_load_error 消费。对所有 mpv
+    /// 装载失败生效（不只 raw dump），正常结束（EOF/STOP/QUIT）不发。
+    /// Mutex 包 Receiver 仅为过 &self + struct Send 检查，轮询独占无争用
+    load_err_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(std::ffi::c_int, String)>>,
 }
 
 // mpv client API 线程安全；回调线程只走全局注册表，不触碰此 handle。
@@ -195,6 +200,8 @@ pub struct RenderInfo {
 impl PlayerService {
     pub fn new(cfg: &Config, gl: &glow::Context, egui_ctx: &egui::Context) -> Result<Self, String> {
         let ctx = mpv_ffi::create()?;
+        // END_FILE(ERROR) → UI 通道（§4.6）：泵线程发送侧，结构体持接收侧
+        let (load_err_tx, load_err_rx) = std::sync::mpsc::channel::<(std::ffi::c_int, String)>();
         let mut s = Self {
             ctx,
             render: None,
@@ -211,6 +218,7 @@ impl PlayerService {
             buffering_cache: Arc::new(AtomicBool::new(false)),
             hwdec_cfg: cfg.player.hwdec.clone(),
             hwdec_fixed: std::cell::RefCell::new(None),
+            load_err_rx: std::sync::Mutex::new(load_err_rx),
         };
         // 播放器参数全部来自 config.toml
         // 常驻事件泵线程：不随日志级别启停（此前 level=no 时整线程不跑，
@@ -222,10 +230,15 @@ impl PlayerService {
         // 职责 2（level != no）：LOG_MESSAGE 转 owned 后走 tracing（带相对
         //   时间戳），与生命周期事件打点对齐成完整时间线（诊断切换延迟）
         let log_on = cfg.player.mpv_log_level != "no";
-        if log_on {
-            if let Err(e) = mpv_ffi::request_log_messages(ctx, &cfg.player.mpv_log_level) {
-                tracing::warn!("订阅 mpv 日志失败（事件泵仍启动）: {e}");
-            }
+        // 订阅级别提升到至少 error（§4.6.3）：END_FILE(ERROR) 回显要附最近
+        // 一条 error 级日志行，与用户日志开关独立、成本为零。泵线程的
+        // tracing 转发仍受 log_on 门控，不受此影响
+        let sub_level = match cfg.player.mpv_log_level.as_str() {
+            "no" | "fatal" => "error",
+            s => s,
+        };
+        if let Err(e) = mpv_ffi::request_log_messages(ctx, sub_level) {
+            tracing::warn!("订阅 mpv 日志失败（事件泵仍启动）: {e}");
         }
         {
             let stop = Arc::new(AtomicBool::new(false));
@@ -236,6 +249,9 @@ impl PlayerService {
             let buffering_flag = s.buffering_cache.clone();
             let time_pos_flag = s.time_pos_cache.clone();
             let duration_flag = s.duration_cache.clone();
+            // 最近一条 ≤ERROR 级日志行（§4.6.3）：END_FILE(ERROR) 回显附带。
+            // 同一闭包内读写，单份 Arc 即可；不设 TTL，下一条 error 覆盖
+            let last_err_log = Arc::new(std::sync::Mutex::new(String::new()));
             // 裸指针以 usize 过线程边界（mpv client API 线程安全）
             let ctx_addr = ctx as usize;
             let t0 = Instant::now();
@@ -295,7 +311,7 @@ impl PlayerService {
                                 }
                             }
                         }
-                        mpv_ffi::MPV_EVENT_LOG_MESSAGE if log_on => {
+                        mpv_ffi::MPV_EVENT_LOG_MESSAGE => {
                             // 字符串指针归 mpv 所有、仅当次事件有效：先转 owned 再格式化
                             let m = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventLogMessage) };
                             let (prefix, text) = unsafe {
@@ -304,16 +320,42 @@ impl PlayerService {
                                     CStr::from_ptr(m.text).to_string_lossy().into_owned(),
                                 )
                             };
+                            // ≤ERROR 级无条件缓存（§4.6.3，与用户日志开关独立）：
+                            // 回显附 log 行（如 Failed to initialize a decoder）
+                            // 比 mpv 错误码文案信息量大
+                            if m.log_level <= mpv_ffi::MPV_LOG_LEVEL_ERROR {
+                                *last_err_log.lock().unwrap() = text.clone();
+                            }
+                            if log_on {
+                                tracing::debug!(
+                                    "[mpv {:>8.3}] {}: {}",
+                                    t0.elapsed().as_secs_f64(),
+                                    prefix,
+                                    text.trim_end()
+                                );
+                            }
+                        }
+                        // 装载失败回显（§4.6）：前置校验拦不住的 mpv 层拒载
+                        // （swscale 不转某格式等）发 UI 通道；EOF/STOP/QUIT
+                        // 正常结束不发。通道对所有 mpv 装载失败生效（不只 raw）
+                        mpv_ffi::MPV_EVENT_END_FILE => {
+                            if !ev.data.is_null() {
+                                let ef =
+                                    unsafe { &*(ev.data as *mut mpv_ffi::MpvEventEndFile) };
+                                if ef.reason == mpv_ffi::MPV_END_FILE_REASON_ERROR {
+                                    let log =
+                                        std::mem::take(&mut *last_err_log.lock().unwrap());
+                                    let _ = load_err_tx.send((ef.error, log));
+                                }
+                            }
                             tracing::debug!(
-                                "[mpv {:>8.3}] {}: {}",
+                                "[mpv {:>8.3}] == 事件 {} ==",
                                 t0.elapsed().as_secs_f64(),
-                                prefix,
-                                text.trim_end()
+                                ev.event_id
                             );
                         }
                         // 关键生命周期事件也打点：与日志行对齐成时间线
                         mpv_ffi::MPV_EVENT_START_FILE
-                        | mpv_ffi::MPV_EVENT_END_FILE
                         | mpv_ffi::MPV_EVENT_FILE_LOADED
                         | mpv_ffi::MPV_EVENT_VIDEO_RECONFIG => {
                             tracing::debug!(
@@ -328,7 +370,10 @@ impl PlayerService {
             }));
             s.log_stop = Some(stop);
             if log_on {
-                tracing::debug!("mpv 日志泵已启动 (level={})", cfg.player.mpv_log_level);
+                tracing::debug!(
+                    "mpv 日志泵已启动 (level={}, 订阅={})",
+                    cfg.player.mpv_log_level, sub_level
+                );
             }
         }
         // 每帧读取的属性全部走 observe_property 订阅（须在泵线程消费前注册；
@@ -485,18 +530,31 @@ impl PlayerService {
         String::new()
     }
 
-    pub fn load(&self, archive_id: u64, entry_idx: usize) {
+    /// per-file 选项合并：hwdec 探测记忆 + 调用方选项（raw dump 走
+    /// rawvideo demuxer 的 demuxer/demuxer-rawvideo-w/h/mp-format/fps
+    /// 等），逗号拼接为 loadfile 第四参数 options；两侧皆空则省略第四参数
+    fn file_opts(&self, extra: &str) -> String {
+        let hw = self.hwdec_file_opt();
+        match (hw.is_empty(), extra.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => extra.to_string(),
+            (false, true) => hw,
+            (false, false) => format!("{hw},{extra}"),
+        }
+    }
+
+    pub fn load(&self, archive_id: u64, entry_idx: usize, extra_opts: &str) {
         // 重置打开完成标志（必须先于 loadfile 提交：快文件 PLAYBACK_RESTART
         // 可在数十 ms 内到达泵线程，若先提交后重置，会被泵线程抢先置位再
         // 被抹掉，门控将卡到 2s 兜底）
         self.playback_ready.store(false, Ordering::Relaxed);
-        let hwdec_opt = self.hwdec_file_opt();
+        let opts = self.file_opts(extra_opts);
         let uri = stream_cb::entry_uri(archive_id, entry_idx);
-        let cmd = if hwdec_opt.is_empty() {
+        let cmd = if opts.is_empty() {
             format!("loadfile {uri} replace")
         } else {
             // 第四参数 options：index 占位 -1
-            format!("loadfile {uri} replace -1 {hwdec_opt}")
+            format!("loadfile {uri} replace -1 {opts}")
         };
         if let Err(e) = mpv_ffi::command_string(self.ctx, &cmd) {
             tracing::error!("loadfile 失败: {e}");
@@ -511,15 +569,15 @@ impl PlayerService {
     }
 
     /// 播放本地文件路径（7z/RAR 后台解压完成后的慢路径）
-    pub fn load_path(&self, path: &std::path::Path) {
+    pub fn load_path(&self, path: &std::path::Path, extra_opts: &str) {
         // 同 load()：重置时机必须先于 loadfile 提交
         self.playback_ready.store(false, Ordering::Relaxed);
-        let hwdec_opt = self.hwdec_file_opt();
+        let opts = self.file_opts(extra_opts);
         let url = to_file_url(path);
-        let cmd = if hwdec_opt.is_empty() {
+        let cmd = if opts.is_empty() {
             format!("loadfile {url} replace")
         } else {
-            format!("loadfile {url} replace -1 {hwdec_opt}")
+            format!("loadfile {url} replace -1 {opts}")
         };
         if let Err(e) = mpv_ffi::command_string(self.ctx, &cmd) {
             tracing::error!("loadfile {url} 失败: {e}");
@@ -528,6 +586,13 @@ impl PlayerService {
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
         self.first_frame.store(false, Ordering::Relaxed);
+    }
+
+    /// 每帧轮询 mpv 装载失败回显（§4.6）：Some((mpv 错误码, error 级日志
+    /// 行)) = 自上次轮询以来有装载失败，UI set_err 透传。try_recv 非阻塞；
+    /// lock 不到（poison）静默跳过，不让播放器故障打断 UI 线程
+    pub fn poll_load_error(&self) -> Option<(std::ffi::c_int, String)> {
+        self.load_err_rx.lock().ok()?.try_recv().ok()
     }
 
     /// loadfile 后是否已画出首帧。false = 处于装载窗口，UI 应高频轮询
@@ -997,6 +1062,154 @@ mod tests {
         mpv_ffi::destroy(ctx);
         let _ = std::fs::remove_dir_all(zip_path.parent().unwrap());
         eprintln!("端到端播放+seek 测试通过 ✓");
+    }
+
+    /// 端到端（raw dump）：ffmpeg 造 nv12 裸帧文件 → loadfile 第四参数下发
+    /// rawvideo demuxer 选项（同 extract.rs raw_demux_opts 拼参格式）→
+    /// 起播 / 时长=帧数÷fps / w·h 由选项解析 / 帧精确 seek；再装载一个
+    /// 不存在的文件验证 END_FILE(ERROR) 事件与 error 级日志行可读——
+    /// §4.6 回显通道的素材链路。前置同上，缺则跳过。
+    /// 注意：不能用「非法选项值」触发——选项解析失败只发 START_FILE+
+    /// 日志、不发 END_FILE（本 libmpv 实测）；UI 层 raw_demux_opts 已在
+    /// 下发前校验 pixfmt，选项坏值路径到不了 mpv，真失败源是文件级错误
+    #[test]
+    fn e2e_rawvideo_dump_with_demux_opts() {
+        let Some(dll_dir) = find_mpv_dll_dir() else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        if !have_ffmpeg() {
+            eprintln!("跳过：未找到 ffmpeg");
+            return;
+        }
+
+        // 64x48 nv12，10 帧 @ 10fps（每帧 4608 B，共 46080 B，时长 1s）
+        let dir = std::env::temp_dir().join(format!("zvf_raw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nv12 = dir.join("t.nv12");
+        let st = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=duration=1:size=64x48:rate=10",
+                "-frames:v",
+                "10",
+                "-pix_fmt",
+                "nv12",
+                "-f",
+                "rawvideo",
+            ])
+            .arg(&nv12)
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "ffmpeg 生成 nv12 失败");
+        // 尺寸自检：与 raw_demux_opts 的整除校验同口径（W·H·12bit/8）
+        assert_eq!(
+            std::fs::metadata(&nv12).unwrap().len(),
+            10 * 64 * 48 * 12 / 8
+        );
+
+        mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
+        let ctx = mpv_ffi::create().unwrap();
+        mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "ao", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "keep-open", "always").unwrap();
+        mpv_ffi::request_log_messages(ctx, "error").unwrap();
+
+        // 1) 正确选项：pix_fmt 名版 mp-format + w/h/fps → rawvideo demuxer
+        let url = to_file_url(&nv12);
+        let opts = "demuxer=rawvideo,demuxer-rawvideo-w=64,demuxer-rawvideo-h=48,\
+                    demuxer-rawvideo-mp-format=nv12,demuxer-rawvideo-fps=10";
+        mpv_ffi::command_string(ctx, &format!("loadfile {url} replace -1 {opts}"))
+            .expect("loadfile 失败");
+
+        let started = wait_prop(ctx, "time-pos", |t| t > 0.15, 15);
+        assert!(
+            started.is_some(),
+            "raw dump 未起播（demuxer-rawvideo-* 选项名或参数有误）"
+        );
+        // 时长 = 帧数 ÷ fps；w/h 命中选项值 → 证明 demuxer 吃到了参数
+        let dur = mpv_ffi::get_property_f64(ctx, "duration")
+            .ok()
+            .flatten()
+            .expect("读不到 duration");
+        assert!((dur - 1.0).abs() < 0.1, "duration 应为 10 帧@10fps=1s: {dur}");
+        assert_eq!(
+            mpv_ffi::get_property_f64(ctx, "width").ok().flatten(),
+            Some(64.0)
+        );
+        assert_eq!(
+            mpv_ffi::get_property_f64(ctx, "height").ok().flatten(),
+            Some(48.0)
+        );
+        // 帧精确 seek（rawvideo 帧=字节偏移）：0.5s = 第 5 帧
+        mpv_ffi::set_property_string(ctx, "pause", "yes").unwrap();
+        mpv_ffi::command_string(ctx, "seek 0.5 absolute").unwrap();
+        let reached = wait_prop(ctx, "time-pos", |t| (t - 0.5).abs() < 0.05, 15);
+        assert!(reached.is_some(), "raw dump seek 超时");
+
+        // 2) 装载不存在的文件 → END_FILE(ERROR)：reason=4 / 非零错误码 /
+        //    error 级日志行（§4.6 回显素材，泵线程同款订阅级别）。
+        //    不能用「非法选项值」触发：选项解析失败只发 START_FILE+日志、
+        //    不发 END_FILE（本 libmpv 实测）；且 UI 层 raw_demux_opts 已在
+        //    下发前校验，选项坏值路径到不了 mpv——真失败源是文件级错误
+        let bad_url = to_file_url(&dir.join("no_such_file.nv12"));
+        mpv_ffi::command_string(ctx, &format!("loadfile {bad_url} replace -1"))
+            .unwrap();
+        // 修复验证：与 PlayerService::load 同款，loadfile 后显式取消暂停
+        // （pause 是全局属性，会跨 loadfile replace 粘滞到新文件）
+        mpv_ffi::set_property_string(ctx, "pause", "no").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut err_log = String::new();
+        // loadfile replace 先给被替换的旧文件（暂停中的第一段）发
+        // END_FILE(STOP)，须等新文件 START_FILE 后、跳过 STOP 伪事件再收
+        let mut seen_start = false;
+        let mut trace: Vec<String> = Vec::new();
+        let end_file;
+        loop {
+            let ev = unsafe { mpv_ffi::wait_event(ctx, 0.1) };
+            let id = unsafe { (*ev).event_id };
+            if id == mpv_ffi::MPV_EVENT_LOG_MESSAGE {
+                let m = unsafe { &*((*ev).data as *mut mpv_ffi::MpvEventLogMessage) };
+                if m.log_level <= mpv_ffi::MPV_LOG_LEVEL_ERROR {
+                    err_log = unsafe {
+                        std::ffi::CStr::from_ptr(m.text).to_string_lossy().into_owned()
+                    };
+                }
+            } else if id == mpv_ffi::MPV_EVENT_START_FILE {
+                seen_start = true;
+            } else if id == mpv_ffi::MPV_EVENT_END_FILE {
+                let ef = unsafe { &*((*ev).data as *mut mpv_ffi::MpvEventEndFile) };
+                trace.push(format!("END_FILE(reason={})", ef.reason));
+                if !seen_start || ef.reason == mpv_ffi::MPV_END_FILE_REASON_STOP {
+                    continue; // 被替换旧文件的伪事件
+                }
+                end_file = (ef.reason, ef.error);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "未收到 END_FILE 事件 trace={trace:?} seen_start={seen_start} err_log={err_log:?}"
+            );
+        }
+        let (reason, code) = end_file;
+        assert_eq!(
+            reason,
+            mpv_ffi::MPV_END_FILE_REASON_ERROR,
+            "装载失败应以 ERROR 结束"
+        );
+        assert_ne!(code, 0, "ERROR 结束应带非零错误码");
+        eprintln!("END_FILE reason={reason} error={code} log={err_log:?}");
+        assert!(
+            !err_log.trim().is_empty(),
+            "error 级日志行（回显素材）应可订阅"
+        );
+
+        mpv_ffi::destroy(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("raw dump 端到端测试通过 ✓");
     }
 
     /// 端到端（慢路径）：7z 包内视频 → SevenzVFS 后台解压 → headless mpv 播本地文件 + seek。

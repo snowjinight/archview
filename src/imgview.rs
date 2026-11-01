@@ -510,6 +510,15 @@ fn decode_image(
 ) -> Result<Decoded, String> {
     match source {
         ImageSource::File(path) => {
+            // 相机 RAW 拦截：with_guessed_format 对 ARW/NEF 探不出格式
+            //（返回 None），须按扩展名先行拦截（方案 §4.3）。失败 fall
+            // through 原路径——改名伪 raw 由 ImageReader 报错 → mpv 回退
+            if is_raw_photo_ext(name) {
+                if let Ok(img) = decode_raw_preview_path(path) {
+                    tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
+                    return finish_static(img, max_dim, full, factor, sharpen);
+                }
+            }
             let reader = image::ImageReader::open(path)
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
@@ -524,6 +533,13 @@ fn decode_image(
             let mut buf = Vec::with_capacity(entry.size.clamp(0, 1024 * 1024 * 1024) as usize);
             vf.read_to_end(&mut buf)
                 .map_err(|e| format!("读取压缩包条目失败: {e}"))?;
+            // 同 File 分支：RAW 拦截（buf 已全量读入，from_bytes 直接解析）
+            if is_raw_photo_ext(name) {
+                if let Ok(img) = decode_raw_preview(&buf) {
+                    tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
+                    return finish_static(img, max_dim, full, factor, sharpen);
+                }
+            }
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
@@ -594,27 +610,115 @@ fn decode_any<R: BufRead + Seek>(
     };
     // 两档尺寸适配（策略见 resample）：基础档 LRU 存 native×ppp（翻页
     // 即 100% 密度直出）；高清档 full 槽存 native×ppp×2（深放大用，
-    // clamp 8192）。factor 由 ImageService 按屏幕 DPI 定
+    // clamp 8192）。factor 由 ImageService 按屏幕 DPI 定。
+    // 共享尾部抽为 finish_static，与 RAW 预览拦截分支共用（方案 §4.3）
     let (w, h) = (img.width(), img.height());
-    let out = resample(img, max_dim, full, factor);
-    // 锐化（配置 image_full_sharpen，仅高清档）：Lanczos 放大的边缘
-    // 补偿，见 sharpen_full
-    let out = if full && sharpen {
-        sharpen_full(out)
-    } else {
-        out
-    };
+    let decoded = finish_static(img, max_dim, full, factor, sharpen)?;
     // 尺寸命名日志：native_size 原图 / lru_size 基础纹理 / full_size
     // full 槽纹理（箭头一致 = 未触发重采样，尺寸原样直进）
+    let Decoded::Static(out) = &decoded else {
+        unreachable!("finish_static 恒返回 Static")
+    };
     tracing::debug!(
         "解码 {fmt:?} [{base}] native_size={w}x{h} {}_size={}x{}{}: {}ms",
         if full { "full" } else { "lru" },
-        out.width(),
-        out.height(),
+        out.size[0],
+        out.size[1],
         if full && sharpen { " 锐化" } else { "" },
         t.elapsed().as_millis()
     );
+    Ok(decoded)
+}
+
+/// 静态图共享尾部：两档尺寸适配（见 [`resample`]）→ 可选锐化（配置
+/// image_full_sharpen，仅高清档：Lanczos 放大的边缘补偿，见
+/// [`sharpen_full`]）→ RGBA。[`decode_any`] 与 RAW 预览拦截分支共用
+fn finish_static(
+    img: image::DynamicImage,
+    max_dim: u32,
+    full: bool,
+    factor: f64,
+    sharpen: bool,
+) -> Result<Decoded, String> {
+    let out = resample(img, max_dim, full, factor);
+    let out = if full && sharpen { sharpen_full(out) } else { out };
     Ok(Decoded::Static(color_image(out)))
+}
+
+/// 相机 RAW 家族扩展名（Sony ARW 家族 + Nikon NEF 家族），与 config
+/// `image_extensions` 中的 raw 段一致，常量硬编码——拦截发生在
+/// wants_texture（is_image_ext）放行后的 decode 层，只认这几家。
+/// 用 Path::extension 判定，"arw" 这类无扩展名裸名不算（防误伤）
+fn is_raw_photo_ext(name: &str) -> bool {
+    const RAW_EXTS: &[&str] = &["arw", "nef", "nrw", "srf", "sr2", "arq"];
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| RAW_EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// 相机 RAW 内嵌 JPEG 预览解码（内存源：zip/目录条目已全量读入）。
+/// raw-files 只解析文件结构（自带 64KiB 块缓存），读出相机内嵌的最大
+/// JPEG 预览再交 image 解码——成本与普通 jpg 同量级，LRU/高清档/
+/// 看门狗机制照常生效。识别/解码失败返回 Err，调用方 fall through
+fn decode_raw_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut f = raw_files::RawFile::from_bytes(bytes)
+        .map_err(|e| format!("RAW 识别失败: {e}"))?;
+    let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
+    let jpeg = f.read_preview(&pv).map_err(|e| format!("读预览失败: {e}"))?;
+    let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
+    Ok(apply_orientation(img, pv.orientation()))
+}
+
+/// 同 [`decode_raw_preview`]，文件源（7z/RAR 落盘缓存）：`RawFile::open`
+/// 的块缓存只读文件结构与预览所在块，优于全量读盘
+fn decode_raw_preview_path(path: &std::path::Path) -> Result<image::DynamicImage, String> {
+    let mut f = raw_files::RawFile::open(path).map_err(|e| format!("RAW 识别失败: {e}"))?;
+    let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
+    let jpeg = f.read_preview(&pv).map_err(|e| format!("读预览失败: {e}"))?;
+    let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
+    Ok(apply_orientation(img, pv.orientation()))
+}
+
+/// EXIF 方向矫正：raw-files `Orientation`（EXIF 1-8，变体名与 image
+/// crate 一一对应）→ image crate 旋转/翻转。EXIF 恰定义 8 个值，
+/// 穷尽匹配无需兜底。镜像/180° 用 in_place 零分配；90/270 旋转需
+/// 重排行列返回新图；EXIF 5/7 = 旋转后左右镜像（主/反对角线转置）
+fn apply_orientation(img: image::DynamicImage, o: raw_files::Orientation) -> image::DynamicImage {
+    use image::imageops;
+    use raw_files::Orientation as O;
+    match o {
+        O::NoTransforms => img,
+        O::FlipHorizontal => {
+            let mut i = img;
+            imageops::flip_horizontal_in_place(&mut i);
+            i
+        }
+        O::Rotate180 => {
+            let mut i = img;
+            imageops::rotate180_in_place(&mut i);
+            i
+        }
+        O::FlipVertical => {
+            let mut i = img;
+            imageops::flip_vertical_in_place(&mut i);
+            i
+        }
+        // EXIF 5：顺时针 90° 后左右镜像（主对角线转置）。
+        // image 0.25 的 imageops 旋转/镜像自由函数返回 ImageBuffer
+        //（非 I），统一 to_rgba8 再包回 DynamicImage
+        O::Rotate90FlipH => image::DynamicImage::ImageRgba8(imageops::flip_horizontal(
+            &imageops::rotate90(&img.to_rgba8()),
+        )),
+        // EXIF 6：顺时针 90°
+        O::Rotate90 => image::DynamicImage::ImageRgba8(imageops::rotate90(&img.to_rgba8())),
+        // EXIF 7：顺时针 270° 后左右镜像（反对角线转置）
+        O::Rotate270FlipH => image::DynamicImage::ImageRgba8(imageops::flip_horizontal(
+            &imageops::rotate270(&img.to_rgba8()),
+        )),
+        // EXIF 8：顺时针 270°
+        O::Rotate270 => image::DynamicImage::ImageRgba8(imageops::rotate270(&img.to_rgba8())),
+    }
 }
 
 /// 帧迭代收集：逐帧尺寸适配 + 延迟钳正 + 帧数封顶
@@ -1438,5 +1542,91 @@ mod tests {
             "t.png",
         );
         assert_eq!(svc.pending.len(), 1);
+    }
+
+    // ---- 相机 RAW 预览（方案 §4.3）----
+
+    #[test]
+    fn is_raw_photo_ext_判定() {
+        // Sony ARW 家族 + Nikon NEF 家族，大小写不敏感、可带路径
+        assert!(is_raw_photo_ext("DSC01234.ARW"));
+        assert!(is_raw_photo_ext("dsc.nef"));
+        assert!(is_raw_photo_ext("a/b/c.NRW"));
+        assert!(is_raw_photo_ext("x.SRF"));
+        assert!(is_raw_photo_ext("x.sr2"));
+        assert!(is_raw_photo_ext("x.ArQ"));
+        // 非 RAW / 无扩展名裸名（Path::extension 语义）/ 后缀更长不算
+        assert!(!is_raw_photo_ext("x.jpg"));
+        assert!(!is_raw_photo_ext("arw"));
+        assert!(!is_raw_photo_ext("x.arwx"));
+    }
+
+    #[test]
+    fn decode_raw_preview_垃圾字节报错供fall_through() {
+        // 改名伪 raw（内容非相机文件）→ 识别失败 Err → decode_image
+        // 拦截分支 fall through 原路径（ImageReader 大概率也失败 → mpv 回退）
+        assert!(decode_raw_preview(b"definitely not a camera raw file").is_err());
+        assert!(decode_raw_preview(&[]).is_err());
+    }
+
+    #[test]
+    fn apply_orientation_八个exif方向映射() {
+        use image::GenericImageView;
+        use raw_files::Orientation as O;
+        // 2×1 横条 [红|绿]：像素方位标识旋转/翻转方向
+        let mut strip = image::RgbaImage::new(2, 1);
+        strip.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        strip.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        let strip = image::DynamicImage::ImageRgba8(strip);
+        let red = image::Rgba([255, 0, 0, 255]);
+        let green = image::Rgba([0, 255, 0, 255]);
+
+        // EXIF 1：原样
+        assert_eq!(
+            apply_orientation(strip.clone(), O::NoTransforms).dimensions(),
+            (2, 1)
+        );
+        // EXIF 6：顺时针 90° → 1×2，红（左端）转到顶部
+        let r = apply_orientation(strip.clone(), O::Rotate90);
+        assert_eq!(r.dimensions(), (1, 2));
+        assert_eq!(r.get_pixel(0, 0), red);
+        assert_eq!(r.get_pixel(0, 1), green);
+        // EXIF 8：顺时针 270° → 1×2，红转到底部
+        let r = apply_orientation(strip.clone(), O::Rotate270);
+        assert_eq!(r.get_pixel(0, 0), green);
+        assert_eq!(r.get_pixel(0, 1), red);
+        // EXIF 2：左右镜像 → 红绿互换
+        let r = apply_orientation(strip.clone(), O::FlipHorizontal);
+        assert_eq!(r.get_pixel(0, 0), green);
+        assert_eq!(r.get_pixel(1, 0), red);
+        // EXIF 3：180°（高 1 的条上等同左右互换）→ 红绿互换
+        let r = apply_orientation(strip.clone(), O::Rotate180);
+        assert_eq!(r.get_pixel(0, 0), green);
+        // EXIF 4：上下镜像（高 1 无可见变化，验证尺寸与不炸）
+        assert_eq!(
+            apply_orientation(strip.clone(), O::FlipVertical).dimensions(),
+            (2, 1)
+        );
+        // EXIF 5/7：旋转 + 镜像 → 1×2 转置
+        assert_eq!(
+            apply_orientation(strip.clone(), O::Rotate90FlipH).dimensions(),
+            (1, 2)
+        );
+        assert_eq!(
+            apply_orientation(strip, O::Rotate270FlipH).dimensions(),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn finish_static_抽取后行为不变() {
+        // 共享尾部抽取回归：基础档阈值内 ×factor 预放大
+        let Decoded::Static(out) =
+            finish_static(image::DynamicImage::new_rgb8(100, 50), 4096, false, 2.0, false)
+                .unwrap()
+        else {
+            panic!("finish_static 恒返回 Static");
+        };
+        assert_eq!(out.size, [200, 100]);
     }
 }

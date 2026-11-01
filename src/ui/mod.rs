@@ -511,6 +511,9 @@ impl eframe::App for App {
         // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
         self.poll_img();
         probe!("poll_img");
+        // mpv 装载失败回显（END_FILE(ERROR) 通道 → set_err）
+        self.poll_mpv_err();
+        probe!("poll_mpv_err");
         // 键盘快捷键（mpv 风格）
         self.handle_shortcuts(&ctx, frame);
         probe!("shortcuts");

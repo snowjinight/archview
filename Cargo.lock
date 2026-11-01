@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "archview"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "alphanumeric-sort",
  "eframe",
@@ -228,6 +228,7 @@ dependencies = [
  "glow",
  "image",
  "libloading",
+ "raw-files",
  "raw-window-handle",
  "rfd",
  "serde",
@@ -2628,6 +2629,12 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
 ]
+
+[[package]]
+name = "raw-files"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "032d6f57da30de60d228de62a3836aac801e3bae5bb05748932d5afc9cba496f"
 
 [[package]]
 name = "raw-window-handle"

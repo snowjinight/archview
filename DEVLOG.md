@@ -21,6 +21,7 @@
 | §5 | 解压会话化回归测试细节（单测 + UI 冒烟） | ARCHITECTURE §11.4 |
 | §6 | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
 | §7 | UI 控制栏布局专项（五坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承） | ARCHITECTURE §14 |
+| §8 | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE） | ARCHITECTURE §13.6 / §13.4 |
 
 ---
 
@@ -629,6 +630,7 @@ cargo test -- --nocapture
 | VarTidy | 分类规则（五类非法+合法路径）、仓库只读三道闸（含 rename 不覆盖）、两级去重（CRC 判重）、密码候选链路（AES zip / 7z 加密头与内容加密 / 同批次多包各不同密码乱序命中 / 中文与特殊字符密码）、中文/空格/特殊字符作者名与包名全链路 |
 | 滑动窗口冒烟（UI 层） | 模拟用户批内来回跳动 0→1→0→2→（解净空闲）→5→0：断言解码线程全程不重启（cancel 句柄同一性）、预取窗口随观看位置滑动、缓存命中立即播放、全部落地文件逐字节内容校验（明细见 §5.2） |
 | config | TOML 默认模板与代码默认值防漂移、序列化往返、特殊字符密码（`#`/空格/中文）引号保留 |
+| RAW 媒体 | config：pixfmt 名单数量快照与容器位数口径、raw 可见性两路径与 glob 匹配、默认模板含 [raw] 节；imgview：RAW 扩展名判定（裸名不误伤）、垃圾字节 fall through、EXIF 八方向映射；ui：raw_demux_opts 四分支文案与拼参格式；player e2e：ffmpeg 造 nv12 → rawvideo 选项装载 → 起播/时长=帧数÷fps/尺寸/帧精确 seek + 装载失败事件与日志链路（外部依赖 ffmpeg，缺则跳过，坑见 §8.3） |
 
 ### 6.3 headless e2e 原理与外部依赖
 
@@ -777,3 +779,84 @@ e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time
 回归**，是当初只加到 6px，视觉上仍显挤；`+= 4` → `+= 10`（12px）后按上表全绿。
 **教训**：先分清"值变了"还是"值一直这么小"再动手——机制不变量 + 一次无头实测
 即可裁决，避免在错误归因上改代码。
+
+---
+
+## 8. RAW 媒体支持专项（2026-11-01：裸数据 dump + 相机 RAW 预览）
+
+> 机制与链路见 ARCHITECTURE §13.6（dump 播放 / 可见性路由 / 失败回显）与
+> §13.4「相机 RAW 照片预览」段；本节记实现踩坑与测试方法细节。
+
+### 8.1 名单计数：手数 194，实测 195（快照断言先跑再定值）
+
+**现象**：`RAWVIDEO_PIXFMTS` 从 `ffmpeg -pix_fmts` 输出转录后，数量快照断言
+手数写 194，跑测试实得 195。
+
+**根因**：195 行长名单手工计数漏 1 项；分组注释里的"（N）"小计与实际行数
+不同步，肉眼逐组对账难定位。
+
+**修复/教训**：快照类断言（len / 数量 / 字节数）**先跑一次让失败信息报出
+实际值，再回填常量**，禁止手数；随后按组 grep 行数核对小计（Bayer 12 /
+Gray 16 / YUV planar 14+56 / NV 23 / packed 10 / RGB 26+12 / GBR 24 /
+XYZ 2 = 195）。README「raw 格式表」附录同表转写时同样按组对账。
+
+### 8.2 image 0.25 imageops 自由函数签名（EXIF 方向矫正）
+
+**现象**：`apply_orientation` 调 `imageops::rotate90(&img)` 类型不合——
+期望操作 `DynamicImage` 并保持返回类型。
+
+**根因**：image 0.25 的 `imageops::rotate90 / rotate270 / flip_horizontal`
+等**自由函数接收 `&ImageBuffer` 且返回 `ImageBuffer`**（非泛型 I、非
+DynamicImage），与 DynamicImage 直接混用即编译错。
+
+**修复**：`to_rgba8()` 统一转 ImageBuffer → imageops 自由函数 →
+`DynamicImage::ImageRgba8(..)` 包回；镜像/180° 用 `*_in_place` 变体零分配。
+EXIF 恰 8 个值，`raw_files::Orientation` 穷尽匹配无兜底；EXIF 5/7 = 旋转后
+镜像（主/反对角线转置），测试用 2×1 红绿条的像素方位把 8 个映射全部钉死。
+
+**附带**：测试里取 `img.width()/height()` 需 `use image::GenericImageView`
+（trait 方法，不在 DynamicImage 固有方法里），否则"找不到方法"。
+
+### 8.3 e2e 三连坑：END_FILE 通道的真实行为（player/mod.rs 集成测试）
+
+背景：`e2e_rawvideo_dump_with_demux_opts` 第二段要验证「装载失败 →
+END_FILE(ERROR) + error 级日志行」回显链路（ARCHITECTURE §13.6）。
+**PlayerService::new 需要 glow::Context（GL 上下文），单测环境拿不到** →
+用裸 `mpv_ffi` ctx（vo/ao=null、keep-open=always）手动复现泵线程的日志订阅
+（`request_log_messages(ctx, "error")`）与事件解析。三轮失败、三个独立的坑：
+
+**坑 A：`loadfile replace` 先给被替换旧文件发 END_FILE(STOP) 伪事件。**
+断言 `reason == ERROR(4)` 实得 2（STOP）——第一段暂停中的 nv12 被替换时
+先收到它自己的 END_FILE。修复：事件循环加 `seen_start` 守卫——先见
+START_FILE、再遇 END_FILE 时跳过 `reason == STOP(2)`。
+
+**坑 B：mipi_rggb10 是真格式（把"我以为的假格式"当非法值用）。** 原计划
+（方案 §7.4 spike）用 mipi_rggb10 当"非法 pixfmt"触发装载失败——本机系统
+ffmpeg `-pix_fmts` 查无此名，想当然认为非法。实测 libmpv **自带的更新版
+ffmpeg（≥5.0，收录 MIPI packed Bayer）认识该名**：选项合法、装载成功；
+且成功装载的文件因 pause 粘滞（keep-open + 上一段的暂停）永不结束 → 15s
+超时。修复：换真正不存在的 `no_such_pixfmt` + loadfile 后显式 `pause=no`
+（pause 是**全局属性**，跨 loadfile replace 粘滞到新文件——
+PlayerService::load 同款处理）。
+
+**坑 C：选项解析失败只发 START_FILE + 日志，不发 END_FILE。** no_such_pixfmt
+后仍超时；把 trace（每条 END_FILE 的 reason 列表）与 err_log 注入 assert
+消息后一眼定位：`trace=["END_FILE(reason=2)"] err_log="Error parsing option
+demuxer-rawvideo-mp-format"`——mpv 对**装载选项解析失败**（per-file options
+坏值）根本不发 END_FILE（本 libmpv 实测）。修复：改装载不存在的文件触发
+**文件级错误**（END_FILE reason=4、error=-13、log="Failed to open..."）——
+这恰是生产真实失败源：UI 层 raw_demux_opts 前置校验后，选项坏值路径根本
+到不了 mpv。
+
+**教训**：①外部库行为边界（事件何时发/不发）必须 e2e 实测钉死，文档与
+直觉都不可信；②测试素材选"确定不存在"的值（no_such_file.nv12），不要选
+"我认为不存在"的值（mipi_rggb10）——版本差异随时打脸；③超时类断言必须把
+现场证据（事件 trace / 日志原文 / 状态标志）注入 assert 消息，否则每轮
+失败都要重新加打印排查。Rust 细节：`let end_file;` 循环内定赋 + break 过
+unused_assignments 警告（超时 assert 是 panic 发散路径，定赋分析认可）。
+
+### 8.4 流程坑复发：同文件并行编辑被静默吞（§2 坑 10）
+
+本轮多处文档编辑再次验证：同一文件的两个 SearchReplace 并行下发，只有一个
+落盘、另一个报成功实未写入。规则不变：**同文件编辑必须串行**，编辑后 Read
+回验关键行。

@@ -942,3 +942,78 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     assert!(app.error.is_none(), "全程不应有错误");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// raw dump 预设校验（方案 §4.5/§8）：raw_demux_opts 的四类拦截文案与
+/// 通过拼参。校验必须在 loadfile 之前——rawvideo demuxer 对尾部零头
+/// 字节不报错、画面错位难排查，故报错均引导核对 [[raw.demux]] 预设
+#[test]
+fn raw_demux_opts_validation() {
+    let mk = |pixfmt: &str, w: u32, h: u32| crate::config::RawDemux {
+        r#match: "sensor_a_*.bin".into(),
+        pixfmt: pixfmt.into(),
+        width: w,
+        height: h,
+        fps: 10.0,
+    };
+    let mut cfg = crate::config::Config::default();
+    cfg.raw.demux = vec![mk("nv12", 64, 48)];
+
+    // 1) 标准容器：不在 raw.extensions 且无预设命中 → 不带选项直接播
+    let app = App::new_for_test(cfg.clone());
+    assert_eq!(
+        app.raw_demux_opts("movie.mp4", Some(1234)).unwrap(),
+        None,
+        "标准容器不应挂 raw 选项"
+    );
+
+    // 2) 预设命中 + 大小整除（10 帧 × 4608B）→ 拼参格式与 e2e 测试同源
+    let opts = app
+        .raw_demux_opts("sensor_a_0.bin", Some(10 * 64 * 48 * 12 / 8))
+        .unwrap()
+        .expect("校验通过应给选项");
+    assert_eq!(
+        opts,
+        "demuxer=rawvideo,demuxer-rawvideo-w=64,demuxer-rawvideo-h=48,\
+         demuxer-rawvideo-mp-format=nv12,demuxer-rawvideo-fps=10"
+    );
+
+    // 3) pixfmt 不在名单：报错须带常用格式速览 + 指向 README raw 格式表
+    let mut bad = cfg.clone();
+    bad.raw.demux[0] = mk("notafmt", 64, 48);
+    let err = App::new_for_test(bad)
+        .raw_demux_opts("sensor_a_0.bin", None)
+        .unwrap_err();
+    assert!(
+        err.contains("不被支持") && err.contains("yuv420p") && err.contains("raw 格式表"),
+        "pixfmt 报错应引导查表: {err}"
+    );
+
+    // 4) 宽高为 0：裸数据宽高无法自动推算
+    let mut bad = cfg.clone();
+    bad.raw.demux[0] = mk("nv12", 0, 48);
+    let err = App::new_for_test(bad)
+        .raw_demux_opts("sensor_a_0.bin", None)
+        .unwrap_err();
+    assert!(err.contains("无法自动推算"), "宽高 0 报错: {err}");
+
+    // 5) 大小不整除：报实际字节数与每帧字节数（4608B/帧）
+    let err = app.raw_demux_opts("sensor_a_0.bin", Some(46081)).unwrap_err();
+    assert!(
+        err.contains("46081") && err.contains("4608") && err.contains("不整除"),
+        "整除报错应带核对数字: {err}"
+    );
+    // size 未知（None）时跳过整除校验，不拦装载
+    assert!(
+        app.raw_demux_opts("sensor_a_0.bin", None).unwrap().is_some(),
+        "size 未知不应误拦"
+    );
+
+    // 6) 命中 raw.extensions（默认 yuv/nv12）但无预设：引导配置而非盲试
+    let err = App::new_for_test(crate::config::Config::default())
+        .raw_demux_opts("clip.yuv", None)
+        .unwrap_err();
+    assert!(
+        err.contains("需在 config.toml 配置") && err.contains("[[raw.demux]]"),
+        "缺预设应引导配置: {err}"
+    );
+}

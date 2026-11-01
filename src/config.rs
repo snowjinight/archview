@@ -14,6 +14,8 @@ const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     pub cache: CacheConfig,
     pub media: MediaConfig,
+    /// 相机 RAW 照片与非标裸数据（raw dump）配置（PLAN_raw_media.md）
+    pub raw: RawConfig,
     pub player: PlayerConfig,
     pub ui: UiConfig,
     pub extract: ExtractConfig,
@@ -158,13 +160,188 @@ impl Default for MediaConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
-            image_extensions: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            // 末 6 个为相机 RAW（raw-files 库提取内嵌 JPEG 预览直读，走图片
+            // 纹理路径）：Sony ARW 家族（arw/srf/sr2/arq）+ Nikon NEF 家族（nef/nrw）
+            image_extensions: [
+                "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "arw", "nef",
+                "nrw", "srf", "sr2", "arq",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             file_open_depth: 1,
         }
     }
+}
+
+/// 非标裸数据（raw dump）配置：这些文件不是标准容器，无法探测参数，
+/// 统一走 mpv rawvideo demuxer（视频桶），由 [[raw.demux]] 预设提供
+/// 像素格式 + 宽高 + fps（经 loadfile per-file 选项下发）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawConfig {
+    /// 这些扩展名的文件按 raw dump 处理：必须在 [[raw.demux]] 命中预设才能播
+    /// （决定列表可见性与「缺预设」引导报错）；.bin 等杂项扩展名不进此表，
+    /// 仅靠 demux 预设 glob 命中才算媒体（防污染文件列表）
+    pub extensions: Vec<String>,
+    /// demux 预设（按声明顺序取首个 glob 命中：先写具体、后写宽泛）。
+    /// 序列化时为空则省略——TOML 不允许向静态定义的数组追加 [[raw.demux]]，
+    /// 默认模板只给注释示例，由用户自行追加
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub demux: Vec<RawDemux>,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        Self {
+            extensions: ["yuv", "nv12"].iter().map(|s| s.to_string()).collect(),
+            demux: Vec::new(),
+        }
+    }
+}
+
+/// 单条 raw dump 播放预设：文件名 glob → 像素格式 + 宽高 + fps
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawDemux {
+    /// 文件名通配：* 与 ?（大小写不敏感；写文件名，不含路径）
+    pub r#match: String,
+    /// FFmpeg 像素格式名（支持名单见 RAWVIDEO_PIXFMTS / README「raw 格式表」）
+    pub pixfmt: String,
+    /// 帧宽（像素）。0 = 暂不支持（自动推算列为后续增强）
+    pub width: u32,
+    /// 帧高（像素）
+    pub height: u32,
+    /// 帧率
+    #[serde(default = "default_raw_fps")]
+    pub fps: f64,
+}
+
+fn default_raw_fps() -> f64 {
+    25.0
+}
+
+/// 极简通配匹配（仅 `*` 与 `?`，大小写不敏感，不引 glob crate）。
+/// 经典迭代回溯：遇 `*` 记录（模式位/名字位），失配时让该 `*` 多吞一字符重试
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            mark += 1;
+            pi = star + 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// rawvideo 可裸读像素格式（名字 → 每像素**位数**）。
+/// 名单来源：`ffmpeg -pix_fmts`（ffmpeg 7.x），筛除硬件(H)/调色板(P)/
+/// bitstream(B)/无输入端口项；mpv demuxer-rawvideo-mp-format 接受同一名单。
+/// 位数为 rawvideo demuxer 实际读写的**容器位数**（9~16bit 采样占 2 字节
+/// 容器、rgb555/444 填零到 16bit 等），比 -pix_fmts 的逻辑位数（按分量
+/// 深度累加）在 10/12bit 格式上更大——帧字节数校验以此为基才与文件
+/// 实际大小吻合。MIPI packed bayer（mipi_rggb10 等）不在本名单：跨像素
+/// 位打包与「容器位数」口径不符（W×H×bits÷8 整除校验不适用）——libmpv
+/// 较新 ffmpeg 实际认识该名（e2e 实测，DEVLOG §8.3 坑 B），本表是有意
+/// 收窄：前置拦截报错优先于让 mpv 试载。
+pub const RAWVIDEO_PIXFMTS: &[(&str, u32)] = &[
+    // Bayer（12，全部仅输入；packed MIPI 10/12bit 不在 ffmpeg 名单）
+    ("bayer_bggr8", 8), ("bayer_rggb8", 8), ("bayer_gbrg8", 8), ("bayer_grbg8", 8),
+    ("bayer_bggr16le", 16), ("bayer_bggr16be", 16),
+    ("bayer_rggb16le", 16), ("bayer_rggb16be", 16),
+    ("bayer_gbrg16le", 16), ("bayer_gbrg16be", 16),
+    ("bayer_grbg16le", 16), ("bayer_grbg16be", 16),
+    // Gray / Gray+Alpha（16）
+    ("gray", 8),
+    ("gray9le", 16), ("gray9be", 16), ("gray10le", 16), ("gray10be", 16),
+    ("gray12le", 16), ("gray12be", 16), ("gray14le", 16), ("gray14be", 16),
+    ("gray16le", 16), ("gray16be", 16),
+    ("grayf32le", 32), ("grayf32be", 32),
+    ("ya8", 16), ("ya16le", 32), ("ya16be", 32),
+    // YUV planar 8-bit（14）
+    ("yuv420p", 12), ("yuv422p", 16), ("yuv444p", 24), ("yuv410p", 9), ("yuv411p", 12),
+    ("yuv440p", 16), ("yuvj420p", 12), ("yuvj422p", 16), ("yuvj444p", 24),
+    ("yuvj440p", 16), ("yuvj411p", 12),
+    ("yuva420p", 20), ("yuva422p", 24), ("yuva444p", 32),
+    // YUV planar 9~16-bit（56；每采样 2 字节容器）
+    ("yuv420p9le", 24), ("yuv420p9be", 24), ("yuv420p10le", 24), ("yuv420p10be", 24),
+    ("yuv420p12le", 24), ("yuv420p12be", 24), ("yuv420p14le", 24), ("yuv420p14be", 24),
+    ("yuv420p16le", 24), ("yuv420p16be", 24),
+    ("yuv422p9le", 32), ("yuv422p9be", 32), ("yuv422p10le", 32), ("yuv422p10be", 32),
+    ("yuv422p12le", 32), ("yuv422p12be", 32), ("yuv422p14le", 32), ("yuv422p14be", 32),
+    ("yuv422p16le", 32), ("yuv422p16be", 32),
+    ("yuv444p9le", 48), ("yuv444p9be", 48), ("yuv444p10le", 48), ("yuv444p10be", 48),
+    ("yuv444p12le", 48), ("yuv444p12be", 48), ("yuv444p14le", 48), ("yuv444p14be", 48),
+    ("yuv444p16le", 48), ("yuv444p16be", 48),
+    ("yuv440p10le", 24), ("yuv440p10be", 24), ("yuv440p12le", 24), ("yuv440p12be", 24),
+    ("yuva420p9le", 40), ("yuva420p9be", 40), ("yuva420p10le", 40), ("yuva420p10be", 40),
+    ("yuva420p16le", 40), ("yuva420p16be", 40),
+    ("yuva422p9le", 48), ("yuva422p9be", 48), ("yuva422p10le", 48), ("yuva422p10be", 48),
+    ("yuva422p12le", 48), ("yuva422p12be", 48), ("yuva422p16le", 48), ("yuva422p16be", 48),
+    ("yuva444p9le", 64), ("yuva444p9be", 64), ("yuva444p10le", 64), ("yuva444p10be", 64),
+    ("yuva444p12le", 64), ("yuva444p12be", 64), ("yuva444p16le", 64), ("yuva444p16be", 64),
+    // YUV semi-planar / NV（23）
+    ("nv12", 12), ("nv21", 12), ("nv16", 16), ("nv24", 24), ("nv42", 24),
+    ("p010le", 24), ("p010be", 24), ("p012le", 24), ("p012be", 24),
+    ("p016le", 24), ("p016be", 24),
+    ("p210le", 32), ("p210be", 32), ("p212le", 32), ("p212be", 32),
+    ("p216le", 32), ("p216be", 32),
+    ("p410le", 48), ("p410be", 48), ("p412le", 48), ("p412be", 48),
+    ("p416le", 48), ("p416be", 48),
+    // YUV packed（10）
+    ("yuyv422", 16), ("uyvy422", 16), ("yvyu422", 16),
+    ("ayuv64le", 64), ("vuya", 32), ("vuyx", 24),
+    ("y210le", 32), ("y212le", 32), ("xv30le", 32), ("xv36le", 64),
+    // RGB packed 8-bit（26）
+    ("rgb24", 24), ("bgr24", 24),
+    ("argb", 32), ("rgba", 32), ("abgr", 32), ("bgra", 32),
+    ("0rgb", 24), ("rgb0", 24), ("0bgr", 24), ("bgr0", 24),
+    ("rgb8", 8), ("bgr8", 8), ("rgb4_byte", 8), ("bgr4_byte", 8),
+    ("rgb565le", 16), ("rgb565be", 16), ("bgr565le", 16), ("bgr565be", 16),
+    ("rgb555le", 16), ("rgb555be", 16), ("bgr555le", 16), ("bgr555be", 16),
+    ("rgb444le", 16), ("rgb444be", 16), ("bgr444le", 16), ("bgr444be", 16),
+    // RGB 高位深（12）
+    ("rgb48le", 48), ("rgb48be", 48), ("bgr48le", 48), ("bgr48be", 48),
+    ("rgba64le", 64), ("rgba64be", 64), ("bgra64le", 64), ("bgra64be", 64),
+    ("x2rgb10le", 32), ("x2bgr10le", 32),
+    ("rgbaf16le", 64), ("rgbaf16be", 64),
+    // Planar RGB / GBR（24；高位深每采样 2 字节容器）
+    ("gbrp", 24),
+    ("gbrp9le", 48), ("gbrp9be", 48), ("gbrp10le", 48), ("gbrp10be", 48),
+    ("gbrp12le", 48), ("gbrp12be", 48), ("gbrp14le", 48), ("gbrp14be", 48),
+    ("gbrp16le", 48), ("gbrp16be", 48),
+    ("gbrpf32le", 96), ("gbrpf32be", 96),
+    ("gbrap", 32),
+    ("gbrap10le", 64), ("gbrap10be", 64), ("gbrap12le", 64), ("gbrap12be", 64),
+    ("gbrap14le", 64), ("gbrap14be", 64), ("gbrap16le", 64), ("gbrap16be", 64),
+    ("gbrapf32le", 128), ("gbrapf32be", 128),
+    // XYZ（2）
+    ("xyz12le", 48), ("xyz12be", 48),
+];
+
+/// 查 pixfmt 名单：Some = 每像素位数（帧位数 = W×H×bits，帧字节数 = /8，
+/// 供不读文件的整除校验）；None = 名字不合法/不可裸读（含 MIPI packed
+/// bayer、调色板 pal8、硬件格式），调用方报错并列出支持名单
+pub fn raw_pixfmt_bits(pixfmt: &str) -> Option<u32> {
+    RAWVIDEO_PIXFMTS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(pixfmt))
+        .map(|(_, b)| *b)
 }
 
 impl Default for PlayerConfig {
@@ -245,6 +422,7 @@ impl Default for Config {
         Self {
             cache: CacheConfig::default(),
             media: MediaConfig::default(),
+            raw: RawConfig::default(),
             player: PlayerConfig::default(),
             ui: UiConfig::default(),
             extract: ExtractConfig::default(),
@@ -321,11 +499,32 @@ impl Config {
     }
 
     pub fn is_video_ext(&self, name: &str) -> bool {
-        Self::has_ext(&self.media.video_extensions, name)
+        // 标准 ∨ raw 可见：.yuv/.nv12（raw.extensions）与 demux 预设 glob 命中
+        // 的 .bin 等也归视频桶（走 mpv rawvideo demuxer）——一处改动，
+        // 列表/标签页/同类跳/单文件打开全部跟随
+        Self::has_ext(&self.media.video_extensions, name) || self.raw_visible(name)
     }
 
     pub fn is_image_ext(&self, name: &str) -> bool {
         Self::has_ext(&self.media.image_extensions, name)
+    }
+
+    /// raw dump 可见性：扩展名在 raw.extensions ∨ 命中任一 [[raw.demux]] 预设
+    pub fn raw_visible(&self, name: &str) -> bool {
+        Self::has_ext(&self.raw.extensions, name) || self.raw_demux(name).is_some()
+    }
+
+    /// 扩展名命中 raw.extensions = 该文件按裸数据处理；无预设命中时
+    /// 调用方应给「请配置 [[raw.demux]]」引导报错而不是让 mpv 盲试
+    pub fn raw_needs_preset(&self, name: &str) -> bool {
+        Self::has_ext(&self.raw.extensions, name)
+    }
+
+    /// 多条 [[raw.demux]] 预设按声明顺序取首个 glob 命中
+    /// （先写具体如 sensor_a_*.bin、后写宽泛如 *.bin）；无命中返回 None
+    pub fn raw_demux(&self, name: &str) -> Option<&RawDemux> {
+        let file = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
+        self.raw.demux.iter().find(|d| glob_match(&d.r#match, file))
     }
 
     fn has_ext(list: &[String], name: &str) -> bool {
@@ -448,11 +647,35 @@ clean_on_switch = false
 [media]
 	# 视频 / 图片的文件扩展名识别列表（不区分大小写）
 	video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
-	image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
+	# 相机 RAW（内嵌预览直读）：Sony ARW 家族 + Nikon NEF 家族
+	image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
+	                    "arw", "nef", "nrw", "srf", "sr2", "arq"]
 	# 打开单个媒体文件（拖入文件/发送到/文件菜单「打开媒体文件」）时，对其
 	# 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
 	# 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
 	file_open_depth = 1
+
+[raw]
+	# 非标裸数据（raw dump）：这些扩展名的文件按裸帧数据处理，需在下方
+	# [[raw.demux]] 命中预设（像素格式 + 宽高）才能播放；帧数由文件大小
+	# 自动得出（文件大小必须能被单帧大小整除，否则报错）。
+	# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）；
+	# 支持的像素格式名单见 README「raw 格式表」（yuv / rgb / gray / bayer 家族）
+	extensions = ["yuv", "nv12"]
+	# 预设示例（两类文件并存：unpacked bayer 的 .bin + NV12 的 .yuv），
+	# 按需去掉行首 # 启用或仿写：
+	# [[raw.demux]]
+	# match = "sensor_a_*.bin"    # 通配 * 与 ?；写文件名（不含路径）
+	# pixfmt = "bayer_rggb16le"   # FFmpeg 像素格式名（如 yuv420p / nv12 / gray）
+	# width = 1920
+	# height = 1080
+	# fps = 30
+	# [[raw.demux]]
+	# match = "*.yuv"
+	# pixfmt = "nv12"
+	# width = 1280
+	# height = 720
+	# fps = 25
 
 [player]
 	# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
@@ -609,6 +832,9 @@ slideshow_secs = 2.0
         // 缺失键按默认值补上
         assert!(out.contains("log_level = \"info\""));
         assert!(out.contains("image_max_dim = 4096"));
+        // 整节补全：[raw] 连注释带示例一并补上（老用户升级场景）
+        assert!(out.contains("extensions = [\"yuv\", \"nv12\"]"));
+        assert!(out.contains("image_extensions"));
         // 根级新键必须在第一个 [表] 头之前（否则会归属到最后一个表）
         let key_pos = out.find("log_level").expect("log_level 已补全");
         let tbl_pos = out.find("\n[").expect("存在表头");
@@ -623,5 +849,138 @@ slideshow_secs = 2.0
         let mut doc2: DocumentMut = out.parse().unwrap();
         assert_eq!(backfill_table(doc2.as_table_mut(), def.as_table()), 0);
         assert_eq!(doc2.to_string(), out);
+    }
+
+    /// [[raw.demux]] 解析与路由：多条预设按声明序首命中（具体在前、
+    /// 宽泛在后）；省略 fps 取默认 25.0；路由时剥离路径分隔符
+    #[test]
+    fn raw_demux_parse_and_route() {
+        let cfg: Config = toml::from_str(
+            r#"
+[raw]
+[[raw.demux]]
+match = "sensor_a_*.bin"
+pixfmt = "bayer_rggb8"
+width = 1920
+height = 1080
+fps = 30.0
+
+[[raw.demux]]
+match = "*.bin"
+pixfmt = "gray"
+width = 640
+height = 480
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.raw.demux.len(), 2);
+        // 首命中：sensor_a_001.bin 命中第 1 条（具体）而非第 2 条（宽泛）
+        let hit = cfg.raw_demux("sensor_a_001.bin").expect("首条命中");
+        assert_eq!(hit.pixfmt, "bayer_rggb8");
+        assert_eq!((hit.width, hit.height), (1920, 1080));
+        assert_eq!(hit.fps, 30.0);
+        // 其余 .bin 落到宽泛兜底；fps 省略 → 默认 25.0
+        let fallback = cfg.raw_demux("cap_003.bin").expect("宽泛兜底命中");
+        assert_eq!(fallback.pixfmt, "gray");
+        assert_eq!(fallback.fps, 25.0);
+        // glob 大小写不敏感 & 路径剥离（预设写文件名，传全路径也能命中）
+        assert!(cfg.raw_demux("dir/SENSOR_A_9.BIN").is_some());
+        assert!(cfg.raw_demux(r"C:\cap\cap_003.bin").is_some());
+        // 无命中 → None；默认配置无预设 → 永远 None
+        assert!(cfg.raw_demux("note.txt").is_none());
+        assert!(Config::default().raw_demux("a.bin").is_none());
+    }
+
+    /// raw 可见性路由：.yuv/.nv12 经 raw.extensions 归视频桶；.bin 仅
+    /// 预设命中时可见；普通视频/图片扩展不受影响
+    #[test]
+    fn is_video_ext_raw_visibility() {
+        let cfg = Config::default();
+        // 原有行为不变
+        assert!(cfg.is_video_ext("movie.mp4"));
+        assert!(!cfg.is_video_ext("photo.jpg"));
+        assert!(!cfg.is_image_ext("frame.yuv"));
+        // raw.extensions → 视频桶（走 mpv rawvideo demuxer），且必须配预设
+        assert!(cfg.is_video_ext("a.yuv"));
+        assert!(cfg.is_video_ext("capture.NV12")); // 大小写不敏感
+        assert!(cfg.raw_needs_preset("a.yuv"));
+        // .bin 默认不可见、也不强制预设（不在 raw.extensions）
+        assert!(!cfg.is_video_ext("cap.bin"));
+        assert!(!cfg.raw_needs_preset("cap.bin"));
+        // 加预设后：命中 → 可见（预设即参数来源，不再算「需预设」）
+        let cfg2: Config = toml::from_str(
+            r#"
+[raw]
+[[raw.demux]]
+match = "cap*.bin"
+pixfmt = "nv12"
+width = 320
+height = 240
+"#,
+        )
+        .unwrap();
+        assert!(cfg2.is_video_ext("cap0001.bin"));
+        assert!(!cfg2.raw_needs_preset("cap0001.bin"));
+        // 预设未命中的 .bin 依旧不可见——防污染文件列表
+        assert!(!cfg2.is_video_ext("other.bin"));
+    }
+
+    /// 极简 glob：`*` 任意序列（含空）、`?` 恰一字符、大小写不敏感、
+    /// 无通配符精确匹配、多字节字符按字符处理
+    #[test]
+    fn glob_matcher() {
+        // 无通配符：精确匹配（大小写不敏感）
+        assert!(glob_match("cap.bin", "CAP.BIN"));
+        assert!(!glob_match("cap.bin", "xap.bin"));
+        // * 任意长度（含空）；? 恰一字符
+        assert!(glob_match("*.bin", "a.bin"));
+        assert!(glob_match("sensor_*.yuv", "sensor_.yuv")); // * 可匹配空
+        assert!(!glob_match("sensor_*.yuv", "sensor_1.bin"));
+        assert!(glob_match("sensor_?.yuv", "sensor_7.yuv"));
+        assert!(!glob_match("sensor_?.yuv", "sensor_12.yuv"));
+        assert!(glob_match("sensor_?x*.raw", "sensor_1xyz.raw"));
+        // 经典回溯：* 吞一字符后重试对齐
+        assert!(glob_match("*aab", "aaab"));
+        assert!(!glob_match("*aab", "aaxb"));
+        // 多字节字符按字符匹配（不按字节截断）
+        assert!(glob_match("传感*.bin", "传感器A.bin"));
+    }
+
+    /// RAWVIDEO_PIXFMTS 完整性：数量快照、bayer 12 项、关键 bits 抽查、
+    /// 容器位数口径、大小写不敏感、MIPI/调色板不在名单、无重复项
+    #[test]
+    fn raw_pixfmt_table() {
+        // 数量快照：增删格式须显式改此数（与 ffmpeg -pix_fmts 筛选名单对账）
+        assert_eq!(RAWVIDEO_PIXFMTS.len(), 195);
+        // bayer 恰 12 项（8bit×4 + 16le/be×4）
+        assert_eq!(
+            RAWVIDEO_PIXFMTS
+                .iter()
+                .filter(|(n, _)| n.starts_with("bayer_"))
+                .count(),
+            12
+        );
+        // 关键格式抽查（8/16-bit 与 bayer 两套口径一致）
+        assert_eq!(raw_pixfmt_bits("yuv420p"), Some(12));
+        assert_eq!(raw_pixfmt_bits("nv12"), Some(12));
+        assert_eq!(raw_pixfmt_bits("gray"), Some(8));
+        assert_eq!(raw_pixfmt_bits("rgb24"), Some(24));
+        // 容器位数口径：9~16bit 采样占 2 字节容器（有意取容器位而非
+        // 逻辑位，帧字节数校验才与文件实际大小吻合）
+        assert_eq!(raw_pixfmt_bits("yuv420p10le"), Some(24));
+        assert_eq!(raw_pixfmt_bits("gray10le"), Some(16));
+        assert_eq!(raw_pixfmt_bits("rgb555le"), Some(16));
+        // 查表大小写不敏感
+        assert_eq!(raw_pixfmt_bits("YUV420P"), Some(12));
+        // 不支持的格式：MIPI packed bayer / 调色板 / 杜撰名
+        assert_eq!(raw_pixfmt_bits("mipi_rggb10"), None);
+        assert_eq!(raw_pixfmt_bits("pal8"), None);
+        assert_eq!(raw_pixfmt_bits("notafmt"), None);
+        // 名单无重复项（防手滑双写同格式不同 bits）
+        let mut names: Vec<&str> = RAWVIDEO_PIXFMTS.iter().map(|(n, _)| *n).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "RAWVIDEO_PIXFMTS 存在重复项");
     }
 }

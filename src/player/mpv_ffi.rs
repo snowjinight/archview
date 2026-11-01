@@ -22,6 +22,15 @@ pub const MPV_EVENT_LOG_MESSAGE: c_int = 2;
 pub const MPV_EVENT_START_FILE: c_int = 6;
 pub const MPV_EVENT_END_FILE: c_int = 7;
 pub const MPV_EVENT_FILE_LOADED: c_int = 8;
+/// mpv_end_file_reason（client.h）：EOF=0 STOP=2 QUIT=3 ERROR=4 REDIRECT=5。
+/// 仅泵线程判装载失败用，其余值不绑
+pub const MPV_END_FILE_REASON_ERROR: c_int = 4;
+/// loadfile replace 会让被替换的旧文件先收到 END_FILE(STOP=2)——
+/// 等待新文件装载结果时必须跳过这条伪事件（e2e 测试钉死）
+pub const MPV_END_FILE_REASON_STOP: c_int = 2;
+/// mpv_log_level（client.h）：NONE=0 FATAL=10 ERROR=20 WARN=30……泵线程
+/// 缓存最近一条 ≤ERROR 级日志行，供 END_FILE(ERROR) 回显附带
+pub const MPV_LOG_LEVEL_ERROR: c_int = 20;
 pub const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
 pub const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
@@ -77,6 +86,15 @@ pub struct MpvEventProperty {
     pub name: *const c_char,
     pub format: c_int,
     pub data: *mut c_void,
+}
+
+/// MPV_EVENT_END_FILE 的 data。reason 取 mpv_end_file_reason；reason=ERROR
+/// 时 error 为 mpv 错误码（不绑 mpv_error_string：error 级日志行文案信息量
+/// 更大，码值仅作兜底显示）
+#[repr(C)]
+pub struct MpvEventEndFile {
+    pub reason: c_int,
+    pub error: c_int,
 }
 
 // ---------- render API（render.h，用于 egui 单平面纹理渲染，ARCHITECTURE.md 13）----------

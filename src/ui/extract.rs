@@ -25,14 +25,71 @@ impl App {
         true
     }
 
+    /// raw dump 预设解析 + 不读文件的整除校验（方案 §4.5）：
+    /// Ok(Some(opts)) = 命中预设且校验通过（loadfile 第四参数）；
+    /// Ok(None) = 非裸数据（标准容器，无需选项）；
+    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高为 0 / 大小不整除 /
+    /// 命中 raw.extensions 但无预设），调用方 set_err 并放弃装载。
+    /// 校验必须在 loadfile 之前：rawvideo demuxer 对尾部零头字节不报错，
+    /// 画面会错位且难排查
+    pub(super) fn raw_demux_opts(
+        &self,
+        name: &str,
+        size: Option<u64>,
+    ) -> Result<Option<String>, String> {
+        match self.cfg.raw_demux(name) {
+            Some(d) => {
+                // 1) 格式名前置校验（名单见 README「raw 格式表」）
+                let Some(bits) = crate::config::raw_pixfmt_bits(&d.pixfmt) else {
+                    return Err(format!(
+                        "raw 预设像素格式 '{}' 不被支持（预设 match='{}'）。\n\
+                         常用：yuv420p / nv12 / yuv422p / yuyv422 / gray / gray16le / bayer_rggb8 / bayer_rggb16le…\n\
+                         完整名单见 README「raw 格式表」（195 项，含全部 yuv/rgb/gray/bayer 家族）。",
+                        d.pixfmt, d.r#match
+                    ));
+                };
+                // 2) 宽高非零（0 = 暂不支持自动推算）
+                if d.width == 0 || d.height == 0 {
+                    return Err(format!(
+                        "raw 预设 match='{}' 的 width/height 未填（pixfmt={}），裸数据宽高无法自动推算。",
+                        d.r#match, d.pixfmt
+                    ));
+                }
+                // 3) 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式）
+                let frame_bits = d.width as u64 * d.height as u64 * bits as u64;
+                if let Some(size) = size {
+                    if size * 8 % frame_bits != 0 {
+                        return Err(format!(
+                            "文件大小 {} B 与 {}x{} {}（每帧 {} B）不整除，无法切帧。\n\
+                             请核对预设 match='{}' 的 width/height/pixfmt 是否与该文件匹配。",
+                            size, d.width, d.height, d.pixfmt, frame_bits / 8, d.r#match
+                        ));
+                    }
+                }
+                Ok(Some(format!(
+                    "demuxer=rawvideo,demuxer-rawvideo-w={},demuxer-rawvideo-h={},\
+                     demuxer-rawvideo-mp-format={},demuxer-rawvideo-fps={}",
+                    d.width, d.height, d.pixfmt, d.fps
+                )))
+            }
+            // 命中 raw.extensions 但无预设：引导配置而非让 mpv 盲试
+            None if self.cfg.raw_needs_preset(name) => Err(format!(
+                "{name} 是裸数据文件，需在 config.toml 配置 [[raw.demux]] 预设\n\
+                 （像素格式 + 宽高；多条预设按声明顺序匹配，支持格式见 README「raw 格式表」）"
+            )),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn play(&mut self, entry_idx: usize) {
         // 先读模式与条目标记结束借用（后续各分支需要 &mut self）
-        let Some((stream, encrypted, has_pw, name)) = self.archive.as_ref().map(|a| {
+        let Some((stream, encrypted, has_pw, name, size)) = self.archive.as_ref().map(|a| {
             (
                 a.stream,
                 a.entries[entry_idx].encrypted,
                 a.password.is_some(),
                 a.entries[entry_idx].name.clone(),
+                a.entries[entry_idx].size,
             )
         }) else {
             return;
@@ -54,6 +111,15 @@ impl App {
             self.play_image(entry_idx);
             return;
         }
+        // raw dump（§4.5）：预设解析 + 整除校验，统一在此拦（快/慢路径
+        // 共用，慢路径先挡一道避免白解压）
+        let raw_opts = match self.raw_demux_opts(&name, Some(size)) {
+            Ok(o) => o,
+            Err(msg) => {
+                self.set_err(msg);
+                return;
+            }
+        };
         // 视频路径需要播放器，先就绪
         if !self.ensure_player() {
             return;
@@ -63,7 +129,7 @@ impl App {
             let Some(arch) = &self.archive else { return };
             let archive_id = arch.id;
             if let Some(p) = &self.player {
-                p.load(archive_id, entry_idx);
+                p.load(archive_id, entry_idx, raw_opts.as_deref().unwrap_or(""));
             }
             // 切视频清防闪快照与图片源：否则快照停留在视频前的旧图，下次
             // 切图解码间隙会闪现那张隔了好几条的图
@@ -149,6 +215,32 @@ impl App {
         self.heal_current_image();
     }
 
+    /// mpv 装载失败回显（§4.6）：END_FILE(ERROR) 经通道发到 UI，附最近
+    /// 一条 error 级日志行（如 Failed to initialize a decoder，比错误码
+    /// 文案信息量大）。对所有 mpv 播放失败生效（不只 raw dump）——顺带
+    /// 修复普通损坏视频黑屏无提示的问题；正常播放（EOF/STOP）不触发
+    pub(super) fn poll_mpv_err(&mut self) {
+        // while let 条件借用与循环体 &mut 交替合法（每迭代重新借用）
+        while let Some((code, log)) = self.player.as_ref().and_then(|p| p.poll_load_error()) {
+            let name = self
+                .archive
+                .as_ref()
+                .and_then(|a| self.playing.map(|i| a.entries[i].name.as_str()))
+                .unwrap_or("");
+            let detail = if log.trim().is_empty() {
+                format!("mpv 错误码 {code}")
+            } else {
+                log.trim_end().to_string()
+            };
+            let hint = if self.cfg.raw_visible(name) {
+                "请核对 [[raw.demux]] 预设（pixfmt/宽高/文件是否为裸帧数据）"
+            } else {
+                "文件可能损坏或编码不受支持"
+            };
+            self.set_err(format!("mpv 无法装载 {name}: {detail}\n{hint}"));
+        }
+    }
+
     /// 每帧自愈：当前应为纹理图，却既不在缓存也不在解码中 → 立即补发请求。
     /// 此前请求只由 nav 的 play_image 发起：条目若在他图显示/占位期间被
     /// 预取推入挤出 LRU（占位期 shown 保护的还是上一张图），回到该图必须
@@ -194,13 +286,14 @@ impl App {
         self.hold_img = None;
         self.img_source = None;
         if let Some(p) = &self.player {
+            // 回退条目必为图片（raw dump 不走纹理路径），无 per-file 选项
             if stream {
-                p.load(archive_id, entry_idx);
+                p.load(archive_id, entry_idx, "");
             } else {
                 let dir = cache::cache_dir(&self.cfg);
                 let dest = cache::dest_path(&dir, archive_id, entry_idx, &name);
                 if dest.exists() {
-                    p.load_path(&dest);
+                    p.load_path(&dest, "");
                 }
             }
         }
@@ -894,11 +987,26 @@ impl App {
             self.prefetch_images();
             return;
         }
-        // 落盘视频走 mpv：同流式路径清快照防隔图闪现
+        // 落盘视频走 mpv：同流式路径清快照防隔图闪现。
+        // raw dump 同样解析预设（§4.5.2）：7z/RAR 无 zvf:// 流，走解压
+        // 会话落地后播放，行为与流式一致（大小用落盘文件实长校验）
         self.hold_img = None;
         self.img_source = None;
+        let raw_name = self
+            .archive
+            .as_ref()
+            .map(|a| a.entries[entry_idx].name.clone())
+            .unwrap_or_default();
+        let raw_len = std::fs::metadata(dest).map(|m| m.len()).ok();
+        let raw_opts = match self.raw_demux_opts(&raw_name, raw_len) {
+            Ok(o) => o,
+            Err(msg) => {
+                self.set_err(msg);
+                return;
+            }
+        };
         if let Some(p) = &self.player {
-            p.load_path(dest);
+            p.load_path(dest, raw_opts.as_deref().unwrap_or(""));
         }
     }
 }

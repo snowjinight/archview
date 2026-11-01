@@ -172,7 +172,34 @@ clean_on_switch = false
 [media]
 # 视频 / 图片的文件扩展名识别列表（不区分大小写）
 video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
-image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]
+# 相机 RAW（内嵌预览直读）：Sony ARW 家族 + Nikon NEF 家族
+image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
+                    "arw", "nef", "nrw", "srf", "sr2", "arq"]
+# 打开单个媒体文件（拖入文件/发送到/文件菜单「打开媒体文件」）时，对其
+# 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认）；N = 向下 N 层；
+# 0 = 不限制（与「打开媒体目录」一致）
+file_open_depth = 1
+
+[raw]
+# 非标裸数据（raw dump）：这些扩展名的文件按裸帧数据处理，需在下方
+# [[raw.demux]] 命中预设（像素格式 + 宽高）才能播放；帧数由文件大小
+# 自动得出（文件大小必须能被单帧大小整除，否则报错）。
+# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）；
+# 支持的像素格式名单见文末「附录：raw 格式表」
+extensions = ["yuv", "nv12"]
+# 预设示例（unpacked bayer 的 .bin + NV12 的 .yuv），按需去掉行首 # 启用或仿写：
+# [[raw.demux]]
+# match = "sensor_a_*.bin"    # 通配 * 与 ?；写文件名（不含路径）
+# pixfmt = "bayer_rggb16le"   # FFmpeg 像素格式名（如 yuv420p / nv12 / gray）
+# width = 1920
+# height = 1080
+# fps = 30
+# [[raw.demux]]
+# match = "*.yuv"
+# pixfmt = "nv12"
+# width = 1280
+# height = 720
+# fps = 25
 
 [player]
 # 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
@@ -240,7 +267,10 @@ report_dir = "auto"
 | `cache.chunk_cache_blocks` | 解码块 LRU 缓存块数；ZIP 流式播放的内存占用 ≈ 两者乘积（默认 4 × 64 = 256MB） |
 | `cache.clean_on_exit` | 退出程序时自动清空解压缓存（默认 false） |
 | `cache.clean_on_switch` | 切换压缩包时是否清理上一个包的缓存（默认 false，保留以便切回时命中） |
-| `media.*_extensions` | 视频 / 图片的文件扩展名识别列表（不区分大小写） |
+| `media.*_extensions` | 视频 / 图片的文件扩展名识别列表（不区分大小写）；图片列表含相机 RAW（`arw` / `nef` 家族，内嵌预览直读） |
+| `media.file_open_depth` | 打开单个媒体文件（拖入 / 发送到 / 文件菜单「打开媒体文件」）时对其所在目录的递归收集深度：`1` = 只收集同级媒体文件（默认，防盘根/超大目录全盘扫描）；`N` = 向下 N 层；`0` = 不限制（与「打开媒体目录」一致） |
+| `raw.extensions` | 非标裸数据（raw dump）扩展名列表，默认 `["yuv", "nv12"]`：命中的文件进视频列表，但必须在 `[[raw.demux]]` 命中预设才能播放（缺预设时报错引导配置）。`.bin` 等杂项扩展名不建议加入（会污染媒体列表），改用 `[[raw.demux]]` 的 glob 命中即可见 |
+| `[[raw.demux]]` | raw dump 播放预设（可多条）：`match`（文件名通配，`*` / `?`，大小写不敏感、不含路径）→ `pixfmt`（像素格式，可选值见文末「附录：raw 格式表」）+ `width` / `height`（帧宽高，必须非 0）+ `fps`（默认 25）。按声明顺序取首个命中：先写具体（`sensor_a_*.bin`）、后写宽泛（`*.yuv`）。装载前整除校验：文件大小必须能被单帧字节数（宽×高×位数÷8）整除，不满足直接报错给出核对数字，不让 mpv 盲播出错位的画面 |
 | `player.hwdec` | 硬件解码（`auto` / `no` / `d3d11va` 等 mpv 取值） |
 | `player.cache_secs` | mpv 缓存秒数，拖回刚看过的片段直接命中缓存，零成本 |
 | `player.demuxer_max_mb` | mpv demuxer 最大缓存（MB） |
@@ -310,6 +340,7 @@ clean_on_switch = false
 - 分卷 ZIP：暂不支持（分卷 RAR 已支持）。
 - 兜底代码页只用一个配置编码（默认 GBK/简中）：密码侧只追加一个候选；zip 文件名侧 UTF-8 校验失败后也只用它解码。包若在日文等其它代码页系统上创建，需把 `codepage` 改为对应编码（如 `shift_jis`）。GBK/Shift-JIS 等双字节编码之间无法从字节层自动区分。
 - 视频缩略图、播放进度记忆：规划中。
+- raw dump（`[[raw.demux]]`）的宽高与像素格式需按文件名预设，不能按文件内容自动推算：列为后续增强。
 
 ## 更多文档
 
@@ -319,3 +350,62 @@ clean_on_switch = false
 ## 开源协议
 
 [MIT](LICENSE)。注意：本程序运行时动态加载的 libmpv 以其自身的开源协议（GPL/LGPL）分发，dll 需自行获取（见上文"获取 libmpv-2.dll"）。
+
+## 附录：raw 格式表（`[[raw.demux]]` pixfmt 可选值）
+
+`[[raw.demux]]` 的 `pixfmt` 可选值共 **195 项**（大小写不敏感），名单同 `ffmpeg -pix_fmts`（ffmpeg 7.x）筛除硬件 / 调色板 / bitstream / 无输入端口项——与 mpv `demuxer-rawvideo-mp-format` 接受的同一名单。
+
+**位数 = 每像素容器位数**（不是逻辑位数）：9~16bit 采样实际占 2 字节容器、rgb555 / rgb444 填零到 16bit 等，帧字节数 = `width × height × 位数 ÷ 8`。装载前的整除校验以此为基，才能与文件实际大小吻合（如 `yuv420p10le` 每像素 24bit 而非逻辑 15bit）。
+
+不在表内的名字（如 MIPI packed bayer `mipi_rggb10`、调色板 `pal8`）会报「不支持的格式」。
+
+| 家族 | 位数/px | 格式名 |
+|---|---|---|
+| Bayer 8-bit | 8 | `bayer_bggr8` `bayer_rggb8` `bayer_gbrg8` `bayer_grbg8` |
+| Bayer 16-bit | 16 | `bayer_bggr16le` `bayer_bggr16be` `bayer_rggb16le` `bayer_rggb16be` `bayer_gbrg16le` `bayer_gbrg16be` `bayer_grbg16le` `bayer_grbg16be` |
+| Gray 8-bit | 8 | `gray` |
+| Gray 9~16-bit | 16 | `gray9le` `gray9be` `gray10le` `gray10be` `gray12le` `gray12be` `gray14le` `gray14be` `gray16le` `gray16be` |
+| Gray float | 32 | `grayf32le` `grayf32be` |
+| Gray+Alpha | 16 / 32 | `ya8`（16）；`ya16le` `ya16be`（32） |
+| YUV planar 8-bit | 9 | `yuv410p` |
+| YUV planar 8-bit | 12 | `yuv420p` `yuv411p` `yuvj420p` `yuvj411p` |
+| YUV planar 8-bit | 16 | `yuv422p` `yuv440p` `yuvj422p` `yuvj440p` |
+| YUV planar 8-bit | 20 | `yuva420p` |
+| YUV planar 8-bit | 24 | `yuv444p` `yuvj444p` `yuva422p` |
+| YUV planar 8-bit | 32 | `yuva444p` |
+| YUV420p 9~16-bit | 24 | `yuv420p9le` `yuv420p9be` `yuv420p10le` `yuv420p10be` `yuv420p12le` `yuv420p12be` `yuv420p14le` `yuv420p14be` `yuv420p16le` `yuv420p16be` |
+| YUV440p 10/12-bit | 24 | `yuv440p10le` `yuv440p10be` `yuv440p12le` `yuv440p12be` |
+| YUVA420p 9~16-bit | 40 | `yuva420p9le` `yuva420p9be` `yuva420p10le` `yuva420p10be` `yuva420p16le` `yuva420p16be` |
+| YUV422p 9~16-bit | 32 | `yuv422p9le` `yuv422p9be` `yuv422p10le` `yuv422p10be` `yuv422p12le` `yuv422p12be` `yuv422p14le` `yuv422p14be` `yuv422p16le` `yuv422p16be` |
+| YUVA422p 9~16-bit | 48 | `yuva422p9le` `yuva422p9be` `yuva422p10le` `yuva422p10be` `yuva422p12le` `yuva422p12be` `yuva422p16le` `yuva422p16be` |
+| YUV444p 9~16-bit | 48 | `yuv444p9le` `yuv444p9be` `yuv444p10le` `yuv444p10be` `yuv444p12le` `yuv444p12be` `yuv444p14le` `yuv444p14be` `yuv444p16le` `yuv444p16be` |
+| YUVA444p 9~16-bit | 64 | `yuva444p9le` `yuva444p9be` `yuva444p10le` `yuva444p10be` `yuva444p12le` `yuva444p12be` `yuva444p16le` `yuva444p16be` |
+| NV12/21 | 12 | `nv12` `nv21` |
+| NV16 | 16 | `nv16` |
+| NV24/42 | 24 | `nv24` `nv42` |
+| P010/P012/P016 | 24 | `p010le` `p010be` `p012le` `p012be` `p016le` `p016be` |
+| P210/P212/P216 | 32 | `p210le` `p210be` `p212le` `p212be` `p216le` `p216be` |
+| P410/P412/P416 | 48 | `p410le` `p410be` `p412le` `p412be` `p416le` `p416be` |
+| YUV packed 16-bit | 16 | `yuyv422` `uyvy422` `yvyu422` |
+| YUV packed 24/32-bit | 24 / 32 | `vuyx`（24）；`vuya`（32） |
+| YUV packed 32-bit | 32 | `y210le` `y212le` `xv30le` |
+| YUV packed 64-bit | 64 | `ayuv64le` `xv36le` |
+| RGB 24-bit | 24 | `rgb24` `bgr24` `0rgb` `rgb0` `0bgr` `bgr0` |
+| RGBA | 32 | `argb` `rgba` `abgr` `bgra` |
+| RGB 8-bit 索引 | 8 | `rgb8` `bgr8` `rgb4_byte` `bgr4_byte` |
+| RGB 565 | 16 | `rgb565le` `rgb565be` `bgr565le` `bgr565be` |
+| RGB 555 | 16 | `rgb555le` `rgb555be` `bgr555le` `bgr555be` |
+| RGB 444 | 16 | `rgb444le` `rgb444be` `bgr444le` `bgr444be` |
+| RGB 48-bit | 48 | `rgb48le` `rgb48be` `bgr48le` `bgr48be` |
+| RGBA 64-bit | 64 | `rgba64le` `rgba64be` `bgra64le` `bgra64be` |
+| RGB 10-bit | 32 | `x2rgb10le` `x2bgr10le` |
+| RGBA float16 | 64 | `rgbaf16le` `rgbaf16be` |
+| GBRP 8-bit | 24 | `gbrp` |
+| GBRP 9~16-bit | 48 | `gbrp9le` `gbrp9be` `gbrp10le` `gbrp10be` `gbrp12le` `gbrp12be` `gbrp14le` `gbrp14be` `gbrp16le` `gbrp16be` |
+| GBRP float | 96 | `gbrpf32le` `gbrpf32be` |
+| GBRA 8-bit | 32 | `gbrap` |
+| GBRA 10~16-bit | 64 | `gbrap10le` `gbrap10be` `gbrap12le` `gbrap12be` `gbrap14le` `gbrap14be` `gbrap16le` `gbrap16be` |
+| GBRA float | 128 | `gbrapf32le` `gbrapf32be` |
+| XYZ | 48 | `xyz12le` `xyz12be` |
+
+常用速查：摄像头裸流 `nv12` / `yuv420p`（12bit/px）；unpacked bayer 传感器 `bayer_rggb16le`（16bit/px）；灰度 `gray`（8）/ `gray16le`（16）；屏录 RGB `bgra`（32）/ `rgb24`（24）。

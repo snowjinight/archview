@@ -58,6 +58,7 @@
 | RAR 读取 | `unrar` | 绑定官方 UnRAR 库（Windows 打包 UnRAR.dll），支持 RAR4/5、分卷 |
 | 视频播放 | 自研 `mpv_ffi` | libloading 运行时动态加载 libmpv-2.dll + 手写最小 FFI 绑定（约 20 符号：核心 + stream_cb + render API）。不用 libmpv-rs：shinchiro 构建的 libmpv.dll.a 是 MinGW 导入库，MSVC 链接不了 |
 | 图片渲染 | `image` crate | 静态图与 GIF/动画 webp 动图走 egui 纹理直显（13.4）：两档纹理按屏幕密度适配（基础 ×ppp / 深放大 full ×ppp×2）/全帧预解码/LRU 预取；mpv 收缩为纯视频 + 解码失败回退 |
+| RAW 媒体 | `raw-files` + mpv rawvideo demuxer | 相机 RAW 照片（ARW/NEF）内嵌 JPEG 预览直解进纹理（13.4）；裸数据 dump（yuv/nv12）经 `[[raw.demux]]` 预设走 mpv rawvideo demuxer（13.6） |
 | GL 后端 | `eframe` (glow) | 渲染器显式指定 glow（0.34 起 eframe 默认 wgpu，glow 才能拿到 `GL` 上下文喂给 mpv render API） |
 | 配置 | `serde` + `toml` | config.toml 带中文注释的默认模板 + 防漂移测试 |
 
@@ -360,6 +361,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions / file_open_depth（单媒体文件入口的目录收集深度，默认 1=只收同级；0=不限，见 4.2）
+[raw]     # extensions（裸数据 dump 扩展名，默认 yuv/nv12——命中即归视频桶但需预设才可播）/ [[raw.demux]] 预设数组（match 通配 glob → pixfmt+宽高+fps，格式名单见 README「raw 格式表」，链路见 13.6）
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume / muted
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
@@ -382,7 +384,9 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 >   查看备份等场景）；spawn 失败回退资源管理器定位并选中该文件。
 >   顶栏绿色提示（含"配置已重载"）显示 5 秒后自动消失（error 需人工处理则常驻）。
 > - 「重载配置」：重读 config.toml 后按生效时机分三档——
->   ① 即时：media 扩展名与 ui.sort_files（`rebuild_view` 重建列表）、codepage
+>   ① 即时：media 扩展名与 ui.sort_files（`rebuild_view` 重建列表）、
+>   raw.extensions/[[raw.demux]]（可见性同走 rebuild_view，播放时现读
+>   self.cfg，13.6）、codepage
 >   （`vfs::set_codepage` 全局量）、ui.font_path（重装字体链）、
 >   ui.image_cache_count（`ImageService::set_cap`），以及一切使用点读
 >   `self.cfg` 的项（预取预算/图片阈值与锐化/幻灯片间隔等）；
@@ -435,6 +439,7 @@ archive/zip : zip
 archive/7z  : sevenz-rust (BlockDecoder 固态直达)
 archive/rar : unrar (UnRAR.dll)
 image       : image 0.25（jpeg/png/webp/gif/bmp/tiff/ico/tga 解码 → egui 纹理直显，见 13.4；动画 webp 经 has_animation 分流逐帧）
+raw-files   : raw-files 0.6（相机 RAW 文件结构解析：只读结构 + 内嵌 JPEG 预览块（64KiB 块缓存），ARW/NEF 家族预览直解，见 13.4；识别失败 fall through 回退）
 config      : serde + toml (config.toml)
 logging     : tracing
 sort        : alphanumeric-sort (file list natural order, optional mode for comic/image collections)
@@ -912,6 +917,17 @@ decode（不可盲目逐帧——静态 `num_frames()==0` 空集误报，DEVLOG 
 记入 + `tex_image_key()` 剔除 + `prefetch_images()` 跳过——否则 mpv 已解出首帧
 却被图片占位永久遮挡。踩坑过程见 DEVLOG §2 坑 4。
 
+**相机 RAW 照片预览（✅，总览与可见性路由见 13.6）**：ARW/NEF 家族（arw/
+nef/nrw/srf/sr2/arq）经 `image_extensions` 归图片桶，`decode_image` 内按扩展名
+**先行拦截**（`with_guessed_format` 对相机 RAW 探不出格式必返 None，不拦截则
+100% 失败）——`raw-files` 只读文件结构与预览所在块（自带 64KiB 块缓存；文件源
+`RawFile::open` 按块读优于全量读盘，内存源条目先全量读入再 `from_bytes`），取出
+相机内嵌的**最大 JPEG 预览**交 image 解码，成本与普通 jpg 同量级，两档纹理/
+LRU/看门狗机制照常生效；EXIF 方向矫正（raw-files `Orientation` 1-8 穷尽匹配 →
+image crate 旋转/翻转：镜像与 180° `in_place` 零分配，90/270 转置重排，5/7 =
+旋转后镜像）后直出。识别/解码失败 fall through 原路径——改名伪 raw 由
+ImageReader 报错 → mpv 回退，与纹理解码失败共用兜底链。
+
 **交互**（✅，参考 Honeyview 等主流看图软件）：
 - 绘制：`Mesh::with_texture + add_rect_with_uv` + `painter_at(媒体区)` 裁剪；
   mpv PaintCallback 以 `tex_image_key().is_none()` 互斥；绘制矩形做**物理像素
@@ -1056,7 +1072,8 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
      512（截断优于回退 mpv）；动图不上采样（多帧 ×4 显存不值当）；
    - 附带：mpv 装载窗口 16ms 轮询（`has_painted_since_load`）——视频/回退路径
      切换时 UI 高频 repaint 解除 mpv VO 等待，首帧画出即停（消两段 ~200ms 空洞）。
-5. PSD/HEIC/AVIF 扩展解码器（按需，接库走同纹理路径）。
+5. PSD/HEIC/AVIF 扩展解码器（按需，接库走同纹理路径）；相机 RAW（ARW/NEF
+   家族）已按同模式落地（raw-files 内嵌 JPEG 预览，见上节）。
 
 ### 13.5 踩坑记录（已迁至 DEVLOG §2）
 
@@ -1064,6 +1081,59 @@ Ns"占位（200ms 轮询）；切视频三处清快照防旧图残留。
 blit READ 绑定套娃虚影 / smooth_scroll_delta 惯性尾巴 / 静态 webp 空集+回退遮挡 /
 LRU 挤出正在显示 / 占位分支早退跳输入 / debug 构建解码慢 / 物理像素对齐 /
 IDE 旧缓冲覆盖磁盘编辑。本文各处单坑引用格式为 `DEVLOG §2 坑 N`。
+
+### 13.6 RAW 媒体链路：裸数据 dump 播放 + 可见性路由（✅ 已落地）
+
+**两类 RAW，两个桶**（同一批改动，方案 PLAN_raw_media.md）：
+
+| 类型 | 例子 | 归属 | 链路 |
+|---|---|---|---|
+| 相机 RAW 照片 | arw/nef/nrw/srf/sr2/arq | 图片桶（`image_extensions`） | imgview 内嵌 JPEG 预览直解（13.4） |
+| 裸数据 dump | yuv/nv12/传感器 *.bin | 视频桶（`is_video_ext` 扩展） | mpv rawvideo demuxer（本节） |
+
+**可见性路由**（`config.rs`）：`is_video_ext = video_extensions 命中 ∨
+raw_visible(name)`，其中 `raw_visible = raw.extensions 命中 ∨ [[raw.demux]]
+glob 命中`。两条可见路径语义分离（防"可见但不可播"）：
+
+- `raw.extensions`（默认 yuv/nv12）命中 = 该文件按裸数据处理，但**无预设
+  不可播**（`raw_needs_preset` → 报错引导配置，不让 mpv 盲试黑屏）；
+- `[[raw.demux]]` glob 命中（如 `sensor_a_*.bin`）= 预设即参数来源，命中即
+  可见可播——未命中的 .bin 依旧不可见，不污染文件列表；
+- glob 匹配：路径剥离 + 大小写不敏感 + `*`/`?`，多条预设按声明顺序首命中。
+
+**播放链路**（`extract.rs` → `player/mod.rs`，快/慢路径共用）：
+
+```
+play() / load_extracted()
+  → raw_demux_opts(name, size)            # loadfile 前置校验（不读文件）
+  │   Ok(Some(opts)) → load/load_path(.., opts)   # 裸数据，带选项装载
+  │   Ok(None)       → 常规装载                    # 标准容器
+  │   Err(msg)       → set_err 放弃               # 配置错误（慢路径先挡，避免白解压）
+  → loadfile 第四参数（index 占位 -1）：
+    demuxer=rawvideo,demuxer-rawvideo-w=W,demuxer-rawvideo-h=H,
+    demuxer-rawvideo-mp-format=pixfmt,demuxer-rawvideo-fps=F
+```
+
+四分支前置校验（Err 文案自带引导，ui 单测钉死）：① pixfmt 不在
+`RAWVIDEO_PIXFMTS` 名单（195 项，源自 `ffmpeg -pix_fmts` 筛除硬件/调色板/
+bitstream；**位数为容器位数**——9~16bit 采样占 2 字节，帧字节 = W×H×bits÷8；
+名单与 README「raw 格式表」附录一致，`raw_pixfmt_bits` 大小写不敏感查表）；
+② 宽高为 0（暂不支持自动推算）；③ 文件大小不整除帧字节（rawvideo demuxer
+对尾部零头不报错、画面错位难排查，故必须前置）；④ 命中 raw.extensions 但
+无预设。
+
+**失败回显（END_FILE(ERROR) 通道）**：装载失败时泵线程发 `(mpv 错误码,
+最近 error 级日志行)` 进 mpsc，UI 每帧 `poll_mpv_err()` 消费 → `set_err`（raw
+文件附「核对 [[raw.demux]] 预设」提示）。**对所有 mpv 装载失败生效**（不只
+raw dump）——顺带修复普通损坏视频黑屏无提示；正常结束（EOF/STOP/QUIT）不发。
+⚠️ mpv 行为边界（player e2e 钉死）：选项解析失败只发 START_FILE + error
+日志、**不发 END_FILE**——前置校验后该路径不可达，真失败源是文件级错误；
+且 `loadfile replace` 会给被替换的旧文件先发 END_FILE(STOP) 伪事件，等待新
+文件结果须先见 START_FILE、再跳过 STOP。
+
+测试：player e2e（ffmpeg 造 nv12 → 选项装载 → 起播/时长=帧数÷fps/尺寸由
+选项解析/帧精确 seek + 装载失败事件与日志链路）+ ui 校验单测（四分支文案
+与拼参格式）。
 
 ## 14. 底部控制栏布局机制（egui 0.36）
 
