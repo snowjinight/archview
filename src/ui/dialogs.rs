@@ -194,3 +194,15 @@ impl App {
         });
     }
 }
+
+/// 「关于」下拉面板文案（顶栏「关于」按钮，panels.rs Popup 渲染）。
+/// 独立纯函数：版本行随 Cargo.toml 自动同步（CARGO_PKG_VERSION）、作者/
+/// 版权行与仓库 LICENSE 保持一致——单测钉住防手写漂移。
+pub(super) fn about_lines() -> Vec<String> {
+    vec![
+        "Archive Media Player（archview）".into(),
+        format!("版本 {}", env!("CARGO_PKG_VERSION")),
+        "作者 snowjinight".into(),
+        "Copyright (c) 2026 snowjinight · MIT License".into(),
+    ]
+}

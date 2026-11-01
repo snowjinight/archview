@@ -1017,3 +1017,22 @@ fn raw_demux_opts_validation() {
         "缺预设应引导配置: {err}"
     );
 }
+
+/// 「关于」下拉面板文案：版本行取 CARGO_PKG_VERSION（防手写硬编码漂移）、
+/// 作者/版权行与仓库 LICENSE 一致（Copyright + MIT）。
+#[test]
+fn about_lines_content() {
+    let lines = crate::ui::dialogs::about_lines();
+    assert_eq!(lines[0], "Archive Media Player（archview）", "应用名行");
+    assert_eq!(
+        lines[1],
+        format!("版本 {}", env!("CARGO_PKG_VERSION")),
+        "版本行应随 Cargo.toml 自动同步"
+    );
+    assert_eq!(lines[2], "作者 snowjinight", "作者行");
+    let cr = &lines[3];
+    assert!(
+        cr.contains("Copyright (c) 2026 snowjinight") && cr.contains("MIT"),
+        "版权行应含作者与 MIT: {cr}"
+    );
+}

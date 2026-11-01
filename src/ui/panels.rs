@@ -215,6 +215,19 @@ impl App {
                         }
                     });
             });
+            // 关于（偶发信息入口，与「快捷键」相邻）：下拉面板（与快捷键 ?
+            // 同款 Popup，再点按钮或点外部自动收起）——名称/版本/作者/版权行
+            let about_btn = ui.button("关于");
+            egui::Popup::from_toggle_button_response(&about_btn).show(|ui| {
+                ui.set_min_width(240.0);
+                let lines = dialogs::about_lines();
+                // 信息层级：应用名加粗 > 版本/作者正常 > 版权行弱化
+                ui.strong(&lines[0]);
+                ui.label(&lines[1]);
+                ui.label(&lines[2]);
+                ui.add_space(6.0);
+                ui.weak(&lines[3]);
+            });
             // 一次性提示（如"配置已重载"）5 秒后自动消失；新提示重新计时。
             // error 需人工处理则常驻（只被下一次操作覆盖）
             let now = ui.input(|i| i.time);
