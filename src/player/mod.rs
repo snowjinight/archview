@@ -543,13 +543,16 @@ impl PlayerService {
         }
     }
 
-    pub fn load(&self, archive_id: u64, entry_idx: usize, extra_opts: &str) {
+    /// `bit_shift`：raw dump 每 u16 采样左移位数（0 = 不位移）。经
+    /// zvf:// URI 查询串下发，open_cb 在流层包装 ShiftReader（12bit 低
+    /// 对齐存 16bit 容器的发黑修复，见 [[raw.demux]] bit_shift）
+    pub fn load(&self, archive_id: u64, entry_idx: usize, extra_opts: &str, bit_shift: u32) {
         // 重置打开完成标志（必须先于 loadfile 提交：快文件 PLAYBACK_RESTART
         // 可在数十 ms 内到达泵线程，若先提交后重置，会被泵线程抢先置位再
         // 被抹掉，门控将卡到 2s 兜底）
         self.playback_ready.store(false, Ordering::Relaxed);
         let opts = self.file_opts(extra_opts);
-        let uri = stream_cb::entry_uri(archive_id, entry_idx);
+        let uri = stream_cb::entry_uri(archive_id, entry_idx, bit_shift);
         let cmd = if opts.is_empty() {
             format!("loadfile {uri} replace")
         } else {
@@ -957,7 +960,7 @@ mod tests {
             .expect("注册 zvf:// 失败");
 
         // 播放
-        let uri = stream_cb::entry_uri(archive_id, entry_idx);
+        let uri = stream_cb::entry_uri(archive_id, entry_idx, 0);
         mpv_ffi::command_string(ctx, &format!("loadfile {uri}")).expect("loadfile 失败");
 
         // 1) 起播：time-pos > 0.5s（vo=null 全速解码，瞬间到达）
@@ -1047,7 +1050,7 @@ mod tests {
             .iter()
             .position(|e| e.name == "clip2.mp4")
             .expect("zip 内应有 clip2.mp4");
-        let uri2 = stream_cb::entry_uri(archive_id, entry_idx2);
+        let uri2 = stream_cb::entry_uri(archive_id, entry_idx2, 0);
         mpv_ffi::command_string(ctx, &format!("loadfile {uri2} replace")).expect("loadfile 失败");
         // 修复验证：loadfile 后显式取消暂停（PlayerService::load 的行为）
         mpv_ffi::set_property_string(ctx, "pause", "no").unwrap();
@@ -1620,11 +1623,11 @@ mod tests {
             }
         };
 
-        let t_a = run("A zvf冷启641", stream_cb::entry_uri(archive_id, idx641));
+        let t_a = run("A zvf冷启641", stream_cb::entry_uri(archive_id, idx641, 0));
         drain(300);
         let t_b = run("B file直读1000", to_file_url(&media_dir.join("1000.webp")));
         drain(300);
-        let t_c = run("C zvf切换1000", stream_cb::entry_uri(archive_id, idx1000));
+        let t_c = run("C zvf切换1000", stream_cb::entry_uri(archive_id, idx1000, 0));
         drain(300);
 
         mpv_ffi::destroy(ctx);

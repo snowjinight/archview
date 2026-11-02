@@ -346,10 +346,14 @@ impl App {
             path.display(),
             self.archive.as_ref().map(|a| a.entries.len()).unwrap_or(0)
         );
+        // 切换内容源 = 翻篇：先清掉旧包遗留的红/绿消息（须在空集合判断
+        // 之前，否则下面 set_notice 会被清掉）
+        self.error = None;
+        self.notice = None;
         // 空集合提示（目录里没有媒体 / 压缩包内没有媒体文件）——
         // 统一在此给出，各打开入口不必各自判断
         if self.archive.as_ref().is_some_and(|a| a.view.is_empty()) {
-            self.notice = Some("没有可播放的视频/图片".into());
+            self.set_notice("没有可播放的视频/图片");
         }
         // 取消并清掉旧包的解压任务：不清会导致旧包 FileDone 到来时
         // load_extracted 把画面切回旧包条目（playing 下标错乱）
@@ -360,7 +364,6 @@ impl App {
         self.extract = None;
         self.playing = None;
         self.last_focus = None; // 旧包的锚点下标对新包无意义
-        self.error = None;
         self.pw_prompt = None;
         // 密码重试场景：恢复播放提交密码时想看的条目（返回调用方执行）；
         // 单媒体文件入口：跳转播放用户传入的目标文件（poll_open 执行 play，

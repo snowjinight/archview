@@ -23,7 +23,7 @@ impl App {
     /// ↑/↓=模式分治：图片=缩放步进、视频=音量±5；M=静音（仅视频；
     /// 真相在 cfg，未播放/未开文件也可预设），
     /// PgUp/PgDn=上一个/下一个，
-    /// L=视频播放模式切换（列表播放↔单视频循环），
+    /// L=视频播放模式三态循环（定格→列表→循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -72,7 +72,7 @@ impl App {
         let (mut do_pause, mut do_mute, mut step_entry) = (false, false, 0i32);
         // 视频暂停时的方向键 = 逐帧步进（上一帧/下一帧）
         let mut frame_dir = 0i32;
-        // L=视频播放模式切换（列表播放↔单视频循环）
+        // L=视频播放模式三态循环（定格→列表→循环）
         let mut loop_toggle = false;
         // 回车=切换全屏；Esc=退出全屏（仅全屏时消费，避免抢其它控件的 Esc）
         let mut fs_toggle = false;
@@ -229,9 +229,9 @@ impl App {
                 p.toggle_pause();
             }
         }
-        // L：视频播放模式切换（列表播放↔单视频循环）
+        // L：视频播放模式三态循环（定格→列表→循环）
         if loop_toggle {
-            self.toggle_video_loop();
+            self.cycle_play_mode();
         }
         // M：静音翻转。真相在 cfg——未播放/未开文件也可预设，
         // 播放器在场才下发 mpv（不在场则等创建时统一应用）
@@ -370,35 +370,47 @@ impl App {
         }
     }
 
-    /// 切换视频播放模式（两态）：列表播放（默认，播完自动下一个）↔
-    /// 单视频循环（mpv loop-file=inf 原生循环，EOF 不触发）。
-    /// 切到循环时若已停在末帧（keep-open EOF 粘滞暂停），回开头复活继续
-    pub(super) fn toggle_video_loop(&mut self) {
-        self.video_loop = !self.video_loop;
-        let on = self.video_loop;
+    /// 循环切换视频播放模式（三态）：Hold（定格，默认，播完停末帧）→
+    /// List（列表，播完自动下一个）→ Loop（mpv loop-file=inf 原生循环，
+    /// EOF 不触发）→ Hold。切到 Loop 时若已停在末帧（keep-open EOF
+    /// 粘滞暂停），回开头复活继续；Hold→List 若正粘滞末帧，下一帧
+    /// eof_tick 立即推进（Hold 门控在读取 eof 之前 return，不写
+    /// eof_handled；列表末尾停住的推进已记 eof_handled，不会误推进）
+    pub(super) fn cycle_play_mode(&mut self) {
+        self.play_mode = match self.play_mode {
+            PlayMode::Hold => PlayMode::List,
+            PlayMode::List => PlayMode::Loop,
+            PlayMode::Loop => PlayMode::Hold,
+        };
+        let m = self.play_mode;
         if let Some(p) = &self.player {
-            p.set_loop(on);
-            if on && p.eof_reached() {
+            p.set_loop(m == PlayMode::Loop);
+            if m == PlayMode::Loop && p.eof_reached() {
                 // loop-file 不回溯已发生的 EOF：手动回开头并解除粘滞暂停
                 p.seek(0.0);
                 p.set_paused(false);
             }
         }
-        self.notice = Some(if on {
-            "单视频循环".into()
-        } else {
-            "列表播放（播完自动下一个）".into()
+        self.set_notice(match m {
+            PlayMode::Hold => "定格播放（播完停在末帧）",
+            PlayMode::List => "列表播放（播完自动下一个）",
+            PlayMode::Loop => "单视频循环",
         });
-        tracing::info!("视频播放模式: {}", if on { "循环" } else { "列表" });
+        tracing::info!("视频播放模式: {m:?}");
     }
 
     /// 列表播放：视频播到末尾自动切下一个（每帧轮询，EOF 后 keep-open
     /// 粘滞暂停使节拍回落 100ms，推进延迟 ≤100ms 不可感知）。
+    /// 仅 List 模式推进；Loop 下 eof-reached 恒 false（mpv 原生循环不
+    /// 触发 EOF）；Hold 下 eof 可为 true 但不推进——切回 List 时立即
+    /// 推进（Hold 门控在读取 eof 之前 return，不写 eof_handled）。
     /// eof_handled 防重入：推进无效果时（列表末尾停住/目标需先解压等
-    /// 装载）不每帧重复触发；eof 复位（新文件开播/手动回拖）自动清空。
-    /// 循环模式下 eof-reached 恒 false（mpv 原生循环不触发 EOF），天然互斥
+    /// 装载）不每帧重复触发；eof 复位（新文件开播/手动回拖）自动清空
     pub(super) fn video_eof_tick(&mut self) {
-        if self.video_loop || self.playing.is_none() || self.playing_is_image() {
+        if self.play_mode != PlayMode::List
+            || self.playing.is_none()
+            || self.playing_is_image()
+        {
             return;
         }
         let eof = self.player.as_ref().is_some_and(|p| p.eof_reached());

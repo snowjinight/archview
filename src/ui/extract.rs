@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// raw dump 命中预设且校验通过后的装载参数：`opts` = loadfile 第四参数
+/// （rawvideo demuxer 拼参）；`bit_shift` = 流层每 u16 采样左移位数
+/// （0 = 不位移，仅快路径 zvf:// 生效）
+#[derive(Debug, PartialEq)]
+pub(super) struct RawLoad {
+    pub(super) opts: String,
+    pub(super) bit_shift: u32,
+}
+
 impl App {
     // ---- 播放 ----
 
@@ -26,17 +35,17 @@ impl App {
     }
 
     /// raw dump 预设解析 + 不读文件的整除校验（方案 §4.5）：
-    /// Ok(Some(opts)) = 命中预设且校验通过（loadfile 第四参数）；
-    /// Ok(None) = 非裸数据（标准容器，无需选项）；
-    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高为 0 / 大小不整除），
-    /// 调用方 set_err 并放弃装载。
+    /// Ok(Some(load)) = 命中预设且校验通过（loadfile 第四参数 + 流层
+    /// bit_shift）；Ok(None) = 非裸数据（标准容器，无需选项）；
+    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高为 0 / 大小不整除 /
+    /// bit_shift 越界或非 le 格式），调用方 set_err 并放弃装载。
     /// 校验必须在 loadfile 之前：rawvideo demuxer 对尾部零头字节不报错，
     /// 画面会错位且难排查
     pub(super) fn raw_demux_opts(
         &self,
         name: &str,
         size: Option<u64>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<RawLoad>, String> {
         match self.cfg.raw_demux(name) {
             Some(d) => {
                 // 1) 格式名前置校验（名单见 README「raw 格式表」）
@@ -55,7 +64,19 @@ impl App {
                         d.r#match, d.pixfmt
                     ));
                 }
-                // 3) 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式）
+                // 3) bit_shift 合法域：0~8；>0 须 le 结尾（按 LE u16 采样
+                //    移位，be/1 字节格式位移会破坏数据）
+                if d.bit_shift > 8
+                    || d.bit_shift > 0 && !d.pixfmt.to_ascii_lowercase().ends_with("le")
+                {
+                    return Err(format!(
+                        "raw 预设 match='{}' 的 bit_shift={} 不合法（pixfmt={}）：\
+                         取值 0~8；>0 时 pixfmt 须为 le 结尾的 16bit 容器格式\
+                         （如 bayer_bggr16le；12bit 低对齐数据填 4、10bit 填 6）。",
+                        d.r#match, d.bit_shift, d.pixfmt
+                    ));
+                }
+                // 4) 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式）
                 let frame_bits = d.width as u64 * d.height as u64 * bits as u64;
                 if let Some(size) = size {
                     if size * 8 % frame_bits != 0 {
@@ -66,11 +87,14 @@ impl App {
                         ));
                     }
                 }
-                Ok(Some(format!(
-                    "demuxer=rawvideo,demuxer-rawvideo-w={},demuxer-rawvideo-h={},\
-                     demuxer-rawvideo-mp-format={},demuxer-rawvideo-fps={}",
-                    d.width, d.height, d.pixfmt, d.fps
-                )))
+                Ok(Some(RawLoad {
+                    opts: format!(
+                        "demuxer=rawvideo,demuxer-rawvideo-w={},demuxer-rawvideo-h={},\
+                         demuxer-rawvideo-mp-format={},demuxer-rawvideo-fps={}",
+                        d.width, d.height, d.pixfmt, d.fps
+                    ),
+                    bit_shift: d.bit_shift,
+                }))
             }
             // 未命中预设：标准容器（mpv 自行处理）；用户手动加进
             // media.video_extensions 的非标文件也走这里——装载失败由
@@ -80,6 +104,10 @@ impl App {
     }
 
     pub(super) fn play(&mut self, entry_idx: usize) {
+        // 用户/自动推进切换条目 = 翻篇：清掉上一条目的红/绿消息
+        //（成功播放则无消息，失败随后 set_err 新红）
+        self.error = None;
+        self.notice = None;
         // 先读模式与条目标记结束借用（后续各分支需要 &mut self）
         let Some((stream, encrypted, has_pw, name, size)) = self.archive.as_ref().map(|a| {
             (
@@ -123,11 +151,16 @@ impl App {
             return;
         }
         if stream {
-            // 快路径：流式播放（zvf://）
+            // 快路径：流式播放（zvf://）。bit_shift>0 时 URI 携带 s=N，
+            // open_cb 在流层包 ShiftReader 修正（12bit 低对齐发黑修复）
             let Some(arch) = &self.archive else { return };
             let archive_id = arch.id;
             if let Some(p) = &self.player {
-                p.load(archive_id, entry_idx, raw_opts.as_deref().unwrap_or(""));
+                let (opts, shift) = match &raw_opts {
+                    Some(r) => (r.opts.as_str(), r.bit_shift),
+                    None => ("", 0),
+                };
+                p.load(archive_id, entry_idx, opts, shift);
             }
             // 切视频清防闪快照与图片源：否则快照停留在视频前的旧图，下次
             // 切图解码间隙会闪现那张隔了好几条的图
@@ -145,6 +178,9 @@ impl App {
     /// 图片纹理直显（流式包静态图含全部 webp + gif 动图）：停掉 mpv 画面，
     /// 请求后台解码（LRU 命中直接显示）。解码失败在 poll_img 中回退 mpv 兜底
     fn play_image(&mut self, entry_idx: usize) {
+        // 切换条目 = 翻篇：清掉上一条目的红/绿消息（与 play() 同款）
+        self.error = None;
+        self.notice = None;
         let Some((key, source, name)) = self.archive.as_ref().map(|a| {
             (
                 (a.id, entry_idx),
@@ -286,7 +322,7 @@ impl App {
         if let Some(p) = &self.player {
             // 回退条目必为图片（raw dump 不走纹理路径），无 per-file 选项
             if stream {
-                p.load(archive_id, entry_idx, "");
+                p.load(archive_id, entry_idx, "", 0);
             } else {
                 let dir = cache::cache_dir(&self.cfg);
                 let dest = cache::dest_path(&dir, archive_id, entry_idx, &name);
@@ -658,8 +694,7 @@ impl App {
                 self.load_extracted(&dest, entry_idx);
                 return;
             }
-            tracing::error!("{msg}");
-            self.error = Some(msg);
+            self.set_err(msg);
             return;
         }
 
@@ -929,7 +964,7 @@ impl App {
                             "解压失败: 压缩包 [{arch}] 条目 [{entry_name}] → [{}]: {e}",
                             dest.display()
                         );
-                        self.error = Some(format!("解压失败: {e}"));
+                        self.set_err(format!("解压失败: {e}"));
                     }
                 }
             }
@@ -951,6 +986,9 @@ impl App {
     /// mpv 画面后从落盘文件后台解码——7z/RAR 图片的公共出口（解压落地
     /// FileDone、缓存命中、锚点回放都汇到这里）
     pub(super) fn load_extracted(&mut self, dest: &Path, entry_idx: usize) {
+        // 后台完成装载上屏 = 新内容翻篇：清旧条目的红/绿消息
+        self.error = None;
+        self.notice = None;
         // 播放到锚点 = "解压完成待消费"提醒消费完毕（start_extract 缓存
         // 命中不经 play()，提醒按钮/B 键/悬浮按钮/列表点击最终都汇到这里）
         if self.last_focus == Some(entry_idx) {
@@ -1004,7 +1042,10 @@ impl App {
             }
         };
         if let Some(p) = &self.player {
-            p.load_path(dest, raw_opts.as_deref().unwrap_or(""));
+            // 慢路径不做 bit_shift（设计定案）：bayer 位移适用面窄，不为
+            // 它给落盘文件增设 zvf:// 单文件通道或改写解压缓存——shift
+            // 静默忽略，走原装载行为（取舍详见 ARCHITECTURE §13.6）
+            p.load_path(dest, raw_opts.as_ref().map(|r| r.opts.as_str()).unwrap_or(""));
         }
     }
 }

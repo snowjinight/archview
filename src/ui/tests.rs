@@ -1,6 +1,6 @@
 //! ui 模块单元测试。
 
-use super::App;
+use super::{App, PlayMode};
 use egui::Widget as _;
 
 /// 磁盘预检的 LRU 换出量计算：缓存未满不换出；超限部分换出但
@@ -955,20 +955,22 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// raw dump 预设校验（方案 §4.5/§8）：raw_demux_opts 的四类拦截文案与
-/// 通过拼参。校验必须在 loadfile 之前——rawvideo demuxer 对尾部零头
-/// 字节不报错、画面错位难排查，故报错均引导核对 [[raw.demux]] 预设
+/// raw dump 预设校验（方案 §4.5/§8）：raw_demux_opts 的五类拦截文案与
+/// 通过拼参（含 bit_shift 流层参数带出）。校验必须在 loadfile 之前——
+/// rawvideo demuxer 对尾部零头字节不报错、画面错位难排查，故报错均
+/// 引导核对 [[raw.demux]] 预设
 #[test]
 fn raw_demux_opts_validation() {
-    let mk = |pixfmt: &str, w: u32, h: u32| crate::config::RawDemux {
+    let mk = |pixfmt: &str, w: u32, h: u32, s: u32| crate::config::RawDemux {
         r#match: "sensor_a_*.bin".into(),
         pixfmt: pixfmt.into(),
         width: w,
         height: h,
         fps: 10.0,
+        bit_shift: s,
     };
     let mut cfg = crate::config::Config::default();
-    cfg.raw.demux = vec![mk("nv12", 64, 48)];
+    cfg.raw.demux = vec![mk("nv12", 64, 48, 0)];
 
     // 1) 标准容器（无预设命中）→ 不带选项直接播
     let app = App::new_for_test(cfg.clone());
@@ -979,19 +981,20 @@ fn raw_demux_opts_validation() {
     );
 
     // 2) 预设命中 + 大小整除（10 帧 × 4608B）→ 拼参格式与 e2e 测试同源
-    let opts = app
+    let r = app
         .raw_demux_opts("sensor_a_0.bin", Some(10 * 64 * 48 * 12 / 8))
         .unwrap()
         .expect("校验通过应给选项");
     assert_eq!(
-        opts,
+        r.opts,
         "demuxer=rawvideo,demuxer-rawvideo-w=64,demuxer-rawvideo-h=48,\
          demuxer-rawvideo-mp-format=nv12,demuxer-rawvideo-fps=10"
     );
+    assert_eq!(r.bit_shift, 0, "未配置 bit_shift 默认 0（不位移）");
 
     // 3) pixfmt 不在名单：报错须带常用格式速览 + 指向 README raw 格式表
     let mut bad = cfg.clone();
-    bad.raw.demux[0] = mk("notafmt", 64, 48);
+    bad.raw.demux[0] = mk("notafmt", 64, 48, 0);
     let err = App::new_for_test(bad)
         .raw_demux_opts("sensor_a_0.bin", None)
         .unwrap_err();
@@ -1002,7 +1005,7 @@ fn raw_demux_opts_validation() {
 
     // 4) 宽高为 0：裸数据宽高无法自动推算
     let mut bad = cfg.clone();
-    bad.raw.demux[0] = mk("nv12", 0, 48);
+    bad.raw.demux[0] = mk("nv12", 0, 48, 0);
     let err = App::new_for_test(bad)
         .raw_demux_opts("sensor_a_0.bin", None)
         .unwrap_err();
@@ -1025,6 +1028,36 @@ fn raw_demux_opts_validation() {
     //    通道回显，见 poll_mpv_err）
     let plain = App::new_for_test(crate::config::Config::default());
     assert_eq!(plain.raw_demux_opts("clip.yuv", None).unwrap(), None);
+
+    // 7) bit_shift 越界（9）：报错带取值域与填写指引
+    let mut bad = cfg.clone();
+    bad.raw.demux[0] = mk("bayer_rggb16le", 64, 48, 9);
+    let err = App::new_for_test(bad)
+        .raw_demux_opts("sensor_a_0.bin", None)
+        .unwrap_err();
+    assert!(
+        err.contains("bit_shift") && err.contains("0~8"),
+        "bit_shift 越界报错: {err}"
+    );
+
+    // 8) bit_shift>0 但 pixfmt 非 le（yuv420p 为 1 字节采样，位移会毁数据）
+    let mut bad = cfg.clone();
+    bad.raw.demux[0] = mk("yuv420p", 64, 48, 4);
+    let err = App::new_for_test(bad)
+        .raw_demux_opts("sensor_a_0.bin", None)
+        .unwrap_err();
+    assert!(err.contains("le"), "非 le 格式应拒绝位移: {err}");
+
+    // 9) 合法组合：bayer_rggb16le + shift 4 → 通过并带出流层参数
+    //    （每帧 64×48×2 B，3 帧 = 18432 B）
+    let mut ok = cfg.clone();
+    ok.raw.demux[0] = mk("bayer_rggb16le", 64, 48, 4);
+    let r = App::new_for_test(ok)
+        .raw_demux_opts("sensor_a_0.bin", Some(3 * 64 * 48 * 2))
+        .unwrap()
+        .expect("合法 bit_shift 不应拦截");
+    assert_eq!(r.bit_shift, 4);
+    assert!(r.opts.contains("bayer_rggb16le"));
 }
 
 /// 「关于」下拉面板文案：版本行取 CARGO_PKG_VERSION（防手写硬编码漂移）、
@@ -1044,4 +1077,172 @@ fn about_lines_content() {
         cr.contains("Copyright (c) 2026 snowjinight") && cr.contains("MIT"),
         "版权行应含作者与 MIT: {cr}"
     );
+}
+
+// ===================== 播放模式三态 + 顶栏消息单槽 =====================
+
+/// T1 三态播放模式：默认定格（Hold）；cycle_play_mode 顺序
+/// Hold → List → Loop → Hold 完整闭环；每次切换置互斥绿提示（文案
+/// 可辨模式）；无播放器在场不触碰 mpv（安全路径）
+#[test]
+fn play_mode_three_state_cycle() {
+    let mut app = App::new_for_test(crate::config::Config::default());
+    assert_eq!(app.play_mode, PlayMode::Hold, "默认应为定格模式");
+    app.cycle_play_mode();
+    assert_eq!(app.play_mode, PlayMode::List);
+    assert_eq!(app.notice.as_deref(), Some("列表播放（播完自动下一个）"));
+    assert!(app.error.is_none());
+    app.cycle_play_mode();
+    assert_eq!(app.play_mode, PlayMode::Loop);
+    assert_eq!(app.notice.as_deref(), Some("单视频循环"));
+    app.cycle_play_mode();
+    assert_eq!(app.play_mode, PlayMode::Hold, "三次切换应回到起点");
+    assert_eq!(app.notice.as_deref(), Some("定格播放（播完停在末帧）"));
+}
+
+/// T2 eof_tick 三态门控：未开包/未播放（player 与 playing 皆空）的
+/// 边界组合下三种模式各轮询一次——门控在读 eof 之前早退，不 panic、
+/// 不产生消息
+#[test]
+fn video_eof_tick_gates_no_panic() {
+    let mut app = App::new_for_test(crate::config::Config::default());
+    for m in [PlayMode::Hold, PlayMode::List, PlayMode::Loop] {
+        app.play_mode = m;
+        app.video_eof_tick();
+    }
+    assert!(app.error.is_none());
+    assert!(app.notice.is_none(), "门控早退不应产生消息");
+}
+
+/// T3 红绿互斥单槽：set_err 清绿写红；set_notice 清红写绿——
+/// 任一时刻顶栏至多一条消息，新消息覆盖旧消息
+#[test]
+fn set_err_set_notice_mutually_exclusive() {
+    let mut app = App::new_for_test(crate::config::Config::default());
+    app.set_notice("绿提示");
+    assert_eq!(app.notice.as_deref(), Some("绿提示"));
+    assert!(app.error.is_none());
+    app.set_err("红错误");
+    assert_eq!(app.error.as_deref(), Some("红错误"));
+    assert!(app.notice.is_none(), "写红应清绿");
+    app.set_notice("绿提示2");
+    assert_eq!(app.notice.as_deref(), Some("绿提示2"));
+    assert!(app.error.is_none(), "写绿应清红");
+}
+
+/// T4 play 入口清槽：切换条目 = 翻篇，旧红/绿消息清空。走图片纹理
+/// 路由验证（stream 目录模式 jpg——new_for_test 无 glow 上下文，
+/// 视频路径 ensure_player 必失败，图片路由不需要播放器）
+#[test]
+fn play_clears_top_messages() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("ui_play_clear_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.jpg"), b"i").unwrap();
+
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = root.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    let vfs: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&root, media_pred(), 0).unwrap());
+    let entries = vfs.list();
+    assert_eq!(entries.len(), 1);
+    app.apply_open_done(root.clone(), None, vfs, 3, entries, None);
+    assert!(
+        app.archive.as_ref().is_some_and(|a| a.stream),
+        "目录集合应走流式路径（图片路由前提）"
+    );
+
+    app.set_notice("旧消息"); // 预置在场消息（绿在场即可验证清除）
+    app.play(0); // jpg + stream + image_texture 默认开 → play_image 路由
+    assert_eq!(app.playing, Some(0));
+    assert!(app.error.is_none(), "play 入口应清红色错误");
+    assert!(app.notice.is_none(), "play 入口应清绿色提示");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// T5 帧首点击清绿：任意鼠标点击清绿色提示（用户操作了=看过了）；
+/// 红色错误不被无关点击消除（操作失败的真相不因点击失效）；纯移动
+/// 不算点击。同帧注入 press+release（egui 判定 click 的最小事件对）
+#[test]
+fn click_clears_notice_but_not_error() {
+    let mut app = App::new_for_test(crate::config::Config::default());
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+    let click_raw = |t: f64| {
+        let mut raw = egui::RawInput {
+            time: Some(t),
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let pos = egui::pos2(10.0, 10.0);
+        for pressed in [true, false] {
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        raw
+    };
+
+    // 1) 绿提示 + 点击 → 清
+    app.set_notice("待读提示");
+    ctx.run_ui(click_raw(0.1).take(), |_| app.clear_notice_on_click(&ctx))
+        .drop_without_applying_deltas();
+    assert!(app.notice.is_none(), "点击应清掉绿色提示");
+
+    // 2) 红错误 + 点击 → 保留
+    app.set_err("红错误");
+    ctx.run_ui(click_raw(0.2).take(), |_| app.clear_notice_on_click(&ctx))
+        .drop_without_applying_deltas();
+    assert_eq!(app.error.as_deref(), Some("红错误"), "点击不得清红色错误");
+
+    // 3) 绿提示 + 纯移动 → 保留
+    app.set_notice("另一条绿");
+    let mut raw = egui::RawInput {
+        time: Some(0.3),
+        screen_rect: Some(screen),
+        ..Default::default()
+    };
+    raw.events
+        .push(egui::Event::PointerMoved(egui::pos2(5.0, 5.0)));
+    ctx.run_ui(raw.take(), |_| app.clear_notice_on_click(&ctx))
+        .drop_without_applying_deltas();
+    assert_eq!(app.notice.as_deref(), Some("另一条绿"), "纯移动不应清提示");
+}
+
+/// T6 切换内容源清双槽 + 空集合提示保留：apply_open_done 帧首先清
+/// 旧包遗留红/绿（翻篇），再对空视图给统一提示——先清后写保证提示
+/// 不被自己清掉（清槽与提示写入的顺序回归）
+#[test]
+fn open_done_clears_messages_and_keeps_empty_hint() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let empty =
+        std::env::temp_dir().join(format!("ui_open_clear_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = empty.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    app.set_err("旧包错误"); // 旧包遗留红在场
+    let vfs: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&empty, media_pred(), 0).unwrap());
+    let entries = vfs.list();
+    assert!(entries.is_empty());
+    app.apply_open_done(empty.clone(), None, vfs, 5, entries, None);
+    assert!(app.error.is_none(), "切换内容源应清掉旧包红色错误");
+    assert_eq!(
+        app.notice.as_deref(),
+        Some("没有可播放的视频/图片"),
+        "空集合统一提示应保留（不被清槽误伤）"
+    );
+
+    let _ = std::fs::remove_dir_all(&empty);
 }

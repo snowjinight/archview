@@ -365,7 +365,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions / file_open_depth（单媒体文件入口的目录收集深度，默认 1=只收同级；0=不限，见 4.2）
-[raw]     # [[raw.demux]] 预设数组（match 通配 glob → pixfmt+宽高+fps，格式名单见 README「raw 格式表」，链路见 13.6）——预设即裸数据唯一可见性入口，无扩展名清单
+[raw]     # [[raw.demux]] 预设数组（match 通配 glob → pixfmt+宽高+fps+可选 bit_shift，格式名单见 README「raw 格式表」，链路见 13.6）——预设即裸数据唯一可见性入口，无扩展名清单
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume / muted
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
@@ -386,7 +386,8 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 >   错误（编辑内容不丢），用户删掉的键由 backfill 自动补全。
 > - 「打开 config 目录」：资源管理器打开 config.toml 所在目录（外部编辑器/
 >   查看备份等场景）；spawn 失败回退资源管理器定位并选中该文件。
->   顶栏绿色提示（含"配置已重载"）显示 5 秒后自动消失（error 需人工处理则常驻）。
+>   顶栏提示（含"配置已重载"）无超时、与错误同槽互斥——任意鼠标点击
+>   清绿（见 §14.2 顶栏消息机制）。
 > - 「重载配置」：重读 config.toml 后按生效时机分三档——
 >   ① 即时：media 扩展名与 ui.sort_files（`rebuild_view` 重建列表）、
 >   [[raw.demux]]（可见性同走 rebuild_view，播放时现读
@@ -1117,7 +1118,8 @@ raw_demux(name)`——**预设即裸数据唯一入口**，没有独立扩展名
 ```
 play() / load_extracted()
   → raw_demux_opts(name, size)            # loadfile 前置校验（不读文件）
-  │   Ok(Some(opts)) → load/load_path(.., opts)   # 裸数据，带选项装载
+  │   Ok(Some(raw)) → 快路径 load(.., raw.opts, raw.bit_shift)   # 裸数据
+  │                  / 慢路径 load_path(.., raw.opts)   # shift 静默忽略（见下）
   │   Ok(None)       → 常规装载                    # 标准容器
   │   Err(msg)       → set_err 放弃               # 配置错误（慢路径先挡，避免白解压）
   → loadfile 第四参数（index 占位 -1）：
@@ -1125,12 +1127,34 @@ play() / load_extracted()
     demuxer-rawvideo-mp-format=pixfmt,demuxer-rawvideo-fps=F
 ```
 
-三分支前置校验（Err 文案自带引导，ui 单测钉死）：① pixfmt 不在
+四分支前置校验（Err 文案自带引导，ui 单测钉死）：① pixfmt 不在
 `RAWVIDEO_PIXFMTS` 名单（195 项，源自 `ffmpeg -pix_fmts` 筛除硬件/调色板/
 bitstream；**位数为容器位数**——9~16bit 采样占 2 字节，帧字节 = W×H×bits÷8；
 名单与 README「raw 格式表」附录一致，`raw_pixfmt_bits` 大小写不敏感查表）；
 ② 宽高为 0（暂不支持自动推算）；③ 文件大小不整除帧字节（rawvideo demuxer
-对尾部零头不报错、画面错位难排查，故必须前置）。
+对尾部零头不报错、画面错位难排查，故必须前置）；④ `bit_shift` 越界（>8）
+或 >0 而 pixfmt 非 le 结尾（按 LE u16 采样移位，be/1 字节格式会被位移毁
+数据；文案带填写指引：12bit 低对齐填 4、10bit 填 6）。
+
+**bit_shift 流层修正（仅快路径）**：预设可带 `bit_shift = N`（0~8，默认 0
+= 不位移）。动机：12bit 等有效位深数据 LSB 对齐（低对齐补零）存进 16bit
+容器时，FFmpeg bayer16→RGB 转换写死取高 8 位（`>>8`），低对齐数据高 4 位
+恒零、只剩 16 级灰阶（播放发黑根因）；左移 4 位后高 8 位即有效数据。传递
+通道：快路径 URI 携带查询串 `zvf://{archive}/{entry}?s=N`（mpv stream_cb
+把完整 URI 原样交给 open_cb；不同 shift → 不同 URI → mpv 缓存天然隔离），
+`parse_uri` 严格解析（坏键/越域判非法），open_cb 在流层包装 `ShiftReader`：
+按**绝对偶地址**配对 LE u16 采样移位（mpv read 回调 buf 起点可为任意文件
+偏移，须从 `pos & !1` 起读、窗口首带 1 字节回看补配对，否则同一像素随
+读取切分漂移），`wrapping_shl` 高位溢出丢弃即期望语义（补的零移出去），
+大小不变、seek 透传、奇尾字节原样透传。目录模式 `DirVFS` 同为 FastSeek
+走 zvf://，天然覆盖。**慢路径（7z/RAR 落盘 `load_path`）不做 bit_shift
+（设计定案）**：shift 静默忽略、走原装载行为。取舍：bayer 位移适用面窄
+（仅低对齐 16bit 容器的 bayer dump），而候选实现都要显著增加代码与架构
+复杂度——落盘文件重新包装进 zvf:// 流需给 stream_cb 增设单文件注册通道；
+落盘原地/解压流中变换则改写解压缓存（忠实拷贝语义丢失，shift 改配置后
+二次位移，须把 shift 编进缓存键）——收益不抵代价，故不支持（评审记录见
+DEVLOG §8.8）。测试：stream_cb 5 单测（URI 往返+严格解析 /
+全量读 / 逐字节恶意切分 / 奇偏移+seek 三基准 / 奇尾字节透传）。
 
 **失败回显（END_FILE(ERROR) 通道）**：装载失败时泵线程发 `(mpv 错误码,
 最近 error 级日志行)` 进 mpsc，UI 每帧 `poll_mpv_err()` 消费 → `set_err`（raw
@@ -1142,8 +1166,8 @@ raw dump）——顺带修复普通损坏视频黑屏无提示；正常结束（
 文件结果须先见 START_FILE、再跳过 STOP。
 
 测试：player e2e（ffmpeg 造 nv12 → 选项装载 → 起播/时长=帧数÷fps/尺寸由
-选项解析/帧精确 seek + 装载失败事件与日志链路）+ ui 校验单测（三分支文案
-与拼参格式）。
+选项解析/帧精确 seek + 装载失败事件与日志链路）+ ui 校验单测（四分支文案
+与拼参格式、bit_shift 域与 le 校验）。
 
 ## 14. 底部控制栏布局机制（egui 0.36）
 
@@ -1172,8 +1196,31 @@ Panel::bottom("controls")              ← 锚定窗口底缘；frame inner bott
   空间**——因此音量组先画不影响按钮组落点（顺序反转是刻意为之）。
 - **五槽等宽 48 对称**：播放键两侧各两槽 → 播放键恰为组的几何中心，Aligner
   居组＝播放键中心落在窗口中线（四槽组时播放键偏 -28px，见 DEVLOG §7 坑3）。
-  视频↔图片模式第五槽一实（↻/≡ 模式键）一隐（等宽占位），组宽恒定，切换零位移。
+  视频↔图片模式第五槽一实（模式键：视频=播放模式三态 ❚❚/≡/↻，图片=翻页开关）
+  一隐（等宽占位），组宽恒定，切换零位移。
   更简的单遍分段备选方案见 §14.5（后续可优化）。
+
+**视频播放模式（三态，mod.rs `PlayMode` + nav.rs `cycle_play_mode`）**——第五槽
+模式键与 L 键共用同一处理，循环顺序 **Hold → List → Loop → Hold**，默认定格：
+
+| 模式 | 行为 | mpv 侧 | EOF 时 eof_tick |
+|---|---|---|---|
+| **Hold 定格（默认）** | 播完停在末帧不动 | `loop-file=no`；全局 `keep-open=always` 已保证末帧定格 + 粘滞暂停 | 不推进（门控在读取 eof 之前早退） |
+| **List 列表** | 播完自动切下一个 | `loop-file=no` | 推进 `play_adjacent(1, false)` |
+| **Loop 循环** | 单视频无限重播 | `loop-file=inf`，EOF 恒不触发 | 天然不触发（mpv 原生循环） |
+
+边界语义：切到 Loop 时若已粘滞末帧（`eof_reached()`），`seek(0)` + 解除
+暂停复活（loop-file 不回溯已发生的 EOF）；Hold→List 若正粘滞末帧，下一帧
+eof_tick 立即推进（Hold 门控早退不写 `eof_handled`）；列表末尾停住已记
+`eof_handled`，切 Hold 再切回 List 不会误推进。图片模式不适用（图片有
+slideshow 自动翻页），L 键与按钮对图片豁免。
+
+**顶栏消息机制（红/绿单槽，mod.rs `set_err`/`set_notice`）**：红（error，
+操作失败）与绿（notice，一次性提示）互斥单槽覆盖——写红清绿、写绿清红，
+新消息覆盖旧消息，**无任何超时**。清除路径仅三条：互斥覆盖；播放入口
+（`play`/`play_image`/`load_extracted`）与切换内容源（`apply_open_done`）
+翻篇清双槽；任意鼠标点击清绿不清红（帧首 `any_click` 检测，用户操作了
+=看过了；红色代表操作失败，不被无关点击消除）。
 
 ### 14.3 不变量（破坏即回归，对应坑见 DEVLOG §7）
 

@@ -182,6 +182,20 @@ enum ListTab {
     Image,
 }
 
+/// 视频播放模式（三态，图片不适用——图片用 slideshow 自动翻页）。
+/// L 键/控制栏按钮循环切换：Hold → List → Loop
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PlayMode {
+    /// 定格（默认）：播完停在末帧不动（复用全局 keep-open=always 的
+    /// EOF 末帧定格 + 粘滞暂停）
+    #[default]
+    Hold,
+    /// 列表：播完自动切下一个（nav.rs video_eof_tick）
+    List,
+    /// 循环：单视频 mpv loop-file=inf 原生循环，EOF 不触发
+    Loop,
+}
+
 /// 图片切换防闪保持画面：上一张最后一帧的绘制快照（纹理 + 屏幕矩形），
 /// 下一张就绪前原样重画（绘制时按 video 区裁剪）。since 每次成功绘制
 /// 刷新，因此 elapsed 度量的是"等待下一张"的时长而非观看时长
@@ -228,10 +242,9 @@ pub struct App {
     dragging: bool,
     drag_pos: f64,
     error: Option<String>,
-    // 一次性提示（如缓存清理结果），显示在顶栏
+    // 一次性提示（如缓存清理结果），显示在顶栏。与 error 互斥单槽：
+    // 新消息覆盖旧消息，无任何超时（清除路径见 set_notice 注释）
     notice: Option<String>,
-    // notice 出现时刻（egui 秒）；顶栏渲染时超 5 秒自动清除（见 panels.rs top_bar）
-    notice_shown_at: Option<f64>,
     // 全屏播放中（隐藏所有面板，仅视频+进度条）
     fullscreen: bool,
     // 文件列表当前标签页（视频/图片）
@@ -244,10 +257,9 @@ pub struct App {
     slideshow_on: bool,
     slideshow_idx: Option<usize>,
     slideshow_anchor: f64,
-    // 视频播放模式（两态，图片不适用——图片用 slideshow）：false=列表播放
-    //（默认，播完自动切下一个，见 nav.rs video_eof_tick）；true=单视频循环
-    //（mpv loop-file=inf 原生循环）。L 键/控制栏按钮切换
-    video_loop: bool,
+    // 视频播放模式（三态，图片不适用——图片用 slideshow）：默认定格
+    //（播完停在末帧），L 键/控制栏按钮循环切换 Hold→List→Loop
+    play_mode: PlayMode,
     // 列表播放 EOF 推进防重入：已处理过 EOF 的条目。推进无效果时（列表
     // 末尾停住/目标需先解压）防每帧重复触发；eof 复位时自动清空
     eof_handled: Option<usize>,
@@ -329,7 +341,6 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
-            notice_shown_at: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -337,7 +348,7 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
-            video_loop: false,
+            play_mode: PlayMode::Hold,
             eof_handled: None,
             extract: None,
             open_job: None,
@@ -385,7 +396,6 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
-            notice_shown_at: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -393,7 +403,7 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
-            video_loop: false,
+            play_mode: PlayMode::Hold,
             eof_handled: None,
             extract: None,
             open_job: None,
@@ -452,10 +462,29 @@ impl App {
         tracing::info!("已加载 {loaded} 个 CJK 字体（中/日/韩字形链）");
     }
 
+    /// 红色错误：互斥覆盖（清掉绿色提示）。无超时，常驻至被新消息或
+    /// 成功播放新内容覆盖（play/play_image/load_extracted/切换内容源）
     pub(super) fn set_err(&mut self, e: impl Into<String>) {
         let e = e.into();
         tracing::error!("{e}");
+        self.notice = None;
         self.error = Some(e);
+    }
+
+    /// 绿色提示：互斥覆盖（清掉红色错误）。无超时——任意鼠标点击即清
+    ///（update 帧首检测，用户操作了即视为已读），新消息覆盖旧消息
+    pub(super) fn set_notice(&mut self, n: impl Into<String>) {
+        self.error = None;
+        self.notice = Some(n.into());
+    }
+
+    /// 帧首：任意鼠标点击即清绿色提示（用户操作了=看过了，无需逐按钮
+    /// 判断）。先清后写——本帧稍后由此点击产生的新提示不受影响。
+    /// 只清绿——红色错误代表操作失败，不被无关点击消除
+    pub(super) fn clear_notice_on_click(&mut self, ctx: &egui::Context) {
+        if self.notice.is_some() && ctx.input(|i| i.pointer.any_click()) {
+            self.notice = None;
+        }
     }
 }
 
@@ -494,6 +523,9 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         probe!("repaint决策");
+        // 任意鼠标点击即清绿色提示（见 clear_notice_on_click；键盘操作
+        // 不触发——键盘动作自身走 set_notice 覆盖或 play 清槽，语义自洽）
+        self.clear_notice_on_click(&ctx);
         // 启动参数打开（SendTo「Archview player」/拖到 exe 上）：首帧触发一次
         if let Some(path) = self.initial_open.take() {
             self.open_path(path);

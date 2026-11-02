@@ -175,12 +175,12 @@ impl App {
         if a.path.is_dir() {
             // 目录媒体集合模式（ARCHITECTURE.md 4.2）：路径本身是目录，
             // 没有"同目录下一个压缩包"概念
-            self.notice = Some("目录集合模式：没有下一个压缩包".into());
+            self.set_notice("目录集合模式：没有下一个压缩包");
             return;
         }
         let list = archives_in_dir(&a.path);
         if list.len() < 2 {
-            self.notice = Some("此目录没有其它压缩包".into());
+            self.set_notice("此目录没有其它压缩包");
             return;
         }
         // 默认选中循环意义上的下一个（末包绕回第一个）

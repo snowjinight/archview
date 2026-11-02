@@ -203,10 +203,23 @@ pub struct RawDemux {
     /// 帧率
     #[serde(default = "default_raw_fps")]
     pub fps: f64,
+    /// 每 u16 采样左移位数（0~8，默认 0 = 不位移，高位溢出丢弃）。
+    /// 适用场景：12bit 等有效位深数据 LSB 对齐（低对齐补零）存进 16bit
+    /// 容器时，FFmpeg bayer16* 转 RGB 写死取高 8 位（>>8），低对齐数据
+    /// 只剩 16 级灰阶——播放发黑根因。12bit→16bit 容器填 4，10bit 填 6。
+    /// 约束：>0 时 pixfmt 须以 "le" 结尾（按 LE u16 采样移位）；仅快路径
+    /// （zip 流式 / 目录模式 zvf:// 流层）生效，7z/RAR 落盘路径不支持
+    /// （设计定案：适用面窄，不为慢路径增加复杂度，见 ARCHITECTURE §13.6）
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub bit_shift: u32,
 }
 
 fn default_raw_fps() -> f64 {
     25.0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// 极简通配匹配（仅 `*` 与 `?`，大小写不敏感，不引 glob crate）。
@@ -651,6 +664,10 @@ clean_on_switch = false
 	# width = 1920
 	# height = 1080
 	# fps = 30
+	# bit_shift = 4               # 可选（默认 0）：12bit 低对齐存 16bit 容器时
+	#                             # 每 u16 采样左移位数（10bit 填 6），修正
+	#                             # bayer16 播放发黑；须 le 结尾格式，仅流式/
+	#                             # 目录模式生效（7z/RAR 落盘不支持，设计定案）
 	# [[raw.demux]]
 	# match = "*.yuv"
 	# pixfmt = "nv12"
@@ -833,7 +850,8 @@ slideshow_secs = 2.0
     }
 
     /// [[raw.demux]] 解析与路由：多条预设按声明序首命中（具体在前、
-    /// 宽泛在后）；省略 fps 取默认 25.0；路由时剥离路径分隔符
+    /// 宽泛在后）；省略 fps 取默认 25.0、省略 bit_shift 取默认 0；
+    /// 路由时剥离路径分隔符
     #[test]
     fn raw_demux_parse_and_route() {
         let cfg: Config = toml::from_str(
@@ -841,10 +859,11 @@ slideshow_secs = 2.0
 [raw]
 [[raw.demux]]
 match = "sensor_a_*.bin"
-pixfmt = "bayer_rggb8"
+pixfmt = "bayer_rggb16le"
 width = 1920
 height = 1080
 fps = 30.0
+bit_shift = 4
 
 [[raw.demux]]
 match = "*.bin"
@@ -857,13 +876,15 @@ height = 480
         assert_eq!(cfg.raw.demux.len(), 2);
         // 首命中：sensor_a_001.bin 命中第 1 条（具体）而非第 2 条（宽泛）
         let hit = cfg.raw_demux("sensor_a_001.bin").expect("首条命中");
-        assert_eq!(hit.pixfmt, "bayer_rggb8");
+        assert_eq!(hit.pixfmt, "bayer_rggb16le");
         assert_eq!((hit.width, hit.height), (1920, 1080));
         assert_eq!(hit.fps, 30.0);
-        // 其余 .bin 落到宽泛兜底；fps 省略 → 默认 25.0
+        assert_eq!(hit.bit_shift, 4, "bit_shift 显式解析");
+        // 其余 .bin 落到宽泛兜底；fps/bit_shift 省略 → 默认 25.0 / 0
         let fallback = cfg.raw_demux("cap_003.bin").expect("宽泛兜底命中");
         assert_eq!(fallback.pixfmt, "gray");
         assert_eq!(fallback.fps, 25.0);
+        assert_eq!(fallback.bit_shift, 0, "bit_shift 省略默认 0（不位移）");
         // glob 大小写不敏感 & 路径剥离（预设写文件名，传全路径也能命中）
         assert!(cfg.raw_demux("dir/SENSOR_A_9.BIN").is_some());
         assert!(cfg.raw_demux(r"C:\cap\cap_003.bin").is_some());

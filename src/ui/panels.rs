@@ -89,12 +89,12 @@ impl App {
                 let _ = std::fs::create_dir_all(&dir);
                 // explorer 打开目录不占用等待（spawn 后立刻返回）
                 if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
-                    self.notice = Some(format!("打开缓存目录失败: {e}"));
+                    self.set_notice(format!("打开缓存目录失败: {e}"));
                 }
             }
             if clean_cache {
                 let freed = cache::clean_all(&cache::cache_dir(&self.cfg));
-                self.notice = Some(format!("已清理缓存 {:.1} MB", freed as f64 / 1048576.0));
+                self.set_notice(format!("已清理缓存 {:.1} MB", freed as f64 / 1048576.0));
                 tracing::info!("手动清理缓存: {:.1} MB", freed as f64 / 1048576.0);
             }
             // ---- 「配置」菜单：内嵌编辑 / 外部编辑器打开 / 热重载 ----
@@ -157,7 +157,7 @@ impl App {
                             ("← / →（暂停时）", "上一帧 / 下一帧"),
                             ("↑ / ↓", "音量 ±5"),
                             ("M", "静音切换"),
-                            ("L", "播放模式：列表 ↔ 单视频循环"),
+                            ("L", "播放模式：定格（默认）→ 列表 → 循环"),
                         ],
                     ),
                     (
@@ -228,17 +228,10 @@ impl App {
                 ui.add_space(6.0);
                 ui.weak(&lines[3]);
             });
-            // 一次性提示（如"配置已重载"）5 秒后自动消失；新提示重新计时。
-            // error 需人工处理则常驻（只被下一次操作覆盖）
-            let now = ui.input(|i| i.time);
-            if let Some(t0) = self.notice_shown_at {
-                if now - t0 >= 5.0 {
-                    self.notice = None;
-                    self.notice_shown_at = None;
-                }
-            } else if self.notice.is_some() {
-                self.notice_shown_at = Some(now);
-            }
+            // 消息单槽覆盖（无超时）：绿色提示任意鼠标点击即清（用户看过
+            // 了，见 update 帧首 clear_notice_on_click）；红色错误代表操作
+            // 失败，仅被新消息或成功播放新内容覆盖（play/play_image/
+            // load_extracted/切换内容源）
             if let Some(n) = &self.notice {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, n);
             }
@@ -294,7 +287,7 @@ impl App {
         if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
             let sel = format!("/select,{}", path.display());
             if std::process::Command::new("explorer").arg(sel).spawn().is_err() {
-                self.notice = Some(format!("打开配置目录失败: {e}"));
+                self.set_notice(format!("打开配置目录失败: {e}"));
             }
         }
     }
@@ -351,7 +344,7 @@ impl App {
         } else {
             ""
         };
-        self.notice = Some(format!("配置已重载{note}"));
+        self.set_notice(format!("配置已重载{note}"));
         tracing::info!("配置已重载（菜单触发）{note}");
     }
 
@@ -1493,15 +1486,23 @@ impl App {
                             act.step = 1;
                         }
                         // 播放模式（仅视频，图片不显示——图片用各自的自动翻页开关）：
-                        // 列表播放（默认，播完自动下一个）↔ 单视频循环；循环中高亮。
-                        // 未播放时也显示，允许预设模式
+                        // 定格（默认，播完停末帧）→ 列表（自动下一个）→ 循环；
+                        // 循环中高亮（延续原语义），icon 区分三态。未播放时也
+                        // 显示，允许预设模式
                         if !self.playing_is_image() {
-                            let (icon, tip) = if self.video_loop {
-                                ("↻", "循环播放中：点击切为列表播放（L）")
-                            } else {
-                                ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
+                            let (icon, tip) = match self.play_mode {
+                                PlayMode::Hold => {
+                                    ("❚❚", "定格播放中：播完停在末帧｜点击切为列表播放（L）")
+                                }
+                                PlayMode::List => {
+                                    ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
+                                }
+                                PlayMode::Loop => {
+                                    ("↻", "循环播放中：单视频无限重播｜点击切为定格（L）")
+                                }
                             };
-                            if icon_btn(ui, icon, tip, self.video_loop).clicked() {
+                            let selected = self.play_mode == PlayMode::Loop;
+                            if icon_btn(ui, icon, tip, selected).clicked() {
                                 act.loop_toggle = true;
                             }
                         } else {
@@ -1525,8 +1526,9 @@ impl App {
         if act.slide {
             self.slideshow_on = !self.slideshow_on;
         }
+        // loop_toggle 语义 = 触发一次播放模式循环（L 键与按钮共用同一动作）
         if act.loop_toggle {
-            self.toggle_video_loop();
+            self.cycle_play_mode();
         }
     }
 
