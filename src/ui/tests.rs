@@ -1097,7 +1097,7 @@ fn play_mode_three_state_cycle() {
     assert_eq!(app.notice.as_deref(), Some("单视频循环"));
     app.cycle_play_mode();
     assert_eq!(app.play_mode, PlayMode::Hold, "三次切换应回到起点");
-    assert_eq!(app.notice.as_deref(), Some("定格播放（播完停在末帧）"));
+    assert_eq!(app.notice.as_deref(), Some("单文件播放（播完停在末帧）"));
 }
 
 /// T2 eof_tick 三态门控：未开包/未播放（player 与 playing 皆空）的

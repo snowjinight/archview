@@ -392,7 +392,7 @@ impl App {
             }
         }
         self.set_notice(match m {
-            PlayMode::Hold => "定格播放（播完停在末帧）",
+            PlayMode::Hold => "单文件播放（播完停在末帧）",
             PlayMode::List => "列表播放（播完自动下一个）",
             PlayMode::Loop => "单视频循环",
         });
