@@ -181,12 +181,15 @@ image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
 file_open_depth = 1
 
 [raw]
-# 非标裸数据（raw dump）：这些扩展名的文件按裸帧数据处理，需在下方
-# [[raw.demux]] 命中预设（像素格式 + 宽高）才能播放；帧数由文件大小
-# 自动得出（文件大小必须能被单帧大小整除，否则报错）。
-# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）；
-# 支持的像素格式名单见文末「附录：raw 格式表」
-extensions = ["yuv", "nv12"]
+# 非标裸数据（raw dump）：没有扩展名清单——文件必须在下方 [[raw.demux]]
+# 命中预设才可见、可播放（预设即参数来源：像素格式 + 宽高；帧数由文件
+# 大小自动得出，大小必须能被单帧大小整除，否则报错）。
+# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
+# 常用 pixfmt 速查（完整 195 项名单见文末「附录：raw 格式表」）：
+#   YUV420 8bit   : yuv420p / nv12 / nv21 / yuvj420p
+#   YUV420 10bit+ : yuv420p10le / p010le / yuv420p16le
+#   unpacked Bayer（16bit/像素，即 2 字节）:
+#     bayer_rggb16le / bayer_bggr16le / bayer_gbrg16le / bayer_grbg16le
 # 预设示例（unpacked bayer 的 .bin + NV12 的 .yuv），按需去掉行首 # 启用或仿写：
 # [[raw.demux]]
 # match = "sensor_a_*.bin"    # 通配 * 与 ?；写文件名（不含路径）
@@ -269,8 +272,7 @@ report_dir = "auto"
 | `cache.clean_on_switch` | 切换压缩包时是否清理上一个包的缓存（默认 false，保留以便切回时命中） |
 | `media.*_extensions` | 视频 / 图片的文件扩展名识别列表（不区分大小写）；图片列表含相机 RAW（`arw` / `nef` 家族，内嵌预览直读） |
 | `media.file_open_depth` | 打开单个媒体文件（拖入 / 发送到 / 文件菜单「打开媒体文件」）时对其所在目录的递归收集深度：`1` = 只收集同级媒体文件（默认，防盘根/超大目录全盘扫描）；`N` = 向下 N 层；`0` = 不限制（与「打开媒体目录」一致） |
-| `raw.extensions` | 非标裸数据（raw dump）扩展名列表，默认 `["yuv", "nv12"]`：命中的文件进视频列表，但必须在 `[[raw.demux]]` 命中预设才能播放（缺预设时报错引导配置）。`.bin` 等杂项扩展名不建议加入（会污染媒体列表），改用 `[[raw.demux]]` 的 glob 命中即可见 |
-| `[[raw.demux]]` | raw dump 播放预设（可多条）：`match`（文件名通配，`*` / `?`，大小写不敏感、不含路径）→ `pixfmt`（像素格式，可选值见文末「附录：raw 格式表」）+ `width` / `height`（帧宽高，必须非 0）+ `fps`（默认 25）。按声明顺序取首个命中：先写具体（`sensor_a_*.bin`）、后写宽泛（`*.yuv`）。装载前整除校验：文件大小必须能被单帧字节数（宽×高×位数÷8）整除，不满足直接报错给出核对数字，不让 mpv 盲播出错位的画面 |
+| `[[raw.demux]]` | raw dump 播放预设（可多条，也是裸数据唯一的可见性入口——`[raw]` 节没有扩展名清单，`.yuv` / `.bin` 等非标文件不写预设就不出现在视频列表）：`match`（文件名通配，`*` / `?`，大小写不敏感、不含路径）→ `pixfmt`（像素格式，可选值见文末「附录：raw 格式表」；config 模板内附常用格式速查）+ `width` / `height`（帧宽高，必须非 0）+ `fps`（默认 25）。按声明顺序取首个命中：先写具体（`sensor_a_*.bin`）、后写宽泛（`*.yuv`）。装载前整除校验：文件大小必须能被单帧字节数（宽×高×位数÷8）整除，不满足直接报错给出核对数字，不让 mpv 盲播出错位的画面 |
 | `player.hwdec` | 硬件解码（`auto` / `no` / `d3d11va` 等 mpv 取值） |
 | `player.cache_secs` | mpv 缓存秒数，拖回刚看过的片段直接命中缓存，零成本 |
 | `player.demuxer_max_mb` | mpv demuxer 最大缓存（MB） |

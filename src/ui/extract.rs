@@ -28,8 +28,8 @@ impl App {
     /// raw dump 预设解析 + 不读文件的整除校验（方案 §4.5）：
     /// Ok(Some(opts)) = 命中预设且校验通过（loadfile 第四参数）；
     /// Ok(None) = 非裸数据（标准容器，无需选项）；
-    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高为 0 / 大小不整除 /
-    /// 命中 raw.extensions 但无预设），调用方 set_err 并放弃装载。
+    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高为 0 / 大小不整除），
+    /// 调用方 set_err 并放弃装载。
     /// 校验必须在 loadfile 之前：rawvideo demuxer 对尾部零头字节不报错，
     /// 画面会错位且难排查
     pub(super) fn raw_demux_opts(
@@ -72,11 +72,9 @@ impl App {
                     d.width, d.height, d.pixfmt, d.fps
                 )))
             }
-            // 命中 raw.extensions 但无预设：引导配置而非让 mpv 盲试
-            None if self.cfg.raw_needs_preset(name) => Err(format!(
-                "{name} 是裸数据文件，需在 config.toml 配置 [[raw.demux]] 预设\n\
-                 （像素格式 + 宽高；多条预设按声明顺序匹配，支持格式见 README「raw 格式表」）"
-            )),
+            // 未命中预设：标准容器（mpv 自行处理）；用户手动加进
+            // media.video_extensions 的非标文件也走这里——装载失败由
+            // END_FILE(ERROR) 通道回显（poll_mpv_err），无需前置拦截
             None => Ok(None),
         }
     }
@@ -232,7 +230,7 @@ impl App {
             } else {
                 log.trim_end().to_string()
             };
-            let hint = if self.cfg.raw_visible(name) {
+            let hint = if self.cfg.raw_demux(name).is_some() {
                 "请核对 [[raw.demux]] 预设（pixfmt/宽高/文件是否为裸帧数据）"
             } else {
                 "文件可能损坏或编码不受支持"

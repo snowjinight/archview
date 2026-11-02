@@ -79,6 +79,14 @@ fn done_fallback_yields_to_extract_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 仿生产媒体名谓词（等价匹配 mp4/jpg 扩展名）——DirVFS 收集层适配
+fn media_pred() -> impl Fn(&str) -> bool {
+    |n: &str| {
+        let ext = n.rsplit('.').next().unwrap_or("");
+        ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("jpg")
+    }
+}
+
 /// 目录 = 媒体集合模式（ARCHITECTURE.md 4.2）的打开链路回归：
 /// 1) spawn_open 目录分支走真实后台线程（DirVFS::open → stream_cb 注册），
 ///    Done 消息携带全部媒体条目、VFS 为 FastSeek、无密码概念
@@ -144,8 +152,9 @@ fn dir_mode_open_pipeline() {
     // 3) 空目录：DirVFS 打开成功但零条目 → 统一提示
     let empty = root.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
-        std::sync::Arc::new(super::DirVFS::open(&empty, &["mp4".into(), "jpg".into()], 0).unwrap());
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
+        super::DirVFS::open(&empty, media_pred(), 0).unwrap(),
+    );
     let entries2 = vfs2.list();
     app.apply_open_done(empty, None, vfs2, 7, entries2, None);
     assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
@@ -219,8 +228,9 @@ fn media_file_entry_focus_jump() {
     assert_eq!(app.list_tab, super::ListTab::Video, "视频目标应留在视频页");
 
     // 4) 图片目标 + 大小写变体：预切图片页、行缓存只含图片行
-    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
-        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
+        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
+    );
     let entries2 = vfs2.list();
     let idx_i = entries2
         .iter()
@@ -237,8 +247,9 @@ fn media_file_entry_focus_jump() {
     assert!(app.list_rows[0].label.contains("a.jpg"));
 
     // 5) 找不到同名条目：静默不播（视图照常），无报错无空集合提示
-    let vfs3: std::sync::Arc<dyn super::ArchiveVFS> =
-        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let vfs3: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
+        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
+    );
     let entries3 = vfs3.list();
     app.pending_focus = Some("nope.mp4".into());
     assert_eq!(
@@ -251,8 +262,9 @@ fn media_file_entry_focus_jump() {
 
     // 6) 压缩包路径不吃焦点：pending_focus 保留待后续目录打开消费/重置
     //    （竞态防线：焦点未消费时用户又开了个压缩包，不得误播同名条目）
-    let vfs4: std::sync::Arc<dyn super::ArchiveVFS> =
-        std::sync::Arc::new(super::DirVFS::open(&media, &["mp4".into(), "jpg".into()], 1).unwrap());
+    let vfs4: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
+        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
+    );
     let entries4 = vfs4.list();
     app.pending_focus = Some("a.jpg".into());
     assert_eq!(
@@ -958,7 +970,7 @@ fn raw_demux_opts_validation() {
     let mut cfg = crate::config::Config::default();
     cfg.raw.demux = vec![mk("nv12", 64, 48)];
 
-    // 1) 标准容器：不在 raw.extensions 且无预设命中 → 不带选项直接播
+    // 1) 标准容器（无预设命中）→ 不带选项直接播
     let app = App::new_for_test(cfg.clone());
     assert_eq!(
         app.raw_demux_opts("movie.mp4", Some(1234)).unwrap(),
@@ -1008,14 +1020,11 @@ fn raw_demux_opts_validation() {
         "size 未知不应误拦"
     );
 
-    // 6) 命中 raw.extensions（默认 yuv/nv12）但无预设：引导配置而非盲试
-    let err = App::new_for_test(crate::config::Config::default())
-        .raw_demux_opts("clip.yuv", None)
-        .unwrap_err();
-    assert!(
-        err.contains("需在 config.toml 配置") && err.contains("[[raw.demux]]"),
-        "缺预设应引导配置: {err}"
-    );
+    // 6) 无预设命中的非标扩展名：不拦截，按普通文件交给 mpv（用户手动
+    //    加进 media.video_extensions 时才会到这——装载失败走 END_FILE
+    //    通道回显，见 poll_mpv_err）
+    let plain = App::new_for_test(crate::config::Config::default());
+    assert_eq!(plain.raw_demux_opts("clip.yuv", None).unwrap(), None);
 }
 
 /// 「关于」下拉面板文案：版本行取 CARGO_PKG_VERSION（防手写硬编码漂移）、

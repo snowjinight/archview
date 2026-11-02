@@ -177,27 +177,16 @@ impl Default for MediaConfig {
 /// 非标裸数据（raw dump）配置：这些文件不是标准容器，无法探测参数，
 /// 统一走 mpv rawvideo demuxer（视频桶），由 [[raw.demux]] 预设提供
 /// 像素格式 + 宽高 + fps（经 loadfile per-file 选项下发）
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RawConfig {
-    /// 这些扩展名的文件按 raw dump 处理：必须在 [[raw.demux]] 命中预设才能播
-    /// （决定列表可见性与「缺预设」引导报错）；.bin 等杂项扩展名不进此表，
-    /// 仅靠 demux 预设 glob 命中才算媒体（防污染文件列表）
-    pub extensions: Vec<String>,
     /// demux 预设（按声明顺序取首个 glob 命中：先写具体、后写宽泛）。
-    /// 序列化时为空则省略——TOML 不允许向静态定义的数组追加 [[raw.demux]]，
-    /// 默认模板只给注释示例，由用户自行追加
+    /// 预设是裸数据唯一入口：glob 命中才可见、可播——不再有独立扩展名
+    /// 清单（.yuv/.bin 等非标扩展名都只靠这里声明，防「可见但不可播」
+    /// 的中间态）。序列化时为空则省略——TOML 不允许向静态定义的数组追加
+    /// [[raw.demux]]，默认模板只给注释示例，由用户自行追加
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub demux: Vec<RawDemux>,
-}
-
-impl Default for RawConfig {
-    fn default() -> Self {
-        Self {
-            extensions: ["yuv", "nv12"].iter().map(|s| s.to_string()).collect(),
-            demux: Vec::new(),
-        }
-    }
 }
 
 /// 单条 raw dump 播放预设：文件名 glob → 像素格式 + 宽高 + fps
@@ -499,25 +488,14 @@ impl Config {
     }
 
     pub fn is_video_ext(&self, name: &str) -> bool {
-        // 标准 ∨ raw 可见：.yuv/.nv12（raw.extensions）与 demux 预设 glob 命中
-        // 的 .bin 等也归视频桶（走 mpv rawvideo demuxer）——一处改动，
-        // 列表/标签页/同类跳/单文件打开全部跟随
-        Self::has_ext(&self.media.video_extensions, name) || self.raw_visible(name)
+        // 标准 ∨ raw 预设 glob 命中（.yuv/.bin 等非标扩展名仅靠
+        // [[raw.demux]] 进入视频桶，走 mpv rawvideo demuxer）——
+        // 一处改动，列表/标签页/同类跳/单文件打开全部跟随
+        Self::has_ext(&self.media.video_extensions, name) || self.raw_demux(name).is_some()
     }
 
     pub fn is_image_ext(&self, name: &str) -> bool {
         Self::has_ext(&self.media.image_extensions, name)
-    }
-
-    /// raw dump 可见性：扩展名在 raw.extensions ∨ 命中任一 [[raw.demux]] 预设
-    pub fn raw_visible(&self, name: &str) -> bool {
-        Self::has_ext(&self.raw.extensions, name) || self.raw_demux(name).is_some()
-    }
-
-    /// 扩展名命中 raw.extensions = 该文件按裸数据处理；无预设命中时
-    /// 调用方应给「请配置 [[raw.demux]]」引导报错而不是让 mpv 盲试
-    pub fn raw_needs_preset(&self, name: &str) -> bool {
-        Self::has_ext(&self.raw.extensions, name)
     }
 
     /// 多条 [[raw.demux]] 预设按声明顺序取首个 glob 命中
@@ -656,12 +634,15 @@ clean_on_switch = false
 	file_open_depth = 1
 
 [raw]
-	# 非标裸数据（raw dump）：这些扩展名的文件按裸帧数据处理，需在下方
-	# [[raw.demux]] 命中预设（像素格式 + 宽高）才能播放；帧数由文件大小
-	# 自动得出（文件大小必须能被单帧大小整除，否则报错）。
-	# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）；
-	# 支持的像素格式名单见 README「raw 格式表」（yuv / rgb / gray / bayer 家族）
-	extensions = ["yuv", "nv12"]
+	# 非标裸数据（raw dump）：没有扩展名清单——文件必须在下方 [[raw.demux]]
+	# 命中预设才可见、可播放（预设即参数来源：像素格式 + 宽高；帧数由文件
+	# 大小自动得出，大小必须能被单帧大小整除，否则报错）。
+	# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
+	# 常用 pixfmt 速查（完整 195 项名单见 README「raw 格式表」）：
+	#   YUV420 8bit   : yuv420p / nv12 / nv21 / yuvj420p
+	#   YUV420 10bit+ : yuv420p10le / p010le / yuv420p16le
+	#   unpacked Bayer（16bit/像素，即 2 字节）:
+	#     bayer_rggb16le / bayer_bggr16le / bayer_gbrg16le / bayer_grbg16le
 	# 预设示例（两类文件并存：unpacked bayer 的 .bin + NV12 的 .yuv），
 	# 按需去掉行首 # 启用或仿写：
 	# [[raw.demux]]
@@ -833,7 +814,7 @@ slideshow_secs = 2.0
         assert!(out.contains("log_level = \"info\""));
         assert!(out.contains("image_max_dim = 4096"));
         // 整节补全：[raw] 连注释带示例一并补上（老用户升级场景）
-        assert!(out.contains("extensions = [\"yuv\", \"nv12\"]"));
+        assert!(out.contains("# [[raw.demux]]"));
         assert!(out.contains("image_extensions"));
         // 根级新键必须在第一个 [表] 头之前（否则会归属到最后一个表）
         let key_pos = out.find("log_level").expect("log_level 已补全");
@@ -891,8 +872,8 @@ height = 480
         assert!(Config::default().raw_demux("a.bin").is_none());
     }
 
-    /// raw 可见性路由：.yuv/.nv12 经 raw.extensions 归视频桶；.bin 仅
-    /// 预设命中时可见；普通视频/图片扩展不受影响
+    /// raw 可见性路由：预设即真相——[[raw.demux]] glob 命中才归视频桶，
+    /// 未命中的非标扩展名（.yuv/.bin）一律不可见；普通视频/图片不受影响
     #[test]
     fn is_video_ext_raw_visibility() {
         let cfg = Config::default();
@@ -900,14 +881,10 @@ height = 480
         assert!(cfg.is_video_ext("movie.mp4"));
         assert!(!cfg.is_video_ext("photo.jpg"));
         assert!(!cfg.is_image_ext("frame.yuv"));
-        // raw.extensions → 视频桶（走 mpv rawvideo demuxer），且必须配预设
-        assert!(cfg.is_video_ext("a.yuv"));
-        assert!(cfg.is_video_ext("capture.NV12")); // 大小写不敏感
-        assert!(cfg.raw_needs_preset("a.yuv"));
-        // .bin 默认不可见、也不强制预设（不在 raw.extensions）
+        // 无任何预设时非标扩展名一律不可见（不猜格式，防 mpv 盲试黑屏）
+        assert!(!cfg.is_video_ext("a.yuv"));
         assert!(!cfg.is_video_ext("cap.bin"));
-        assert!(!cfg.raw_needs_preset("cap.bin"));
-        // 加预设后：命中 → 可见（预设即参数来源，不再算「需预设」）
+        // 配预设后：命中 → 可见（预设即参数来源）
         let cfg2: Config = toml::from_str(
             r#"
 [raw]
@@ -920,9 +897,10 @@ height = 240
         )
         .unwrap();
         assert!(cfg2.is_video_ext("cap0001.bin"));
-        assert!(!cfg2.raw_needs_preset("cap0001.bin"));
         // 预设未命中的 .bin 依旧不可见——防污染文件列表
         assert!(!cfg2.is_video_ext("other.bin"));
+        // .yuv 同样需显式声明（如 match = "*.yuv"），无默认扩展名捷径
+        assert!(!cfg2.is_video_ext("a.yuv"));
     }
 
     /// 极简 glob：`*` 任意序列（含空）、`?` 恰一字符、大小写不敏感、

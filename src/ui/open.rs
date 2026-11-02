@@ -122,15 +122,12 @@ impl App {
                 candidates.push(c.clone());
             }
         }
-        // 目录集合的媒体扩展名过滤集（视频+图片，配置驱动；压缩包等其它文件天然被排除）
-        let media_exts: Vec<String> = self
-            .cfg
-            .media
-            .video_extensions
-            .iter()
-            .chain(self.cfg.media.image_extensions.iter())
-            .cloned()
-            .collect();
+        // 目录集合的媒体名谓词（is_video_ext ∨ is_image_ext，与 rebuild_view
+        // 同源）：标准扩展名 ∨ [[raw.demux]] 预设 glob 命中——.yuv420 等非标
+        // 名在收集层即可见（旧「扩展名白名单」旁路曾把预设命中文件在扫描
+        // 阶段丢弃，目录模式下列表里根本不出现）；压缩包等其它文件天然排除
+        let cfg_t = self.cfg.clone();
+        let is_media = move |name: &str| cfg_t.is_video_ext(name) || cfg_t.is_image_ext(name);
         // 单媒体文件入口（pending_focus 置位）对所在目录的收集深度取配置
         // （默认 1 = 只收集目标文件同级，防盘根/超大目录全盘扫描）；
         // 显式打开目录不限深（与既有递归行为一致）
@@ -155,7 +152,7 @@ impl App {
                 // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
                 // ARCHITECTURE.md 4.2）——无加密概念，不走密码探测链；文件模式照旧
                 let opened = if path_t.is_dir() {
-                    DirVFS::open(&path_t, &media_exts, dir_depth)
+                    DirVFS::open(&path_t, is_media, dir_depth)
                         .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
                 } else {
                     // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：

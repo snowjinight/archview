@@ -21,7 +21,7 @@
 | §5 | 解压会话化回归测试细节（单测 + UI 冒烟） | ARCHITECTURE §11.4 |
 | §6 | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
 | §7 | UI 控制栏布局专项（五坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承） | ARCHITECTURE §14 |
-| §8 | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE） | ARCHITECTURE §13.6 / §13.4 |
+| §8 | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE / raw.extensions 移除——预设即唯一入口） | ARCHITECTURE §13.6 / §13.4 |
 
 ---
 
@@ -860,3 +860,61 @@ unused_assignments 警告（超时 assert 是 panic 发散路径，定赋分析�
 本轮多处文档编辑再次验证：同一文件的两个 SearchReplace 并行下发，只有一个
 落盘、另一个报成功实未写入。规则不变：**同文件编辑必须串行**，编辑后 Read
 回验关键行。
+
+### 8.5 需求变更：raw.extensions 移除——预设即唯一入口（2026-11-02）
+
+初版设计里裸数据可见性是两条路：`[raw] extensions` 扩展名清单（默认
+yuv/nv12）命中即进视频列表 + `[[raw.demux]]` 预设命中即见且可播，清单命中
+但无预设时前置报错引导配置（`raw_needs_preset`）。上线即被用户一句话点破
+冗余：**写清单根本省不掉预设**——.nv12 文件就算在 extensions 里，仍必须在
+`[[raw.demux]]` 写 `*.nv12` + pixfmt + 宽高才能播；两处都写、参数却只有
+预设里有，清单只贡献"可见但不可播"的中间态（用户会先看到列表项、点开才报
+错配置缺失，体验更差而非更好）。
+
+修订（一处真相）：删 `RawConfig::extensions` / `raw_visible` /
+`raw_needs_preset`，`is_video_ext = video_extensions 命中 ∨ raw_demux(name)`
+——预设 glob 是裸数据唯一入口，命中即可见可播，未写预设的 .yuv/.bin 干脆
+不出现。连带删除校验第④分支（"命中清单但无预设"随清单消亡，四分支→三
+分支）；用户手动加进 `media.video_extensions` 的非标文件回落为普通装载，
+失败走 END_FILE 通道回显（不再前置拦截——那类文件本来就不在裸数据语义里）。
+
+兼容与模板：serde 忽略未知字段，老 config 里残留的 `extensions = [...]`
+静默跳过无需迁移；`[raw]` 节只剩注释时 backfill 照常整节补全（toml_edit
+decor 保留）。同时按用户要求在 config 模板 `[raw]` 注释里加常用 pixfmt
+速查（yuv420p/nv12/nv21/yuvj420p、yuv420p10le/p010le/yuv420p16le、
+4 个 bayer 16le）——195 项全名单查 README 附录太远，开箱即写的高频子集
+放模板内一行可达。
+
+教训（适用于一切"清单 + 规则"双层设计）：**两套机制给同一文件两种命运时，
+先问较弱的那套是否真能独立成立**。extensions 离开预设不能播，预设离开
+extensions 却完全自洽（glob 想写 *.yuv 就写）——不对称即冗余信号，
+该删的是弱侧。
+
+### 8.6 Bug 修复：目录模式收集层旁路 raw 预设（2026-11-02）
+
+§8.5 移除 raw.extensions 当天即暴露连带 bug：用户写 `[[raw.demux]]
+match = "*.yuv420"` 后打开 .yuv420 所在目录，文件既不出现也不能播放。
+config 写法、UI 过滤层（`rebuild_view` 走 `is_video_ext`，含预设 glob）均
+正确——真因在第三层：目录模式的收集层 `DirVFS::open` 收的是**扩展名白名单**
+（`&[String]` 逐项比对，open.rs 拼接 video+image extensions 传入），预设
+glob 命中对它无效，非标名在扫描阶段即被丢弃，根本轮不到列表过滤。
+
+三层梳理：压缩包模式列出全部条目、过滤全在 rebuild_view（预设生效，无恙）；
+目录模式 = 收集（DirVFS 白名单，预设失效）+ 过滤（rebuild_view，预设生效）
+——两层各信一套真相，弱侧（白名单）悄悄把文件丢了。
+
+修复（一处真相，两处消费）：`DirVFS::open/walk` 的 `exts: &[String]` 改为
+泛型名字谓词 `F: Fn(&str) -> bool`；生产侧（open.rs 目录分支）传
+`cfg.is_video_ext(name) || cfg.is_image_ext(name)`（Config 已 derive
+Clone，clone 入线程闭包）——收集与过滤同源，预设 glob 在收集层即生效。
+测试调用点全量适配（player e2e、ui tests 加 `media_pred()` 辅助，共 5 处
+——首改漏了第 4 处白名单调用，编译期 E0277 拦下）+ 新增回归测试
+`name_predicate_collects_raw_preset_glob_names`（非标名进集合、非媒体名
+排除）。98 passed。
+
+教训：**"过滤规则"一旦有多处消费，任何一处自己另写一套判定都是旁路**。
+扩展名白名单在 raw 支持之前就存在且自洽（标准媒体确实按扩展名判），新增
+预设入口时只改了 `is_video_ext` 却漏查它的全部语义等价消费方——白名单
+恰好是 `is_video_ext` 的子集，标准文件两套判定同结果，测试全绿掩盖了
+缺口。改判定函数时，grep 它的语义等价物（这里是 `media_exts` 拼接）比
+改函数本身更重要。

@@ -1534,8 +1534,12 @@ mod tests {
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
 
         // 目录模式注册（同生产：本地文件 O(1) seek 直通）
-        let dir_vfs =
-            crate::vfs::dir_vfs::DirVFS::open(&media_dir, &["webp".to_string()], 0).unwrap();
+        let dir_vfs = crate::vfs::dir_vfs::DirVFS::open(
+            &media_dir,
+            |n: &str| n.to_ascii_lowercase().ends_with(".webp"),
+            0,
+        )
+        .unwrap();
         let vfs: std::sync::Arc<dyn crate::vfs::ArchiveVFS> = std::sync::Arc::new(dir_vfs);
         let (archive_id, entries) = stream_cb::register_with_progress(vfs, &media_dir, &|_, _| {});
         let idx641 = entries

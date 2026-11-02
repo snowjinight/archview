@@ -231,7 +231,11 @@ zip / RAR4 = 系统 ANSI 代码页。探测时对每个候选密码生成「UTF-
 ### 4.2 目录 = 媒体集合（DirVFS）
 
 打开目录不再"寻找目录内的压缩包"，而是把目录本身当作媒体集合：**递归收集其中
-图片/视频（按 config 扩展名过滤，压缩包等其它文件天然被排除），跳过压缩包不展开**。
+图片/视频，跳过压缩包不展开**。收集过滤是**名字谓词**（`is_video_ext(name) ∨
+is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名 ∨
+`[[raw.demux]]` 预设 glob 命中——`.yuv420` 等非标名在收集层即可见；压缩包等
+其它文件天然被排除（曾用扩展名白名单旁路预设，raw 文件在目录模式下根本
+不出现，已统一为同源谓词，复盘见 DEVLOG §8.6）。
 一条规则覆盖全部入口——`initial_archive`（命令行/SendTo/拖到 exe）、拖放进窗口、
 「打开目录」按钮，它们都汇聚到 `spawn_open` 的目录分支。混合多选（目录+压缩包同时
 「发送到」）按参数顺序取**第一个有效项**打开，其余忽略——语义可预期优先。
@@ -361,7 +365,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 
 [cache]   # dll 目录 / 解压缓存目录 / LRU 上限 / 解码块大小与块数 / 清理时机
 [media]   # video_extensions / image_extensions / file_open_depth（单媒体文件入口的目录收集深度，默认 1=只收同级；0=不限，见 4.2）
-[raw]     # extensions（裸数据 dump 扩展名，默认 yuv/nv12——命中即归视频桶但需预设才可播）/ [[raw.demux]] 预设数组（match 通配 glob → pixfmt+宽高+fps，格式名单见 README「raw 格式表」，链路见 13.6）
+[raw]     # [[raw.demux]] 预设数组（match 通配 glob → pixfmt+宽高+fps，格式名单见 README「raw 格式表」，链路见 13.6）——预设即裸数据唯一可见性入口，无扩展名清单
 [player]  # hwdec / cache_secs / demuxer_max_mb / volume / muted
 [ui]      # font_path / slideshow_secs / wheel_switch_secs / ask_next_archive / sort_files（自然序，默认关=包内顺序）/ extract_overlay_delay_ms / image_texture / image_cache_count / image_max_dim / image_full_threshold（full 触发阈值，默认 2.0）/ image_full_sharpen（full 锐化开关，默认开）——图片纹理直显，见 13.4
 [extract] # prefetch_downstream_mb（下游预取上限）/ prefetch_upstream_mb（上游预取上限，见 11.1）
@@ -385,7 +389,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 >   顶栏绿色提示（含"配置已重载"）显示 5 秒后自动消失（error 需人工处理则常驻）。
 > - 「重载配置」：重读 config.toml 后按生效时机分三档——
 >   ① 即时：media 扩展名与 ui.sort_files（`rebuild_view` 重建列表）、
->   raw.extensions/[[raw.demux]]（可见性同走 rebuild_view，播放时现读
+>   [[raw.demux]]（可见性同走 rebuild_view，播放时现读
 >   self.cfg，13.6）、codepage
 >   （`vfs::set_codepage` 全局量）、ui.font_path（重装字体链）、
 >   ui.image_cache_count（`ImageService::set_cap`），以及一切使用点读
@@ -1089,17 +1093,24 @@ IDE 旧缓冲覆盖磁盘编辑。本文各处单坑引用格式为 `DEVLOG §2 
 | 类型 | 例子 | 归属 | 链路 |
 |---|---|---|---|
 | 相机 RAW 照片 | arw/nef/nrw/srf/sr2/arq | 图片桶（`image_extensions`） | imgview 内嵌 JPEG 预览直解（13.4） |
-| 裸数据 dump | yuv/nv12/传感器 *.bin | 视频桶（`is_video_ext` 扩展） | mpv rawvideo demuxer（本节） |
+| 裸数据 dump | yuv/nv12/传感器 *.bin | 视频桶（`is_video_ext` 预设命中） | mpv rawvideo demuxer（本节） |
 
 **可见性路由**（`config.rs`）：`is_video_ext = video_extensions 命中 ∨
-raw_visible(name)`，其中 `raw_visible = raw.extensions 命中 ∨ [[raw.demux]]
-glob 命中`。两条可见路径语义分离（防"可见但不可播"）：
+raw_demux(name)`——**预设即裸数据唯一入口**，没有独立扩展名清单（曾设
+`raw.extensions` 默认 yuv/nv12，因与预设完全冗余而移除：文件无论如何都得写
+`[[raw.demux]]` 才能拿到 pixfmt/宽高，清单只制造"可见但不可播"的中间态）：
 
-- `raw.extensions`（默认 yuv/nv12）命中 = 该文件按裸数据处理，但**无预设
-  不可播**（`raw_needs_preset` → 报错引导配置，不让 mpv 盲试黑屏）；
-- `[[raw.demux]]` glob 命中（如 `sensor_a_*.bin`）= 预设即参数来源，命中即
-  可见可播——未命中的 .bin 依旧不可见，不污染文件列表；
+- `[[raw.demux]]` glob 命中（如 `sensor_a_*.bin` / `*.yuv`）= 预设即参数
+  来源，命中即可见可播；未命中一律不可见，`.yuv`/`.bin` 不写预设就不进
+  列表，不污染文件列表；
+- 用户手动加进 `media.video_extensions` 的非标文件不再前置拦截——按普通
+  文件交给 mpv，装载失败走 END_FILE 通道回显（见下）；
 - glob 匹配：路径剥离 + 大小写不敏感 + `*`/`?`，多条预设按声明顺序首命中。
+
+判定有两处消费且同源：列表过滤（`rebuild_view`）与**目录收集**
+（`DirVFS::open` 收集谓词 = `is_video_ext(name) ∨ is_image_ext(name)`，
+见 4.2）——目录模式曾用扩展名白名单旁路预设，`.yuv420` 在收集阶段即被
+丢弃、列表里根本不出现；已统一为同源谓词（复盘见 DEVLOG §8.6）。
 
 **播放链路**（`extract.rs` → `player/mod.rs`，快/慢路径共用）：
 
@@ -1114,13 +1125,12 @@ play() / load_extracted()
     demuxer-rawvideo-mp-format=pixfmt,demuxer-rawvideo-fps=F
 ```
 
-四分支前置校验（Err 文案自带引导，ui 单测钉死）：① pixfmt 不在
+三分支前置校验（Err 文案自带引导，ui 单测钉死）：① pixfmt 不在
 `RAWVIDEO_PIXFMTS` 名单（195 项，源自 `ffmpeg -pix_fmts` 筛除硬件/调色板/
 bitstream；**位数为容器位数**——9~16bit 采样占 2 字节，帧字节 = W×H×bits÷8；
 名单与 README「raw 格式表」附录一致，`raw_pixfmt_bits` 大小写不敏感查表）；
 ② 宽高为 0（暂不支持自动推算）；③ 文件大小不整除帧字节（rawvideo demuxer
-对尾部零头不报错、画面错位难排查，故必须前置）；④ 命中 raw.extensions 但
-无预设。
+对尾部零头不报错、画面错位难排查，故必须前置）。
 
 **失败回显（END_FILE(ERROR) 通道）**：装载失败时泵线程发 `(mpv 错误码,
 最近 error 级日志行)` 进 mpsc，UI 每帧 `poll_mpv_err()` 消费 → `set_err`（raw
@@ -1132,7 +1142,7 @@ raw dump）——顺带修复普通损坏视频黑屏无提示；正常结束（
 文件结果须先见 START_FILE、再跳过 STOP。
 
 测试：player e2e（ffmpeg 造 nv12 → 选项装载 → 起播/时长=帧数÷fps/尺寸由
-选项解析/帧精确 seek + 装载失败事件与日志链路）+ ui 校验单测（四分支文案
+选项解析/帧精确 seek + 装载失败事件与日志链路）+ ui 校验单测（三分支文案
 与拼参格式）。
 
 ## 14. 底部控制栏布局机制（egui 0.36）

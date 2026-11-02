@@ -28,7 +28,9 @@ pub struct DirVFS {
 }
 
 impl DirVFS {
-    /// 打开目录为媒体集合。`exts` = 媒体扩展名（不带点，不分大小写）。
+    /// 打开目录为媒体集合。`is_media` = 媒体名谓词（生产侧传
+    /// `is_video_ext(name) || is_image_ext(name)`，与列表过滤同源——标准
+    /// 扩展名 ∨ [[raw.demux]] 预设 glob 命中，.yuv420 等非标名在此层即可见）。
     /// - 根目录不可读 → `Err(Io)`（定性失败）
     /// - 子目录不可读 / 条目 stat 失败 → 静默跳过（部分可读的树照常收集）
     /// - 无媒体文件 → `Ok`（空列表），由 UI 在打开完成时统一提示
@@ -36,7 +38,11 @@ impl DirVFS {
     /// `max_depth` = 递归收集深度：1 = 只收集目录直接子文件（单媒体文件
     /// 入口的默认，防盘根/超大目录全盘扫描）；N = 向下 N 层；0 = 不限制
     /// （「打开媒体目录」入口的默认，与 MAX_DEPTH 栈保险无关）
-    pub fn open(root: &Path, exts: &[String], max_depth: usize) -> Result<Self, VfsError> {
+    pub fn open<F: Fn(&str) -> bool>(
+        root: &Path,
+        is_media: F,
+        max_depth: usize,
+    ) -> Result<Self, VfsError> {
         // 根目录可读性在此定性：不可读直接失败，错误文案与压缩包打开一致
         std::fs::read_dir(root)?;
         let mut vfs = DirVFS {
@@ -44,11 +50,17 @@ impl DirVFS {
             entries: Vec::new(),
             paths: HashMap::new(),
         };
-        vfs.walk(root, exts, 0, max_depth);
+        vfs.walk(root, &is_media, 0, max_depth);
         Ok(vfs)
     }
 
-    fn walk(&mut self, dir: &Path, exts: &[String], depth: usize, max_depth: usize) {
+    fn walk<F: Fn(&str) -> bool>(
+        &mut self,
+        dir: &Path,
+        is_media: &F,
+        depth: usize,
+        max_depth: usize,
+    ) {
         // max_depth=0 不限制，否则与栈保险 MAX_DEPTH 取小
         let limit = if max_depth == 0 {
             MAX_DEPTH
@@ -67,15 +79,12 @@ impl DirVFS {
             let Ok(ft) = e.file_type() else { continue };
             let p = e.path();
             if ft.is_dir() {
-                self.walk(&p, exts, depth + 1, max_depth);
+                self.walk(&p, is_media, depth + 1, max_depth);
             } else if ft.is_file() {
-                // 扩展名过滤（小写比较）：压缩包/字幕等其它文件天然不在集合内
-                let ext = p
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if !exts.iter().any(|x| x.eq_ignore_ascii_case(&ext)) {
+                // 媒体名谓词过滤（与列表 rebuild_view 同源）：标准扩展名 ∨ raw
+                // 预设 glob 命中——压缩包/字幕等其它文件天然不在集合内
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !is_media(&name) {
                     continue;
                 }
                 let Ok(md) = e.metadata() else { continue };
@@ -171,11 +180,13 @@ mod tests {
         (root, files)
     }
 
-    fn exts() -> Vec<String> {
-        ["mp4", "jpg", "mkv"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+    /// 仿生产谓词（等价匹配 mp4/jpg/mkv 扩展名，大小写不敏感——覆盖
+    /// make_tree 里的大写 .MP4）；raw 预设 glob 场景见专项回归测试
+    fn is_media() -> impl Fn(&str) -> bool {
+        |n: &str| {
+            let ext = n.rsplit('.').next().unwrap_or("");
+            ["mp4", "jpg", "mkv"].iter().any(|x| x.eq_ignore_ascii_case(ext))
+        }
     }
 
     fn find<'a>(files: &'a [(String, Vec<u8>)], rel: &str) -> &'a (String, Vec<u8>) {
@@ -185,7 +196,7 @@ mod tests {
     #[test]
     fn walk_collects_media_recursively_deterministic_order_skips_non_media() {
         let (root, files) = make_tree();
-        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
+        let vfs = DirVFS::open(&root, is_media(), 0).unwrap();
         let list = vfs.list();
         let names: Vec<&str> = list.iter().map(|e| e.name.as_str()).collect();
         // 字典序确定；相对路径 '/' 分隔；非媒体与压缩包均被过滤
@@ -201,7 +212,7 @@ mod tests {
     #[test]
     fn open_entry_reads_and_seeks_correct_file() {
         let (root, files) = make_tree();
-        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
+        let vfs = DirVFS::open(&root, is_media(), 0).unwrap();
         let (rel, data) = find(&files, "sub/deep/d.mkv");
         let entry = VirtualEntry {
             name: rel.clone(),
@@ -227,7 +238,7 @@ mod tests {
     #[test]
     fn unknown_entry_errors_and_empty_dir_yields_empty_collection() {
         let (root, _) = make_tree();
-        let vfs = DirVFS::open(&root, &exts(), 0).unwrap();
+        let vfs = DirVFS::open(&root, is_media(), 0).unwrap();
         let ghost = VirtualEntry {
             name: "ghost.mp4".into(),
             size: 0,
@@ -239,7 +250,7 @@ mod tests {
 
         let empty = root.join("empty_dir_不存在的子树");
         std::fs::create_dir_all(&empty).unwrap();
-        let vfs2 = DirVFS::open(&empty, &exts(), 0).unwrap();
+        let vfs2 = DirVFS::open(&empty, is_media(), 0).unwrap();
         assert!(vfs2.list().is_empty());
         // empty 在 root 内部，随 root 一起删除
         std::fs::remove_dir_all(&root).unwrap();
@@ -253,7 +264,7 @@ mod tests {
         // make_tree: a.mp4 / b.MP4（root 直接子文件），sub/c.jpg（1 层），
         // sub/deep/d.mkv（2 层）
         let names = |d: usize| -> Vec<String> {
-            DirVFS::open(&root, &exts(), d)
+            DirVFS::open(&root, is_media(), d)
                 .unwrap()
                 .list()
                 .into_iter()
@@ -278,6 +289,39 @@ mod tests {
     fn unreadable_root_errors() {
         // 不存在的路径：read_dir 失败定性为打开失败（与压缩包路径不存在同待遇）
         let missing = std::env::temp_dir().join("dirvfs_missing_root_不存在");
-        assert!(DirVFS::open(&missing, &exts(), 0).is_err());
+        assert!(DirVFS::open(&missing, is_media(), 0).is_err());
+    }
+
+    #[test]
+    fn name_predicate_collects_raw_preset_glob_names() {
+        // 回归：目录收集从「扩展名白名单」改为「名字谓词」后，raw 预设 glob
+        // 命中的非标名（*.yuv420 / sensor_a_*.bin）也能进集合——白名单时代
+        // 这类文件在扫描阶段即被丢弃，列表里根本不出现（glob 匹配语义本身
+        // 在 config.rs 另测，此处谓词为仿写）
+        let root =
+            std::env::temp_dir().join(format!("dirvfs_raw_pred_{}_0", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("frame.yuv420"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join("sub/sensor_a_0001.bin"), vec![0u8; 64]).unwrap();
+        std::fs::write(root.join("note.txt"), b"x").unwrap();
+        let is_media = |n: &str| {
+            let ext = n.rsplit('.').next().unwrap_or("");
+            ext.eq_ignore_ascii_case("mp4")
+                || n.to_ascii_lowercase().ends_with(".yuv420")
+                || n.to_ascii_lowercase().starts_with("sensor_a_")
+        };
+        let vfs = DirVFS::open(&root, is_media, 0).unwrap();
+        let mut names: Vec<String> = vfs.list().iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        // 谓词收到的是文件名（不含路径），条目名仍是 root 下相对路径（'/' 分隔）
+        assert_eq!(
+            names,
+            vec![
+                "frame.yuv420".to_string(),
+                "sub/sensor_a_0001.bin".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
