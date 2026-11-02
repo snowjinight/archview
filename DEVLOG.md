@@ -22,6 +22,7 @@
 | §6 | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
 | §7 | UI 控制栏布局专项（五坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承） | ARCHITECTURE §14 |
 | §8 | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE / raw.extensions 移除——预设即唯一入口 / bayer16 低对齐发黑——bit_shift 流层修正） | ARCHITECTURE §13.6 / §13.4 |
+| §9 | NV12 dump→视频 encode 引擎 e2e 攻坚（vo=lavc 隐式切换不存在 / o·ovc 非运行期 / bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠） | encode/mod.rs |
 
 ---
 
@@ -638,10 +639,18 @@ e2e 测试不需要人工看画面：mpv 以无渲染模式运行，通过 `time
 `eof-reached` 等属性断言播放状态，`cache=no` 强制 seek 请求打到 VFS 层，能真实
 暴露流实现缺陷。
 
-外部依赖两条：
+外部依赖三条（**本机工具位置**，换机时改探测 fallback 或设环境变量）：
 
 - **RAR 测试**需要本机装有 WinRAR（探测环境变量 `ARCHVIEW_TEST_RAR` 或
-  Program Files 常见路径，找不到自动跳过，不算失败）；
+  Program Files 常见路径，找不到自动跳过，不算失败）——
+  本机在 `C:\Program Files\WinRAR`（rar.exe/UnRAR.exe 均在此，标准位置可自动探测）；
+- **ffmpeg/ffprobe**（player e2e 造数据 / encode e2e 精确帧数断言）——
+  本机在 `D:\11_software`（**不在 PATH**）。encode 侧探测顺序：
+  PATH → `ARCHVIEW_TEST_FFMPEG` 环境变量（目录或 exe 完整路径均可）
+  → 硬编码 fallback `D:\11_software\ffprobe.exe`（换机改
+  `src/encode/mod.rs` 的 `ffprobe_exe()`）。
+  player e2e 侧暂仍 PATH-only，跑前需临时
+  `$env:PATH = "D:\11_software;$env:PATH"`（后续可统一到 ffprobe_exe 模式）；
 - **VarTidy 本地冒烟环境**：`test_tidy\setup.bat`（目录已 gitignore）一键全链路
   ——构建 → `cargo run --example make_smoke_fixtures` 生成 6 个测试包
   （明文/AES zip/明文/内容加密 7z/特殊字符密码 + 既有仓库）→ dry-run →
@@ -1021,4 +1030,50 @@ zvf 单文件装载（须给 stream_cb 增设注册通道）/ 落盘后原地变
 109 passed（基线 104）：新增 stream_cb 5 测（URI 往返+严格解析 / 全量
 读 / 逐字节恶意切分 / 奇偏移+seek / 奇尾字节透传），既有 ui 校验测试
 扩 3 用例（shift 越界 / 非 le 拒绝 / 合法组合带出 bit_shift）。
+
+## 9. NV12 dump→视频 encode 引擎 e2e 攻坚（src/encode/，2026-11-02）
+
+ConcatFile 拼接流（复用 zvf 协议无关四回调，注册为 `zcat://`）喂
+headless mpv，`demuxer=rawvideo` 系列选项 + `o/ovc/ovcopts` 编码输出。
+链路打通共排掉五个坑，全部有实证：
+
+**坑 1：运行时 API 没有 `--o` 的隐式 vo 切换**。命令行 `mpv --o=x.mp4`
+会隐式把 vo 切到 lavc，但 `mpv_set_option_string` 不做该切换——vo 留
+null 时文件被当普通播放消费（END_FILE 正常 EOF 但零输出），且换
+vo=lavc 后报 "No video or audio streams selected"。必须显式
+`vo=lavc,ao=null`。
+
+**坑 2：o/ovc 是非运行期选项**。在 `mpv_initialize` 之后设置不生效
+（encode 上下文不创建，报 vo 初始化失败）。为此把 `mpv_ffi::create`
+拆成 `create_uninit()` + `initialize()`（播放链路 create() 行为不变），
+encode 侧选项全部就位后才 initialize。
+
+**坑 3：ovcopts 的 x264 私有名会被覆写**。`bframes=0` 设了不生效
+（x264 参数行仍 bframes=3），而 crf=28 同串生效——对照实验证明 ovcopts
+通道本身是通的、bframes 被单独覆写：ffmpeg libx264 包装层用
+AVCodecContext.max_b_frames 覆写私有 i_bframe。必须用 ffmpeg 通用名
+`bf=0`。引擎默认追加 `bf=0`（用户显式指定 bf=/bframes= 时不覆盖）。
+
+**坑 4：edit list 裁掉末帧（最隐蔽）**。现象：容器 nb_frames=10、包
+10 个、PTS 网格完整，但 mpv/ffmpeg 解码都只出 9 帧，丢的是最后一帧。
+链路：mpv 编码路径发出的包 duration=0 → movenc 按 PTS 差推算样本
+时长，末样本时长 0 → track/elst 总时长少一帧（0.9s 而非 1.0s）→
+libavformat 系 demuxer 按 elst 裁掉 PTS≥21600 的末包。实证：
+`ffmpeg -ignore_editlist 1` 可解出全部 10 帧。修复：mp4 系输出
+`ofopts=use_editlist=0`（bf=0 已消除负 DTS，本就不需要 elst 补偿）。
+注意坑 3 的 bf=0 与坑 4 配套：只修其一时 bframes 路径仍因负 DTS 写
+elst（media_time=4800）裁帧。
+
+**坑 5：命令字符串引号内 `\` 是转义符**。`loadfile "C:\Users\..."`
+报 "invalid parameter"——mpv 命令解析器吃掉反斜杠。路径须转正斜杠。
+
+**验证方法**：e2e 用纯 Rust 造 10 帧 64×48 nv12（每帧恒定亮度 i*25）
+→ 编码后第二 mpv 实例回读 width/height/duration（核心断言零外部
+依赖）→ ffprobe 精确帧数（可选增强，三级探测：PATH →
+ARCHVIEW_TEST_FFMPEG → `D:\11_software` 固定 fallback，rar_exe 同款
+模式）。回读失败与丢帧靠亮度序列（0,25,…,200 解出、225 丢失）定位。
+
+113 passed（基线 109）：encode 新增 4 测（ConcatFile 跨界读/seek 语义 /
+校验+取消 / e2e）。壳（UI/CLI）未接入，mod 声明处 `#[allow(dead_code)]`
+占位，接入后移除。
 

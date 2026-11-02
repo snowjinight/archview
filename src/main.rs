@@ -3,6 +3,10 @@
 
 mod cache;
 mod config;
+// encode 引擎（dump 序列→视频）：纯库形态，壳（UI/CLI）尚未接入，
+// 调用方只有测试——壳接入后移除 allow
+#[allow(dead_code)]
+mod encode;
 mod imgview;
 mod player;
 mod ui;

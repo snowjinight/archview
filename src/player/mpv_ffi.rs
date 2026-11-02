@@ -276,21 +276,39 @@ pub fn err_str(err: c_int) -> String {
     }
 }
 
-/// 创建并初始化 mpv 实例
-pub fn create() -> Result<*mut MpvHandle, String> {
+/// 只创建不初始化：供需要先设置非运行期选项（如 encode 的 o/ovc——
+/// 这类选项在 mpv_initialize 后设置不生效）再 initialize 的场景。
+/// 失败/不再需要时调用方负责 destroy
+pub fn create_uninit() -> Result<*mut MpvHandle, String> {
     let a = api()?;
     unsafe {
         let ctx = (a.create)();
         if ctx.is_null() {
             return Err("mpv_create 返回空".into());
         }
-        let r = (a.initialize)(ctx);
-        if r < 0 {
-            (a.terminate_destroy)(ctx);
-            return Err(format!("mpv_initialize 失败: {}", err_str(r)));
-        }
         Ok(ctx)
     }
+}
+
+/// 初始化（create_uninit 之后、任何 command/加载之前调用一次）
+pub fn initialize(ctx: *mut MpvHandle) -> Result<(), String> {
+    let a = api()?;
+    let r = unsafe { (a.initialize)(ctx) };
+    if r < 0 {
+        Err(format!("mpv_initialize 失败: {}", err_str(r)))
+    } else {
+        Ok(())
+    }
+}
+
+/// 创建并初始化 mpv 实例
+pub fn create() -> Result<*mut MpvHandle, String> {
+    let ctx = create_uninit()?;
+    if let Err(e) = initialize(ctx) {
+        destroy(ctx);
+        return Err(e);
+    }
+    Ok(ctx)
 }
 
 pub fn destroy(ctx: *mut MpvHandle) {
@@ -369,8 +387,9 @@ pub fn set_property_string_async(
 }
 
 /// 读 f64 属性（time-pos / duration 等），属性不存在返回 None。
-/// 生产帧路径已全部 observe 化，仅测试的属性轮询在用
-#[cfg(test)]
+/// 生产帧路径已全部 observe 化；测试的属性轮询与 encode 引擎进度查询在用
+/// （encode 的壳接入前 bin 侧无调用方，届时移除 allow）
+#[allow(dead_code)]
 pub fn get_property_f64(ctx: *mut MpvHandle, name: &str) -> Result<Option<f64>, String> {
     let a = api()?;
     let name = CString::new(name).map_err(|e| e.to_string())?;

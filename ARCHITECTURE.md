@@ -109,16 +109,16 @@
 │  应用核心 (状态机：浏览/打开中/播放/解压中)        │
 └────┬───────────────────┬────────────────────────────┘
      │                   │
-┌────▼───────────┐  ┌────▼──────────────────────┐
-│  播放服务       │  │  VarTidy 整理器（CLI）     │
-│  mpv_ffi       │  │  分类 + 去重 + 批量抽取    │
-│  stream_cb     │  │  → 直写 var 仓库（只增）   │
-└────┬───────────┘  └────┬──────────────────────┘
-     │                   │ open_entry / extract_batch
+┌────▼───────────┐  ┌────▼──────────────────────┐  ┌────▼────────────────┐
+│  播放服务       │  │  VarTidy 整理器（CLI）     │  │  encode 引擎（15）  │
+│  mpv_ffi       │  │  分类 + 去重 + 批量抽取    │  │  dump 序列→视频     │
+│  stream_cb     │  │  → 直写 var 仓库（只增）   │  │  headless mpv       │
+└────┬───────────┘  └────┬──────────────────────┘  └────┬────────────────┘
+     │                   │ open_entry / extract_batch    │ open_entry
      │                   │ （播放侧解压走 extract_session，见 11.4）
-     │ Read + Seek       │
-┌────▼───────────────────▼─────────────────────────────┐
-│  VFS 层（核心抽象，播放与整理共用）                 │
+     │ Read + Seek       │                              │ Read + Seek
+┌────▼───────────────────▼──────────────────────────────▼┐
+│  VFS 层（核心抽象，播放/整理/编码共用）              │
 │  trait ArchiveVFS { list(); open_entry() }           │
 │  trait VirtualFile: Read + Seek { size() }           │
 │  ├─ ZipVFS    （随机访问）                           │
@@ -136,8 +136,10 @@
 └───────────────────────┘   └──────────────────────────┘
 ```
 
-**架构不变量**：播放器与 VarTidy 整理器是 VFS 层的两个并列消费者，互不感知。
-未来扩展（音频播放、文本预览等）只需新增消费者，VFS 不动 —— 这是本设计的核心扩展点。
+**架构不变量**：播放器、VarTidy 整理器、encode 编码引擎（15）是 VFS 层的三个并列
+消费者，互不感知。未来扩展（音频播放、文本预览等）只需新增消费者，VFS 不动 ——
+这是本设计的核心扩展点（encode 引擎即按此扩展点并入：单向依赖 vfs / player，
+零反向依赖，壳未接入前以 `#[allow(dead_code)]` 占位）。
 
 **线程模型**（全进程 5 类线程，边界即数据流边界）：
 
@@ -174,6 +176,7 @@
 | `vfs/dir_vfs.rs` | 目录媒体集合 DirVFS（4.2） |
 | `vartidy/mod.rs` | VarTidy CLI：输入展开 → 规划（分类 + 两级去重）→ 批量抽取直写仓库 → 报告；`tidy` 参数解析（§12） |
 | `vartidy/classify.rs` | var 文件名分类规则（class_var.py 移植：作者.内容.版本.var 四段校验） |
+| `encode/mod.rs` | encode 引擎（纯库，第三 VFS 消费者，§15）：裸 dump 序列 → 视频——ConcatFile 拼接 + zcat:// 流 + headless mpv encode 模式；壳（UI/CLI）未接入 |
 
 ---
 
@@ -430,6 +433,7 @@ passwords = []              # 加密包密码候选列表（播放器与 VarTidy
 | 追加 | 解压会话化（11.4）：extract_session 持久解码会话，跳转零取消 | 固态包随机跳看重定向不重起 | ✅ |
 | 追加 | 渲染架构迁移（13）：wid 原生子窗口 → mpv render API + glow 后端 + PaintCallback blit，删除全部窗口叠放绕路代码 | egui 单平面，视频画面缩放质量随窗口实时重采样 | ✅ |
 | 追加 | 播放流畅性专项（DEVLOG §3）：常驻事件泵 + 六属性 observe_property 订阅缓存（UI 帧路径零 get_property）+ vsync 主钟 | 打开/切换/seek 全程 UI 不冻结 | ✅ |
+| 追加 | encode 引擎（15）：VFS dump 序列 → 视频（ConcatFile 拼接 + zcat:// + headless mpv encode 模式，五坑见 DEVLOG §9） | 引擎完成（e2e 帧级校验）；UI / CLI 薄壳待讨论 | 🔶 |
 | 下一步 | 图片专属纹理浏览器（13.4）：图片不走 mpv，解码直进 egui 纹理；翻页零延迟 + 缩放平移 + 动图逐帧 + 两档高清纹理（×ppp/×ppp×2）+ 模式感知滚轮 | 纹理路径与 mpv 路径并存互兜底；mpv 收缩为纯视频 | 🔶 1-4 步已落地（含物理像素对齐修复与交互改版），5（PSD/HEIC/AVIF）按需 |
 
 ---
@@ -1278,3 +1282,79 @@ DEVLOG §7.6。最近一次全量回归（12px 版）：行底距窗口底 12.0�
 内部 + 移除 egui_alignments 依赖 + §14.2 与本节对调改写 + DEVLOG 新条目 + 重跑
 §14.4 回归。另有混合变体（整行区域 + 三连组块先排后放居中 + 音量组后画贴右）亦可
 单遍且保紧凑，但同样需先验证 child Ui 组合行为。
+
+---
+
+## 15. encode 引擎：裸 dump 序列 → 视频（VFS 第三消费者，纯库）
+
+> 形态：**纯引擎库**（`src/encode/`），不含 UI / CLI 入口——壳（后台线程 + 进度
+> 展示 / 参数解析）后续按需接入，且与 VarTidy 一样走「与播放器并列的入口」，
+> 不塞进播放流程。输入：`Arc<dyn ArchiveVFS>` + dump 条目序列（DirVFS 目录 /
+> ZIP / 7Z / RAR 通吃，与播放器同源同能力）；输出：编码视频文件（容器由输出
+> 扩展名推断）。完整踩坑叙事（五坑：vo=lavc 隐式切换不存在 / o·ovc 非运行期 /
+> bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠）见 **DEVLOG §9**，本节只留
+> 机制与设计决策。
+
+### 15.1 数据通路
+
+```
+N 个 dump 条目（壳负责按文件名升序排序过滤，引擎只做校验）
+  → ConcatFile 逻辑拼接（零拷贝：rawvideo demuxer 只认连续字节流，
+    read/seek 按字节区间路由到成员 VirtualFile）
+  → zcat://<id> stream_cb 协议（zvf:// 姊妹协议：read/seek/size/close
+    四回调直接复用 player/stream_cb，仅 open_cb 为本模块专属）
+  → headless mpv（vo=null，与 GUI 播放的 render API 链路完全无关）
+     · demuxer 选项走 loadfile 第四参数（与播放链路同构，13.6 同口径）：
+       demuxer=rawvideo,demuxer-rawvideo-w/h/mp-format/fps
+     · 编码选项走全局选项（mpv_initialize 前下发）：o=<输出> ovc=<编码器>
+       ovcopts=<参数>（+ mp4 系 ofopts=use_editlist=0，见 15.2）
+  → END_FILE(EOF) = 编码完成 → 回读自校验
+```
+
+引擎对外仅一个入口 `encode_raw_sequence`（阻塞直至完成/失败/取消），格式参数
+`EncodeFormat`（pixfmt/宽高/fps/bit_shift）、编码参数 `EncodeOptions`
+（ovc/ovcopts，默认 libx264）、统计 `EncodeStats`（文件数/字节/帧数）。
+格式参数来源 = `[[raw.demux]]` 预设命中值或壳显式输入，由壳负责解析。
+
+### 15.2 关键设计
+
+- **create_uninit / initialize 拆分**：o / ovc / ovcopts / ofopts 是非运行期
+  选项，必须在 `mpv_initialize` 前下发——与播放链路（create 即初始化）刻意
+  不同，mpv_ffi 为此新增 `create_uninit` 符号。
+- **默认 bf=0 + mp4 系 use_editlist=0（配套）**：mpv encode 路径包 duration=0
+  → movenc 按 PTS 差推算末样本时长 0 → edit list 总时长少一帧 → libavformat
+  系解码器按 elst 裁末帧（e2e 实证 10 帧只解出 9）；而 x264 默认 B 帧的负 DTS
+  会让 muxer 写 elst 补偿——只修其一仍裁帧。bf 必须用 ffmpeg 通用名（x264
+  私有名 bframes 会被 libx264 包装层用 avctx 覆写，设了不生效）。用户 ovcopts
+  显式指定 bf=/bframes= 时以其为准。细节见 DEVLOG §9 坑3/坑4。
+- **校验先行**：pixfmt 名单（config raw.pixfmts）、帧对齐（总字节须为帧大小
+  整数倍，不匹配即报"序列与格式参数不匹配或混入非 dump 文件"）、fps/宽高/
+  bit_shift 越界、加密条目拒绝——错误文案与播放链路 raw_demux_opts 同口径。
+- **bit_shift 流层修正（ShiftReader）**：12bit 低对齐数据存 16bit 容器的高位
+  修正，语义同播放链路——修不正的数据编进去也是废片，故在流层先修正再喂 mpv。
+- **取消 / 进度**：`cancel: &AtomicBool`（置位即 stop，返回「已取消」；半成品
+  输出不删除，交壳决定——失败现场有调试价值，重试会覆盖）；`progress:
+  &dyn Fn(f64)`（0~100，引擎线程回调，壳自行处理跨线程）。开始前已取消则
+  不加载 dll 直接退出（零成本路径）。
+- **回读自校验**：编码完成后起第二个 headless mpv 回读输出文件（宽高/时长），
+  e2e 另有 ffprobe 精确帧数断言（三级工具探测：PATH → `ARCHVIEW_TEST_FFMPEG`
+  环境变量 → 固定 fallback，惯例同 rar_vfs 的 rar/ffprobe 探测）。
+
+### 15.3 复用清单（引擎并入本仓库的依据）
+
+| 复用能力 | 来源 | 说明 |
+|---|---|---|
+| stream_cb 四回调 + REGISTRY | `player/stream_cb.rs` | zcat 仅换协议名与 open_cb，回调桥接/装箱约定原样复用（§4 两约束） |
+| mpv 最小 FFI | `player/mpv_ffi.rs` | 新增 create_uninit；dll 加载/错误处理同源 |
+| rawvideo demuxer 选项口径 + raw_pixfmt_bits | `config.rs` + 13.6 | 与播放 raw 链路同一套 pixfmt 名单与位深表 |
+| 输入能力（四 VFS + 密码探测 + 分卷 RAR） | `vfs/` 全部 | dump 序列在压缩包内或磁盘目录均可编码 |
+
+单向依赖：encode → vfs / player / config，零反向依赖；与播放器、VarTidy 互不感知。
+
+### 15.4 实施状态
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 1 | 引擎本体：ConcatFile / zcat:// / headless encode / 校验 / 取消 / 进度 / 回读校验 | ✅ 完成（4 测试：拼接读越界/seek 语义/校验取消/e2e 帧级校验；全量 113 通过；main.rs `#[allow(dead_code)]` 占位，壳接入后移除） |
+| 2 | UI 薄壳（后台线程 + 进度展示 + raw 预设联动） | 待讨论 |
+| 3 | CLI 薄壳（与 tidy 并行的子命令形态，不改播放分发语义） | 待讨论 |

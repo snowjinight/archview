@@ -139,7 +139,9 @@ pub(crate) unsafe extern "C" fn open_cb(
     ffi::MPV_ERROR_SUCCESS
 }
 
-unsafe extern "C" fn read_cb(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64 {
+// 以下四回调与协议无关（只操作 cookie 指向的 Box<dyn VirtualFile>）：
+// zvf:// 与 encode 引擎的 zcat:// 拼接流共用
+pub(crate) unsafe extern "C" fn read_cb(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64 {
     if cookie.is_null() {
         return -1;
     }
@@ -154,7 +156,7 @@ unsafe extern "C" fn read_cb(cookie: *mut c_void, buf: *mut c_char, nbytes: u64)
     }
 }
 
-unsafe extern "C" fn seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
+pub(crate) unsafe extern "C" fn seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
     if cookie.is_null() {
         return ffi::MPV_ERROR_UNSUPPORTED as i64;
     }
@@ -165,14 +167,14 @@ unsafe extern "C" fn seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
     }
 }
 
-unsafe extern "C" fn size_cb(cookie: *mut c_void) -> i64 {
+pub(crate) unsafe extern "C" fn size_cb(cookie: *mut c_void) -> i64 {
     if cookie.is_null() {
         return -1;
     }
     (*(cookie as *mut Box<dyn crate::vfs::VirtualFile>)).size() as i64
 }
 
-unsafe extern "C" fn close_cb(cookie: *mut c_void) {
+pub(crate) unsafe extern "C" fn close_cb(cookie: *mut c_void) {
     if !cookie.is_null() {
         drop(Box::from_raw(
             cookie as *mut Box<dyn crate::vfs::VirtualFile>,
@@ -194,7 +196,7 @@ unsafe extern "C" fn close_cb(cookie: *mut c_void) {
 /// 首尾各带最多 1 字节伙伴字节（回看/前看），变换后裁出交付段。
 /// raw 帧大小恒为偶数，实际读取天然 2 字节对齐，此处按任意偏移通用
 /// 实现以求稳健。
-struct ShiftReader {
+pub(crate) struct ShiftReader {
     inner: Box<dyn crate::vfs::VirtualFile>,
     shift: u32,
     /// 逻辑偏移（= 内层文件偏移，移位不改变大小）
@@ -202,7 +204,7 @@ struct ShiftReader {
 }
 
 impl ShiftReader {
-    fn new(inner: Box<dyn crate::vfs::VirtualFile>, shift: u32) -> Self {
+    pub(crate) fn new(inner: Box<dyn crate::vfs::VirtualFile>, shift: u32) -> Self {
         debug_assert!((1..=8).contains(&shift));
         // open_entry 契约：新开句柄位于 0（DirVFS/ZipVFS 同此）
         Self { inner, shift, pos: 0 }
