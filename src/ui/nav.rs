@@ -27,6 +27,38 @@ impl App {
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Ctrl+A = 全选当前列表（§15.5 多选基建）。让位：搜索框聚焦（文本框
+        // 原生全选）、密码/配置编辑器/编码确认窗在场（它们的 TextEdit 要收
+        // 事件）。先于下方"无播放器早退"——列表选择与播放无关
+        if self.pw_prompt.is_none()
+            && self.config_editor.is_none()
+            && self.encode_dialog.is_none()
+            && !self.list_rows.is_empty()
+            && ctx.memory(|m| m.focused()) != Some(search_box_id())
+        {
+            let mut select_all = false;
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    if let egui::Event::Key {
+                        key: egui::Key::A,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        if modifiers.command {
+                            select_all = true;
+                            return false;
+                        }
+                    }
+                    true
+                });
+            });
+            if select_all {
+                self.selected = self.list_rows.iter().map(|r| r.idx).collect();
+            }
+        }
         // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
         if self.player.is_none() && self.tex_image_key().is_none() {
             // 未开任何文件时 M 仍可预设静音——真相在 cfg（与控制栏 ♪ 按钮一致），

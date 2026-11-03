@@ -3,9 +3,7 @@
 
 mod cache;
 mod config;
-// encode 引擎（dump 序列→视频）：纯库形态，壳（UI/CLI）尚未接入，
-// 调用方只有测试——壳接入后移除 allow
-#[allow(dead_code)]
+// encode 引擎（dump 序列→视频）+ CLI 壳：UI 壳尚未接入（多选/右键/确认窗）
 mod encode;
 mod imgview;
 mod player;
@@ -15,12 +13,17 @@ mod vfs;
 
 fn main() -> eframe::Result<()> {
     // CLI 子命令分发：`archview tidy ...` = var 资源包增量整理（ARCHITECTURE.md 第 12 章），
+    // `archview encode ...` = 帧序列 dump → 视频（ARCHITECTURE.md 15.5），
     // 无参数 = GUI 播放器（行为不变）。
     // GUI 模式下命令行中的压缩包/目录作为初始打开目标
     // （SendTo「Archview player」快捷方式 / 拖到 exe 上 / 文件关联）
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("tidy") {
         let code = vartidy::cli_main(&args[1..]);
+        std::process::exit(code);
+    }
+    if args.first().map(String::as_str) == Some("encode") {
+        let code = encode::cli::cli_main(&args[1..]);
         std::process::exit(code);
     }
 

@@ -23,6 +23,8 @@
 | §7 | UI 控制栏布局专项（五坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承） | ARCHITECTURE §14 |
 | §8 | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE / raw.extensions 移除——预设即唯一入口 / bayer16 低对齐发黑——bit_shift 流层修正） | ARCHITECTURE §13.6 / §13.4 |
 | §9 | NV12 dump→视频 encode 引擎 e2e 攻坚（vo=lavc 隐式切换不存在 / o·ovc 非运行期 / bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠） | encode/mod.rs |
+| §10 | encode 三壳接入（CLI·SendTo / UI 多选右键确认窗）：egui 0.36 三处 API 实测差异 + move 闭包夺所有权 + 可操作绿条与帧首点击清除的竞态 | encode/cli.rs · ui/ |
+| §11 | Ctrl/Shift「间歇性不生效」根因：InputState.modifiers 跨帧状态失焦清零且 winit 不重发（事件内联快照优先修法） | ARCHITECTURE §15.5 |
 
 ---
 
@@ -1076,4 +1078,138 @@ ARCHVIEW_TEST_FFMPEG → `D:\11_software` 固定 fallback，rar_exe 同款
 113 passed（基线 109）：encode 新增 4 测（ConcatFile 跨界读/seek 语义 /
 校验+取消 / e2e）。壳（UI/CLI）未接入，mod 声明处 `#[allow(dead_code)]`
 占位，接入后移除。
+
+## 10. encode 三壳接入（CLI·SendTo / UI，2026-11-02）
+
+引擎（§9）之上按 ARCHITECTURE §15.5 接三壳：`[encode]` config 节、
+`archview encode` CLI 子命令 + SendTo 第三项、UI 多选/右键/确认窗/后台
+任务。壳侧排掉六个坑（前五个是编译期即报的 egui 0.36 / Rust 实测差异，
+第六个是纯逻辑竞态）：
+
+**坑 1：`Event::Key` 模式必须带 `..`（E0027）**。0.36 的 Key 事件有
+`physical_key` 等字段，模式逐字段写会报"missing field"。事件匹配一律
+`Event::Key { key, pressed, repeat, modifiers, .. }`。
+
+**坑 2：`Modifiers.command` 是字段不是方法（E0599）**。`modifiers.command()`
+报 "field, not method"——直接 `modifiers.command`（bool）。编译器提示的
+`command_only()` 语义不同（仅 Ctrl 且无其它修饰），不要顺手采纳。
+
+**坑 3：`Ui` 没有 `close_menu()`（E0599）**。`Response::context_menu`
+内点 Button 菜单**自动关闭**，无需也不能显式调用。
+
+**坑 4：`move ||` 闭包内 `&out` 夺走所有权（E0382）**。move 闭包先夺取
+`out` 再借用，闭包外 EncodeJob 构造再用 `out` 即"moved value"。修法
+`let out_t = out.clone();` 且**闭包体内改用 `&out_t`**——只加 clone 不改
+闭包体引用，错误原样复现（本次实际踩了两轮）。
+
+**坑 5：`Response::on_hover_cursor` 消耗 self（E0382）**。0.36 该方法
+`fn on_hover_cursor(self, ...) -> Response` 取所有权，之后还要 `resp.clicked()`
+就得 `resp.clone().on_hover_cursor(...)`（Response 是廉价 Arc clone）。
+
+**坑 6：可操作绿条 vs 帧首 any_click 清除的竞态（纯逻辑）**。"完成绿条
+点击打开输出目录"的朴素实现会静默失效：`clear_notice_on_click` 在帧首
+跑（update 开头），任意点击即清 notice——同一帧稍后渲染绿条时 notice
+已是 None，Label 的 `clicked()` 永远收不到那次点击。修法：`encode_done_dir`
+在场（动作未消费）时帧首**不清**，由绿条控件自身消费点击（开目录 +
+take 动作 + 消条）；新消息经 `set_notice`/`set_err` 统一清伴随动作，
+杜绝旧动作挂在新消息上。语义代价：可操作绿条不被无关点击消除——可接受
+（它是待执行动作，不是纯提示）。
+
+**UI 多选语义决定**（apply_row_click，钉死在测试里）：普通点击=单选+锚点
++播放；Ctrl=toggle 且**锚点跟随被点击行**（含移除时——与资源管理器一致，
+测试初版想当然以为锚点停在原选中行而挂掉）；Shift=从锚点整段替换（含反
+向）；锚点是代际残留（切包后不在行缓存）退化单行不 panic；切包
+（apply_open_done）清 selected+锚点（entry 下标对新包是错位引用）。
+
+**多选视觉与播放语义修订**（用户反馈两条，§11 修复后的第二轮打磨；视觉
+方案又经用户实测打回、第三轮定稿）：
+- 选中视觉两试皆废，根因**不是**初判的"撞色"——egui 0.36
+  widgets/button.rs 渲染守卫：`has_frame_margin && (state != Inactive ||
+  frame_when_inactive)` 不满足时 layout.frame 被剥成无填充
+  `Frame::new().inner_margin(...)`，**显式 fill 根本不进渲染**。而
+  `Button::selectable(selected)` 内部是 `.selected(selected).
+  frame_when_inactive(selected)`——非播放行 selected=false → Inactive 态
+  fill 必被剥：初版 fill(selection.bg_fill) 从未生效过（用户"看不出选中"
+  的真因）；第二版琥珀 fill 同理——仅 hover/按住瞬间 state=Active 可见
+  （用户实测"点住变黄、松手恢复"）；而播放行 selected=true →
+  frame_when_inactive=true → frame 恒生效，琥珀覆盖主题蓝（"正在播放变
+  黄"）。调 frame_when_inactive(true) 是死路——全员常驻按钮底色。终版：
+  大写 S 前缀 + 主题感知琥珀着色（AMBER_DARK/LIGHT 常量，与 hover 气泡
+  目录段共用——同色相视觉语言）。文字显式色无条件优先（widget_text.rs
+  `text_color.unwrap_or_else(...)`），不受背景 fill 守卫影响；元组
+  IntoAtoms 拼 S 段+文件名段，S 不放大字号（AtomLayout 行高取各段
+  max，放大破坏等高前提）、无真加粗可选（默认字体无 bold variant，
+  strong() 只是提亮色标志且被显式色覆盖）。演进插曲：✓（fallback 字体
+  度量风险）→[x]→[s] 纯文本版先后落地，用户去 [] 求更醒目——大写 S +
+  琥珀定稿。playing 行仍由 selectable 选中态着主题蓝（S 保持琥珀，暖
+  冷对比清晰）。
+- Ctrl/Shift 点击**恒不播放**（原实现无锚点 Shift 等同普通点击会播放）：
+  多选通常为批量编码服务，点一下就切歌反而打断当前播放。无锚点 Shift =
+  单选+锚点落地，下续 Shift 才有范围基准。测试以「play 开头清
+  error/notice」为无 archive 环境下的 play 调用观测点。
+
+132 passed（基线 113）：CLI 11 测（parse/收集/唯一族/自然序/缺口警告/
+输出命名/选项组装/密码合并），UI 3 测（多选语义含不播放断言/切包清空/
+click_modifiers 快照），config 防漂移等 5 测。
+
+## 11. Ctrl/Shift「间歇性不生效」根因：修饰键两条数据路径（2026-11-03）
+
+历史遗留问题：UI 里 Ctrl/Shift 修饰键**间歇性不生效**（曾遇到但没找到
+原因，无法稳定复现）。§10 的多选上线后此问题直接挡死 Ctrl/Shift 多选，
+本轮从 egui-winit / egui 源码把根因钉死。
+
+### 两条数据路径（根因所在）
+
+egui 里修饰键有**两条语义不同的数据流**，混用即埋雷：
+
+1. **事件内联 modifiers（原子快照）**：egui-winit 把 `self.modifiers`
+   广播进每个 `Key` / `MouseWheel` / `PointerButton` 事件的 `modifiers`
+   字段（egui-winit lib.rs on_mouse_button_input / on_mouse_wheel /
+   on_keyboard_input 三处）。这是 **winit 生成该事件瞬间的修饰键快照**，
+   与帧边界、焦点状态无关——永远忠实于用户按下那一刻。
+2. **`InputState.modifiers`（跨帧累积状态）**：egui begin_pass 里由
+   `Event::ModifiersChanged` 事件流维护（input_state/mod.rs：跨帧携带
+   `let mut modifiers = self.modifiers` + 事件更新 + **`WindowFocused(false)`
+   清零**）；egui-winit 侧 `Focused(false)` 同样清 `self.modifiers`。
+
+### 根因机制（为何「间歇性、无法复现」）
+
+按住 Ctrl/Shift 期间窗口失焦（Alt+Tab / 弹出子窗 / 系统对话框）→ 两层
+modifiers 全部清零 → 焦点恢复时 **winit 不重发 ModifiersChanged**——用户
+仍按着键，但操作系统层面无新的键状态变化，winit 没有任何事件可发 →
+`i.modifiers` 停在清零态，直到用户**松开重按**才恢复。表现为：正常操作
+两路等价一切正常；一旦按住修饰键期间切过窗，接下来读 `i.modifiers` 的
+功能静默失效——复现条件隐蔽（要按住期间恰好失焦），与「间歇性、找不到
+原因」完全吻合。
+
+反证链（为何 Ctrl+A 从未失效）：nav.rs 的全选用的是 `Event::Key` 的
+**事件内联** `modifiers.command`——快照路径免疫失焦清零，所以它一直正常。
+这也解释了另一处矛盾：滚轮缩放读 `i.modifiers.ctrl` 但平时可用——无失焦
+场景两路等价，失焦场景才分岔。
+
+### 修法：事件内联快照优先 + 跨帧状态兜底（四处）
+
+统一原则：**修饰键判断取触发事件自带的内联快照；事件缺失（如异步轮询、
+无事件的帧）才回退 `i.modifiers`**。落地为 helper + 三处改写：
+
+- **`App::click_modifiers`**（panels.rs，多选点击专用）：倒序找当帧最后
+  一个 `PointerButton{Primary}` 事件取内联 modifiers，找不到回退
+  `i.modifiers`。倒序=取帧末快照（同帧 press/release 修饰不一致时以
+  release 为准，与用户最终意图一致）。
+- **滚轮缩放**（panels.rs）：`MouseWheel` 事件内联 `ctrl |= modifiers.ctrl`
+  逐事件聚合 + `i.modifiers.ctrl` 兜底。
+- **config_editor Ctrl+S / Ctrl+/**：`i.key_pressed(Key::S) && i.modifiers.ctrl`
+  改为 `events` 里匹配 `Event::Key{key:S, pressed:true, repeat:false,
+  modifiers}` 且 `modifiers.ctrl`（Ctrl+/ 加 `!modifiers.shift`）。
+  `key_pressed` 内部依赖跨帧状态，必改事件匹配才能带快照。
+
+### 教训
+
+- egui 里读修饰键**永远优先事件内联快照**；`i.modifiers` 只配当兜底。
+  官方示例大量用 `i.modifiers.ctrl` 属「无失焦场景等价」的幸存者偏差。
+- 排查此类「间歇性」问题的路径：先找同一功能里**一直正常**的兄弟实现
+  （Ctrl+A vs 多选点击），对比两者数据来源差异——分岔点即根因。
+- 回归测试 `click_modifiers_prefers_inline_snapshot`（tests.rs）三场景：
+  内联优先（跨帧状态为空仍命中——直接模拟失焦清零现场）/ 回退跨帧 /
+  帧末快照。132 passed。
 

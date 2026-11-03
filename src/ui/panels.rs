@@ -6,6 +6,11 @@ use super::*;
 /// 主题强调色（进度条/播放头共用）
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
 
+/// 主题感知琥珀（dark 亮琥珀 / light 深琥珀）：hover 气泡目录段与
+/// 列表选中标志 S 共用——同色相的视觉语言（文件夹联想/选中定位）
+const AMBER_DARK: egui::Color32 = egui::Color32::from_rgb(224, 172, 76);
+const AMBER_LIGHT: egui::Color32 = egui::Color32::from_rgb(146, 102, 12);
+
 // ---- 帧呈现节奏探针（常驻诊断，debug 级默认静默） ----
 // PaintCallback 闭包每帧重建，跨帧状态放 thread_local（回调恒在 UI/GL 线程）。
 // 每 5s 汇总：绘制次数与间隔 avg/max、>25ms 长帧归因（render 侧/UI 侧）、
@@ -232,8 +237,30 @@ impl App {
             // 了，见 update 帧首 clear_notice_on_click）；红色错误代表操作
             // 失败，仅被新消息或成功播放新内容覆盖（play/play_image/
             // load_extracted/切换内容源）
-            if let Some(n) = &self.notice {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, n);
+            // 编码完成绿条整条可点：点击=打开输出所在目录（§15.5）。
+            // clone 文本先释放借用——点击回调里还要 take 伴随字段并消条
+            if let Some(n) = self.notice.clone() {
+                let clickable = self.encode_done_dir.is_some();
+                let lbl = egui::Label::new(
+                    egui::RichText::new(n).color(egui::Color32::LIGHT_GREEN),
+                )
+                .sense(if clickable {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                });
+                let resp = ui.add(lbl);
+                if clickable {
+                    resp.clone()
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        if let Some(dir) = self.encode_done_dir.take() {
+                            let _ =
+                                std::process::Command::new("explorer").arg(&dir).spawn();
+                        }
+                        self.notice = None;
+                    }
+                }
             }
             if let Some(e) = &self.error {
                 ui.colored_label(egui::Color32::RED, e);
@@ -348,6 +375,27 @@ impl App {
         tracing::info!("配置已重载（菜单触发）{note}");
     }
 
+    /// 点击时刻的修饰键（列表多选语义）。取当帧 PointerButton 事件的
+    /// **内联 modifiers**——egui-winit 生成事件瞬间的原子快照；事件缺失
+    /// 时退回 `i.modifiers` 跨帧状态。不能只用 `i.modifiers`：它由
+    /// ModifiersChanged 事件流维护，窗口失焦即清零且 winit 焦点恢复
+    /// **不重发**——按住 Ctrl/Shift 期间切窗再回来修饰键就静默丢失，
+    /// 即历史「Ctrl/Shift 间歇性不生效」的根因（DEVLOG §11）
+    pub(super) fn click_modifiers(i: &egui::InputState) -> egui::Modifiers {
+        i.events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    modifiers,
+                    ..
+                } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or(i.modifiers)
+    }
+
     pub(super) fn file_list(&mut self, ui: &mut egui::Ui) {
         // 压缩包名（仅文件名，无路径；完整路径悬停显示）
         if let Some(a) = &self.archive {
@@ -406,11 +454,21 @@ impl App {
                     self.rebuild_view();
                 }
             }
+            // 多选计数（§15.5）：有选择时右侧弱提示（编码对象个数一目了然）
+            if !self.selected.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("已选 {}", self.selected.len()));
+                });
+            }
         });
         ui.separator();
 
         // ---- 虚拟化列表：只布局可见行（万级条目从每帧 O(n) 降到 O(可见行数)）----
         let mut action: Option<usize> = None;
+        // 右键菜单动作（菜单闭包内不能借 &mut self——外置 flag，闭包外统一消费）
+        let mut menu_encode: Option<usize> = None;
+        let mut menu_all = false;
+        let mut menu_clear = false;
         let mut scrolled = false;
         // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
         // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
@@ -427,6 +485,9 @@ impl App {
         let row_h = self.row_h.unwrap_or_else(|| ui.spacing().interact_size.y);
         // 预收集不可变数据，避免渲染闭包内借用 self
         let rows = &self.list_rows;
+        // 多选集（§15.5 行高亮）与预设探测（右键菜单 enable 判定）
+        let sel = &self.selected;
+        let cfg = &self.cfg;
         // hover 气泡要完整包内路径（含目录段），与 rows 一样预取引用进闭包
         let entries = self.archive.as_ref().map(|a| &a.entries);
         let playing = self.playing;
@@ -492,10 +553,46 @@ impl App {
                         // 必须截断——selectable_label 默认换行会把长名行撑成 2 行高，
                         // 行高不均匀破坏虚拟化的等高前提：首行实测高被钉在 2 行值上，
                         // 渲染范围按虚高 step 缩水 → 底部空隙 + 翻页时 step 双稳态翻转
-                        let mut resp =
-                            egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
-                                .truncate()
-                                .ui(ui);
+                        // 多选指示（§15.5）终版：大写 S 前缀 + 主题感知琥珀
+                        // 着色（同 hover 气泡目录段 AMBER，视觉语言一致）。
+                        // 底色方案两试皆废——egui Button 显式 fill 受
+                        // `state != Inactive || frame_when_inactive` 守卫
+                        //（widgets/button.rs）：非播放行 selectable 选中态
+                        // frame_when_inactive=false，Inactive 帧被剥成无填充
+                        // Frame，**fill 根本不渲染**（仅 hover/按住瞬间可见，
+                        // 表现为"点住才变色、松手就恢复"），这也是初版
+                        // fill(selection.bg_fill) 从未生效的原因；调
+                        // frame_when_inactive(true) 则全员常驻按钮底色。
+                        // 文字显式色则无条件优先（widget_text.rs
+                        // `text_color.unwrap_or_else(...)`），不受该守卫影响。
+                        // 元组 atoms（IntoAtoms）拼 S 段+文件名段：不放大 S
+                        // 字号（AtomLayout 行高取各段 max，放大破坏等高前
+                        // 提）、无真加粗可选（默认字体无 bold variant，
+                        // strong() 只是提亮色标志且被显式色覆盖）——大写+
+                        // 琥珀已够醒目。playing 行仍由 selectable 选中态着
+                        // 主题蓝（S 保持琥珀，暖冷对比清晰）
+                        let btn = if sel.contains(&r.idx) {
+                            let sel_c = if ui.visuals().dark_mode {
+                                AMBER_DARK
+                            } else {
+                                AMBER_LIGHT
+                            };
+                            egui::Button::selectable(
+                                playing == Some(r.idx),
+                                (
+                                    egui::RichText::new("S ").color(sel_c),
+                                    egui::RichText::new(r.label.as_str()),
+                                ),
+                            )
+                            .truncate()
+                        } else {
+                            egui::Button::selectable(
+                                playing == Some(r.idx),
+                                r.label.as_str(),
+                            )
+                            .truncate()
+                        };
+                        let mut resp = btn.ui(ui);
                         // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
                         // 一个平面，气泡盖在视频画面上不再被 mpv 原生子窗口遮挡
                         //（wid 时代因此禁用过 hover，见 ARCHITECTURE.md 11.2）。
@@ -514,12 +611,9 @@ impl App {
                                 // 目录段琥珀（文件夹联想）、文件名主题蓝（与进度条
                                 // ACCENT 同源）；深浅主题各配一档亮度保证对比度
                                 let (dir_c, file_c) = if ui.visuals().dark_mode {
-                                    (egui::Color32::from_rgb(224, 172, 76), ACCENT)
+                                    (AMBER_DARK, ACCENT)
                                 } else {
-                                    (
-                                        egui::Color32::from_rgb(146, 102, 12),
-                                        egui::Color32::from_rgb(24, 98, 200),
-                                    )
+                                    (AMBER_LIGHT, egui::Color32::from_rgb(24, 98, 200))
                                 };
                                 let mut job = egui::text::LayoutJob::default();
                                 if !dir.is_empty() {
@@ -540,6 +634,31 @@ impl App {
                                 ui.label(job);
                             });
                         }
+                        // 右键菜单（§15.5）：编码为视频 / 全选 / 清除选择。
+                        // 编码项 enable：行命中 raw 预设 ∨ 已有多选（入口必可达，
+                        // 校验语义在 open_encode_dialog：未命中/混族红字报错）
+                        resp.context_menu(|ui| {
+                            let enc_ok = entries
+                                .and_then(|es| es.get(r.idx))
+                                .is_some_and(|e| cfg.raw_demux(&e.name).is_some())
+                                || !sel.is_empty();
+                            if ui
+                                .add_enabled(enc_ok, egui::Button::new("编码为视频…"))
+                                .clicked()
+                            {
+                                menu_encode = Some(r.idx);
+                            }
+                            ui.separator();
+                            if ui.button("全选（Ctrl+A）").clicked() {
+                                menu_all = true;
+                            }
+                            if ui
+                                .add_enabled(!sel.is_empty(), egui::Button::new("清除选择"))
+                                .clicked()
+                            {
+                                menu_clear = true;
+                            }
+                        });
                         if measured.is_none() {
                             measured = Some(resp.rect.height());
                         }
@@ -597,8 +716,66 @@ impl App {
                 self.row_h = Some(h);
             }
         }
-        if let Some(ei) = action {
-            self.play(ei);
+        if let Some(idx) = action {
+            // 多选语义分治（§15.5）：无修饰=单选+播放 / Ctrl=toggle / Shift=范围。
+            // 修饰键走 PointerButton 事件内联快照（click_modifiers，DEVLOG §11）
+            let mods = ui.input(Self::click_modifiers);
+            self.apply_row_click(idx, mods);
+        }
+        // 右键菜单动作（闭包内 flag，此处统一消费）
+        if let Some(idx) = menu_encode {
+            self.open_encode_dialog(Some(idx));
+        }
+        if menu_all {
+            self.selected = self.list_rows.iter().map(|r| r.idx).collect();
+        }
+        if menu_clear {
+            self.selected.clear();
+            self.select_anchor = None;
+        }
+    }
+
+    /// 文件列表行点击的多选语义（§15.5）。无修饰 = 清空多选、单选并播放；
+    /// Ctrl+点击 = toggle 该行；Shift+点击 = 锚点到该行的范围（list_rows
+    /// 显示序连续段；锚点或目标行被搜索过滤掉 → 退化为单行）。**Ctrl/Shift
+    /// 只改选区、恒不播放**——多选通常为批量编码服务，点一下就切歌反而
+    /// 打断当前播放；无锚点 Shift = 单选+锚点落地（下续 Shift 有范围基准）。
+    /// 锚点 = 最近一次无修饰/Ctrl 点击的行，Shift 不移动锚点（连续扩展）
+    pub(super) fn apply_row_click(&mut self, idx: usize, mods: egui::Modifiers) {
+        if mods.shift {
+            let Some(anchor) = self.select_anchor else {
+                // 无锚点：单选+锚点落地，不播放
+                self.selected.clear();
+                self.selected.insert(idx);
+                self.select_anchor = Some(idx);
+                return;
+            };
+            let range = self
+                .list_rows
+                .iter()
+                .position(|r| r.idx == anchor)
+                .zip(self.list_rows.iter().position(|r| r.idx == idx))
+                .map(|(a, b)| {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    self.list_rows[lo..=hi].iter().map(|r| r.idx).collect::<Vec<_>>()
+                });
+            self.selected.clear();
+            match range {
+                Some(idxs) => self.selected.extend(idxs),
+                None => {
+                    self.selected.insert(idx);
+                }
+            }
+        } else if mods.ctrl {
+            if !self.selected.insert(idx) {
+                self.selected.remove(&idx);
+            }
+            self.select_anchor = Some(idx);
+        } else {
+            self.selected.clear();
+            self.selected.insert(idx);
+            self.select_anchor = Some(idx);
+            self.play(idx);
         }
     }
 
@@ -965,11 +1142,17 @@ impl App {
         let mut wheel_anchor = None;
         if resp.hovered() {
             let (dy, cursor, ctrl) = ui.input(|i| {
-                let dy = i.events.iter().fold(0.0_f32, |acc, e| match e {
-                    egui::Event::MouseWheel { delta, .. } => acc + delta.y,
-                    _ => acc,
-                });
-                (dy, i.pointer.latest_pos(), i.modifiers.ctrl)
+                // 滚轮事件内联 modifiers（原子快照）优先 + 跨帧状态兜底
+                // （同 click_modifiers，免疫失焦清零——DEVLOG §11）
+                let mut dy = 0.0_f32;
+                let mut ctrl = i.modifiers.ctrl;
+                for e in &i.events {
+                    if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
+                        dy += delta.y;
+                        ctrl |= modifiers.ctrl;
+                    }
+                }
+                (dy, i.pointer.latest_pos(), ctrl)
             });
             if dy != 0.0 {
                 if ctrl || self.img_view.zoom.is_some() {

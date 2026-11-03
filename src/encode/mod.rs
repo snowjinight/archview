@@ -19,6 +19,9 @@
 //!   → END_FILE(EOF) = 编码完成
 //! ```
 
+/// CLI 壳（`archview encode` 子命令 + SendTo；ARCHITECTURE §15.5）
+pub mod cli;
+
 use crate::config::raw_pixfmt_bits;
 use crate::player::mpv_ffi as ffi;
 use crate::player::stream_cb as zvf_cb;

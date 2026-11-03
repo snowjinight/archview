@@ -162,6 +162,95 @@ fn dir_mode_open_pipeline() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// 多选语义（§15.5）：普通点击=单选+换锚点+播放；Ctrl/Shift 只改选区
+/// **恒不播放**（play 开头清 error/notice——无 archive 测试环境下以此
+/// 观测 play 是否被调）；Ctrl=toggle 独立加选/移除；Shift=从锚点连选
+/// （含反向、整段替换）；锚点是代际残留（不在当前行缓存）时退化单行
+/// 不 panic；无锚点 Shift = 单选+锚点落地、不播放
+#[test]
+fn row_click_multi_select_semantics() {
+    let mut app = App::new_for_test(crate::config::Config::default());
+    app.list_rows = (0..5)
+        .map(|i| super::ListRow {
+            idx: i,
+            label: format!("f{i}.raw"),
+        })
+        .collect();
+    let sel = |a: &App| a.selected.iter().copied().collect::<Vec<_>>();
+
+    // 普通点击：单选 + 锚点跟随 + 播放
+    app.set_err("x");
+    app.apply_row_click(1, egui::Modifiers::NONE);
+    assert_eq!(sel(&app), vec![1]);
+    assert_eq!(app.select_anchor, Some(1));
+    assert!(app.error.is_none(), "普通点击应触发播放（play 清消息）");
+
+    // Ctrl 加选：不覆盖既有选择，锚点移到最新操作行，不播放
+    app.set_err("x");
+    app.apply_row_click(3, egui::Modifiers::CTRL);
+    assert_eq!(sel(&app), vec![1, 3]);
+    assert_eq!(app.select_anchor, Some(3));
+    assert!(app.error.is_some(), "Ctrl 点击不应触发播放");
+
+    // Ctrl 再点已选行：toggle 移除（锚点跟随被点击行——与资源管理器一致）
+    app.apply_row_click(1, egui::Modifiers::CTRL);
+    assert_eq!(sel(&app), vec![3]);
+    assert_eq!(app.select_anchor, Some(1));
+
+    // Shift 反向连选（锚点 1 → 点 0）：整段替换为 0..=1，不播放
+    app.set_err("x");
+    app.apply_row_click(0, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&app), vec![0, 1]);
+    assert!(app.error.is_some(), "Shift 点击不应触发播放");
+
+    // Shift 正向（锚点仍是 1 → 点 4）：替换为 1..=4
+    app.apply_row_click(4, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&app), vec![1, 2, 3, 4]);
+
+    // 锚点残留旧代际（不在行缓存）：Shift 退化单行
+    app.select_anchor = Some(99);
+    app.apply_row_click(2, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&app), vec![2]);
+
+    // 无锚点 Shift：单选+锚点落地，不播放
+    app.select_anchor = None;
+    app.set_err("x");
+    app.apply_row_click(4, egui::Modifiers::SHIFT);
+    assert_eq!(sel(&app), vec![4]);
+    assert_eq!(app.select_anchor, Some(4));
+    assert!(app.error.is_some(), "无锚点 Shift 也不应触发播放");
+}
+
+/// 切包清空多选（§15.5）：entry 下标对新包是错位引用，apply_open_done
+/// 必须清空 selected 与范围锚点
+#[test]
+fn archive_switch_clears_selection() {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root =
+        std::env::temp_dir().join(format!("ui_sel_clear_{}_{}", std::process::id(), uniq));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("b.mp4"), b"v").unwrap();
+
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = root.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    let vfs: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&root, media_pred(), 0).unwrap());
+    let entries = vfs.list();
+    assert!(!entries.is_empty(), "前置：目录应收集到 1 个媒体");
+
+    // 预置旧包的选择状态后切包
+    app.selected = [1, 2, 4].into_iter().collect();
+    app.select_anchor = Some(2);
+    app.apply_open_done(root.clone(), None, vfs, 7, entries, None);
+    assert!(app.selected.is_empty(), "切包必须清空多选（下标错位引用）");
+    assert_eq!(app.select_anchor, None, "范围锚点一并清除");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// 单媒体文件入口（拖入文件/SendTo/命令行/「打开媒体文件」）回归：
 /// 1) open_path 分流：媒体文件 → 打开父目录 + 记 pending_focus（保留磁盘写法）
 /// 2) spawn_open 按 media.file_open_depth（默认 1）收集：只含目标同级条目
@@ -1245,4 +1334,69 @@ fn open_done_clears_messages_and_keeps_empty_hint() {
     );
 
     let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// 修饰键读取路径回归（DEVLOG §11 根因）：多选点击的修饰键必须取
+/// PointerButton 事件的**内联快照**，不能只依赖跨帧 `i.modifiers`——
+/// 后者窗口失焦即清零且 winit 焦点恢复不重发，按住 Ctrl/Shift 切窗
+/// 再回来修饰键静默丢失（历史「Ctrl/Shift 间歇性不生效」）。
+/// 钉死三场景：内联快照优先（跨帧状态为空也取到）/ 事件缺失回退
+/// 跨帧状态 / press 与 release 修饰不同时取帧末（点击判定时刻）
+#[test]
+fn click_modifiers_prefers_inline_snapshot() {
+    let ctx = egui::Context::default();
+    // 场景 1：PointerButton 内联 Ctrl，跨帧状态为空（失焦清零后未恢复
+    // 的根因现场）→ 应取到 ctrl
+    let mut raw = egui::RawInput::default();
+    for pressed in [true, false] {
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::CTRL,
+        });
+    }
+    ctx.run_ui(raw.take(), |ui| {
+        let m = ui.input(App::click_modifiers);
+        assert!(
+            m.ctrl && !m.shift,
+            "内联快照应生效（跨帧状态为空也能取到 Ctrl）"
+        );
+    })
+    .drop_without_applying_deltas();
+
+    // 场景 2：帧 A 建立跨帧状态（ModifiersChanged(SHIFT)），帧 B 无
+    // PointerButton 事件 → 回退读跨帧状态
+    let mut raw = egui::RawInput::default();
+    raw.events
+        .push(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+    ctx.run_ui(raw.take(), |_| {})
+        .drop_without_applying_deltas();
+    ctx.run_ui(egui::RawInput::default().take(), |ui| {
+        let m = ui.input(App::click_modifiers);
+        assert!(
+            m.shift && !m.ctrl,
+            "事件缺失时应回退跨帧状态 i.modifiers"
+        );
+    })
+    .drop_without_applying_deltas();
+
+    // 场景 3：press 带 Ctrl、release 无修饰（按下后松开前放掉 Ctrl）
+    // → 取帧末 release 的快照（egui click 判定时刻）
+    let mut raw = egui::RawInput::default();
+    for (pressed, modifiers) in
+        [(true, egui::Modifiers::CTRL), (false, egui::Modifiers::default())]
+    {
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        });
+    }
+    ctx.run_ui(raw.take(), |ui| {
+        let m = ui.input(App::click_modifiers);
+        assert!(!m.ctrl, "press 与 release 修饰不同时应取帧末（release）快照");
+    })
+    .drop_without_applying_deltas();
 }

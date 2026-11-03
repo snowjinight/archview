@@ -32,6 +32,8 @@ pub struct Config {
     pub passwords: Vec<String>,
     /// VarTidy（`archview tidy` CLI 子命令）配置
     pub vartidy: VarTidyConfig,
+    /// encode（`archview encode` CLI / UI「编码为视频」）编码参数
+    pub encode: EncodeConfig,
     /// 主程序日志级别：error/warn/info/debug/trace，也支持 EnvFilter 指令
     /// 语法（如 "info,archview::ui::panels=debug" 只开某模块 debug 诊断）。
     /// RUST_LOG 环境变量优先生效
@@ -54,6 +56,35 @@ impl Default for VarTidyConfig {
         Self {
             repo_dir: String::new(),
             report_dir: "auto".into(),
+        }
+    }
+}
+
+/// encode 壳编码参数（ARCHITECTURE §15.5）：壳把 vcodec 组装进 EncodeOptions，
+/// crf/preset/ovcopts 组装成 ovcopts（用户项追加在后，同键后者生效 =
+/// 用户显式项以用户为准；引擎再统一追加 bf=0 兜底，用户显式 bf/bframes 除外）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EncodeConfig {
+    /// ffmpeg 通用视频编码器名（mpv ovc），默认 H.264；libx265 / libsvtav1 等
+    /// 需本机 libmpv 构建内置才可用
+    pub vcodec: String,
+    /// 恒定质量（x264/x265 crf）：越低画质越高体积越大
+    pub crf: u32,
+    /// 编码速度预设（ultrafast…veryslow）
+    pub preset: String,
+    /// 附加编码器选项（ffmpeg 通用键值对，如 "bf=3" / "threads=8"），
+    /// 空串 = 无；同键覆盖 crf/preset 组装出的默认项
+    pub ovcopts: String,
+}
+
+impl Default for EncodeConfig {
+    fn default() -> Self {
+        Self {
+            vcodec: "libx264".into(),
+            crf: 23,
+            preset: "medium".into(),
+            ovcopts: String::new(),
         }
     }
 }
@@ -431,6 +462,7 @@ impl Default for Config {
             codepage: "gbk".into(),
             passwords: Vec::new(),
             vartidy: VarTidyConfig::default(),
+            encode: EncodeConfig::default(),
             log_level: "info".into(),
         }
     }
@@ -754,6 +786,19 @@ prefetch_upstream_mb = 512
 repo_dir = ""
 	# 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
 report_dir = "auto"
+
+[encode]
+	# 「编码为视频」（CLI archview encode / UI 右键「编码为视频…」）编码参数。
+	# vcodec 需本机 libmpv 构建内置；crf/preset 组装为 ovcopts 键值对，
+	# ovcopts 是附加编码器选项（如 "bf=3" / "threads=8"），同键覆盖 crf/preset；
+	# 引擎自动追加 bf=0 兜底（显式给 bf=/bframes= 除外）
+vcodec = "libx264"
+	# 恒定质量（x264/x265 crf）：越低画质越高体积越大
+crf = 23
+	# 编码速度预设（ultrafast…veryslow）
+preset = "medium"
+	# 附加编码器选项；空 = 无
+ovcopts = ""
 "#;
 
 #[cfg(test)]

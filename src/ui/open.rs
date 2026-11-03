@@ -313,6 +313,9 @@ impl App {
                 gen: 0,
             })),
         });
+        // 新包旧选择无意义：清多选与范围锚点（entry 下标对新包是错位引用）
+        self.selected.clear();
+        self.select_anchor = None;
         self.rebuild_view();
         // 单媒体文件入口：目标文件所在目录打开完成（仅目录模式消费——
         // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。

@@ -2,6 +2,7 @@
 //!（本包末项后翻 / N 键主动触发共用）。
 
 use super::*;
+use crate::encode::cli;
 
 impl App {
     /// 密码输入弹窗（加密头=打开阶段 / 加密条目=播放阶段）。窗口视口居中
@@ -192,6 +193,384 @@ impl App {
             sel,
             at_end,
         });
+    }
+
+    // ============ 「编码为视频…」确认窗 + 后台任务（§15.5 UI 执行） ============
+
+    /// 弹出「编码为视频…」确认窗（右键菜单入口）。ctx_row = 右键行
+    /// （序列模式的目标行）；selected ≥2 时精确模式优先（所见即所选，
+    /// 忽略右键行）。校验失败（未命中预设/混族）以红字报错，不开窗
+    pub(super) fn open_encode_dialog(&mut self, ctx_row: Option<usize>) {
+        if self.encode_job.is_some() {
+            self.set_notice("已有编码任务进行中（同时仅一个）");
+            return;
+        }
+        // 组装期只读借 archive/cfg（错误文案先收集，借束后统一 set_err）
+        let assembled: Result<EncodeDialog, String> = (|| {
+            let a = self.archive.as_ref().ok_or("未打开压缩包")?;
+            // ---- 模式与条目集：多选 ≥2 = 精确（自然序）；否则以目标行定位整族 ----
+            let (entries_idx, alt): (Vec<usize>, Option<Vec<usize>>) =
+                if self.selected.len() >= 2 {
+                    let mut v: Vec<usize> = self.selected.iter().copied().collect();
+                    v.sort_by(|&x, &y| {
+                        alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
+                    });
+                    (v, None)
+                } else {
+                    let row = ctx_row.or_else(|| self.selected.iter().next().copied());
+                    let row = row.ok_or("没有可编码的目标行")?;
+                    let name = &a.entries[row].name;
+                    let pi = cli::preset_index(&self.cfg, name).ok_or_else(|| {
+                        format!("文件 [{name}] 未命中任何 [[raw.demux]] 预设（config.toml）")
+                    })?;
+                    // UI 版带下标族收集：全包条目按同一预设分组（组内 name 自然序）。
+                    // 不走 cli::families——它返回条目本体，name→下标回查是 O(n²)
+                    let mut fam: Vec<usize> = a
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| {
+                            !e.is_dir && cli::preset_index(&self.cfg, &e.name) == Some(pi)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    fam.sort_by(|&x, &y| {
+                        alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
+                    });
+                    (fam, Some(vec![row]))
+                };
+            if entries_idx.is_empty() {
+                return Err("没有可编码的文件".into());
+            }
+            // ---- 族一致性校验（CLI 同款文案；序列模式恒过——整族同预设）----
+            let mut fam_id: Option<usize> = None;
+            for &i in &entries_idx {
+                let name = &a.entries[i].name;
+                match cli::preset_index(&self.cfg, name) {
+                    None => {
+                        return Err(format!(
+                            "文件 [{name}] 未命中任何 [[raw.demux]] 预设（config.toml）"
+                        ))
+                    }
+                    Some(p) => match fam_id {
+                        None => fam_id = Some(p),
+                        Some(prev) if prev == p => {}
+                        Some(prev) => {
+                            let x = &self.cfg.raw.demux[prev].r#match;
+                            let y = &self.cfg.raw.demux[p].r#match;
+                            return Err(format!(
+                                "选中的文件命中多个不同预设（{x} 与 {y}），\
+                                 不是同一序列；请只选同一族的文件"
+                            ));
+                        }
+                    },
+                }
+            }
+            let preset = &self.cfg.raw.demux[fam_id.unwrap()];
+            // 输出基目录：压缩包=所在目录；目录集合模式=目录本身（与 CLI 同口径）
+            let base = if a.path.is_dir() {
+                a.path.clone()
+            } else {
+                a.path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default()
+            };
+            let ve: Vec<VirtualEntry> =
+                entries_idx.iter().map(|&i| a.entries[i].clone()).collect();
+            Ok(EncodeDialog {
+                entries: entries_idx,
+                alt_entries: alt,
+                whole: true,
+                preset_match: preset.r#match.clone(),
+                fmt: cli::encode_format(preset),
+                out: cli::default_output(&base, &ve[0].name)
+                    .display()
+                    .to_string(),
+                warnings: cli::numbering_gaps(&ve),
+            })
+        })();
+        match assembled {
+            Ok(d) => self.encode_dialog = Some(d),
+            Err(e) => self.set_err(e),
+        }
+    }
+
+    /// 「编码为视频…」双形态窗（§15.5）：任务在跑 = 进度窗（进度条+取消）；
+    /// 否则 = 确认窗（概要 / 二选一 / fps / 输出路径 / 警告 / 开始）
+    pub(super) fn encode_dialog_window(&mut self, ctx: &egui::Context) {
+        // ---- 形态一：进度窗（后台任务在跑） ----
+        if let Some(job) = self.encode_job.as_ref() {
+            let cancel = job.cancel.clone();
+            let progress = job.progress;
+            let out_disp = job.out.display().to_string();
+            let secs = job.started.elapsed().as_secs_f64();
+            let mut cancelled = false;
+            egui::Window::new("编码中…")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(format!("输出：{out_disp}"));
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::ProgressBar::new((progress / 100.0).clamp(0.0, 1.0))
+                            .show_percentage(),
+                    );
+                    ui.weak(format!("已运行 {secs:.0} s · 编码器独立于播放，可继续浏览"));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("取消编码").clicked() {
+                                cancelled = true;
+                            }
+                        });
+                    });
+                });
+            if cancelled {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        // ---- 形态二：确认窗 ----
+        let mut start = false;
+        let mut cancelled = false;
+        let mut swap = false;
+        if let Some(d) = self.encode_dialog.as_mut() {
+            let out_trim = d.out.trim().to_string();
+            let out_exists = !out_trim.is_empty() && std::path::Path::new(&out_trim).exists();
+            egui::Window::new("编码为视频")
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.set_min_width(400.0);
+                    ui.label(format!(
+                        "{} 个文件 · 预设 [{}]（{}×{} {}）",
+                        d.entries.len(),
+                        d.preset_match,
+                        d.fmt.width,
+                        d.fmt.height,
+                        d.fmt.pixfmt
+                    ));
+                    // 单选二选一（序列模式；多选精确模式无此项）
+                    if let Some(alt) = &d.alt_entries {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .radio(d.whole, format!("整个序列（{} 帧）", d.entries.len()))
+                                .clicked()
+                                && !d.whole
+                            {
+                                swap = true;
+                            }
+                            if ui.radio(!d.whole, format!("仅此文件（{} 帧）", alt.len()))
+                                .clicked()
+                                && d.whole
+                            {
+                                swap = true;
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("帧率：");
+                        ui.add(
+                            egui::DragValue::new(&mut d.fmt.fps)
+                                .range(1.0..=240.0)
+                                .speed(0.5)
+                                .suffix(" fps"),
+                        );
+                        ui.weak("来自预设，可改");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("输出：");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.out)
+                                .desired_width((ui.available_width() - 40.0).max(60.0)),
+                        );
+                    });
+                    if out_exists {
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            "输出文件已存在——拒绝覆盖，请修改路径",
+                        );
+                    }
+                    for w in &d.warnings {
+                        let warn_c = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(224, 172, 76)
+                        } else {
+                            egui::Color32::from_rgb(146, 102, 12)
+                        };
+                        ui.colored_label(warn_c, format!("警告：{w}"));
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !out_exists && !out_trim.is_empty(),
+                                    egui::Button::new("开始编码"),
+                                )
+                                .clicked()
+                            {
+                                start = true;
+                            }
+                            if ui.button("取消").clicked() {
+                                cancelled = true;
+                            }
+                        });
+                    });
+                });
+        }
+        if swap {
+            self.encode_dialog_swap();
+        }
+        if start {
+            self.start_encode();
+        } else if cancelled {
+            self.encode_dialog = None;
+        }
+    }
+
+    /// 确认窗二选一切换：交换 entries ↔ alt_entries（whole 翻转），重算
+    /// 默认输出与警告（首帧变了，断点集合随之变）
+    fn encode_dialog_swap(&mut self) {
+        let Some(mut d) = self.encode_dialog.take() else {
+            return;
+        };
+        if let Some(a) = self.archive.as_ref() {
+            if let Some(alt) = d.alt_entries.take() {
+                let prev = std::mem::replace(&mut d.entries, alt);
+                d.alt_entries = Some(prev);
+                d.whole = !d.whole;
+                let base = if a.path.is_dir() {
+                    a.path.clone()
+                } else {
+                    a.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+                };
+                let ve: Vec<VirtualEntry> =
+                    d.entries.iter().map(|&i| a.entries[i].clone()).collect();
+                d.out =
+                    cli::default_output(&base, &ve[0].name).display().to_string();
+                d.warnings = cli::numbering_gaps(&ve);
+            }
+        }
+        self.encode_dialog = Some(d);
+    }
+
+    /// 从确认窗启动后台编码（§15.5：线程跑引擎 + mpsc 回报；同时仅一个
+    /// 任务，编码 mpv 实例独立——播放不受影响）。dialog 随之关闭，进度
+    /// 由 encode_dialog_window 的进度窗形态接管
+    fn start_encode(&mut self) {
+        let Some(d) = self.encode_dialog.take() else {
+            return;
+        };
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
+        if d.out.trim().is_empty() {
+            self.set_err("输出路径为空");
+            return;
+        }
+        let out = PathBuf::from(d.out.trim());
+        if out.exists() {
+            self.set_err("输出文件已存在，拒绝覆盖");
+            return;
+        }
+        let entries: Vec<VirtualEntry> = d.entries.iter().map(|&i| a.entries[i].clone()).collect();
+        let vfs = a.vfs.clone();
+        let fmt = d.fmt;
+        let dll = self.cfg.dll_path();
+        let opts = cli::encode_options(&self.cfg.encode);
+        tracing::info!(
+            "UI 编码任务启动：{} 个文件（{}x{} {} @ {}fps）→ {}",
+            entries.len(),
+            fmt.width,
+            fmt.height,
+            fmt.pixfmt,
+            fmt.fps,
+            out.display()
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = cancel.clone();
+        let egui_ctx = self.egui_ctx.clone();
+        let out_t = out.clone();
+        std::thread::spawn(move || {
+            // 进度节流：引擎每帧回调（全速转码下极密），≥100ms 才发一次；
+            // Cell 单线程内部可变性（回调是 &dyn Fn，不能 FnMut）
+            let last = std::cell::Cell::new(None::<std::time::Instant>);
+            let progress = |p: f64| {
+                let now = std::time::Instant::now();
+                let due =
+                    !matches!(last.get(), Some(t) if now.duration_since(t).as_millis() < 100);
+                if due {
+                    last.set(Some(now));
+                    let _ = tx.send(EncodeMsg::Progress(p as f32));
+                    egui_ctx.request_repaint();
+                }
+            };
+            let r = crate::encode::encode_raw_sequence(
+                &dll, &vfs, &entries, &fmt, &out_t, &opts, &cancel_t, &progress,
+            );
+            let _ = tx.send(match r {
+                Ok(s) => EncodeMsg::Done(s),
+                Err(e) => EncodeMsg::Failed(e),
+            });
+            egui_ctx.request_repaint();
+        });
+        self.encode_job = Some(EncodeJob {
+            cancel,
+            rx,
+            out,
+            started: std::time::Instant::now(),
+            progress: 0.0,
+        });
+    }
+
+    /// 后台编码任务轮询（update 每帧）：Progress 刷新进度值；终态三分支
+    /// ——Done 绿条 / "已取消" 绿条（用户主动，非错误）/ 其它失败红字。
+    /// 任务收尾即清槽（下个任务可启动）
+    pub(super) fn poll_encode(&mut self) {
+        let mut terminal: Option<Result<crate::encode::EncodeStats, String>> = None;
+        if let Some(job) = self.encode_job.as_mut() {
+            loop {
+                match job.rx.try_recv() {
+                    Ok(EncodeMsg::Progress(p)) => job.progress = p,
+                    Ok(EncodeMsg::Done(s)) => {
+                        terminal = Some(Ok(s));
+                        break;
+                    }
+                    Ok(EncodeMsg::Failed(e)) => {
+                        terminal = Some(Err(e));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        terminal = Some(Err("编码线程已退出".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(res) = terminal {
+            let job = self.encode_job.take().unwrap();
+            let secs = job.started.elapsed().as_secs_f64();
+            match res {
+                Ok(s) => {
+                    self.set_notice(format!(
+                        "编码完成：{} 帧 → {}（{:.1}s，点击打开所在目录）",
+                        s.frames,
+                        job.out.display(),
+                        secs
+                    ));
+                    // 绿条伴随动作：整条可点 → 打开输出所在目录（§15.5）
+                    self.encode_done_dir = job.out.parent().map(|p| p.to_path_buf());
+                }
+                Err(e) if e == "已取消" => self.set_notice("已取消编码"),
+                Err(e) => self.set_err(e),
+            }
+        }
     }
 }
 

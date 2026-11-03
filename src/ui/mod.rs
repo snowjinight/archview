@@ -93,6 +93,46 @@ struct NextArchivePrompt {
     at_end: bool,
 }
 
+/// 「编码为视频…」确认窗状态（§15.5 UI 执行）。打开时由选中集/右键行组装：
+/// 多选（≥2）= 精确模式（所见即所选）；单选/无选 = 序列模式（窗内二选一，
+/// 默认整族）。entries 为 entries 下标（自然序），fmt 来自命中预设（fps 可改）
+struct EncodeDialog {
+    /// 参与编码的条目下标（自然序；「仅所选」与「整族」切换时重建）
+    entries: Vec<usize>,
+    /// 单选二选一：另一档候选（整族）。多选精确模式 = None（无切换）
+    alt_entries: Option<Vec<usize>>,
+    /// 二选一当前档：true = entries（整族，默认）；false = alt_entries（仅此文件）
+    whole: bool,
+    /// 命中预设（显示族信息用；参数真身走 fmt）
+    preset_match: String,
+    /// 编码格式（fps 窗内可改，其余来自预设）
+    fmt: crate::encode::EncodeFormat,
+    /// 输出路径（默认 = 压缩包所在目录/目录本身 + 首帧基名.mp4；已存在拒绝）
+    out: String,
+    /// 编号断点等预警（警告不中止）
+    warnings: Vec<String>,
+}
+
+/// 后台编码任务：线程跑 encode_raw_sequence，mpsc 回报进度/终态。
+/// 同时仅一个（§15.5）；取消 = cancel 置位，引擎 stop 后返回 Err("已取消")
+struct EncodeJob {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<EncodeMsg>,
+    /// 输出路径（完成通知文案 + 已存在校验）
+    out: PathBuf,
+    started: std::time::Instant,
+    /// 最新进度（0~100，poll_encode 更新，进度窗渲染）
+    progress: f32,
+}
+
+/// 编码线程 → UI 消息（progress 回调在引擎线程，跨线程走 channel）
+enum EncodeMsg {
+    /// 0~100
+    Progress(f32),
+    Done(crate::encode::EncodeStats),
+    Failed(String),
+}
+
 /// 后台解压任务（7z/RAR）：UI 侧的期望状态 + 消息通道。真正的解码循环
 /// 在会话线程里（ArchiveState.session 伴生，见 vfs::ArchiveVFS::extract_session），
 /// 跳转只重写会话目标集、不重启解码流；此对象描述"UI 现在想要什么"
@@ -245,6 +285,9 @@ pub struct App {
     // 一次性提示（如缓存清理结果），显示在顶栏。与 error 互斥单槽：
     // 新消息覆盖旧消息，无任何超时（清除路径见 set_notice 注释）
     notice: Option<String>,
+    // 编码完成绿条的伴随动作（§15.5）：Some 时绿条整条可点——点击
+    // 打开输出所在目录。属旧消息的动作随新消息/播放/切内容源失效
+    encode_done_dir: Option<std::path::PathBuf>,
     // 全屏播放中（隐藏所有面板，仅视频+进度条）
     fullscreen: bool,
     // 文件列表当前标签页（视频/图片）
@@ -300,6 +343,16 @@ pub struct App {
     // open_path 分流置位（媒体文件 → 父目录集合），打开完成时 apply_open_done
     // 消费——预切标签页 + 跳转播放该文件；每次 open_path 重置，防旧值残留
     pending_focus: Option<String>,
+    // 文件列表多选（Ctrl+点击 toggle / Shift+范围 / Ctrl+A 全选，§15.5）：
+    // 全局条目下标集（对 entries 稳定，跨搜索过滤保留），「编码为视频…」
+    // 的对象。打开/切换压缩包时清空
+    selected: std::collections::BTreeSet<usize>,
+    // Shift 范围选锚点（最近一次无修饰/Ctrl 点击的行）
+    select_anchor: Option<usize>,
+    // 「编码为视频…」确认窗（§15.5）：None = 关闭
+    encode_dialog: Option<EncodeDialog>,
+    // 后台编码任务（§15.5：同时仅一个；编码 mpv 实例独立，播放不受影响）
+    encode_job: Option<EncodeJob>,
 }
 
 impl App {
@@ -341,6 +394,7 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
+            encode_done_dir: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -366,6 +420,10 @@ impl App {
             config_editor: None,
             initial_open: initial,
             pending_focus: None,
+            selected: Default::default(),
+            select_anchor: None,
+            encode_dialog: None,
+            encode_job: None,
         }
     }
 
@@ -396,6 +454,7 @@ impl App {
             drag_pos: 0.0,
             error: None,
             notice: None,
+            encode_done_dir: None,
             fullscreen: false,
             list_tab: ListTab::Video,
             scrolled_to: None,
@@ -421,6 +480,10 @@ impl App {
             config_editor: None,
             initial_open: None,
             pending_focus: None,
+            selected: Default::default(),
+            select_anchor: None,
+            encode_dialog: None,
+            encode_job: None,
         }
     }
 
@@ -468,6 +531,7 @@ impl App {
         let e = e.into();
         tracing::error!("{e}");
         self.notice = None;
+        self.encode_done_dir = None;
         self.error = Some(e);
     }
 
@@ -475,14 +539,22 @@ impl App {
     ///（update 帧首检测，用户操作了即视为已读），新消息覆盖旧消息
     pub(super) fn set_notice(&mut self, n: impl Into<String>) {
         self.error = None;
+        // 新消息不继承旧消息的伴随动作（调用方随后可再挂自己的动作）
+        self.encode_done_dir = None;
         self.notice = Some(n.into());
     }
 
     /// 帧首：任意鼠标点击即清绿色提示（用户操作了=看过了，无需逐按钮
     /// 判断）。先清后写——本帧稍后由此点击产生的新提示不受影响。
-    /// 只清绿——红色错误代表操作失败，不被无关点击消除
+    /// 只清绿——红色错误代表操作失败，不被无关点击消除。
+    /// 例外：编码完成绿条（encode_done_dir 在场）不可由此清——点击
+    /// 正是它的"打开输出目录"手势（帧首先清会让控件回调永远收不到
+    /// 这次点击），由 panels.rs 绿条自身消费并消条
     pub(super) fn clear_notice_on_click(&mut self, ctx: &egui::Context) {
-        if self.notice.is_some() && ctx.input(|i| i.pointer.any_click()) {
+        if self.notice.is_some()
+            && self.encode_done_dir.is_none()
+            && ctx.input(|i| i.pointer.any_click())
+        {
             self.notice = None;
         }
     }
@@ -564,6 +636,11 @@ impl eframe::App for App {
         // 内嵌 config.toml 编辑器窗口（「配置 → 编辑」）
         self.config_editor_window(&ctx);
         probe!("config_editor");
+        // 「编码为视频…」确认窗 + 后台编码任务轮询（§15.5 UI 执行）
+        self.encode_dialog_window(&ctx);
+        probe!("encode_dialog");
+        self.poll_encode();
+        probe!("poll_encode");
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条
