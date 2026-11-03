@@ -249,6 +249,10 @@ pub struct App {
     cfg: Config,
     archive: Option<ArchiveState>,
     search: String,
+    /// 搜索防抖：输入变化置 dirty 记时间戳，停顿 cfg.ui.search_debounce_ms
+    /// 后由 file_list 重建（0 = 本帧立即）；rebuild_view 统一清零
+    search_dirty: bool,
+    search_last_edit: Option<std::time::Instant>,
     /// 当前播放的 entry（entries 下标）
     playing: Option<usize>,
     /// glow GL 上下文（启动期 CreationContext 注入，照搬开源参考方案）：
@@ -378,6 +382,8 @@ impl App {
             cfg,
             archive: None,
             search: String::new(),
+            search_dirty: false,
+            search_last_edit: None,
             playing: None,
             gl: cc.gl.clone(),
             egui_ctx: cc.egui_ctx.clone(),
@@ -438,6 +444,8 @@ impl App {
             cfg,
             archive: None,
             search: String::new(),
+            search_dirty: false,
+            search_last_edit: None,
             playing: None,
             gl: None,
             egui_ctx: ctx.clone(),

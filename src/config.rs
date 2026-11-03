@@ -409,6 +409,9 @@ pub struct UiConfig {
     /// 字典序，关闭排序对这类包显示无变化。
     /// true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10）
     pub sort_files: bool,
+    /// 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤重建
+    /// （万级条目的大包逐键重建才有感卡顿）。0 = 不防抖，每键即时过滤
+    pub search_debounce_ms: u64,
     /// 解压覆盖层显示前的宽限期（毫秒）：正在播放视频时切换到需解压的条目，
     /// 超过该时长仍未解完才隐藏视频窗口并显示进度覆盖层——快速解压
     /// （缓存命中/小文件）全程不打扰播放，避免窗口闪烁
@@ -440,6 +443,7 @@ impl Default for UiConfig {
             wheel_switch_secs: 0.3,
             ask_next_archive: true,
             sort_files: false,
+            search_debounce_ms: 200,
             extract_overlay_delay_ms: 500,
             image_texture: true,
             image_cache_count: 3,
@@ -747,6 +751,9 @@ ask_next_archive = true
 	# true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10，
 	#   而非字典序的 1/10/2）
 sort_files = false
+	# 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤。
+	# 0 = 不防抖，每键即时过滤（小包最顺手）
+search_debounce_ms = 200
 	# 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
 	# 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
 extract_overlay_delay_ms = 500

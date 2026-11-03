@@ -409,13 +409,40 @@ impl App {
             ui.weak("未打开压缩包或目录");
         }
         ui.horizontal(|ui| {
-            ui.label("Search:");
+            ui.label("Search:").on_hover_text(
+                "高级搜索语法：\n\
+                 空格 = 与（a b 同时包含）\n\
+                 | = 或（a|b 任一包含）\n\
+                 ! = 排除（!a 不包含）\n\
+                 \"...\" = 精确短语（含空格）\n\
+                 * ? = 通配符（多字符/单字符）\n\
+                 <...> = 分组（a <b|c>、!<a|b>）\n\
+                 组合示例：aem num !temp | tnr block",
+            );
             let resp = egui::TextEdit::singleline(&mut self.search)
                 .id(search_box_id())
+                .hint_text("a b 与 | 或 ! 排除 \"短语\" *? 通配 <分组>")
                 .show(ui)
                 .response;
             if resp.changed() {
-                self.rebuild_view();
+                self.search_dirty = true;
+                self.search_last_edit = Some(std::time::Instant::now());
+            }
+            // 防抖：停顿 cfg.ui.search_debounce_ms 后才重建（0 = 本帧立即，
+            // 等价不防抖）。脏了但未到期时 request_repaint_after 预订到期帧
+            // ——egui 按需重绘，不预订的话停手后没人唤醒这一帧
+            if self.search_dirty {
+                let debounce =
+                    std::time::Duration::from_millis(self.cfg.ui.search_debounce_ms);
+                let since = self
+                    .search_last_edit
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                if since >= debounce {
+                    self.rebuild_view(); // 内部统一清 dirty
+                } else {
+                    ui.ctx().request_repaint_after(debounce - since);
+                }
             }
         });
         ui.separator();

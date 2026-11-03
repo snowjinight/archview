@@ -26,6 +26,9 @@ sevenz-rust = { version = "0.6.1", features = ["aes256"] }
 unrar = "0.5.8"
 encoding_rs = "0.8"
 alphanumeric-sort = "1.5"
+# 高级搜索（search_engine）通配符 * ? 展开为正则；
+# 已是 unrar 的间接依赖，显式声明不增加实际编译产物
+regex = "1"
 # 图片解码（静态图 egui 纹理直显）：只启用媒体配置里出现的格式，
 # 避免默认特性的 avif/openexr 等重依赖拖慢编译
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "ico", "tga"] }

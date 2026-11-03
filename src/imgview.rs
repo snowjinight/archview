@@ -1276,12 +1276,27 @@ mod tests {
         assert_eq!(tex.size, [16, 12]);
     }
 
+    /// 读取仓库根 testdata/ 下的测试夹具（二进制夹具不入 src/）。
+    fn read_testdata(name: &str) -> Option<Vec<u8>> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name);
+        std::fs::read(p).ok()
+    }
+
     #[test]
     fn decode_动画webp逐帧() {
         // 夹具：ffmpeg libwebp 生成的 2 帧动画（红/蓝 20×14，100ms/帧，
         // VP8X ANIM 位置位 + ANIM/ANMF 块）——has_animation 路由进 gif
-        // 同款逐帧机制；动图不预放大，帧为画布原尺寸
-        let bytes = include_bytes!("testdata/anim2.webp");
+        // 同款逐帧机制；动图不预放大，帧为画布原尺寸。
+        // 夹具在仓库根 testdata/anim2.webp，缺失时跳过；生成命令：
+        //   ffmpeg -f lavfi -i color=c=red:s=20x14  -frames:v 1 f0.png
+        //   ffmpeg -f lavfi -i color=c=blue:s=20x14 -frames:v 1 f1.png
+        //   ffmpeg -framerate 10 -i f%d.png -loop 0 testdata/anim2.webp
+        let Some(bytes) = read_testdata("anim2.webp") else {
+            eprintln!("跳过：testdata/anim2.webp 不存在（生成命令见本测试注释）");
+            return;
+        };
         let dir = std::env::temp_dir().join(format!("archview_imgtest_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim2.webp");

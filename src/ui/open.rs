@@ -383,18 +383,25 @@ impl App {
         retry_play.map(|(entry_idx, _)| entry_idx).or(focus_idx)
     }
 
-    /// 重新计算过滤视图：搜索框子串匹配 + 只显示媒体文件（视频/图片按 config 分类），
+    /// 重新计算过滤视图：搜索框高级语法匹配（search_engine：空格 AND、| OR、
+    /// ! 排除、"精确短语"、* ? 通配、<分组>，语法说明见根目录 serach.md）
+    /// + 只显示媒体文件（视频/图片按 config 分类），
     /// 按文件名自然序排序（数字段按数值比较：1/2/10，而非字典序的 1/10/2；
     /// 保证序号/上一个下一个顺序稳定，与归档内部顺序无关）。
     /// 同时重建列表行缓存（虚拟化渲染的显示数据）：只在打开/搜索/切标签时执行，
     /// 不再每帧重算——万级条目时每帧 clone/format 是 UI 卡顿的主因
     pub(super) fn rebuild_view(&mut self) {
+        // 本重建即消费当前搜索文本，脏标记统一清零（防抖到期/打开/切标签
+        // 等任何入口调用后，file_list 不再重复触发）
+        self.search_dirty = false;
         let Some(a) = &mut self.archive else {
             self.list_rows.clear();
             self.list_counts = (0, 0);
             return;
         };
-        let search = self.search.to_lowercase();
+        // 解析一次，逐条目评估：无通配符的纯词匹配内部退化为 contains，
+        // 性能与旧子串实现持平；空查询 matches 一切（等价于不过滤）
+        let query = crate::search_engine::parse_query(&self.search);
         a.view = a
             .entries
             .iter()
@@ -402,7 +409,7 @@ impl App {
             .filter(|(_, e)| {
                 !e.is_dir
                     && (self.cfg.is_video_ext(&e.name) || self.cfg.is_image_ext(&e.name))
-                    && (search.is_empty() || e.name.to_lowercase().contains(&search))
+                    && query.matches(&e.name)
             })
             .map(|(i, _)| i)
             .collect();
@@ -428,8 +435,9 @@ impl App {
         // 自动切标签页：当前标签页为空而另一类非空时跳过去。
         // 纯图片/纯视频的包打开时不再停在空列表上让用户误以为没打开
         // （搜索过滤后的空结果不切——那属于"没匹配"而非"没这类文件"，
-        //   需要搜索框为空才切，避免打断用户在另一标签页里搜东西）
-        if search.is_empty() {
+        //   需要搜索框为空才切，避免打断用户在另一标签页里搜东西；
+        //   注意不能用 query.is_empty()：输入 "!" 等无法成词的内容也会解析为空树）
+        if self.search.trim().is_empty() {
             let (n_video, n_image) = {
                 let mut c = (0usize, 0usize);
                 for &i in &a.view {

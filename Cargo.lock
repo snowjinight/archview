@@ -230,6 +230,7 @@ dependencies = [
  "libloading",
  "raw-files",
  "raw-window-handle",
+ "regex",
  "rfd",
  "serde",
  "sevenz-rust",
