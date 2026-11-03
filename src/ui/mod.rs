@@ -351,7 +351,8 @@ pub struct App {
     // 全局条目下标集（对 entries 稳定，跨搜索过滤保留），「编码为视频…」
     // 的对象。打开/切换压缩包时清空
     selected: std::collections::BTreeSet<usize>,
-    // Shift 范围选锚点（最近一次无修饰/Ctrl 点击的行）
+    // Shift 范围选锚点（最近一次 Ctrl 点击的行；无锚点 Shift 自行落地；
+    // 无修饰点击=纯播放，不碰锚点——播放高亮自动追踪但锚点保持稳定）
     select_anchor: Option<usize>,
     // 「编码为视频…」确认窗（§15.5）：None = 关闭
     encode_dialog: Option<EncodeDialog>,

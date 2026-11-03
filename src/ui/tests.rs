@@ -178,24 +178,32 @@ fn row_click_multi_select_semantics() {
         .collect();
     let sel = |a: &App| a.selected.iter().copied().collect::<Vec<_>>();
 
-    // 普通点击：单选 + 锚点跟随 + 播放
+    // 普通点击 = 纯播放：不写入选区、不清选区、不动锚点
     app.set_err("x");
     app.apply_row_click(1, egui::Modifiers::NONE);
-    assert_eq!(sel(&app), vec![1]);
-    assert_eq!(app.select_anchor, Some(1));
+    assert!(sel(&app).is_empty(), "普通点击是播放不是选择");
+    assert_eq!(app.select_anchor, None, "普通点击不落锚点");
     assert!(app.error.is_none(), "普通点击应触发播放（play 清消息）");
 
-    // Ctrl 加选：不覆盖既有选择，锚点移到最新操作行，不播放
+    // Ctrl 加选：只选显式 Ctrl 过的行，锚点移到最新操作行，不播放
     app.set_err("x");
     app.apply_row_click(3, egui::Modifiers::CTRL);
-    assert_eq!(sel(&app), vec![1, 3]);
+    assert_eq!(sel(&app), vec![3]);
     assert_eq!(app.select_anchor, Some(3));
     assert!(app.error.is_some(), "Ctrl 点击不应触发播放");
 
     // Ctrl 再点已选行：toggle 移除（锚点跟随被点击行——与资源管理器一致）
-    app.apply_row_click(1, egui::Modifiers::CTRL);
-    assert_eq!(sel(&app), vec![3]);
-    assert_eq!(app.select_anchor, Some(1));
+    app.apply_row_click(3, egui::Modifiers::CTRL);
+    assert!(sel(&app).is_empty());
+    assert_eq!(app.select_anchor, Some(3));
+
+    // 普通点击播放不破坏既有选区也不动锚点（播放与选区/锚点完全解耦）
+    app.apply_row_click(1, egui::Modifiers::CTRL); // 选区 [1]，锚点 1
+    app.set_err("x");
+    app.apply_row_click(2, egui::Modifiers::NONE);
+    assert_eq!(sel(&app), vec![1], "预览播放不得清空/改动选区");
+    assert_eq!(app.select_anchor, Some(1), "锚点不随播放移动");
+    assert!(app.error.is_none(), "普通点击应触发播放");
 
     // Shift 反向连选（锚点 1 → 点 0）：整段替换为 0..=1，不播放
     app.set_err("x");

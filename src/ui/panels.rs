@@ -1,6 +1,7 @@
 //! 各面板绘制：顶栏（菜单/标签页/搜索/提示）、左侧文件列表（虚拟化）、中央媒体区（mpv 纹理 blit/解压进度覆盖层）、底部控制栏与进度条。
 
 use super::*;
+use egui::AtomExt;
 
 /// 进度条/播放头主题色
 /// 主题强调色（进度条/播放头共用）
@@ -598,6 +599,13 @@ impl App {
                         // strong() 只是提亮色标志且被显式色覆盖）——大写+
                         // 琥珀已够醒目。playing 行仍由 selectable 选中态着
                         // 主题蓝（S 保持琥珀，暖冷对比清晰）
+                        // ⚠ atom_shrink 必须钉在文件名段：egui 的 wrap_mode
+                        //（truncate）只作用于 shrink 原子，多原子未显式指定时
+                        // egui 自动选中**第一个**文本原子（= "S " 前缀），文件
+                        // 名段被 atom.rs 强制 Extend（全宽不截断）→ 行期望宽
+                        // 度=完整文件名宽 → 溢出内容撑宽左面板的 PanelState
+                        //（resizable 面板宽=上一帧内容矩形），表现为"一选中
+                        // 列表就被文件名撑开"。完整文件名在悬停气泡查看。
                         let btn = if sel.contains(&r.idx) {
                             let sel_c = if ui.visuals().dark_mode {
                                 AMBER_DARK
@@ -608,7 +616,8 @@ impl App {
                                 playing == Some(r.idx),
                                 (
                                     egui::RichText::new("S ").color(sel_c),
-                                    egui::RichText::new(r.label.as_str()),
+                                    egui::RichText::new(r.label.as_str())
+                                        .atom_shrink(true),
                                 ),
                             )
                             .truncate()
@@ -762,12 +771,18 @@ impl App {
         }
     }
 
-    /// 文件列表行点击的多选语义（§15.5）。无修饰 = 清空多选、单选并播放；
-    /// Ctrl+点击 = toggle 该行；Shift+点击 = 锚点到该行的范围（list_rows
-    /// 显示序连续段；锚点或目标行被搜索过滤掉 → 退化为单行）。**Ctrl/Shift
-    /// 只改选区、恒不播放**——多选通常为批量编码服务，点一下就切歌反而
-    /// 打断当前播放；无锚点 Shift = 单选+锚点落地（下续 Shift 有范围基准）。
-    /// 锚点 = 最近一次无修饰/Ctrl 点击的行，Shift 不移动锚点（连续扩展）
+    /// 文件列表行点击的多选语义（§15.5）。无修饰 = 纯播放，**不写入也
+    /// 不清空选区，也不动锚点**——选区为批量编码服务，预览播放不应伪造/
+    /// 破坏选区（否则"播放 A 后右键 B"会因 sel 非空误亮编码入口）；
+    /// 锚点也不跟随播放：高亮会追踪"下一个"自动推进，锚点若跟着走，
+    /// Shift 连选会以隐形陈旧位置为基准拉出意外大范围；Ctrl+点击 =
+    /// toggle 该行并落锚点；Shift+点击 = 锚点到该行的范围（list_rows
+    /// 显示序连续段；锚点或目标行被搜索过滤掉 → 退化为单行）。
+    /// **Ctrl/Shift 只改选区、恒不播放**——多选通常为批量编码服务，
+    /// 点一下就切歌反而打断当前播放；无锚点 Shift = 单选+锚点落地
+    ///（下续 Shift 有范围基准）。
+    /// 锚点 = 最近一次 Ctrl 点击（或无锚点 Shift 落地）的行，
+    /// Shift 不移动锚点（连续扩展），无修饰点击不碰锚点
     pub(super) fn apply_row_click(&mut self, idx: usize, mods: egui::Modifiers) {
         if mods.shift {
             let Some(anchor) = self.select_anchor else {
@@ -799,9 +814,8 @@ impl App {
             }
             self.select_anchor = Some(idx);
         } else {
-            self.selected.clear();
-            self.selected.insert(idx);
-            self.select_anchor = Some(idx);
+            // 纯播放：不动 selected 也不动 select_anchor——两者都只由
+            // 显式选择动作（Ctrl/Shift）驱动，与播放状态完全解耦
             self.play(idx);
         }
     }
