@@ -7,8 +7,8 @@ mod config;
 mod encode;
 mod imgview;
 mod player;
-// 文件列表高级搜索语法引擎（AND/OR/NOT/短语/通配/分组）
-mod search_engine;
+// 高级搜索：语法引擎 + 搜索历史（AND/OR/NOT/短语/通配/分组）
+mod search;
 mod ui;
 mod vartidy;
 mod vfs;

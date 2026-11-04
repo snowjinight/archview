@@ -401,7 +401,7 @@ impl App {
         };
         // 解析一次，逐条目评估：无通配符的纯词匹配内部退化为 contains，
         // 性能与旧子串实现持平；空查询 matches 一切（等价于不过滤）
-        let query = crate::search_engine::parse_query(&self.search);
+        let query = crate::search::parse_query(&self.search);
         a.view = a
             .entries
             .iter()

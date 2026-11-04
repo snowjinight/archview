@@ -253,6 +253,9 @@ pub struct App {
     /// 后由 file_list 重建（0 = 本帧立即）；rebuild_view 统一清零
     search_dirty: bool,
     search_last_edit: Option<std::time::Instant>,
+    /// 搜索历史缓存（最近优先）：搜索框聚焦时从磁盘刷新，记录/清空时同步
+    /// 更新；UI 只取前 15 条展示。持久化见 search/history.rs
+    search_history: Vec<String>,
     /// 当前播放的 entry（entries 下标）
     playing: Option<usize>,
     /// glow GL 上下文（启动期 CreationContext 注入，照搬开源参考方案）：
@@ -385,6 +388,7 @@ impl App {
             search: String::new(),
             search_dirty: false,
             search_last_edit: None,
+            search_history: Vec::new(),
             playing: None,
             gl: cc.gl.clone(),
             egui_ctx: cc.egui_ctx.clone(),
@@ -447,6 +451,7 @@ impl App {
             search: String::new(),
             search_dirty: false,
             search_last_edit: None,
+            search_history: Vec::new(),
             playing: None,
             gl: None,
             egui_ctx: ctx.clone(),

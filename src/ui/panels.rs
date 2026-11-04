@@ -420,6 +420,7 @@ impl App {
                  <...> = 分组（a <b|c>、!<a|b>）\n\
                  组合示例：aem num !temp | tnr block",
             );
+            let mut picked: Option<String> = None;
             let resp = egui::TextEdit::singleline(&mut self.search)
                 .id(search_box_id())
                 .hint_text("a b 与 | 或 ! 排除 \"短语\" *? 通配 <分组>")
@@ -428,6 +429,46 @@ impl App {
             if resp.changed() {
                 self.search_dirty = true;
                 self.search_last_edit = Some(std::time::Instant::now());
+            }
+            // 聚焦搜索框即在下方展开最近搜索历史（最多 15 条）：Popup::open
+            // 每帧按聚焦态强制开关 = 聚焦即开、失焦即关，无需自管开关状态。
+            // 单行 TextEdit 回车即失焦（egui 语义），「失焦」天然覆盖回车确认
+            // ——失焦时才把非空查询记入历史，输入中途（200ms 防抖窗口内的
+            // 未完成输入）不会被误记录
+            if resp.gained_focus() {
+                self.search_history = crate::search::history::load_search_history();
+            }
+            if resp.has_focus() {
+                egui::Popup::from_response(&resp)
+                    .open(true)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .width(resp.rect.width().max(200.0))
+                    .show(|ui| {
+                        let mut shown = false;
+                        for q in self.search_history.iter().take(15) {
+                            shown = true;
+                            if ui.button(q.as_str()).clicked() {
+                                picked = Some(q.clone());
+                            }
+                        }
+                        if !shown {
+                            ui.weak("暂无搜索历史");
+                        }
+                        ui.separator();
+                        if ui.button("清空历史").clicked() {
+                            crate::search::history::clear_search_history();
+                            self.search_history.clear();
+                        }
+                    });
+            }
+            if let Some(q) = picked {
+                // 点选历史：填入后走既有防抖重建；不回焦——失焦顺带收起弹层
+                self.search = q;
+                self.search_dirty = true;
+                self.search_last_edit = Some(std::time::Instant::now());
+            } else if resp.lost_focus() && !self.search.trim().is_empty() {
+                self.search_history =
+                    crate::search::history::add_search_history(self.search.trim());
             }
             // 防抖：停顿 cfg.ui.search_debounce_ms 后才重建（0 = 本帧立即，
             // 等价不防抖）。脏了但未到期时 request_repaint_after 预订到期帧
