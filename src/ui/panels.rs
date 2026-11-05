@@ -421,6 +421,8 @@ impl App {
                  组合示例：aem num !temp | tnr block",
             );
             let mut picked: Option<String> = None;
+            // 本帧点了「清空历史」（该点击同样使搜索框失焦，需跳过记录回写）
+            let mut cleared = false;
             let resp = egui::TextEdit::singleline(&mut self.search)
                 .id(search_box_id())
                 .hint_text("a b 与 | 或 ! 排除 \"短语\" *? 通配 <分组>")
@@ -430,43 +432,97 @@ impl App {
                 self.search_dirty = true;
                 self.search_last_edit = Some(std::time::Instant::now());
             }
-            // 聚焦搜索框即在下方展开最近搜索历史（最多 15 条）：Popup::open
-            // 每帧按聚焦态强制开关 = 聚焦即开、失焦即关，无需自管开关状态。
-            // 单行 TextEdit 回车即失焦（egui 语义），「失焦」天然覆盖回车确认
-            // ——失焦时才把非空查询记入历史，输入中途（200ms 防抖窗口内的
-            // 未完成输入）不会被误记录
+            // 搜索框内右侧一键清空「×」：有内容才出现，覆盖在输入框右端内部
+            // （后于 TextEdit 创建，点击命中优先于文本编辑区）
+            if !self.search.is_empty() {
+                let side = resp.rect.height() - 4.0;
+                let btn_rect = egui::Rect::from_center_size(
+                    egui::pos2(
+                        resp.rect.right() - side * 0.5 - 2.0,
+                        resp.rect.center().y,
+                    ),
+                    egui::vec2(side, side),
+                );
+                let clear_btn = ui.put(
+                    btn_rect,
+                    egui::Button::new(egui::RichText::new("×").size(14.0)).frame(false),
+                );
+                if clear_btn.clicked() {
+                    // 立即清空过滤，不等 200ms 防抖
+                    self.search.clear();
+                    self.rebuild_view();
+                }
+            }
+            // 搜索历史弹层（最多 15 条）：点击搜索框进入输入模式时展开；
+            // 没有历史不显示。开关状态由 egui memory 持有，关闭全部走
+            // Popup 内置行为，无手动判断：
+            //   - 点历史项 / 「清空历史」→ 显式 close_id（弹层内部点击
+            //     不触发 CloseOnClickOutside）
+            //   - 点其他任何位置（含再点一次搜索框 = toggle 收起）
+            //     → CloseOnClickOutside
+            //   - Esc → Popup 内置收起
+            //   - 回车 / Tab 离开输入状态 → lost_focus 收起
+            // 打开只在 resp.clicked()（抬起帧）触发而非 gained_focus（按下帧）：
+            // 若按下帧就打开，同一轮点击在抬起帧完成时会被 CloseOnClickOutside
+            // 判成「点击弹层外部」而立刻收起（历史栏闪现即灭的根因）
             if resp.gained_focus() {
                 self.search_history = crate::search::history::load_search_history();
             }
-            if resp.has_focus() {
+            let popup_id = egui::Popup::default_response_id(&resp);
+            // lost_focus 预关闭必须排除「有点击的帧」：egui 默认
+            // SurrenderFocusOn::Clicks——点击完成帧若点击不在 TextEdit 上，
+            // 它当场交出焦点（lost_focus=true）。若此时预关闭弹层，弹层
+            // 在本帧被跳过渲染，按钮 clicked() 永远收不到 = 点不中。
+            // 有点击的帧交给上面的 CloseOnClickOutside 在绘制后再判定
+            let any_click = ui.input(|i| i.pointer.any_click());
+            if self.search_history.is_empty() || (resp.lost_focus() && !any_click) {
+                egui::Popup::close_id(ui.ctx(), popup_id);
+            } else {
+                let set_open = resp.clicked().then_some(egui::SetOpenCommand::Bool(true));
+                // 半透明底色：跟随主题 window_fill 只压 alpha，深浅色主题都不突兀
+                let popup_fill = {
+                    let w = ui.visuals().window_fill;
+                    egui::Color32::from_rgba_unmultiplied(w.r(), w.g(), w.b(), 214)
+                };
+                let frame = egui::Frame::popup(ui.style()).fill(popup_fill);
+                // 弹层与搜索框等宽：Area 的 default_width 只是首帧约束，
+                // 内容最小宽度须显式设为「搜索框宽度 - Frame 左右内边距」，
+                // 否则弹层收缩为最长历史项的自然宽度（比搜索框窄得多）
+                let inner_w = (resp.rect.width() - frame.inner_margin.sum().x).max(0.0);
                 egui::Popup::from_response(&resp)
-                    .open(true)
+                    .open_memory(set_open)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .width(resp.rect.width().max(200.0))
+                    .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                    .width(resp.rect.width())
+                    .frame(frame)
                     .show(|ui| {
-                        let mut shown = false;
+                        ui.set_min_width(inner_w);
+                        // 历史项：无底色按钮，只保留文字（半透明弹层上不叠色块）
                         for q in self.search_history.iter().take(15) {
-                            shown = true;
-                            if ui.button(q.as_str()).clicked() {
+                            if ui.add(egui::Button::new(q.as_str()).frame(false)).clicked() {
                                 picked = Some(q.clone());
+                                egui::Popup::close_id(ui.ctx(), popup_id);
                             }
                         }
-                        if !shown {
-                            ui.weak("暂无搜索历史");
-                        }
                         ui.separator();
-                        if ui.button("清空历史").clicked() {
+                        if ui.add(egui::Button::new("清空历史").frame(false)).clicked() {
                             crate::search::history::clear_search_history();
                             self.search_history.clear();
+                            cleared = true;
+                            // 历史已空 = 不再显示弹层
+                            egui::Popup::close_id(ui.ctx(), popup_id);
                         }
                     });
             }
             if let Some(q) = picked {
-                // 点选历史：填入后走既有防抖重建；不回焦——失焦顺带收起弹层
+                // 点选历史：填入搜索框并立即按该查询重建列表（跳过防抖等待）
                 self.search = q;
-                self.search_dirty = true;
-                self.search_last_edit = Some(std::time::Instant::now());
-            } else if resp.lost_focus() && !self.search.trim().is_empty() {
+                self.rebuild_view(); // 内部清 search_dirty
+            } else if resp.lost_focus() && !cleared && !self.search.trim().is_empty() {
+                // 失焦（含回车确认，单行 TextEdit 回车即失焦）才记录，
+                // 输入中途的未完成查询不会被防抖逻辑误记进历史。
+                // cleared：点「清空历史」也会触发失焦，此时不回写当前查询
+                egui::Popup::close_id(ui.ctx(), popup_id);
                 self.search_history =
                     crate::search::history::add_search_history(self.search.trim());
             }
