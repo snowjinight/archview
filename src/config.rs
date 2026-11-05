@@ -246,7 +246,7 @@ pub struct RawDemux {
 }
 
 fn default_raw_fps() -> f64 {
-    25.0
+    3.0
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -687,6 +687,7 @@ clean_on_switch = false
 	# 命中预设才可见、可播放（预设即参数来源：像素格式 + 宽高；帧数由文件
 	# 大小自动得出，大小必须能被单帧大小整除，否则报错）。
 	# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
+	# fps 可省略，默认 3。
 	# 常用 pixfmt 速查（完整 195 项名单见 README「raw 格式表」）：
 	#   YUV420 8bit   : yuv420p / nv12 / nv21 / yuvj420p
 	#   YUV420 10bit+ : yuv420p10le / p010le / yuv420p16le
@@ -902,7 +903,7 @@ slideshow_secs = 2.0
     }
 
     /// [[raw.demux]] 解析与路由：多条预设按声明序首命中（具体在前、
-    /// 宽泛在后）；省略 fps 取默认 25.0、省略 bit_shift 取默认 0；
+    /// 宽泛在后）；省略 fps 取默认 3.0、省略 bit_shift 取默认 0；
     /// 路由时剥离路径分隔符
     #[test]
     fn raw_demux_parse_and_route() {
@@ -932,10 +933,10 @@ height = 480
         assert_eq!((hit.width, hit.height), (1920, 1080));
         assert_eq!(hit.fps, 30.0);
         assert_eq!(hit.bit_shift, 4, "bit_shift 显式解析");
-        // 其余 .bin 落到宽泛兜底；fps/bit_shift 省略 → 默认 25.0 / 0
+        // 其余 .bin 落到宽泛兜底；fps/bit_shift 省略 → 默认 3.0 / 0
         let fallback = cfg.raw_demux("cap_003.bin").expect("宽泛兜底命中");
         assert_eq!(fallback.pixfmt, "gray");
-        assert_eq!(fallback.fps, 25.0);
+        assert_eq!(fallback.fps, 3.0);
         assert_eq!(fallback.bit_shift, 0, "bit_shift 省略默认 0（不位移）");
         // glob 大小写不敏感 & 路径剥离（预设写文件名，传全路径也能命中）
         assert!(cfg.raw_demux("dir/SENSOR_A_9.BIN").is_some());
