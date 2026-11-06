@@ -27,11 +27,17 @@ impl App {
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // config.toml 编辑器在场：键盘只归编辑器。回车/方向键/空格/字母在
+        // 编辑器里都是编辑操作，全局快捷键若照常消费会抢键（实测回车误触
+        // 全屏、←/→ 误触 seek）。早退后事件流不再被 retain 掉，编辑器的
+        // TextEdit 原生收键，Ctrl+S / Ctrl+/ 检测也读同一事件流
+        if self.config_editor.is_some() {
+            return;
+        }
         // Ctrl+A = 全选当前列表（§15.5 多选基建）。让位：搜索框聚焦（文本框
         // 原生全选）、密码/配置编辑器/编码确认窗在场（它们的 TextEdit 要收
         // 事件）。先于下方"无播放器早退"——列表选择与播放无关
         if self.pw_prompt.is_none()
-            && self.config_editor.is_none()
             && self.encode_dialog.is_none()
             && !self.list_rows.is_empty()
             && ctx.memory(|m| m.focused()) != Some(search_box_id())
