@@ -16,7 +16,7 @@
 | 后台解压 | 7Z / RAR 自动后台解压到缓存目录，完成后无缝播放 |
 | 随机跳看 | 固态包跳转零打断：解码会话常驻，任何跳转只重定向目标、不重启解压；预取窗口随观看位置滑动，连续翻页跨批无等待断崖，看过的条目再点秒开 |
 | 连续看包 | N 键直接弹出同目录压缩包列表；或翻到本包最后一项再往后翻（PgDn / 视频区滚轮 / ">" 按钮）时弹出。默认选中下一个，末包循环回第一个；分卷 RAR 只列首卷，点选任意包打开；本会话看过的包灰色显示；`ui.ask_next_archive` 可关。目录集合模式没有"下一个压缩包"概念，翻到末尾仅顶栏提示 |
-| 裸数据播放 | 非标裸数据（`.yuv` / `.bin` dump 等）经 `[[raw.demux]]` 预设直接播放：预设命中即可见即可播，像素格式 / 宽高 / 帧率由预设提供；详见「播放器 → 非标裸数据播放」 |
+| 裸数据播放 | 非标裸数据（`.yuv` / `.bin` dump 等）经 `[[raw.demux]]` 预设直接播放：内置 nv12 / yuv400 / raw 三条默认预设零配置可用，宽高可从文件名内嵌 `WxH` 兜底，Bayer 排列可自动探测；详见「播放器 → 非标裸数据播放」 |
 | 播放控制 | mpv 风格快捷键、底部全宽进度条拖动 seek、音量调节、静音提示 |
 | 图片自动播放 | PPT 式自动翻页（控制栏播放/暂停按钮或空格切换） |
 | 全屏 | 回车进入，Esc 退出，全屏内快捷键照常可用（双击画面留给图片缩放，不再触发全屏） |
@@ -286,7 +286,7 @@ clean_on_switch = false
 
 > RAM Disk 容量有限：单条目超过剩余空间时（如蓝光原盘），解压前会预检磁盘余量并**直接报错提示**（不再发起注定失败的解压）——此时需手动把 `cache.dir` 改回磁盘目录并重启程序。`clean_on_exit` / `clean_on_switch` 保持 false 即可：RAM Disk 生命周期与系统一致，重启自动归零。
 
-### 播放器配置项（`[media]` / `[player]` / `[ui]` / `[extract]` 节）
+### 播放器配置项（`[media]` / `[raw]` / `[player]` / `[ui]` / `[extract]` 节）
 
 ```toml
 [media]
@@ -299,6 +299,24 @@ image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
 # 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认）；N = 向下 N 层；
 # 0 = 不限制（与「打开媒体目录」一致）
 file_open_depth = 1
+
+[raw]
+# 非标裸数据（raw dump）预设：命中 [[raw.demux]] 才可见、可播放；
+# 宽高可省略（或 0）= 从文件名内嵌 WxH 兜底，fps 可省略（默认 3）。
+# 内置三条默认预设如下（可改可删；在 config.toml 写任何 [[raw.demux]]
+# 即整体替换默认三条），完整写法与校验规则见「非标裸数据播放」
+[[raw.demux]]
+match = "*.nv12"
+pixfmt = "nv12"
+
+[[raw.demux]]
+match = "*.yuv400"
+pixfmt = "gray"
+
+[[raw.demux]]
+match = "*.raw"
+pixfmt = "bayer_auto16le"   # 伪格式：装载时读首帧自动探测 Bayer 排列
+bit_shift = 4               # 12bit 低对齐存 16bit 容器的左移修正
 
 [player]
 # 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
@@ -354,6 +372,7 @@ prefetch_upstream_mb = 512
 |---|---|
 | `media.*_extensions` | 视频 / 图片的文件扩展名识别列表（不区分大小写）；图片列表含相机 RAW（`arw` / `nef` 家族，内嵌预览直读） |
 | `media.file_open_depth` | 打开单个媒体文件（拖入 / 发送到 / 文件菜单「打开媒体文件」）时对其所在目录的递归收集深度：`1` = 只收集同级媒体文件（默认，防盘根/超大目录全盘扫描）；`N` = 向下 N 层；`0` = 不限制（与「打开媒体目录」一致） |
+| `raw.demux` | 非标裸数据预设数组（`[[raw.demux]]`）：`match` 文件名通配 + `pixfmt` + 可选 `width`/`height`/`fps`/`bit_shift`；宽高省略或 0 时从文件名内嵌 `WxH` 兜底。内置三条默认（`*.nv12`→nv12、`*.yuv400`→gray、`*.raw`→bayer_auto16le+bit_shift=4）；config.toml 写任何 `[[raw.demux]]` 即整体替换默认三条。详见「非标裸数据播放」 |
 | `player.hwdec` | 硬件解码（`auto` / `no` / `d3d11va` 等 mpv 取值） |
 | `player.cache_secs` | mpv 缓存秒数，拖回刚看过的片段直接命中缓存，零成本 |
 | `player.demuxer_max_mb` | mpv demuxer 最大缓存（MB） |
