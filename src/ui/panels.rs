@@ -381,7 +381,7 @@ impl App {
     /// 时退回 `i.modifiers` 跨帧状态。不能只用 `i.modifiers`：它由
     /// ModifiersChanged 事件流维护，窗口失焦即清零且 winit 焦点恢复
     /// **不重发**——按住 Ctrl/Shift 期间切窗再回来修饰键就静默丢失，
-    /// 即历史「Ctrl/Shift 间歇性不生效」的根因（DEVLOG §11）
+    /// 即历史「Ctrl/Shift 间歇性不生效」的根因（doc/架构落地开发/11_修饰键两条数据路径.md §11）
     pub(super) fn click_modifiers(i: &egui::InputState) -> egui::Modifiers {
         i.events
             .iter()
@@ -728,7 +728,7 @@ impl App {
                         let mut resp = btn.ui(ui);
                         // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
                         // 一个平面，气泡盖在视频画面上不再被 mpv 原生子窗口遮挡
-                        //（wid 时代因此禁用过 hover，见 ARCHITECTURE.md 11.2）。
+                        //（wid 时代因此禁用过 hover，见 doc/架构设计/11_性能优化与虚拟列表.md §11.2）。
                         // 目录段/文件名双色显示，一眼区分
                         if let Some(es) = entries {
                             let name = es[r.idx].name.as_str();
@@ -851,7 +851,7 @@ impl App {
         }
         if let Some(idx) = action {
             // 多选语义分治（§15.5）：无修饰=单选+播放 / Ctrl=toggle / Shift=范围。
-            // 修饰键走 PointerButton 事件内联快照（click_modifiers，DEVLOG §11）
+            // 修饰键走 PointerButton 事件内联快照（click_modifiers，doc/架构落地开发/11_修饰键两条数据路径.md §11）
             let mods = ui.input(Self::click_modifiers);
             self.apply_row_click(idx, mods);
         }
@@ -1057,7 +1057,7 @@ impl App {
                 );
             }
         }
-        // mpv render API 纹理渲染（ARCHITECTURE.md 13，照搬开源参考实现的
+        // mpv render API 纹理渲染（doc/架构设计/13_渲染架构迁移.md，照搬开源参考实现的
         // PaintCallback 模式）：离屏 FBO ← mpv 绘制 → blit 到 egui 画布。
         // extract_wait 期间该帧不提交画面，覆盖层自然露出（取代旧"隐藏子窗口"）；
         // 图片模式 mpv 已 stop（idle），不提交 PaintCallback（避免黑帧盖住纹理）
@@ -1281,7 +1281,7 @@ impl App {
         if resp.hovered() {
             let (dy, cursor, ctrl) = ui.input(|i| {
                 // 滚轮事件内联 modifiers（原子快照）优先 + 跨帧状态兜底
-                // （同 click_modifiers，免疫失焦清零——DEVLOG §11）
+                // （同 click_modifiers，免疫失焦清零——doc/架构落地开发/11_修饰键两条数据路径.md §11）
                 let mut dy = 0.0_f32;
                 let mut ctrl = i.modifiers.ctrl;
                 for e in &i.events {
@@ -1814,7 +1814,7 @@ impl App {
                             let (icon, tip) = match self.play_mode {
                                 PlayMode::Hold => {
                                     // ▶I：播完即停（剪辑"播到出点"隐喻）。
-                                    // 竖线选形两轮实测（DEVLOG §7.6 第三轮）：
+                                    // 竖线选形两轮实测（doc/架构落地开发/07_UI控制栏布局专项.md §7.6 第三轮）：
                                     // ❚ 一族上飘 1.5px；▮ 同心但宽 12 显胖；
                                     // I 宽 3、顶缘与 ▶ 齐平（Δcy -0.5）定稿
                                     ("▶I", "单文件播放：播完停在末帧（不循环、不自动下一个）｜点击切为列表播放（L）")

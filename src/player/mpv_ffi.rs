@@ -97,7 +97,7 @@ pub struct MpvEventEndFile {
     pub error: c_int,
 }
 
-// ---------- render API（render.h，用于 egui 单平面纹理渲染，ARCHITECTURE.md 13）----------
+// ---------- render API（render.h，用于 egui 单平面纹理渲染，doc/架构设计/13_渲染架构迁移.md）----------
 
 pub type MpvRenderContext = c_void;
 

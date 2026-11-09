@@ -1044,7 +1044,7 @@ impl App {
         if let Some(p) = &self.player {
             // 慢路径不做 bit_shift（设计定案）：bayer 位移适用面窄，不为
             // 它给落盘文件增设 zvf:// 单文件通道或改写解压缓存——shift
-            // 静默忽略，走原装载行为（取舍详见 ARCHITECTURE §13.6）
+            // 静默忽略，走原装载行为（取舍详见 doc/架构设计/13_渲染架构迁移.md §13.6）
             p.load_path(dest, raw_opts.as_ref().map(|r| r.opts.as_str()).unwrap_or(""));
         }
     }

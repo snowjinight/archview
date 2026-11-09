@@ -1,4 +1,4 @@
-//! encode CLI 壳（ARCHITECTURE §15.5）：`archview encode <输入...> [-o out] [-p pw] [-q]`
+//! encode CLI 壳（doc/架构设计/15_encode引擎.md §15.5）：`archview encode <输入...> [-o out] [-p pw] [-q]`
 //!
 //! 输入语义总纲「显式选择即精确」：
 //! - ≥1 个帧文件 = 精确模式：多文件参数是**一个序列的成员**（区别于 tidy 的
@@ -534,7 +534,7 @@ pub(crate) fn numbering_gaps(entries: &[VirtualEntry]) -> Vec<String> {
 
 /// [encode] 节 → 引擎选项。crf/preset 组装为 ovcopts 默认项，用户 ovcopts
 /// 追加在后（mpv ovcopts 同键后值覆盖前值 = 用户显式项以用户为准；
-/// 引擎再统一追加 bf=0 兜底，用户显式 bf/bframes 除外——ARCHITECTURE 15.2）
+/// 引擎再统一追加 bf=0 兜底，用户显式 bf/bframes 除外——doc/架构设计/15_encode引擎.md §15.2）
 pub(crate) fn encode_options(ec: &EncodeConfig) -> EncodeOptions {
     let mut parts = vec![format!("crf={}", ec.crf), format!("preset={}", ec.preset)];
     let user = ec.ovcopts.trim();

@@ -1,6 +1,6 @@
 //! encode 引擎：裸数据 dump 序列 → 视频文件（libmpv encode 模式）。
 //!
-//! 架构定位（ARCHITECTURE.md 不变量）：播放器与 VarTidy 是 VFS 层的两个
+//! 架构定位（doc/架构设计/03_整体架构.md 不变量）：播放器与 VarTidy 是 VFS 层的两个
 //! 并列消费者，本引擎是第三个消费者——输入 `Arc<dyn ArchiveVFS>` +
 //! `VirtualEntry` 序列（DirVFS 磁盘目录 / ZipVFS / 7z / RAR 通吃），
 //! 输出编码文件。UI 与 CLI 均为本引擎的薄壳（后台线程 + 进度展示 /
@@ -19,7 +19,7 @@
 //!   → END_FILE(EOF) = 编码完成
 //! ```
 
-/// CLI 壳（`archview encode` 子命令 + SendTo；ARCHITECTURE §15.5）
+/// CLI 壳（`archview encode` 子命令 + SendTo；doc/架构设计/15_encode引擎.md §15.5）
 pub mod cli;
 
 use crate::config::raw_pixfmt_bits;

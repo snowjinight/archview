@@ -6,7 +6,7 @@ edition = "2021"
 
 [dependencies]
 # glow 后端：eframe 0.34 起默认 wgpu，须显式关闭默认特性指定 glow——
-# mpv render API 需要拿 glow::Context 喂 get_proc_address（ARCHITECTURE.md 13）
+# mpv render API 需要拿 glow::Context 喂 get_proc_address（doc/架构设计/13_渲染架构迁移.md）
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 egui = "0.36"
 glow = "0.17"

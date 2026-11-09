@@ -337,7 +337,7 @@ pub trait ArchiveVFS: Send + Sync {
         None
     }
 
-    /// 校验密码能否解密指定条目（打开阶段密码探测用，ARCHITECTURE.md 12.5）。
+    /// 校验密码能否解密指定条目（打开阶段密码探测用，doc/架构设计/12_VarTidy整理器.md §12.5）。
     /// - Ok(())：密码可用于该条目（或条目未加密，任意密码都通过）
     /// - Err(Password)：密码错误 / 加密但未提供密码
     ///
@@ -384,7 +384,7 @@ fn probe_entry(entries: &[VirtualEntry]) -> Option<&VirtualEntry> {
         .min_by_key(|e| e.size)
 }
 
-/// 打开压缩包并在打开阶段锁定密码（规划期密码探测，ARCHITECTURE.md 12.5）。
+/// 打开压缩包并在打开阶段锁定密码（规划期密码探测，doc/架构设计/12_VarTidy整理器.md §12.5）。
 /// 尝试序列：无密码 → candidates 依次（绝大多数包不加密，无密码零成本直通）。
 /// - 加密头包（7z/RAR）：open 即验密码，候选逐个重开
 /// - 内容加密包（zip AES / 7z / RAR 明文头）：open 恒成功，对最小加密条目

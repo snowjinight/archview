@@ -87,7 +87,7 @@ fn media_pred() -> impl Fn(&str) -> bool {
     }
 }
 
-/// 目录 = 媒体集合模式（ARCHITECTURE.md 4.2）的打开链路回归：
+/// 目录 = 媒体集合模式（doc/架构设计/04_VFS层.md §4.2）的打开链路回归：
 /// 1) spawn_open 目录分支走真实后台线程（DirVFS::open → stream_cb 注册），
 ///    Done 消息携带全部媒体条目、VFS 为 FastSeek、无密码概念
 /// 2) apply_open_done 状态迁移：stream=true（流式快路径）、视图重建
@@ -1344,7 +1344,7 @@ fn open_done_clears_messages_and_keeps_empty_hint() {
     let _ = std::fs::remove_dir_all(&empty);
 }
 
-/// 修饰键读取路径回归（DEVLOG §11 根因）：多选点击的修饰键必须取
+/// 修饰键读取路径回归（doc/架构落地开发/11_修饰键两条数据路径.md §11 根因）：多选点击的修饰键必须取
 /// PointerButton 事件的**内联快照**，不能只依赖跨帧 `i.modifiers`——
 /// 后者窗口失焦即清零且 winit 焦点恢复不重发，按住 Ctrl/Shift 切窗
 /// 再回来修饰键静默丢失（历史「Ctrl/Shift 间歇性不生效」）。

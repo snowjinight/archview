@@ -174,7 +174,7 @@ impl App {
         }
         let Some(a) = &self.archive else { return };
         if a.path.is_dir() {
-            // 目录媒体集合模式（ARCHITECTURE.md 4.2）：路径本身是目录，
+            // 目录媒体集合模式（doc/架构设计/04_VFS层.md §4.2）：路径本身是目录，
             // 没有"同目录下一个压缩包"概念
             self.set_notice("目录集合模式：没有下一个压缩包");
             return;

@@ -1,4 +1,4 @@
-//! VarTidy：var 资源包增量整理流水线（CLI 子命令 `archview tidy`，ARCHITECTURE.md 第 12 章）。
+//! VarTidy：var 资源包增量整理流水线（CLI 子命令 `archview tidy`，doc/架构设计/12_VarTidy整理器.md）。
 //!
 //! 核心原则（不可违反）：
 //! 1. 仓库只读 + 增量：仓库已有文件/文件夹一律不动，仅创建新作者目录、写入仓库没有的新 var
@@ -757,7 +757,7 @@ fn build_report_text(
 // ============================================================
 
 const USAGE: &str = "\
-archview tidy — var 资源包增量整理（架构与规则见 ARCHITECTURE.md 第 12 章）
+archview tidy — var 资源包增量整理（架构与规则见 doc/架构设计/12_VarTidy整理器.md）
 
 用法: archview tidy <压缩包或目录> [更多输入...] [选项]
 

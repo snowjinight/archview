@@ -166,7 +166,7 @@ impl App {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
                 // Ctrl+S：编辑器肌肉记忆，防"以为存了"（写盘/校验失败会保留窗口提示）。
-                // 修饰键取 Key 事件内联字段（原子快照，免疫失焦清零——DEVLOG §11）
+                // 修饰键取 Key 事件内联字段（原子快照，免疫失焦清零——doc/架构落地开发/11_修饰键两条数据路径.md §11）
                 if ui.input(|i| {
                     i.events.iter().any(|e| {
                         matches!(
@@ -203,7 +203,7 @@ impl App {
                         // Ctrl+/：选中行注释切换（无选区 = 光标所在行）。
                         // TextEdit 无此内置命令不消费按键；cursor_range 仅在
                         // 编辑器持有焦点时为 Some（恰好是语义要求）。
-                        // 修饰键取 Key 事件内联字段（DEVLOG §11）
+                        // 修饰键取 Key 事件内联字段（doc/架构落地开发/11_修饰键两条数据路径.md §11）
                         if let Some(cr) = out.cursor_range {
                             if ui.input(|i| {
                                 i.events.iter().any(|e| {

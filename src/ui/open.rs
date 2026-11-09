@@ -16,7 +16,7 @@ impl App {
     }
 
     /// 打开目录按钮：目录即媒体集合（递归收集图片/视频，跳过压缩包——
-    /// 与拖放/命令行参数同一条规则，ARCHITECTURE.md 4.2）。
+    /// 与拖放/命令行参数同一条规则，doc/架构设计/04_VFS层.md §4.2）。
     /// 空集合提示在打开完成时统一给出（poll_open 的 Done 分支）
     pub(super) fn open_dir_dialog(&mut self) {
         let Some(dir) = rfd::FileDialog::new().pick_folder() else {
@@ -150,12 +150,12 @@ impl App {
                     stage: stage.into(),
                 });
                 // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
-                // ARCHITECTURE.md 4.2）——无加密概念，不走密码探测链；文件模式照旧
+                // doc/架构设计/04_VFS层.md §4.2）——无加密概念，不走密码探测链；文件模式照旧
                 let opened = if path_t.is_dir() {
                     DirVFS::open(&path_t, is_media, dir_depth)
                         .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
                 } else {
-                    // 打开阶段即探测并锁定密码（ARCHITECTURE.md 12.5）：
+                    // 打开阶段即探测并锁定密码（doc/架构设计/12_VarTidy整理器.md §12.5）：
                     // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
                     // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
                     open_with_password_probe(&path_t, &candidates)

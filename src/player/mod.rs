@@ -100,7 +100,7 @@ fn make_fbo(gl: &glow::Context, w: i32, h: i32) -> (glow::NativeFramebuffer, glo
     }
 }
 
-/// render API 状态（ARCHITECTURE.md 13）。生存到 shutdown_render（eframe on_exit，
+/// render API 状态（doc/架构设计/13_渲染架构迁移.md）。生存到 shutdown_render（eframe on_exit，
 /// GL current 线程、早于 mpv terminate）——顺序不可颠倒。
 struct RenderState {
     rctx: *mut mpv_ffi::MpvRenderContext,
@@ -419,7 +419,7 @@ impl PlayerService {
         mpv_ffi::stream_cb_add_ro(ctx, "zvf", null_mut(), stream_cb::open_cb)
             .map_err(|e| format!("注册 zvf:// 协议失败: {e}"))?;
 
-        // render API 模式（ARCHITECTURE.md 13）：vo=libmpv 必须在 create_render_context
+        // render API 模式（doc/架构设计/13_渲染架构迁移.md）：vo=libmpv 必须在 create_render_context
         // 之前设置；timing-offset=0 配合 render_gl_render 的 BLOCK_FOR_TARGET_TIME=0
         // （render.h 建议）：render 永不阻塞，帧节奏由 vsync 连续重绘保证
         s.opt("vo", "libmpv");

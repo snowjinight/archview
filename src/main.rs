@@ -14,8 +14,8 @@ mod vartidy;
 mod vfs;
 
 fn main() -> eframe::Result<()> {
-    // CLI 子命令分发：`archview tidy ...` = var 资源包增量整理（ARCHITECTURE.md 第 12 章），
-    // `archview encode ...` = 帧序列 dump → 视频（ARCHITECTURE.md 15.5），
+    // CLI 子命令分发：`archview tidy ...` = var 资源包增量整理（doc/架构设计/12_VarTidy整理器.md），
+    // `archview encode ...` = 帧序列 dump → 视频（doc/架构设计/15_encode引擎.md §15.5），
     // 无参数 = GUI 播放器（行为不变）。
     // GUI 模式下命令行中的压缩包/目录作为初始打开目标
     // （SendTo「Archview player」快捷方式 / 拖到 exe 上 / 文件关联）
@@ -79,9 +79,9 @@ fn main() -> eframe::Result<()> {
 }
 
 /// GUI 启动参数解析：压缩包文件直接打开；目录即媒体集合（递归收集图片/视频，
-/// 跳过压缩包——与拖放/打开目录对话框同一条规则，ARCHITECTURE.md 4.2）；
+/// 跳过压缩包——与拖放/打开目录对话框同一条规则，doc/架构设计/04_VFS层.md §4.2）；
 /// 单个媒体文件（视频/图片，按 config 扩展名判定）也接受——open_path 会
-/// 分流为"其所在目录集合 + 跳转播放该文件"（ARCHITECTURE.md 4.2 单文件入口）。
+/// 分流为"其所在目录集合 + 跳转播放该文件"（doc/架构设计/04_VFS层.md §4.2 单文件入口）。
 /// 混合多选（目录+压缩包同时"发送到"）按参数顺序取第一个有效项，其余忽略。
 /// 非路径/非压缩包/非媒体文件参数忽略——保持无参数启动行为完全不变
 fn initial_archive(args: &[String], cfg: &config::Config) -> Option<std::path::PathBuf> {

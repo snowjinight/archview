@@ -40,7 +40,7 @@ pub struct Config {
     pub log_level: String,
 }
 
-/// VarTidy 配置：仓库与报告路径集中此处，代码零硬编码（ARCHITECTURE.md 12.6）
+/// VarTidy 配置：仓库与报告路径集中此处，代码零硬编码（doc/架构设计/12_VarTidy整理器.md §12.6）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VarTidyConfig {
@@ -60,7 +60,7 @@ impl Default for VarTidyConfig {
     }
 }
 
-/// encode 壳编码参数（ARCHITECTURE §15.5）：壳把 vcodec 组装进 EncodeOptions，
+/// encode 壳编码参数（doc/架构设计/15_encode引擎.md §15.5）：壳把 vcodec 组装进 EncodeOptions，
 /// crf/preset/ovcopts 组装成 ovcopts（用户项追加在后，同键后者生效 =
 /// 用户显式项以用户为准；引擎再统一追加 bf=0 兜底，用户显式 bf/bframes 除外）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,7 +240,7 @@ pub struct RawDemux {
     /// 只剩 16 级灰阶——播放发黑根因。12bit→16bit 容器填 4，10bit 填 6。
     /// 约束：>0 时 pixfmt 须以 "le" 结尾（按 LE u16 采样移位）；仅快路径
     /// （zip 流式 / 目录模式 zvf:// 流层）生效，7z/RAR 落盘路径不支持
-    /// （设计定案：适用面窄，不为慢路径增加复杂度，见 ARCHITECTURE §13.6）
+    /// （设计定案：适用面窄，不为慢路径增加复杂度，见 doc/架构设计/13_渲染架构迁移.md §13.6）
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub bit_shift: u32,
 }
@@ -290,7 +290,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// 深度累加）在 10/12bit 格式上更大——帧字节数校验以此为基才与文件
 /// 实际大小吻合。MIPI packed bayer（mipi_rggb10 等）不在本名单：跨像素
 /// 位打包与「容器位数」口径不符（W×H×bits÷8 整除校验不适用）——libmpv
-/// 较新 ffmpeg 实际认识该名（e2e 实测，DEVLOG §8.3 坑 B），本表是有意
+/// 较新 ffmpeg 实际认识该名（e2e 实测，doc/架构落地开发/08_RAW媒体支持专项.md §8.3 坑 B），本表是有意
 /// 收窄：前置拦截报错优先于让 mpv 试载。
 pub const RAWVIDEO_PIXFMTS: &[(&str, u32)] = &[
     // Bayer（12，全部仅输入；packed MIPI 10/12bit 不在 ffmpeg 名单）
@@ -764,7 +764,7 @@ image_texture = true
 	# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
 image_cache_count = 3
 	# 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
-	# 升级资格判据同此值（详见 ARCHITECTURE.md 13.4 两档策略）
+	# 升级资格判据同此值（详见 doc/架构设计/13_渲染架构迁移.md §13.4 两档策略）
 image_max_dim = 4096
 	# 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
 	# （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244%

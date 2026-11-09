@@ -365,7 +365,7 @@ prefetch_upstream_mb = 512
 | `ui.extract_overlay_delay_ms` | 解压进度覆盖层的宽限期（毫秒）：播放中切到需解压的条目，超过该时长仍未解完才隐藏视频显示进度；快速解压全程不打扰播放 |
 | `ui.image_texture` | 图片走 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均走此链路）。解码失败的图片自动回退 mpv |
 | `ui.image_cache_count` | 图片纹理 LRU 缓存张数（含当前张），预解码 ±1 相邻页，翻页零等待 |
-| `ui.image_max_dim` | 基础纹理档尺寸上限（预放大 ×ppp 后超过则原尺寸直进）；full 高清档升级资格判据同此值（详见 ARCHITECTURE.md 13.4 两档策略） |
+| `ui.image_max_dim` | 基础纹理档尺寸上限（预放大 ×ppp 后超过则原尺寸直进）；full 高清档升级资格判据同此值（详见 [架构设计 13.4 两档策略](doc/架构设计/13_渲染架构迁移.md)） |
 | `ui.image_full_threshold` | 高清档触发/换画阈值：屏幕物理像素超过基础纹理该倍数（zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244% 滚轮档（×1.25⁴ ≈ 2.44）才升级；调小（如 1.4）更早升级对比，调大（如 3.0）基本关闭 |
 | `ui.image_full_sharpen` | 高清档 Lanczos 放大后叠加 unsharp mask 锐化（补偿插值摊平的边缘坡度；强对比边缘可能有轻微光晕，可关闭对比） |
 | `extract.prefetch_downstream_mb` | 下游预取上限（MB），0 = 关闭：solid 包（7z / solid RAR）解压时顺带预取下标更大的后续文件，一次顺序解压流解出一批，翻页直接命中 |
@@ -467,7 +467,7 @@ report_dir = "auto"
 
 | 配置项 | 说明 |
 |---|---|
-| `vartidy.repo_dir` | var 仓库目录，必须已存在（整理器绝不修改仓库已有内容）；空 = 未配置，CLI 需 `-o` 指定；详见 ARCHITECTURE.md 第 12 章 |
+| `vartidy.repo_dir` | var 仓库目录，必须已存在（整理器绝不修改仓库已有内容）；空 = 未配置，CLI 需 `-o` 指定；详见 [架构设计第 12 章](doc/架构设计/12_VarTidy整理器.md) |
 | `vartidy.report_dir` | 报告输出目录，`auto` = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净） |
 
 ## 从源码构建
@@ -507,12 +507,14 @@ package.bat no-mpv     rem 精简包（不含 mpv，自行下载放 exe 同目�
 - 兜底代码页只用一个配置编码（默认 GBK/简中）：密码侧只追加一个候选；zip 文件名侧 UTF-8 校验失败后也只用它解码。包若在日文等其它代码页系统上创建，需把 `codepage` 改为对应编码（如 `shift_jis`）。GBK/Shift-JIS 等双字节编码之间无法从字节层自动区分。
 - 视频缩略图、播放进度记忆：规划中。
 - raw dump（`[[raw.demux]]`）的宽高与像素格式需按文件名预设，不能按文件内容自动推算：列为后续增强。
-- raw dump 的 `bit_shift` 位移修正仅快路径（zip 流式 / 目录模式）生效：bayer 位移适用面窄，不为 7z/RAR 落盘路径增加代码与架构复杂度（设计定案，见 ARCHITECTURE §13.6）。
+- raw dump 的 `bit_shift` 位移修正仅快路径（zip 流式 / 目录模式）生效：bayer 位移适用面窄，不为 7z/RAR 落盘路径增加代码与架构复杂度（设计定案，见 [架构设计 §13.6](doc/架构设计/13_渲染架构迁移.md)）。
 
 ## 更多文档
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)：架构设计——VFS 抽象层、双路径播放、密码链路、缓存策略、线程模型、模块清单、大包性能设计。
-- [DEVLOG.md](DEVLOG.md)：修复记录 / 踩坑手册 / 日志排查对照 / 测试运行方式与覆盖矩阵。
+架构与开发文档按节拆分在 `doc/` 目录下，按需阅读：
+
+- [doc/架构设计/](doc/架构设计/README.md)：架构设计（原 ARCHITECTURE.md）——VFS 抽象层、双路径播放、密码链路、缓存策略、线程模型、模块清单、大包性能设计。
+- [doc/架构落地开发/](doc/架构落地开发/README.md)：修复记录 / 踩坑手册 / 日志排查对照 / 测试运行方式与覆盖矩阵（原 DEVLOG.md）。
 
 ## 开源协议
 
