@@ -208,28 +208,64 @@ impl Default for MediaConfig {
 /// 非标裸数据（raw dump）配置：这些文件不是标准容器，无法探测参数，
 /// 统一走 mpv rawvideo demuxer（视频桶），由 [[raw.demux]] 预设提供
 /// 像素格式 + 宽高 + fps（经 loadfile per-file 选项下发）
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RawConfig {
     /// demux 预设（按声明顺序取首个 glob 命中：先写具体、后写宽泛）。
     /// 预设是裸数据唯一入口：glob 命中才可见、可播——不再有独立扩展名
     /// 清单（.yuv/.bin 等非标扩展名都只靠这里声明，防「可见但不可播」
-    /// 的中间态）。序列化时为空则省略——TOML 不允许向静态定义的数组追加
-    /// [[raw.demux]]，默认模板只给注释示例，由用户自行追加
+    /// 的中间态）。默认内置三类 FPGA dump 常见后缀（nv12/yuv400/raw），
+    /// 宽高交由文件名内嵌 WxH 兜底（[[raw.demux]] 数组不逐项 backfill：
+    /// 用户已有任一预设则整用用户的，需要默认三条时手动复制）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub demux: Vec<RawDemux>,
 }
 
+impl Default for RawConfig {
+    fn default() -> Self {
+        RawConfig {
+            demux: vec![
+                // NV12 8bit 半平面 dump
+                RawDemux {
+                    r#match: "*.nv12".into(),
+                    pixfmt: "nv12".into(),
+                    fps: default_raw_fps(),
+                    ..Default::default()
+                },
+                // YUV400 = 8bit 单色平面
+                RawDemux {
+                    r#match: "*.yuv400".into(),
+                    pixfmt: "gray".into(),
+                    fps: default_raw_fps(),
+                    ..Default::default()
+                },
+                // unpacked Bayer dump：12bit 低对齐存 16bit 容器；
+                // bayer_auto16le = 伪格式，装载时自动探测排列（见 raw_pixfmt_bits）
+                RawDemux {
+                    r#match: "*.raw".into(),
+                    pixfmt: "bayer_auto16le".into(),
+                    fps: default_raw_fps(),
+                    bit_shift: 4,
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+}
+
 /// 单条 raw dump 播放预设：文件名 glob → 像素格式 + 宽高 + fps
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RawDemux {
     /// 文件名通配：* 与 ?（大小写不敏感；写文件名，不含路径）
     pub r#match: String,
-    /// FFmpeg 像素格式名（支持名单见 RAWVIDEO_PIXFMTS / README「raw 格式表」）
+    /// FFmpeg 像素格式名（支持名单见 RAWVIDEO_PIXFMTS / README「raw 格式表」；
+    /// 另支持伪格式 bayer_auto16le = 自动探测排列）
     pub pixfmt: String,
-    /// 帧宽（像素）。0 = 暂不支持（自动推算列为后续增强）
+    /// 帧宽（像素）。省略或 0 = 从文件名内嵌 WxH 兜底（见 parse_filename_dims）
+    #[serde(default)]
     pub width: u32,
-    /// 帧高（像素）
+    /// 帧高（像素）。省略或 0 = 从文件名内嵌 WxH 兜底
+    #[serde(default)]
     pub height: u32,
     /// 帧率
     #[serde(default = "default_raw_fps")]
@@ -371,10 +407,64 @@ pub const RAWVIDEO_PIXFMTS: &[(&str, u32)] = &[
 /// 供不读文件的整除校验）；None = 名字不合法/不可裸读（含 MIPI packed
 /// bayer、调色板 pal8、硬件格式），调用方报错并列出支持名单
 pub fn raw_pixfmt_bits(pixfmt: &str) -> Option<u32> {
+    // 伪格式（不在 RAWVIDEO_PIXFMTS / ffmpeg 名单）：16bit 容器 Bayer，
+    // 排列（RGGB/BGGR/GRBG/GBRG）装载时由像素统计自动探测（仅播放链路；
+    // encode 引擎引用本函数的调用点须显式拦截，防伪格式漏进 ffmpeg 滤镜图）
+    if pixfmt.eq_ignore_ascii_case("bayer_auto16le") {
+        return Some(16);
+    }
     RAWVIDEO_PIXFMTS
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(pixfmt))
         .map(|(_, b)| *b)
+}
+
+/// 从文件名提取内嵌分辨率候选（按出现顺序）：`WxH`（分隔符 x/X）。
+/// 边界规则：数字段两端不得邻接字母/数字（防 v2x4、mp3x4 类误匹配；
+/// "0x10" 十六进制因 W=0 天然被拒）；段长 1~5 位数字（≤99999）。
+/// 返回空 = 文件名不含可用分辨率。例：
+/// `fpga_in_s0_1920x1080_00_12345.raw` → [(1920, 1080)]
+pub fn parse_filename_dims(name: &str) -> Vec<(u32, u32)> {
+    let b = name.as_bytes();
+    // x 位置左侧数字串起点（b[s..x] 全数字且 s-1 非字母数字）
+    let digits_before = |x: usize| -> Option<usize> {
+        let mut s = x;
+        while s > 0 && b[s - 1].is_ascii_digit() {
+            s -= 1;
+        }
+        let len = x - s;
+        if len == 0 || len > 5 || (s > 0 && b[s - 1].is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some(s)
+    };
+    // x 位置右侧数字串区间 [x+1, e)（e 处非字母数字）
+    let digits_after = |x: usize| -> Option<(usize, usize)> {
+        let mut e = x + 1;
+        while e < b.len() && b[e].is_ascii_digit() {
+            e += 1;
+        }
+        let len = e - (x + 1);
+        if len == 0 || len > 5 || (e < b.len() && b[e].is_ascii_alphanumeric()) {
+            return None;
+        }
+        Some((x + 1, e))
+    };
+    let mut out = Vec::new();
+    for i in 0..b.len() {
+        if b[i] != b'x' && b[i] != b'X' || i == 0 {
+            continue;
+        }
+        if let (Some(s), Some((rs, re))) = (digits_before(i), digits_after(i)) {
+            // ≤5 位数字串解析必成功不溢出
+            let w: u32 = std::str::from_utf8(&b[s..i]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+            let h: u32 = std::str::from_utf8(&b[rs..re]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+            if w > 0 && h > 0 {
+                out.push((w, h));
+            }
+        }
+    }
+    out
 }
 
 impl Default for PlayerConfig {
@@ -626,186 +716,243 @@ fn backfill_table(dst: &mut Table, src: &Table) -> usize {
 /// 约束：解析结果必须与 Config::default() 完全一致——
 /// 防漂移测试 default_template_matches_config_default 钉死，改默认值须同步改模板。
 const DEFAULT_TOML: &str = r#"
-	# =============================================================
-	# Archview 配置文件（TOML）
-	# 启动时按「exe 同目录 → 当前工作目录」查找 config.toml，不存在则生成本文件。
-	# 已有配置缺新版本新增的键时，启动自动按默认值补全并写回
-	# （已有键值与注释原样保留）。
-	# 通用规则：
-	#   * 字符串一律用双引号；含 # 、空格等特殊字符的值（尤其密码）更必须双引号
-	#   * 路径推荐正斜杠 "D:/dir"；反斜杠必须双写 "D:\\dir"（TOML 转义）
-	#   * "auto" 表示自动探测；相对路径相对启动时工作目录，建议绝对路径
-	# =============================================================
+# =============================================================
+# Archview 配置文件（TOML）
+# 启动时按「exe 同目录 → 当前工作目录」查找 config.toml，不存在则生成本文件。
+# 已有配置缺新版本新增的键时，启动自动按默认值补全并写回
+# （已有键值与注释原样保留）。
+# 通用规则：
+#   * 字符串一律用双引号；含 # 、空格等特殊字符的值（尤其密码）更必须双引号
+#   * 路径推荐正斜杠 "D:/dir"；反斜杠必须双写 "D:\\dir"（TOML 转义）
+#   * "auto" 表示自动探测；相对路径相对启动时工作目录，建议绝对路径
+# =============================================================
 
-	# 非 UTF-8 字节兜底代码页：老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，
-	# 密码与 zip 文件名同源编码。用于密码候选追加 + zip 文件名解码兜底
-	# （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
-	# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只用 UTF-8
+# 非 UTF-8 字节兜底代码页：老工具（老 WinRAR/好压等）按系统 ANSI 代码页打包，
+# 密码与 zip 文件名同源编码。用于密码候选追加 + zip 文件名解码兜底
+# （无 UTF-8 标志且非合法 UTF-8 的名字，中文包即 GBK）。
+# 取值如 "gbk" / "big5" / "shift_jis" / "euc-kr"；"none" = 只用 UTF-8
 codepage = "gbk"
 
-	# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
-	# 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
-	# 密码框、VarTidy 记失败跳包。密码始终用双引号包裹；仅用于解压，不写入日志/报告
+# 加密包密码候选列表（播放器与 VarTidy 公用，按序尝试）。
+# 打开压缩包阶段即自动探测：无密码优先 → 本列表依次；全不匹配时播放器才弹
+# 密码框、VarTidy 记失败跳包。密码始终用双引号包裹；仅用于解压，不写入日志/报告
 passwords = []
 
-	# 主程序日志级别：error / warn / info / debug / trace。
-	# 也支持按模块指令（EnvFilter 语法）只开某模块的诊断日志，如帧节奏探针：
-	#   log_level = "info,archview::ui::panels=debug"
-	# RUST_LOG 环境变量优先生效
+# 主程序日志级别：error / warn / info / debug / trace。
+# 也支持按模块指令（EnvFilter 语法）只开某模块的诊断日志，如帧节奏探针：
+#   log_level = "info,archview::ui::panels=debug"
+# RUST_LOG 环境变量优先生效
 log_level = "info"
 
+# ============ 解压缓存（目录 / 容量 / 清理） ============
 [cache]
-	# libmpv-2.dll 搜索目录；"auto" = exe 同目录
+
+# libmpv-2.dll 搜索目录；"auto" = exe 同目录
 dll_dir = "auto"
-	# 7Z/RAR 解压缓存目录；"auto" = %TEMP%\archview_cache
-	# 可指向 RAM Disk 提速（见 README「RAM Disk 缓存」）；目录不存在会自动创建
+
+# 7Z/RAR 解压缓存目录；"auto" = %TEMP%\archview_cache
+# 可指向 RAM Disk 提速（见 README「RAM Disk 缓存」）；目录不存在会自动创建
 dir = "auto"
-	# 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
+
+# 缓存总量上限（MB），超出按 LRU（最久未访问）驱逐
 max_size_mb = 8192
-	# 解码块大小（MB）
+
+# 解码块大小（MB）
 chunk_size_mb = 4
-	# 解码块 LRU 缓存块数
+
+# 解码块 LRU 缓存块数
 chunk_cache_blocks = 64
-	# 退出程序时自动清空解压缓存
+
+# 退出程序时自动清空解压缓存
 clean_on_exit = false
-	# 切换压缩包时自动清理上一个包的解压缓存（false = 保留以便切回命中）
+
+# 切换压缩包时自动清理上一个包的解压缓存（false = 保留以便切回命中）
 clean_on_switch = false
 
+# ============ 媒体扩展名与目录收集 ============
 [media]
-	# 视频 / 图片的文件扩展名识别列表（不区分大小写）
-	video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
-	# 相机 RAW（内嵌预览直读）：Sony ARW 家族 + Nikon NEF 家族
-	image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
-	                    "arw", "nef", "nrw", "srf", "sr2", "arq"]
-	# 打开单个媒体文件（拖入文件/发送到/文件菜单「打开媒体文件」）时，对其
-	# 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
-	# 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
-	file_open_depth = 1
 
+# 视频 / 图片的文件扩展名识别列表（不区分大小写）
+video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
+
+# 相机 RAW（内嵌预览直读）：Sony ARW 家族 + Nikon NEF 家族
+image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
+                    "arw", "nef", "nrw", "srf", "sr2", "arq"]
+
+# 打开单个媒体文件（拖入文件/发送到/文件菜单「打开媒体文件」）时，对其
+# 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
+# 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
+file_open_depth = 1
+
+# ============ 非标裸数据（raw dump）预设 ============
 [raw]
-	# 非标裸数据（raw dump）：没有扩展名清单——文件必须在下方 [[raw.demux]]
-	# 命中预设才可见、可播放（预设即参数来源：像素格式 + 宽高；帧数由文件
-	# 大小自动得出，大小必须能被单帧大小整除，否则报错）。
-	# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
-	# fps 可省略，默认 3。
-	# 常用 pixfmt 速查（完整 195 项名单见 README「raw 格式表」）：
-	#   YUV420 8bit   : yuv420p / nv12 / nv21 / yuvj420p
-	#   YUV420 10bit+ : yuv420p10le / p010le / yuv420p16le
-	#   unpacked Bayer（16bit/像素，即 2 字节）:
-	#     bayer_rggb16le / bayer_bggr16le / bayer_gbrg16le / bayer_grbg16le
-	# 预设示例（两类文件并存：unpacked bayer 的 .bin + NV12 的 .yuv），
-	# 按需去掉行首 # 启用或仿写：
-	# [[raw.demux]]
-	# match = "sensor_a_*.bin"    # 通配 * 与 ?；写文件名（不含路径）
-	# pixfmt = "bayer_rggb16le"   # FFmpeg 像素格式名（如 yuv420p / nv12 / gray）
-	# width = 1920
-	# height = 1080
-	# fps = 30
-	# bit_shift = 4               # 可选（默认 0）：12bit 低对齐存 16bit 容器时
-	#                             # 每 u16 采样左移位数（10bit 填 6），修正
-	#                             # bayer16 播放发黑；须 le 结尾格式，仅流式/
-	#                             # 目录模式生效（7z/RAR 落盘不支持，设计定案）
-	# [[raw.demux]]
-	# match = "*.yuv"
-	# pixfmt = "nv12"
-	# width = 1280
-	# height = 720
-	# fps = 25
 
+# 非标裸数据：没有扩展名清单——文件必须在下方 [[raw.demux]] 命中预设
+# 才可见、可播放（预设即参数来源：像素格式 + 宽高；帧数由文件大小自动
+# 得出，大小必须能被单帧大小整除，否则报错）。
+# 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
+# fps 可省略，默认 3；width/height 可省略或填 0 = 从文件名内嵌 WxH
+# 兜底（如 fpga_in_s0_1920x1080_00_1.raw → 1920x1080；文件名无分辨率
+# 且预设宽高为 0 时报错）。内置三条默认预设如下（可改可删；已有自定义
+# 预设的老配置不会被自动合并，需要时手动复制）：
+
+# NV12 8bit 半平面 dump
+[[raw.demux]]
+match = "*.nv12"
+pixfmt = "nv12"
+
+# YUV400 = 8bit 单色平面
+[[raw.demux]]
+match = "*.yuv400"
+pixfmt = "gray"
+
+# unpacked Bayer dump（12bit 低对齐存 16bit 容器）：
+# bayer_auto16le = 伪格式，装载时读首帧自动探测排列
+# （RGGB/BGGR/GRBG/GBRG，置信不足按 RGGB）；需固定排列时写具体名
+[[raw.demux]]
+match = "*.raw"
+pixfmt = "bayer_auto16le"
+bit_shift = 4
+
+# 自定义示例（仿写后去掉行首 #；写具体宽高优先于文件名解析）：
+# [[raw.demux]]
+# match = "sensor_a_*.bin"    # 通配 * 与 ?；写文件名（不含路径）
+# pixfmt = "bayer_rggb16le"   # FFmpeg 像素格式名（如 yuv420p / nv12 / gray）
+# width = 1920
+# height = 1080
+# fps = 30
+# bit_shift = 4               # 可选（默认 0）：12bit 低对齐存 16bit 容器时
+#                             # 每 u16 采样左移位数（10bit 填 6），修正
+#                             # bayer16 播放发黑；须 le 结尾格式，仅流式/
+#                             # 目录模式生效（7z/RAR 落盘不支持，设计定案）
+
+# ============ 播放器（mpv 参数） ============
 [player]
-	# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
+
+# 硬件解码："auto" / "no" / "d3d11va" 等 mpv 取值
 hwdec = "auto"
-	# mpv 缓存秒数（拖回刚看过的片段直接命中缓存，零成本）
+
+# mpv 缓存秒数（拖回刚看过的片段直接命中缓存，零成本）
 cache_secs = 30
-	# mpv demuxer 最大缓存（MB）
+
+# mpv demuxer 最大缓存（MB）
 demuxer_max_mb = 512
-	# demux 探测字节预算（打开阶段识别容器格式的读取上限）。
-	# 压缩包内流=逐字节解压，预算直接换算成打开耗时，调小即提速；
-	# "auto" = mpv 原生默认（≈5MB）；过小可能识别不了冷门容器
+
+# demux 探测字节预算（打开阶段识别容器格式的读取上限）。
+# 压缩包内流=逐字节解压，预算直接换算成打开耗时，调小即提速；
+# "auto" = mpv 原生默认（≈5MB）；过小可能识别不了冷门容器
 demuxer_probesize = "2MiB"
-	# demux 探测时长预算（秒，确定各流参数的分析上限）。
-	# "auto" = mpv 原生默认（≈5s）；过小可能漏识别延迟出现的音轨/字幕流
+
+# demux 探测时长预算（秒，确定各流参数的分析上限）。
+# "auto" = mpv 原生默认（≈5s）；过小可能漏识别延迟出现的音轨/字幕流
 demuxer_analyzeduration = "1"
-	# 初始音量（0-100）
+
+# 初始音量（0-100）
 volume = 100
-	# 静音（重启保持；未播放时也可预先设置，播放器创建时生效）
+
+# 静音（重启保持；未播放时也可预先设置，播放器创建时生效）
 muted = false
-	# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
-	# 诊断 mpv 内部行为（demux 探测/hwdec/解码链路）时临时设 "v"——
-	# 量极大，转发到主程序日志；平时保持 "no"
+
+# mpv 内部日志级别（no/fatal/error/warn/info/status/v/debug/trace）。
+# 诊断 mpv 内部行为（demux 探测/hwdec/解码链路）时临时设 "v"——
+# 量极大，转发到主程序日志；平时保持 "no"
 mpv_log_level = "no"
 
+# ============ 界面 ============
 [ui]
-	# CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
-	# 也可指定单个字体文件的绝对路径
+
+# CJK 字体路径；"auto" = 自动加载系统中/日/韩候选字体链（支持中日韩文件名显示）
+# 也可指定单个字体文件的绝对路径
 font_path = "auto"
-	# 图片自动播放（PPT 式翻页）间隔秒数
+
+# 图片自动播放（PPT 式翻页）间隔秒数
 slideshow_secs = 1.0
-	# 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+
+# 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
 wheel_switch_secs = 0.3
-	# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
+
+# 翻到本包最后一项再往后导航时，是否弹窗选择同目录其它压缩包
 ask_next_archive = true
-	# 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
-	# false（默认）= 保持压缩包内部顺序：固态包下内部顺序 == 物理码流顺序，
-	#   预取直接命中物理相邻文件（翻页性能最优）。
-	#   注意：7-Zip 工具打的包内部本来就是字典序，关闭排序对这类包显示无变化。
-	# true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10，
-	#   而非字典序的 1/10/2）
+
+# 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
+# false（默认）= 保持压缩包内部顺序：固态包下内部顺序 == 物理码流顺序，
+#   预取直接命中物理相邻文件（翻页性能最优）。
+#   注意：7-Zip 工具打的包内部本来就是字典序，关闭排序对这类包显示无变化。
+# true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10，
+#   而非字典序的 1/10/2）
 sort_files = false
-	# 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤。
-	# 0 = 不防抖，每键即时过滤（小包最顺手）
+
+# 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤。
+# 0 = 不防抖，每键即时过滤（小包最顺手）
 search_debounce_ms = 200
-	# 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
-	# 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
+
+# 解压进度覆盖层显示前的宽限期（毫秒）：播放中切换到需解压的条目，
+# 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
 extract_overlay_delay_ms = 500
-	# 图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均
-	# 走此链路）。解码失败的图片自动回退 mpv
+
+# 图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均
+# 走此链路）。解码失败的图片自动回退 mpv
 image_texture = true
-	# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
+
+# 图片纹理 LRU 缓存张数（含当前张）：预解码 ±1 相邻页，翻页零等待
 image_cache_count = 3
-	# 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
-	# 升级资格判据同此值（详见 doc/架构设计/13_渲染架构迁移.md §13.4 两档策略）
+
+# 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
+# 升级资格判据同此值（详见 doc/架构设计/13_渲染架构迁移.md §13.4 两档策略）
 image_max_dim = 4096
-	# 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
-	# （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244%
-	# 滚轮档（×1.25⁴≈2.44）才升级——full ×2 纹理采样比 ≥1 才有肉眼
-	# 增益，195% 档实拍 A/B 与 base 直放大无差；调小（如 1.4）可更早
-	# 升级对比，调大（如 3.0）基本关闭
+
+# 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
+# （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = 越过 244%
+# 滚轮档（×1.25⁴≈2.44）才升级——full ×2 纹理采样比 ≥1 才有肉眼
+# 增益，195% 档实拍 A/B 与 base 直放大无差；调小（如 1.4）可更早
+# 升级对比，调大（如 3.0）基本关闭
 image_full_threshold = 2.0
-	# 高清档 Lanczos 放大后叠加 unsharp mask 锐化（放大插值把边缘坡度
-	# 摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关掉可对比）
+
+# 高清档 Lanczos 放大后叠加 unsharp mask 锐化（放大插值把边缘坡度
+# 摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关掉可对比）
 image_full_sharpen = true
 
+# ============ 解压预取 ============
 [extract]
-	# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件
-	# （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
-	# 翻页直接命中，摊薄固态包定位成本
+
+# 下游预取上限（MB），0 = 关闭：solid 包（7z/solid RAR）解压时顺带预取后续文件
+# （下标更大 = 列表向下 = 解码流推进方向）。一次顺序解压流解出一批文件，
+# 翻页直接命中，摊薄固态包定位成本
 prefetch_downstream_mb = 512
-	# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
-	# （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
-	# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
-	# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
+
+# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+# （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
+# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
+# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
 prefetch_upstream_mb = 512
 
+# ============ VarTidy 整理器 ============
 [vartidy]
-	# VarTidy（"archview.exe tidy" CLI 子命令）配置
-	# var 仓库根目录。必须已存在——整理器绝不修改/移动/删除仓库已有内容，
-	# 仅新建作者子目录并写入仓库没有的新 var。空 = 未配置（CLI 需 -o 指定）
+
+# VarTidy（"archview.exe tidy" CLI 子命令）配置
+# var 仓库根目录。必须已存在——整理器绝不修改/移动/删除仓库已有内容，
+# 仅新建作者子目录并写入仓库没有的新 var。空 = 未配置（CLI 需 -o 指定）
 repo_dir = ""
-	# 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
+
+# 报告输出目录；"auto" = 首个输入压缩包所在目录（不写入仓库，保持仓库纯净）
 report_dir = "auto"
 
+# ============ 编码引擎 ============
 [encode]
-	# 「编码为视频」（CLI archview encode / UI 右键「编码为视频…」）编码参数。
-	# vcodec 需本机 libmpv 构建内置；crf/preset 组装为 ovcopts 键值对，
-	# ovcopts 是附加编码器选项（如 "bf=3" / "threads=8"），同键覆盖 crf/preset；
-	# 引擎自动追加 bf=0 兜底（显式给 bf=/bframes= 除外）
+
+# 「编码为视频」（CLI archview encode / UI 右键「编码为视频…」）编码参数。
+# vcodec 需本机 libmpv 构建内置；crf/preset 组装为 ovcopts 键值对，
+# ovcopts 是附加编码器选项（如 "bf=3" / "threads=8"），同键覆盖 crf/preset；
+# 引擎自动追加 bf=0 兜底（显式给 bf=/bframes= 除外）
 vcodec = "libx264"
-	# 恒定质量（x264/x265 crf）：越低画质越高体积越大
+
+# 恒定质量（x264/x265 crf）：越低画质越高体积越大
 crf = 23
-	# 编码速度预设（ultrafast…veryslow）
+
+# 编码速度预设（ultrafast…veryslow）
 preset = "medium"
-	# 附加编码器选项；空 = 无
+
+# 附加编码器选项；空 = 无
 ovcopts = ""
 "#;
 
@@ -814,9 +961,18 @@ mod tests {
     use super::*;
 
     /// 防漂移：带注释的默认模板解析回来必须与代码默认值逐项一致。
-    /// 任何一侧改默认值都必须同步另一侧，本测试会拦住遗忘
+    /// 任何一侧改默认值都必须同步另一侧，本测试会拦住遗忘。
+    /// 另设节头存在性断言：节头（如 [cache]）被误删时，键会全部落到顶层
+    /// 被 serde 静默忽略、各 table 字段恰好以默认值兜底——上面的逐项比较
+    /// 会假通过（实际发生过），节头缺失必须在这里先炸
     #[test]
     fn default_template_matches_config_default() {
+        for head in ["[cache]", "[media]", "[raw]", "[player]", "[ui]", "[extract]", "[vartidy]", "[encode]"] {
+            assert!(
+                DEFAULT_TOML.contains(&format!("\n{head}\n")),
+                "DEFAULT_TOML 缺少节头 {head}（键会静默落到顶层被忽略）"
+            );
+        }
         let from_tpl: Config = toml::from_str(DEFAULT_TOML).expect("默认模板必须是合法 TOML");
         assert_eq!(from_tpl, Config::default());
     }
@@ -883,8 +1039,9 @@ slideshow_secs = 2.0
         // 缺失键按默认值补上
         assert!(out.contains("log_level = \"info\""));
         assert!(out.contains("image_max_dim = 4096"));
-        // 整节补全：[raw] 连注释带示例一并补上（老用户升级场景）
+        // 整节补全：[raw] 连注释带内置三条预设一并补上（老用户升级场景）
         assert!(out.contains("# [[raw.demux]]"));
+        assert!(out.contains("bayer_auto16le"));
         assert!(out.contains("image_extensions"));
         // 根级新键必须在第一个 [表] 头之前（否则会归属到最后一个表）
         let key_pos = out.find("log_level").expect("log_level 已补全");
@@ -941,9 +1098,56 @@ height = 480
         // glob 大小写不敏感 & 路径剥离（预设写文件名，传全路径也能命中）
         assert!(cfg.raw_demux("dir/SENSOR_A_9.BIN").is_some());
         assert!(cfg.raw_demux(r"C:\cap\cap_003.bin").is_some());
-        // 无命中 → None；默认配置无预设 → 永远 None
+        // 无命中 → None；默认三条预设不覆盖 .bin → 普通数据文件不可见
         assert!(cfg.raw_demux("note.txt").is_none());
         assert!(Config::default().raw_demux("a.bin").is_none());
+    }
+
+    /// 默认模板内置三条 FPGA dump 预设（nv12/yuv400/raw）：宽高 0 交由
+    /// 文件名内嵌 WxH 兜底；raw 用伪格式 bayer_auto16le + bit_shift 4
+    #[test]
+    fn raw_default_presets_builtin() {
+        let cfg = Config::default();
+        assert_eq!(cfg.raw.demux.len(), 3);
+        let nv12 = cfg.raw_demux("cap_01.NV12").unwrap();
+        assert_eq!((nv12.pixfmt.as_str(), nv12.width, nv12.height), ("nv12", 0, 0));
+        assert_eq!(nv12.fps, 3.0);
+        let y400 = cfg.raw_demux("x.yuv400").unwrap();
+        assert_eq!(y400.pixfmt, "gray");
+        let raw = cfg.raw_demux("fpga_in_s0_1920x1080_00_1.raw").unwrap();
+        assert_eq!(raw.pixfmt, "bayer_auto16le");
+        assert_eq!(raw.bit_shift, 4);
+        // 伪格式按 16bit 容器参与整除校验；仅 le 变体
+        assert_eq!(raw_pixfmt_bits("bayer_auto16le"), Some(16));
+        assert_eq!(raw_pixfmt_bits("BAYER_AUTO16LE"), Some(16));
+        assert_eq!(raw_pixfmt_bits("bayer_auto16be"), None);
+        // 可见性：默认三条后缀进视频桶；其它非标后缀仍不可见
+        assert!(cfg.is_video_ext("fpga_in_s0_1920x1080_00_1.raw"));
+        assert!(cfg.is_video_ext("x.nv12"));
+        assert!(cfg.is_video_ext("x.yuv400"));
+        assert!(!cfg.is_video_ext("a.yuv"));
+        assert!(!cfg.is_video_ext("cap.bin"));
+    }
+
+    /// 文件名内嵌 WxH 解析：标准 dump 名、大写 X、多候选按出现序；
+    /// 边界规则防误匹配（字母/数字邻接、十六进制 0x10 因 W=0 被拒、超长段）
+    #[test]
+    fn parse_filename_dims_cases() {
+        assert_eq!(
+            parse_filename_dims("fpga_in_s0_1920x1080_00_12345.raw"),
+            vec![(1920, 1080)]
+        );
+        assert_eq!(parse_filename_dims("cap_1280X720_01.nv12"), vec![(1280, 720)]);
+        assert_eq!(
+            parse_filename_dims("a_640x480_b_320x240.yuv"),
+            vec![(640, 480), (320, 240)]
+        );
+        assert!(parse_filename_dims("v2x4raw.bin").is_empty(), "左侧邻字母");
+        assert!(parse_filename_dims("mp3x4.bin").is_empty(), "左侧邻字母");
+        assert!(parse_filename_dims("raw4x8x.bin").is_empty(), "右侧邻字母");
+        assert!(parse_filename_dims("addr_0x10.bin").is_empty(), "W=0 十六进制");
+        assert!(parse_filename_dims("no_dims.bin").is_empty());
+        assert!(parse_filename_dims("f_123456x789.bin").is_empty(), "段长 >5 位");
     }
 
     /// raw 可见性路由：预设即真相——[[raw.demux]] glob 命中才归视频桶，

@@ -228,3 +228,94 @@ zvf 单文件装载（须给 stream_cb 增设注册通道）/ 落盘后原地变
 109 passed（基线 104）：新增 stream_cb 5 测（URI 往返+严格解析 / 全量
 读 / 逐字节恶意切分 / 奇偏移+seek / 奇尾字节透传），既有 ui 校验测试
 扩 3 用例（shift 越界 / 非 le 拒绝 / 合法组合带出 bit_shift）。
+
+### 8.9 需求变更：文件名分辨率兜底 + 内置默认三预设（2026-11-09）
+
+**动机**：FPGA dump 文件名自带分辨率（`sprintf("fpga_in_s%d_%dx%d_%02d_%lu.raw", ...)` →
+`fpga_in_s0_1920x1080_00_12345.raw`），配置写错分辨率或懒得写时应有兜底；
+且 nv12 / yuv400 / raw 三类常用后缀每次都要手写预设太重。
+
+**实现**（设计语义见 [ARCHITECTURE §13.6](../架构设计/13_渲染架构迁移.md)）：
+
+- `config.rs` 新增 `parse_filename_dims(name)`：**字节级**扫描 `WxH` 字样
+  （`x`/`X` 分隔），边界规则——数字段长 1~5 位、段两端不邻接字母数字
+  （避免把 `_00_`、`s0` 里的数字误判进分辨率），w/h>0 才入候选，按出现
+  顺序返回。不引 regex，纯闭包实现。
+- `raw_demux_opts` 宽高候选链：预设 width/height 非 0 在前 + 文件名兜底
+  去重，逐候选过整除校验取首个通过者；候选空报「宽高无法确定（需预设
+  或文件名 WxH）」，全失败报「与任一候选分辨率不整除（列出全部候选）」。
+- `RawConfig` 移除 derive(Default) 改手写：内置三条默认预设 `*.nv12`→
+  nv12、`*.yuv400`→gray、`*.raw`→bayer_auto16le+bit_shift=4（fps 均
+  `default_raw_fps()`）；`RawDemux` derive Default，width/height 加
+  `#[serde(default)]`（省略即 0，语义与填 0 一致走兜底）。
+- DEFAULT_TOML 的 `[raw]` 节由注释示例改为三条真实条目 + 注释说明；
+  防漂移测试同步。
+- `RawLoad` 由 `opts: String` 重构为结构化字段（w/h/pixfmt/fps/bit_shift/
+  auto_bayer）+ `opts()` 方法，为 bayer 探测（8.10）让出装载前改参的能力。
+
+**测试**：新增 `raw_default_presets_builtin` / `parse_filename_dims_cases`
+（含 `x` 分隔、边界邻接字母数字拒绝、多候选按序）；ui 校验用例扩 4
+（文件名兜底成功 / 配错分辨率被文件名救回 / 预设有效优先 / auto_bayer
+带出），改写 2（宽高无法确定与不整除的新文案）。全量 149 passed。
+
+**两个实现级坑**：
+
+1. 手写 Default 里 `..Default::default()` 会让 fps 落到 RawDemux derive
+   的 0.0 而非 `default_raw_fps()`——三条预设必须显式写 `fps:`；
+2. **默认预设与 serde 替换语义撞车**：用户 TOML 写了任何 `[[raw.demux]]`
+   即整体替换默认数组（`#[serde(default)]` 不做逐项合并，只有顶层
+   backfill 键级合并），但**程序内 push 会叠加**——encode CLI 测试
+   `nv12_cfg()` 向 `Config::default()` push `*.nv12` 后，内置同名预设
+   （宽高 0）按声明序抢先命中，整除校验直接失败。修复：`nv12_cfg()`
+   先 `cfg.raw.demux.clear()` 再 push，并注释说明替换语义。
+
+### 8.10 bayer_auto16le：Bayer 排列自动探测（伪格式，2026-11-09）
+
+**动机**：raw dump 大多是 16bit unpack 的 Bayer（12bit 低对齐存 16bit
+容器，bit_shift=4），但排列（RGGB/BGGB/GBRG/GRBG）无从得知——写错排列
+红蓝互换。用户确认可用相关性启发式探测。
+
+**实现**（算法机制见 [ARCHITECTURE §13.6](../架构设计/13_渲染架构迁移.md)）：
+
+- 伪格式 `bayer_auto16le`：`raw_pixfmt_bits` 表查前特判返回 16（16bit
+  容器，可配 bit_shift），照常过 pixfmt 校验与整除校验；装载前读首帧
+  探测，把 pixfmt 原地替换为具体 `bayer_*16le`。
+- `extract.rs` 新增 `detect_bayer_layout(read, w, h)`：读首帧前 128 行
+  （`take + read_to_end`，整除对齐 2×2 块），统计主/反对角相邻同色均值差
+  （G 沿对角强相关 → 差小的一对对角位置是 G）与四位置均值（组内非 G 两
+  位置均值大者判 R，R>B 是统计规律）。置信门槛：对角差比 5% 余量、
+  R/B 相对差 1%、近零均值保护（`d_large==0` 或 `(m00+m11)<2.0` 判
+  不可分）——置信不足返回 None，调用侧兜底 `bayer_rggb16le` 并 warn 日志。
+- 接入两条路径：快路径 `open_entry` 新开句柄探测（不动播放流）；慢路径
+  7z/RAR 落盘后 `File::open(dest)` 同款探测——**慢路径仅缺 bit_shift
+  位移修正（8.8 定案），探测不受影响**（探测读的是原始容器数据）。
+- encode 引擎 validate 入口显式拒绝 bayer_auto16le（报错文案指引写明
+  具体排列）——探测是一次性读首帧的播放链路能力，编码序列逐帧探测
+  既慢也无必要。
+- 测试 `bayer_layout_detection`：四种排列各合成 32×16 数据逐一验证 +
+  纯灰数据 None + 过小帧 None。
+
+**过程坑**：合成测试数据造错一次——GBRG 的 G 在主对角 `(0,0)/(1,1)`
+（G B / R G 才是合法棋盘），先写成 G B / G R 违反棋盘律导致用例假失败；
+写 Bayer 测试数据先画 2×2 棋盘再对照四种命名。
+
+### 8.11 DEFAULT_TOML 注释风格重排：节头误删与防漂移测试盲区（2026-11-09）
+
+**需求变更**：用户嫌「注释固定 tab 缩进」不顺眼（尤其 `[raw]` 节键/注释/
+示例混排参差），改为全顶格 + 节前 `# ==== 中文说明 ====` 横线标题 + 键间
+空行分隔。存量 config.toml 由 backfill 只补缺键不动注释，需删除重生成。
+
+**踩坑**：重排时把真节头（`[cache]` 等 8 个）**替换**成了注释标题——
+注释里的 `[cache]` 不是 TOML 节头，键全部落到顶层被 serde 静默忽略。
+更糟的是防漂移测试仍通过：各 table 字段反序列化失败后恰好用
+serde 默认值兜底，`from_tpl == Config::default()` 假成立——**逐项比较
+对"整节键丢失"不敏感**。用户看文件时发现节头没了才暴露。
+
+**修复**：横线标题只写中文说明（去掉节名），真节头独立成行紧跟其下；
+`default_template_matches_config_default` 增加节头存在性断言
+（8 个 `\n[节头]\n` 文本检查），节头缺失时先于逐项比较炸出。
+
+**教训**：① 注释里写 `[section]` 字样时极易顺手把真节头吞掉——标题行
+不含节名，节头永远独立成行；② 默认值兜底的相等断言对"键丢失"有盲区，
+模板类测试要加结构存在性检查（纯文本断言即可）；③ serde 静默忽略未知
+顶层键 + table 字段默认值兜底 = 结构错误零报错，解析成功 ≠ 解析正确。

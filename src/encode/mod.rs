@@ -101,6 +101,13 @@ pub fn encode_raw_sequence(
     if entries.iter().any(|e| e.encrypted) {
         return Err("编码输入含加密条目（暂不支持，请先解压）".into());
     }
+    if fmt.pixfmt.eq_ignore_ascii_case("bayer_auto16le") {
+        return Err(
+            "编码引擎不支持 bayer_auto16le（自动排列探测仅播放链路），\
+             请在预设中写明具体排列（如 bayer_rggb16le）"
+                .into(),
+        );
+    }
     let Some(bits) = raw_pixfmt_bits(&fmt.pixfmt) else {
         return Err(format!(
             "像素格式 [{}] 不在 rawvideo 支持名单（config.toml 的 raw.pixfmts）",

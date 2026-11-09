@@ -1083,7 +1083,7 @@ fn raw_demux_opts_validation() {
         .unwrap()
         .expect("校验通过应给选项");
     assert_eq!(
-        r.opts,
+        r.opts(),
         "demuxer=rawvideo,demuxer-rawvideo-w=64,demuxer-rawvideo-h=48,\
          demuxer-rawvideo-mp-format=nv12,demuxer-rawvideo-fps=10"
     );
@@ -1100,18 +1100,19 @@ fn raw_demux_opts_validation() {
         "pixfmt 报错应引导查表: {err}"
     );
 
-    // 4) 宽高为 0：裸数据宽高无法自动推算
+    // 4) 宽高为 0 且文件名无内嵌分辨率：宽高无法确定
     let mut bad = cfg.clone();
     bad.raw.demux[0] = mk("nv12", 0, 48, 0);
     let err = App::new_for_test(bad)
         .raw_demux_opts("sensor_a_0.bin", None)
         .unwrap_err();
-    assert!(err.contains("无法自动推算"), "宽高 0 报错: {err}");
+    assert!(err.contains("宽高无法确定") && err.contains("WxH"), "宽高 0 报错: {err}");
 
-    // 5) 大小不整除：报实际字节数与每帧字节数（4608B/帧）
+    // 5) 大小不整除：报文件大小与尝试过的候选分辨率（文件名无 WxH →
+    //    仅预设宽高 64x48 一个候选）
     let err = app.raw_demux_opts("sensor_a_0.bin", Some(46081)).unwrap_err();
     assert!(
-        err.contains("46081") && err.contains("4608") && err.contains("不整除"),
+        err.contains("46081") && err.contains("64x48") && err.contains("不整除"),
         "整除报错应带核对数字: {err}"
     );
     // size 未知（None）时跳过整除校验，不拦装载
@@ -1154,7 +1155,105 @@ fn raw_demux_opts_validation() {
         .unwrap()
         .expect("合法 bit_shift 不应拦截");
     assert_eq!(r.bit_shift, 4);
-    assert!(r.opts.contains("bayer_rggb16le"));
+    assert!(r.opts().contains("bayer_rggb16le"));
+
+    // 10) 文件名分辨率兜底：预设宽高 0 + 文件名内嵌 WxH → 用文件名打开
+    //     （FPGA dump 命名模式：fpga_in_s%d_%dx%d_%02d_%lu.raw）
+    let mut ok = cfg.clone();
+    ok.raw.demux[0] = mk("nv12", 0, 0, 0);
+    ok.raw.demux[0].r#match = "*.bin".into();
+    let r = App::new_for_test(ok)
+        .raw_demux_opts("fpga_in_s0_1920x1080_00_1.bin", Some(10 * 1920 * 1080 * 12 / 8))
+        .unwrap()
+        .expect("文件名兜底应通过");
+    assert_eq!((r.w, r.h), (1920, 1080));
+    assert!(r.opts().contains("demuxer-rawvideo-w=1920"));
+    assert!(r.opts().contains("demuxer-rawvideo-h=1080"));
+
+    // 11) 预设宽高配错（整除失败）→ 文件名候选救回（预设配成远大于
+    //     文件的大分辨率，单帧字节数超过整包 → 不整除）
+    let mut ok = cfg.clone();
+    ok.raw.demux[0] = mk("nv12", 3840, 2160, 0);
+    ok.raw.demux[0].r#match = "*.bin".into();
+    let r = App::new_for_test(ok)
+        .raw_demux_opts("fpga_in_s0_1280x720_00_1.bin", Some(5 * 1280 * 720 * 12 / 8))
+        .unwrap()
+        .expect("文件名候选应通过");
+    assert_eq!((r.w, r.h), (1280, 720));
+
+    // 12) 预设宽高有效时优先于文件名候选（兜底仅在失败时介入）
+    let mut ok = cfg.clone();
+    ok.raw.demux[0] = mk("nv12", 64, 48, 0);
+    ok.raw.demux[0].r#match = "*.bin".into();
+    let r = App::new_for_test(ok)
+        .raw_demux_opts("fpga_in_s0_1280x720_00_1.bin", Some(10 * 64 * 48 * 12 / 8))
+        .unwrap()
+        .expect("预设宽高有效应直接通过");
+    assert_eq!((r.w, r.h), (64, 48));
+
+    // 13) 伪格式 bayer_auto16le：通过校验并带 auto_bayer 标记（排列在
+    //     装载前由 resolve_auto_bayer 探测替换，opts 暂含伪格式名）
+    let mut ok = cfg.clone();
+    ok.raw.demux[0] = mk("bayer_auto16le", 64, 48, 4);
+    let r = App::new_for_test(ok)
+        .raw_demux_opts("sensor_a_0.bin", Some(3 * 64 * 48 * 2))
+        .unwrap()
+        .expect("伪格式应通过校验");
+    assert!(r.auto_bayer);
+    assert!(r.opts().contains("bayer_auto16le"));
+}
+
+/// Bayer 排列探测：对四种排列各合成已知通道布局的帧（R/G/B 值分离 +
+/// 渐变扰动），断言判定一一对应；纯灰数据 / 帧过小返回 None（调用方
+/// 按 RGGB 兜底）
+#[test]
+fn bayer_layout_detection() {
+    use super::extract::detect_bayer_layout;
+    let (w, h) = (32u32, 16u32);
+    // (r,c) 位置 → 通道值：R=3000 G=2000 B=1000（12bit 域内）+ 渐变扰动
+    let make = |p00: u16, p01: u16, p10: u16, p11: u16| -> Vec<u8> {
+        let mut v = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let g = ((x + y) % 32) as u16;
+                let val = match (y % 2, x % 2) {
+                    (0, 0) => p00,
+                    (0, 1) => p01,
+                    (1, 0) => p10,
+                    _ => p11,
+                } + g;
+                v.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        v
+    };
+    let (r, g, b) = (3000u16, 2000u16, 1000u16);
+    assert_eq!(
+        detect_bayer_layout(&mut make(r, g, g, b).as_slice(), w, h),
+        Some("bayer_rggb16le")
+    );
+    assert_eq!(
+        detect_bayer_layout(&mut make(b, g, g, r).as_slice(), w, h),
+        Some("bayer_bggr16le")
+    );
+    assert_eq!(
+        detect_bayer_layout(&mut make(g, b, r, g).as_slice(), w, h),
+        Some("bayer_gbrg16le")
+    );
+    assert_eq!(
+        detect_bayer_layout(&mut make(g, r, b, g).as_slice(), w, h),
+        Some("bayer_grbg16le")
+    );
+    // 纯灰（各通道等值）：对角差全 0 不可判 → None
+    assert_eq!(
+        detect_bayer_layout(&mut make(2048, 2048, 2048, 2048).as_slice(), w, h),
+        None
+    );
+    // 帧过小（<8 宽 / <4 高）→ None
+    assert_eq!(
+        detect_bayer_layout(&mut make(r, g, g, b).as_slice(), 4, 2),
+        None
+    );
 }
 
 /// 「关于」下拉面板文案：版本行取 CARGO_PKG_VERSION（防手写硬编码漂移）、

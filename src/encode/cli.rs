@@ -711,6 +711,10 @@ mod tests {
 
     fn nv12_cfg() -> Config {
         let mut cfg = Config::default();
+        // 清掉内置三条默认预设（nv12/yuv400/raw）：serde 语义下用户 TOML
+        // 写了 [[raw.demux]] 即整体替换默认数组；程序内 push 才会叠加，
+        // 同名 *.nv12 会被默认宽高 0 的条目按声明序抢先命中
+        cfg.raw.demux.clear();
         cfg.raw.demux.push(RawDemux {
             r#match: "*.nv12".into(),
             pixfmt: "nv12".into(),
