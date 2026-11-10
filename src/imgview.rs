@@ -164,6 +164,9 @@ pub struct ImageService {
     /// 洪水会把正在显示的条目从队尾挤出（cap 小时必现），导致该图
     /// frame()=None 而 pending 已空 → 永久停在"正在解码图片…"占位符
     shown: Option<ImgKey>,
+    /// 对比模式显示集合：多栏同时显示时全部受逐出保护（预取洪水不挤掉
+    /// 任何一栏）；单图模式恒空，与 shown 互不干扰
+    shown_multi: Vec<ImgKey>,
     /// 原图纹理单槽：大图放大到 1:1 附近时按需解码不降采样版本无缝换画。
     /// 单槽不进 LRU——原图显存大（8192²×4B=256MB），只随当前显示条目存续
     /// （frame() 切条目即弃）
@@ -185,6 +188,7 @@ impl ImageService {
             cache: VecDeque::new(),
             cap: cap.max(1),
             shown: None,
+            shown_multi: Vec::new(),
             full: None,
             full_pending: None,
             full_failed: None,
@@ -195,6 +199,15 @@ impl ImageService {
     /// 收缩在下次推入时生效（逐出按本字段比较，已缓存内容不主动丢弃）
     pub fn set_cap(&mut self, cap: usize) {
         self.cap = cap.max(1);
+    }
+
+    /// 对比模式显示集合（逐出保护；退出对比时清空）
+    pub fn set_shown_multi(&mut self, keys: Vec<ImgKey>) {
+        self.shown_multi = keys;
+    }
+
+    pub fn clear_shown_multi(&mut self) {
+        self.shown_multi.clear();
     }
 
     /// 请求解码（幂等：已缓存/解码中直接返回）。
@@ -393,10 +406,21 @@ impl ImageService {
     /// 静态图/未到点 = None 时长。UI 每帧对当前 key 调用并
     /// `request_repaint_after(delay)` 驱动动画；命中即提至 LRU 队首
     pub fn frame(&mut self, key: ImgKey) -> Option<(egui::TextureHandle, Option<Duration>)> {
+        self.frame_ex(key, true)
+    }
+
+    /// 对比模式变体：非主栏调用传 `drop_stale_full=false`——多栏每帧轮流
+    /// frame() 不同 key，若人人都弃槽会把主栏刚升级的 full 纹理立即抖掉；
+    /// 只有主栏（真正拥有 full 槽的栏）走 true，主栏切换时自然淘汰旧槽
+    pub fn frame_ex(
+        &mut self,
+        key: ImgKey,
+        drop_stale_full: bool,
+    ) -> Option<(egui::TextureHandle, Option<Duration>)> {
         let pos = self.pos(key)?;
         // 原图单槽生命周期跟随显示条目：切条目即弃（旧原图显存大不留驻）；
         // 放弃标记不清——解码失败是确定性的，重试只会再失败一遍
-        if self.full.as_ref().is_some_and(|(k, _)| *k != key) {
+        if drop_stale_full && self.full.as_ref().is_some_and(|(k, _)| *k != key) {
             self.full = None;
         }
         // 标记显示中：cache_push 逐出时跳过（预取洪水不再挤掉正在显示的图）
@@ -478,17 +502,16 @@ impl ImageService {
         self.cache.iter().position(|(k, _)| *k == key)
     }
 
-    /// 入缓存并逐出最久未用（超容量时）；逐出跳过 key（刚推入）与 shown
-    /// （正在显示）。二者都不堪逐时允许临时超容（break），下次推入再收缩
+    /// 入缓存并逐出最久未用（超容量时）；逐出跳过 key（刚推入）、shown
+    /// （正在显示）与 shown_multi（对比模式各栏）。全都不堪逐时允许临时
+    /// 超容（break），下次推入再收缩
     fn cache_push(&mut self, key: ImgKey, c: Cached) {
         self.cache.push_front((key, c));
         let shown = self.shown;
         while self.cache.len() > self.cap {
-            let Some(victim) = self
-                .cache
-                .iter()
-                .rposition(|(k, _)| *k != key && Some(*k) != shown)
-            else {
+            let Some(victim) = self.cache.iter().rposition(|(k, _)| {
+                *k != key && Some(*k) != shown && !self.shown_multi.contains(k)
+            }) else {
                 break;
             };
             self.cache.remove(victim);

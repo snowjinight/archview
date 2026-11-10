@@ -26,6 +26,7 @@
 | [§9 encode引擎e2e攻坚](09_encode引擎e2e攻坚.md) | NV12 dump→视频 encode 引擎 e2e 攻坚（vo=lavc 隐式切换不存在 / o·ovc 非运行期 / bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠） | encode/mod.rs |
 | [§10 encode三壳接入](10_encode三壳接入.md) | encode 三壳接入（CLI·SendTo / UI 多选右键确认窗）：egui 0.36 三处 API 实测差异 + move 闭包夺所有权 + 可操作绿条与帧首点击清除的竞态 | encode/cli.rs · ui/ |
 | [§11 修饰键两条数据路径](11_修饰键两条数据路径.md) | Ctrl/Shift「间歇性不生效」根因：InputState.modifiers 跨帧状态失焦清零且 winit 不重发（事件内联快照优先修法） | [ARCHITECTURE §15.5](../架构设计/15_encode引擎.md) |
+| [§12 多图对比视图专项](12_多图对比视图专项.md) | 多图对比视图（2~6 栏同步缩放）：方案 A 几何纯函数 / RawFrameService 线程模型 / source_ready 防污染闸门 / 三处防播放劫持守卫 / egui 0.36 差异 | [ARCHITECTURE §16](../架构设计/16_多图对比视图.md) |
 
 ## 维护约定（强制）
 

@@ -1,127 +1,7 @@
 //! 播放与后台解压链路：mpv 播放器管理、批次计算与磁盘预检、solid 会话解压任务提交/轮询、密码重放与已解压文件装载。
 
 use super::*;
-
-/// raw dump 命中预设且校验通过后的装载参数：`opts()` 生成 loadfile 第四
-/// 参数（rawvideo demuxer 拼参）；`bit_shift` = 流层每 u16 采样左移位数
-/// （0 = 不位移，仅快路径 zvf:// 生效）；`auto_bayer` = pixfmt 为伪格式
-/// bayer_auto16le，装载前须经 resolve_auto_bayer 读首帧探测排列并替换
-#[derive(Debug, PartialEq)]
-pub(super) struct RawLoad {
-    pub(super) w: u32,
-    pub(super) h: u32,
-    pub(super) pixfmt: String,
-    pub(super) fps: f64,
-    pub(super) bit_shift: u32,
-    pub(super) auto_bayer: bool,
-}
-
-impl RawLoad {
-    /// loadfile 第四参数（拼参格式与 player e2e 测试同源）
-    pub(super) fn opts(&self) -> String {
-        format!(
-            "demuxer=rawvideo,demuxer-rawvideo-w={},demuxer-rawvideo-h={},\
-             demuxer-rawvideo-mp-format={},demuxer-rawvideo-fps={}",
-            self.w, self.h, self.pixfmt, self.fps
-        )
-    }
-}
-
-/// Bayer 排列自动探测（伪格式 bayer_auto16le 专用）：读首帧前若干行按
-/// LE u16 解析（12bit 低对齐数据用容器原值即可，统计不受影响），两级启发式：
-/// ① 主/反对角逐对均值差——G 同色强相关、R-B 跨色弱相关，差值小的对角线
-///    即 G-G 对角：反对角 → {rggb, bggr}，主对角 → {gbrg, grbg}；
-/// ② 组内两非 G 位置采样均值，大者判为 R（自然图像/彩条下 R>B 统计成立；
-///    相对差 <1% 视为不可分辨）。置信不足返回 None，调用方按 RGGB 兜底。
-/// None 另见：帧过小（<8x4）/ 读取失败
-pub(super) fn detect_bayer_layout(
-    read: &mut impl std::io::Read,
-    w: u32,
-    h: u32,
-) -> Option<&'static str> {
-    use std::io::Read as _;
-    const MAX_ROWS: usize = 128; // 采样行数上限（1920 宽 ≈ 512KB，zip 头部解压开销可忽略）
-    if w < 8 || h < 4 {
-        return None;
-    }
-    let stride = w as usize * 2;
-    let mut buf = Vec::with_capacity(MAX_ROWS * stride);
-    read.take(MAX_ROWS as u64 * stride as u64)
-        .read_to_end(&mut buf)
-        .ok()?;
-    let rows = buf.len() / stride;
-    let rows = rows - rows % 2; // 2x2 块对齐
-    if rows < 4 {
-        return None;
-    }
-    let w = w as usize;
-    let px = |r: usize, c: usize| -> u16 {
-        u16::from_le_bytes([buf[r * stride + c * 2], buf[r * stride + c * 2 + 1]])
-    };
-    // 偶对齐 2x2 块内统计：d_main=|(0,0)-(1,1)|，d_anti=|(0,1)-(1,0)|；
-    // 同时累加四个位置的均值（组内 R/B 判别用）
-    let (mut d_main, mut d_anti) = (0u64, 0u64);
-    let (mut s00, mut s01, mut s10, mut s11) = (0u64, 0u64, 0u64, 0u64);
-    let mut n = 0u64;
-    for br in (0..rows - 1).step_by(2) {
-        for bc in (0..w - 1).step_by(2) {
-            let (p00, p01) = (px(br, bc) as u64, px(br, bc + 1) as u64);
-            let (p10, p11) = (px(br + 1, bc) as u64, px(br + 1, bc + 1) as u64);
-            d_main += p00.abs_diff(p11);
-            d_anti += p01.abs_diff(p10);
-            s00 += p00;
-            s01 += p01;
-            s10 += p10;
-            s11 += p11;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        return None;
-    }
-    // ① G-G 对角（需明显差距，噪声/纯灰数据不可靠 → 交由调用方兜底）
-    let (gg_is_main, d_small, d_large) = if d_main < d_anti {
-        (true, d_main, d_anti)
-    } else {
-        (false, d_anti, d_main)
-    };
-    if d_large == 0 || d_small * 100 > d_large * 95 {
-        return None;
-    }
-    // ② 组内 R/B 均值判别（R>B 统计；相对差 <1% 或均值近零不可分辨）
-    let mean = |s: u64| s as f64 / n as f64;
-    let rggb_or_bggr = |m00: f64, m11: f64| -> Option<&'static str> {
-        if (m00 + m11).abs() < 2.0 || (m00 - m11).abs() * 100.0 < (m00 + m11) * 0.5 {
-            return None;
-        }
-        Some(if m00 > m11 { "bayer_rggb16le" } else { "bayer_bggr16le" })
-    };
-    let gbrg_or_grbg = |m01: f64, m10: f64| -> Option<&'static str> {
-        if (m01 + m10).abs() < 2.0 || (m01 - m10).abs() * 100.0 < (m01 + m10) * 0.5 {
-            return None;
-        }
-        Some(if m01 > m10 { "bayer_grbg16le" } else { "bayer_gbrg16le" })
-    };
-    if gg_is_main {
-        // G 在主对角 (0,0)/(1,1)，R/B 在 (0,1)/(1,0)
-        gbrg_or_grbg(mean(s01), mean(s10))
-    } else {
-        // G 在反对角 (0,1)/(1,0)，R/B 在 (0,0)/(1,1)
-        rggb_or_bggr(mean(s00), mean(s11))
-    }
-}
-
-/// 伪格式 bayer_auto16le 的装载前解析：读首帧探测排列并替换 pixfmt；
-/// 探测不可靠（数据不足/纯灰）按 RGGB 兜底并记日志
-pub(super) fn resolve_auto_bayer(r: &mut RawLoad, read: &mut impl std::io::Read) {
-    if !r.auto_bayer {
-        return;
-    }
-    r.auto_bayer = false;
-    let probed = detect_bayer_layout(read, r.w, r.h).unwrap_or("bayer_rggb16le");
-    tracing::info!("bayer 排列探测: {} ({}x{})", probed, r.w, r.h);
-    r.pixfmt = probed.to_string();
-}
+use crate::rawdec::{resolve_auto_bayer, RawLoad};
 
 impl App {
     // ---- 播放 ----
@@ -146,99 +26,24 @@ impl App {
         true
     }
 
-    /// raw dump 预设解析 + 不读文件的整除校验（方案 §4.5）：
-    /// Ok(Some(load)) = 命中预设且校验通过（loadfile 第四参数 + 流层
-    /// bit_shift）；Ok(None) = 非裸数据（标准容器，无需选项）；
-    /// Err(msg) = 配置错误（pixfmt 不在名单 / 宽高缺失且文件名无分辨率 /
-    /// 大小不整除 / bit_shift 越界或非 le 格式），调用方 set_err 并放弃装载。
-    /// 校验必须在 loadfile 之前：rawvideo demuxer 对尾部零头字节不报错，
-    /// 画面会错位且难排查。
-    ///
-    /// 宽高兜底（文件名分辨率）：预设 width/height 为 0，或预设宽高整除
-    /// 校验失败时，解析文件名内嵌 WxH（如 fpga_in_s0_1920x1080_00_1.raw）
-    /// 逐候选重走整除校验，首个通过者胜出；候选序 = 预设宽高（若有效）
-    /// 在前、文件名按出现顺序在后
+    /// raw dump 预设解析 + 不读文件的整除校验（机制与五类拦截文案见
+    /// crate::rawdec::raw_demux_opts，本方法是薄委托）
     pub(super) fn raw_demux_opts(
         &self,
         name: &str,
         size: Option<u64>,
     ) -> Result<Option<RawLoad>, String> {
-        let Some(d) = self.cfg.raw_demux(name) else {
-            return Ok(None);
-        };
-        // 1) 格式名前置校验（名单见 README「raw 格式表」；bayer_auto16le
-        //    为伪格式=16bit 容器，排列装载时自动探测）
-        let Some(bits) = crate::config::raw_pixfmt_bits(&d.pixfmt) else {
-            return Err(format!(
-                "raw 预设像素格式 '{}' 不被支持（预设 match='{}'）。\n\
-                 常用：yuv420p / nv12 / yuv422p / yuyv422 / gray / gray16le / bayer_rggb8 / bayer_rggb16le / bayer_auto16le…\n\
-                 完整名单见 README「raw 格式表」（195 项，含全部 yuv/rgb/gray/bayer 家族）。",
-                d.pixfmt, d.r#match
-            ));
-        };
-        let auto_bayer = d.pixfmt.eq_ignore_ascii_case("bayer_auto16le");
-        // 2) bit_shift 合法域：0~8；>0 须 le 结尾（按 LE u16 采样
-        //    移位，be/1 字节格式位移会破坏数据）
-        if d.bit_shift > 8
-            || d.bit_shift > 0 && !d.pixfmt.to_ascii_lowercase().ends_with("le")
-        {
-            return Err(format!(
-                "raw 预设 match='{}' 的 bit_shift={} 不合法（pixfmt={}）：\
-                 取值 0~8；>0 时 pixfmt 须为 le 结尾的 16bit 容器格式\
-                 （如 bayer_bggr16le；12bit 低对齐数据填 4、10bit 填 6）。",
-                d.r#match, d.bit_shift, d.pixfmt
-            ));
-        }
-        // 3) 宽高候选：预设非 0 优先，文件名内嵌 WxH 兜底（预设配错分辨率
-        //    时整除校验会失败，文件名分辨率是 dump 工具写进名字的可靠参数）
-        let mut candidates: Vec<(u32, u32)> = Vec::new();
-        if d.width > 0 && d.height > 0 {
-            candidates.push((d.width, d.height));
-        }
-        for c in crate::config::parse_filename_dims(name) {
-            if !candidates.contains(&c) {
-                candidates.push(c);
-            }
-        }
-        if candidates.is_empty() {
-            return Err(format!(
-                "raw 预设 match='{}' 的 width/height 未填（pixfmt={}），且文件名\
-                 无内嵌分辨率：宽高无法确定。\n\
-                 请在预设填 width/height，或让文件名携带 WxH（如 xxx_1920x1080_00.raw）。",
-                d.r#match, d.pixfmt
-            ));
-        }
-        // 4) 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式），
-        //    逐候选取首个通过者
-        for &(w, h) in &candidates {
-            let frame_bits = w as u64 * h as u64 * bits as u64;
-            if let Some(size) = size {
-                if size * 8 % frame_bits != 0 {
-                    continue;
-                }
-            }
-            return Ok(Some(RawLoad {
-                w,
-                h,
-                pixfmt: d.pixfmt.clone(),
-                fps: d.fps,
-                bit_shift: d.bit_shift,
-                auto_bayer,
-            }));
-        }
-        let tried = candidates
-            .iter()
-            .map(|(w, h)| format!("{w}x{h}"))
-            .collect::<Vec<_>>()
-            .join("、");
-        Err(format!(
-            "文件大小 {} B 与任一候选分辨率（{tried}）的 {} 单帧大小都不整除，无法切帧。\n\
-             请核对预设 match='{}' 的 width/height/pixfmt 是否与该文件匹配。",
-            size.unwrap_or(0), d.pixfmt, d.r#match
-        ))
+        crate::rawdec::raw_demux_opts(&self.cfg, name, size)
     }
 
     pub(super) fn play(&mut self, entry_idx: usize) {
+        // 对比模式中任何播放动作（列表点击/翻页快捷键/退出对比回落）=
+        // 退出对比回落单图模式（exit_compare 已 take 后调 play，不触发此分支）
+        if self.compare.is_some() {
+            self.compare = None;
+            self.img.clear_shown_multi();
+            self.rawdec.retain(&[]);
+        }
         // 用户/自动推进切换条目 = 翻篇：清掉上一条目的红/绿消息
         //（成功播放则无消息，失败随后 set_err 新红）
         self.error = None;
@@ -1046,7 +851,8 @@ impl App {
                 }
                 ExtMsg::FileDone(i) => {
                     // 批内条目落地：是当前期望目标则立即播放（预取的留在缓存里
-                    // 供后续翻页命中），否则只记账
+                    // 供后续翻页命中），否则只记账。对比模式不自动播放——
+                    // compare_tick 的落地检查按栏拾取（播放会劫持对比会话）
                     let mut play: Option<(PathBuf, usize)> = None;
                     if let Some(j) = &mut self.extract {
                         if let Some(d) = j.pending.remove(&i) {
@@ -1058,7 +864,10 @@ impl App {
                             }
                             // 缓存命中路径已直接播放该条目时不重播
                             // （重播会让视频闪断、图片重置动画）
-                            if i == j.entry_idx && self.playing != Some(i) {
+                            if i == j.entry_idx
+                                && self.playing != Some(i)
+                                && self.compare.is_none()
+                            {
                                 play = Some((d, i));
                             }
                         }
@@ -1084,10 +893,12 @@ impl App {
                         self.playing
                     );
                     // 兜底：目标理论上已由 FileDone 播放（gen 匹配 = 期望
-                    // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播
+                    // 未被后续重定向取代且未被批内切走）；文件在而没播过才补播。
+                    // 对比模式不补播（compare_tick 落地检查拾取，播放会劫持会话）
                     if !reviewing
                         && gen == self.next_gen
                         && self.playing != Some(entry_idx)
+                        && self.compare.is_none()
                         && std::fs::metadata(&dest).is_ok()
                     {
                         self.load_extracted(&dest, entry_idx);

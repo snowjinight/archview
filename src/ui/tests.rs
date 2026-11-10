@@ -1208,7 +1208,7 @@ fn raw_demux_opts_validation() {
 /// 按 RGGB 兜底）
 #[test]
 fn bayer_layout_detection() {
-    use super::extract::detect_bayer_layout;
+    use crate::rawdec::detect_bayer_layout;
     let (w, h) = (32u32, 16u32);
     // (r,c) 位置 → 通道值：R=3000 G=2000 B=1000（12bit 域内）+ 渐变扰动
     let make = |p00: u16, p01: u16, p10: u16, p11: u16| -> Vec<u8> {

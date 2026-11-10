@@ -6,10 +6,16 @@
 //! 功能按子模块拆分（均为 `App` 的拆分 `impl` 块，字段集中在此）：
 //! - [`open`]     打开链路（对话框/拖放/后台打开线程/视图重建）
 //! - [`extract`]  播放与后台解压链路（流式快路径、solid 滑窗会话、缓存命中）
+//! - [`compare`]  多图对比视图（会话状态机 + 入口/键位编排，§16）
 //! - [`dialogs`]  弹窗（密码输入、下一个压缩包选择）
 //! - [`nav`]      快捷键与媒体导航（全屏、上一个/下一个、自动翻页）
 //! - [`panels`]   UI 面板（顶栏/文件列表/媒体区/控制栏）与进度条绘制
 //! - [`config_editor`] 内嵌 config.toml 编辑器（'#' 注释灰色高亮、保存即热生效）
+//!
+//! **目录 ≠ 层级**（层级 × 模块映射见 doc/架构设计/03_整体架构.md）：本目录
+//! 是 GUI 应用线整体——panels/nav/dialogs/config_editor 是交互壳切片（L4），
+//! open/extract/compare 是应用编排切片（L3）；媒体能力服务（player/imgview/
+//! rawdec）与基建（vfs/search/config）在 crate 根，按能力命名。
 
 use crate::cache;
 use crate::config::Config;
@@ -31,6 +37,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
+mod compare;
 mod config_editor;
 mod dialogs;
 mod extract;
@@ -39,6 +46,14 @@ mod open;
 mod panels;
 #[cfg(test)]
 mod tests;
+
+// 对比视图共享符号（panels 绘制/入口谓词、nav 键位分派引用）；
+// raw 软解服务住在 crate::rawdec 媒体层（与 ImageService 平级）
+use crate::rawdec::RawFrameService;
+use compare::{
+    compare_eligible, grid_cells, pane_image_rect, clamp_center, sync_zoom_center, sync_zoom_step,
+    CompareSession, PaneKind,
+};
 
 /// 搜索框固定 Id：快捷键处理时仅对该控件让出键盘
 fn search_box_id() -> egui::Id {
@@ -361,6 +376,10 @@ pub struct App {
     encode_dialog: Option<EncodeDialog>,
     // 后台编码任务（§15.5：同时仅一个；编码 mpv 实例独立，播放不受影响）
     encode_job: Option<EncodeJob>,
+    // 多图对比会话（compare.rs）：Some = 对比模态（mpv 不在场，独立键表）
+    compare: Option<CompareSession>,
+    // raw 帧软解服务（对比栏专用：后台线程解码 → mpsc → UI 上传纹理）
+    rawdec: RawFrameService,
 }
 
 impl App {
@@ -435,6 +454,8 @@ impl App {
             select_anchor: None,
             encode_dialog: None,
             encode_job: None,
+            compare: None,
+            rawdec: RawFrameService::new(cc.egui_ctx.clone()),
         }
     }
 
@@ -456,7 +477,7 @@ impl App {
             gl: None,
             egui_ctx: ctx.clone(),
             player: None,
-            img: ImageService::new(ctx, img_cap),
+            img: ImageService::new(ctx.clone(), img_cap),
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
@@ -498,6 +519,8 @@ impl App {
             select_anchor: None,
             encode_dialog: None,
             encode_job: None,
+            compare: None,
+            rawdec: RawFrameService::new(ctx.clone()),
         }
     }
 
@@ -629,6 +652,9 @@ impl eframe::App for App {
         // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
         self.poll_img();
         probe!("poll_img");
+        // 对比模式 tick（raw 帧轮询/对齐、image 栏自愈、非流式落地检查）
+        self.compare_tick();
+        probe!("compare_tick");
         // mpv 装载失败回显（END_FILE(ERROR) 通道 → set_err）
         self.poll_mpv_err();
         probe!("poll_mpv_err");

@@ -609,6 +609,7 @@ impl App {
         let mut menu_encode: Option<usize> = None;
         let mut menu_all = false;
         let mut menu_clear = false;
+        let mut menu_compare: Option<usize> = None;
         let mut scrolled = false;
         // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
         // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
@@ -796,6 +797,29 @@ impl App {
                             {
                                 menu_encode = Some(r.idx);
                             }
+                            // 对比显示：入口判定宽松（选中集非空或右键行为合格
+                            // 条目即可点击）——合格数不足时 try_enter_compare
+                            // 统一弹提示，菜单不必复刻校验逻辑
+                            let cmp_ok = !sel.is_empty()
+                                || entries
+                                    .and_then(|es| es.get(r.idx))
+                                    .is_some_and(|e| compare_eligible(cfg, &e.name));
+                            if ui
+                                .add_enabled(
+                                    cmp_ok,
+                                    egui::Button::new(format!(
+                                        "对比显示（C）{}",
+                                        if sel.is_empty() {
+                                            "：先 Ctrl+点选 2~6 张"
+                                        } else {
+                                            ""
+                                        }
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                menu_compare = Some(r.idx);
+                            }
                             ui.separator();
                             if ui.button("全选（Ctrl+A）").clicked() {
                                 menu_all = true;
@@ -873,6 +897,11 @@ impl App {
         // 右键菜单动作（闭包内 flag，此处统一消费）
         if let Some(idx) = menu_encode {
             self.open_encode_dialog(Some(idx));
+        }
+        // 对比显示：右键行不在选中集时先补选入（右键语义 = 含该行参与对比）
+        if let Some(idx) = menu_compare {
+            self.selected.insert(idx);
+            self.try_enter_compare();
         }
         if menu_all {
             self.selected = self.list_rows.iter().map(|r| r.idx).collect();
@@ -975,6 +1004,11 @@ impl App {
 
         // 媒体区；click_and_drag 为图片拖拽平移准备（视频无副作用）
         let resp = ui.allocate_rect(video, egui::Sense::click_and_drag());
+        // 对比模态：整个媒体区交给网格布局绘制（mpv 占位分支全部让位）
+        if self.compare.is_some() {
+            self.compare_view(ui, &resp, video);
+            return;
+        }
         // 当前条目是否纹理直显图片（视频/动图/开关关闭 = None，走 mpv 分支）
         let img_key = self.tex_image_key();
         // 解压覆盖层显示条件：
@@ -1559,6 +1593,301 @@ impl App {
                     .request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
+    }
+
+    /// 多图对比视图（compare.rs 会话渲染）：网格分栏 + 共享 zoom/center +
+    /// 每栏独立交互（点击换主栏、拖拽平移、滚轮锚缩放）。raw 栏走软解
+    /// 纹理服务，帧徽标显示游标错位。
+    /// 交互语义（方案 A）：zoom = 相对各栏 fit 的倍率（None=适应窗口），
+    /// center = 视口中心指向的归一化图像坐标——不同分辨率图内容对齐；
+    /// 滚轮 fit 态=整组滑动（与单图翻页习惯一致），缩放态/Ctrl=悬停栏锚缩放
+    pub(super) fn compare_view(&mut self, ui: &mut egui::Ui, resp: &egui::Response, video: egui::Rect) {
+        let n = match self.compare.as_ref() {
+            Some(s) => s.panes.len(),
+            None => return,
+        };
+        let cells = grid_cells(video, n);
+        let ppp = ui.ctx().pixels_per_point();
+        let amber = if ui.visuals().dark_mode {
+            AMBER_DARK
+        } else {
+            AMBER_LIGHT
+        };
+        // ---- 滚轮先取（fit 态=整组滑动，缩放态留给栏内锚缩放）----
+        let mut wheel = 0.0f32;
+        let mut wheel_pos = None;
+        if resp.hovered() {
+            let (dy, pos, ctrl) = ui.input(|i| {
+                let mut dy = 0.0_f32;
+                let mut ctrl = i.modifiers.ctrl;
+                for e in &i.events {
+                    if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
+                        dy += delta.y;
+                        ctrl |= modifiers.ctrl;
+                    }
+                }
+                (dy, i.pointer.latest_pos(), ctrl)
+            });
+            let zoomed = ctrl || self.compare.as_ref().is_some_and(|s| s.zoom.is_some());
+            if dy != 0.0 && !zoomed {
+                // fit 态裸滚轮 = 整组滑动（上滚=上一个，与单图模式同向），
+                // 节流同款（wheel_switch_secs）
+                let now = ui.input(|i| i.time);
+                if now - self.wheel_last >= self.cfg.ui.wheel_switch_secs {
+                    self.wheel_last = now;
+                    let dir = if dy > 0.0 { -1 } else { 1 };
+                    self.compare_slide(dir);
+                }
+            } else if dy != 0.0 {
+                wheel = dy;
+                wheel_pos = pos;
+            }
+        }
+        let master0 = self.compare.as_ref().map(|s| s.master).unwrap_or(0);
+        let wheel_used = std::cell::Cell::new(false);
+        for i in 0..n {
+            let Some(cell) = cells.get(i) else { break };
+            // 栏内数据快照（会话借用随即结束，绘制/交互段要 &mut）
+            let (key, kind) = {
+                let s = self.compare.as_ref().unwrap();
+                let p = &s.panes[i];
+                (p.key, p.kind.clone())
+            };
+            let pr = ui.allocate_rect(*cell, egui::Sense::click_and_drag());
+            let mut set_master = false;
+            let mut drag = egui::Vec2::ZERO;
+            if pr.clicked() {
+                set_master = true;
+            }
+            if pr.dragged() {
+                drag = pr.drag_delta();
+            }
+            let (zoom_s, center_s) = {
+                let s = self.compare.as_ref().unwrap();
+                (s.zoom, s.center)
+            };
+            match &kind {
+                PaneKind::Image => {
+                    // frame_ex：主栏 true（拥有 full 槽、可弃旧槽），非主栏
+                    // false（每帧轮流 frame 若人人弃槽会把主栏 full 抖掉）
+                    let Some((tex, rest)) = self.img.frame_ex(key, i == master0) else {
+                        self.draw_pane_text(
+                            ui,
+                            cell,
+                            "正在解码图片…（非流式包等待解压落地）",
+                        );
+                        if set_master {
+                            self.compare.as_mut().unwrap().master = i;
+                        }
+                        continue;
+                    };
+                    if let Some(rest) = rest {
+                        ui.ctx().request_repaint_after(rest);
+                    }
+                    let native = tex.size_vec2();
+                    let fit = fit_scale(*cell, native);
+                    // full 纹理选画 + 升级触发（仅主栏，判据同单图 image_view）
+                    let zoom = zoom_s.unwrap_or(fit);
+                    let native_max = native.max_elem() as u32;
+                    if i == master0
+                        && native_max <= self.cfg.ui.image_max_dim
+                        && zoom * ppp > self.cfg.ui.image_full_threshold
+                        && self.img.is_static(key)
+                        && !self.img.has_full(key)
+                        && !self.img.is_full_pending(key)
+                        && !self.img.is_full_failed(key)
+                    {
+                        let s = self.compare.as_ref().unwrap();
+                        let p = &s.panes[i];
+                        let (source, name2) = (p.source.clone(), p.name.clone());
+                        self.img.request_full(
+                            key,
+                            source,
+                            &name2,
+                            self.cfg.ui.image_full_sharpen,
+                        );
+                    }
+                    let screen_px = (native * zoom * ppp).max_elem();
+                    let want_full = screen_px > native_max as f32 * self.cfg.ui.image_full_threshold;
+                    let full = if want_full { self.img.full_tex(key) } else { None };
+                    let tex = full.unwrap_or(tex);
+                    let tid = tex.id();
+                    self.draw_pane_and_interact(
+                        ui,
+                        cell,
+                        &pr,
+                        i,
+                        &tid,
+                        native,
+                        zoom_s,
+                        center_s,
+                        set_master,
+                        drag,
+                        &wheel,
+                        wheel_pos,
+                        &wheel_used,
+                        ppp,
+                    );
+                }
+                PaneKind::Raw(info) => {
+                    let native = egui::vec2(info.w as f32, info.h as f32);
+                    let tid = self.rawdec.frame(key).map(|t| t.tex.id());
+                    match tid {
+                        Some(tid) => {
+                            self.draw_pane_and_interact(
+                                ui,
+                                cell,
+                                &pr,
+                                i,
+                                &tid,
+                                native,
+                                zoom_s,
+                                center_s,
+                                set_master,
+                                drag,
+                                &wheel,
+                                wheel_pos,
+                                &wheel_used,
+                                ppp,
+                            );
+                        }
+                        None => {
+                            // 解码失败（确定性）显示错误；否则解码中占位
+                            let msg = self.rawdec.err(key).cloned();
+                            match msg {
+                                Some(e) => self.draw_pane_text(ui, cell, &format!("解码失败：{e}")),
+                                None => self.draw_pane_text(ui, cell, "解码中…"),
+                            }
+                            if set_master {
+                                self.compare.as_mut().unwrap().master = i;
+                            }
+                        }
+                    }
+                    // 帧徽标：多帧 raw 栏右下角显示"游标钳制后帧号/总帧数"
+                    if info.frame_count > 1 {
+                        let s = self.compare.as_ref().unwrap();
+                        let cur = s.cursor.min(info.frame_count - 1) + 1;
+                        self.paint_badge(ui, *cell, &format!("{}/{}", cur, info.frame_count));
+                    }
+                }
+                PaneKind::RawErr(msg) => {
+                    // 错误文案直接占整栏（配置错误：预设参数不支持软解）
+                    let rect = egui::Rect::from_min_size(
+                        cell.left_top() + egui::vec2(4.0, 18.0),
+                        egui::vec2(cell.width() - 8.0, cell.height() - 22.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.label(
+                            egui::RichText::new(msg).small().color(ui.visuals().warn_fg_color),
+                        );
+                    });
+                    if set_master {
+                        self.compare.as_mut().unwrap().master = i;
+                    }
+                }
+            }
+        }
+        // 名称徽标统一压栈绘制（在纹理之上）：主栏琥珀、其余弱化
+        let master = self.compare.as_ref().map(|s| s.master).unwrap_or(0);
+        for i in 0..n {
+            let Some(cell) = cells.get(i) else { break };
+            let name = self.compare.as_ref().unwrap().panes[i].name.clone();
+            let prefix = if i == master { "★ " } else { "" };
+            ui.painter_at(*cell).text(
+                cell.left_top() + egui::vec2(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{prefix}{name}"),
+                egui::TextStyle::Small.resolve(ui.style()),
+                if i == master { amber } else { ui.visuals().weak_text_color() },
+            );
+        }
+    }
+
+    /// 对比栏的纹理绘制 + 共享 zoom/center 交互（图像栏与 raw 栏共用：
+    /// 两者都以 (native, tex_id) 抽象，差异只在纹理来源）
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pane_and_interact(
+        &mut self,
+        ui: &mut egui::Ui,
+        cell: &egui::Rect,
+        pr: &egui::Response,
+        i: usize,
+        tex_id: &egui::TextureId,
+        native: egui::Vec2,
+        zoom_in: Option<f32>,
+        center_in: egui::Vec2,
+        set_master: bool,
+        drag: egui::Vec2,
+        wheel: &f32,
+        wheel_pos: Option<egui::Pos2>,
+        wheel_used: &std::cell::Cell<bool>,
+        ppp: f32,
+    ) {
+        let fit = fit_scale(*cell, native);
+        // ---- 交互先于绘制（同 image_view：改完 zoom/center 绘制统一 clamp）----
+        if set_master {
+            self.compare.as_mut().unwrap().master = i;
+        }
+        // 拖拽平移：图像跟手 → 视口中心指向的图像坐标反向移动，
+        // 按本栏 clamp（用户看到的即所限，其它栏绘制时各自 clamp）
+        if drag != egui::Vec2::ZERO {
+            let disp = native * zoom_in.unwrap_or(fit);
+            let c = center_in - drag / disp;
+            self.compare.as_mut().unwrap().center = clamp_center(c, disp, cell.size());
+        }
+        // 滚轮锚缩放：悬停栏为交互栏（fit 态滚轮已在 compare_view 顶部
+        // 消费为整组滑动，这里只收缩放态/Ctrl 的量）
+        if *wheel != 0.0 && !wheel_used.get() && pr.hovered() {
+            if let Some(pos) = wheel_pos.filter(|p| cell.contains(*p)) {
+                let factor = if *wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                if let Some(nz) = sync_zoom_step(zoom_in, factor) {
+                    let disp_b = native * zoom_in.unwrap_or(fit);
+                    let disp_a = native * nz;
+                    let delta = pos - cell.center();
+                    let c = sync_zoom_center(center_in, delta, disp_b, disp_a);
+                    let s = self.compare.as_mut().unwrap();
+                    s.zoom = Some(nz);
+                    s.center = clamp_center(c, disp_a, cell.size());
+                } else {
+                    // 缩小触底（≤fit）落回适应窗口
+                    let s = self.compare.as_mut().unwrap();
+                    s.zoom = None;
+                    s.center = egui::vec2(0.5, 0.5);
+                }
+                wheel_used.set(true);
+            }
+        }
+        // ---- 绘制：交互段可能刚改过 zoom/center，重取最新值 ----
+        let (zoom_v, center_v) = {
+            let s = self.compare.as_ref().unwrap();
+            (s.zoom, s.center)
+        };
+        let disp = native * zoom_v.unwrap_or(fit);
+        let center = clamp_center(center_v, disp, cell.size());
+        let mut raw = pane_image_rect(*cell, disp, center);
+        // 物理像素 snap（同 image_view：100% 态防双线性发糊/拖拽亚像素爬动）
+        let snapped = egui::Rect::from_min_max(
+            (raw.min * ppp).round() / ppp,
+            (raw.max * ppp).round() / ppp,
+        );
+        if snapped.width() > 0.0 && snapped.height() > 0.0 {
+            raw = snapped;
+        }
+        let mut mesh = egui::Mesh::with_texture(*tex_id);
+        mesh.add_rect_with_uv(
+            raw,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        ui.painter_at(*cell).add(egui::Shape::mesh(mesh));
+    }
+
+    /// 对比栏等待/占位绘制：栏内居中一行弱化文案（解码中/解码失败/错误）
+    fn draw_pane_text(&self, ui: &mut egui::Ui, cell: &egui::Rect, text: &str) {
+        ui.put(
+            egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width() - 12.0, 24.0)),
+            egui::Label::new(egui::RichText::new(text).weak()),
+        );
     }
 
     /// 媒体区右下角小徽标（黑底半透明圆角 + 白字）：缩放模式指示用

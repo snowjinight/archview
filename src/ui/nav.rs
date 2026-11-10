@@ -65,6 +65,13 @@ impl App {
                 self.selected = self.list_rows.iter().map(|r| r.idx).collect();
             }
         }
+        // 对比模态：独立键表全权接管（mpv 播放键全禁，分派单位是模式）。
+        // 先于"无播放器早退"——对比模式 mpv 不在场（纹理/raw 软解），无
+        // 播放器也成立
+        if self.compare.is_some() {
+            self.compare_shortcuts(ctx, frame);
+            return;
+        }
         // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
         if self.player.is_none() && self.tex_image_key().is_none() {
             // 未开任何文件时 M 仍可预设静音——真相在 cfg（与控制栏 ♪ 按钮一致），
@@ -117,6 +124,8 @@ impl App {
         let mut fs_exit = false;
         // B=回到锚点（最后一次实际解压位置，见 App.last_focus）
         let mut go_focus = false;
+        // C=进入多图对比（选中合格条目 ≥2；校验与提示在 try_enter_compare）
+        let mut enter_compare = false;
         // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
         let mut ask_next_key = false;
         // 图片模式缩放：+/−=步进，0=100%，Home=适应窗口
@@ -243,6 +252,11 @@ impl App {
                         go_focus = true;
                         false
                     }
+                    // C=进入多图对比视图（选中 2~6 个合格条目分栏同步缩放）
+                    egui::Key::C if m.is_none() => {
+                        enter_compare = true;
+                        false
+                    }
                     egui::Key::N if m.is_none() => {
                         ask_next_key = true;
                         false
@@ -314,6 +328,10 @@ impl App {
         // N：直接弹出下一个压缩包选择窗（不等翻到末项，主动触发无“已到末项”文案）
         if ask_next_key {
             self.ask_next_archive(false);
+        }
+        // C：进入多图对比视图（选中集 ∩ 入口谓词 ≥2 才放行，校验在内部）
+        if enter_compare {
+            self.try_enter_compare();
         }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
