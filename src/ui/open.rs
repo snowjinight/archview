@@ -400,18 +400,22 @@ impl App {
             return;
         };
         // 解析一次，逐条目评估：无通配符的纯词匹配内部退化为 contains，
-        // 性能与旧子串实现持平；空查询 matches 一切（等价于不过滤）
+        // 性能与旧子串实现持平；空查询 matches 一切（等价于不过滤）。
+        // 视频判定（is_video_ext 含 raw 预设匹配）每条目只做一次，分类结果
+        // kinds 与 view 同序携带，后续计数/行缓存直接查表——旧实现同一名单
+        // 要过 3 遍 is_video_ext，万级条目 × raw 预设回溯时开销放大 3 倍
         let query = crate::search::parse_query(&self.search);
-        a.view = a
+        let mut classified: Vec<(usize, bool)> = a
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| {
-                !e.is_dir
-                    && (self.cfg.is_video_ext(&e.name) || self.cfg.is_image_ext(&e.name))
-                    && query.matches(&e.name)
+            .filter_map(|(i, e)| {
+                if e.is_dir || !query.matches(&e.name) {
+                    return None;
+                }
+                let is_video = self.cfg.is_video_ext(&e.name);
+                (is_video || self.cfg.is_image_ext(&e.name)).then_some((i, is_video))
             })
-            .map(|(i, _)| i)
             .collect();
         // 排序（config: ui.sort_files，默认关）：自然序（alphanumeric-sort），
         // 数字段按数值比较（1/2/10），非数字段不区分大小写——看漫画/图集时开启。
@@ -422,15 +426,16 @@ impl App {
         if self.cfg.ui.sort_files {
             // 预生成小写键（每条一次分配），比较器内不再重复 to_lowercase
             // （旧比较器每次比较做 2 次 to_lowercase，万级条目 ≈ 34 万次分配）。
-            // 用 (idx, key) 对排序再取回 idx：键与位置绑定，排序中不会错位
-            let mut keyed: Vec<(usize, String)> = a
-                .view
+            // 键与 (idx, 分类) 绑定排序再取回：排序中不会错位
+            let mut keyed: Vec<(usize, bool, String)> = classified
                 .iter()
-                .map(|&i| (i, a.entries[i].name.to_lowercase()))
+                .map(|&(i, v)| (i, v, a.entries[i].name.to_lowercase()))
                 .collect();
-            keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.1, &y.1));
-            a.view = keyed.into_iter().map(|(i, _)| i).collect();
+            keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.2, &y.2));
+            classified = keyed.into_iter().map(|(i, v, _)| (i, v)).collect();
         }
+        let (view, kinds): (Vec<usize>, Vec<bool>) = classified.into_iter().unzip();
+        a.view = view;
 
         // 自动切标签页：当前标签页为空而另一类非空时跳过去。
         // 纯图片/纯视频的包打开时不再停在空列表上让用户误以为没打开
@@ -438,17 +443,11 @@ impl App {
         //   需要搜索框为空才切，避免打断用户在另一标签页里搜东西；
         //   注意不能用 query.is_empty()：输入 "!" 等无法成词的内容也会解析为空树）
         if self.search.trim().is_empty() {
-            let (n_video, n_image) = {
-                let mut c = (0usize, 0usize);
-                for &i in &a.view {
-                    if self.cfg.is_video_ext(&a.entries[i].name) {
-                        c.0 += 1;
-                    } else {
-                        c.1 += 1;
-                    }
-                }
-                c
-            };
+            let (n_video, n_image) = kinds
+                .iter()
+                .fold((0usize, 0usize), |(v, m), &is_video| {
+                    if is_video { (v + 1, m) } else { (v, m + 1) }
+                });
             let (cur, other) = match self.list_tab {
                 ListTab::Video => (n_video, n_image),
                 ListTab::Image => (n_image, n_video),
@@ -468,12 +467,10 @@ impl App {
             }
         }
 
-        // 行缓存：当前标签页的行 + 两类计数（view 内）
+        // 行缓存：当前标签页的行 + 两类计数（view 内，分类查 kinds 不再重判）
         let mut counts = (0usize, 0usize);
         let mut tab_items: Vec<(usize, &str)> = Vec::new();
-        for &i in &a.view {
-            let e = &a.entries[i];
-            let is_video = self.cfg.is_video_ext(&e.name);
+        for (&i, &is_video) in a.view.iter().zip(&kinds) {
             if is_video {
                 counts.0 += 1;
             } else {
@@ -483,7 +480,7 @@ impl App {
             if (self.list_tab == ListTab::Video) != is_video {
                 continue;
             }
-            tab_items.push((i, e.name.as_str()));
+            tab_items.push((i, a.entries[i].name.as_str()));
         }
         let total = tab_items.len();
         self.list_rows = tab_items

@@ -290,32 +290,55 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 
 /// 极简通配匹配（仅 `*` 与 `?`，大小写不敏感，不引 glob crate）。
-/// 经典迭代回溯：遇 `*` 记录（模式位/名字位），失配时让该 `*` 多吞一字符重试
+/// 经典迭代回溯：遇 `*` 记录（模式位/名字位），失配时让该 `*` 多吞一字符重试。
+/// 直接在 UTF-8 字节上跑、零堆分配（万级文件逐名匹配的热路径）：`?` 与
+/// `*` 回溯均按 UTF-8 字符粒度推进（char_len 跳过续字节），非 ASCII 模式/
+/// 文件名逐字节相等 == 逐字符相等，语义与旧 Vec<char> 实现完全一致
 fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    // ni 处 UTF-8 字符的字节长（&str 保证合法 UTF-8，ni 恒在字符边界）
+    let char_len = |bytes: &[u8], i: usize| match bytes[i] {
+        b if b < 0x80 => 1,
+        b if b >= 0xF0 => 4,
+        b if b >= 0xE0 => 3,
+        b if b >= 0xC0 => 2,
+        _ => 1, // 孤立续字节（不可达）：按 1 字节兜底，不 panic
+    };
     let (mut pi, mut ni) = (0usize, 0usize);
     let (mut star, mut mark) = (usize::MAX, 0usize);
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+        if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
             pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+            ni += if p[pi - 1] == b'?' { char_len(n, ni) } else { 1 };
+        } else if pi < p.len() && p[pi] == b'*' {
             star = pi;
             mark = ni;
             pi += 1;
         } else if star != usize::MAX {
-            mark += 1;
+            mark += char_len(n, mark); // `*` 多吞一个字符重试
             pi = star + 1;
             ni = mark;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+    while pi < p.len() && p[pi] == b'*' {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// 纯后缀形模式判定：`*` 仅在开头出现一次、其余为字面字符（`*.raw`、
+/// `*_dump.raw`，`*` 单独出现 = 匹配一切也归此类）→ 命中条件退化为
+/// 「大小写不敏感 ends_with」，万级文件热路径免回溯；返回 None（含中置
+/// `*`/`?`）才走 glob_match 通用回溯。与 glob 语义逐点等价：星吞任意
+/// （含零个）字符后接字面后缀 == ends_with 该后缀
+fn suffix_pattern(pattern: &str) -> Option<&str> {
+    let rest = pattern.strip_prefix('*')?;
+    rest.as_bytes()
+        .iter()
+        .all(|&b| b != b'*' && b != b'?')
+        .then_some(rest)
 }
 
 /// rawvideo 可裸读像素格式（名字 → 每像素**位数**）。
@@ -638,10 +661,19 @@ impl Config {
     }
 
     /// 多条 [[raw.demux]] 预设按声明顺序取首个 glob 命中
-    /// （先写具体如 sensor_a_*.bin、后写宽泛如 *.bin）；无命中返回 None
+    /// （先写具体如 sensor_a_*.bin、后写宽泛如 *.bin）；无命中返回 None。
+    /// 热路径分流：纯后缀形模式（`*.raw` 等，见 suffix_pattern）走大小写
+    /// 不敏感 ends_with（免回溯零分配），其余才走 glob_match 通用回溯——
+    /// 内置三条默认预设全落快路，万级文件目录扫描匹配成本降 ~2 个数量级
     pub fn raw_demux(&self, name: &str) -> Option<&RawDemux> {
         let file = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
-        self.raw.demux.iter().find(|d| glob_match(&d.r#match, file))
+        self.raw.demux.iter().find(|d| match suffix_pattern(&d.r#match) {
+            Some(suf) => {
+                let (f, s) = (file.as_bytes(), suf.as_bytes());
+                f.len() >= s.len() && f[f.len() - s.len()..].eq_ignore_ascii_case(s)
+            }
+            None => glob_match(&d.r#match, file),
+        })
     }
 
     fn has_ext(list: &[String], name: &str) -> bool {
@@ -1200,6 +1232,60 @@ height = 240
         assert!(!glob_match("*aab", "aaxb"));
         // 多字节字符按字符匹配（不按字节截断）
         assert!(glob_match("传感*.bin", "传感器A.bin"));
+    }
+
+    /// 字节匹配实现的字符粒度回归：`?` 与 `*` 回溯均按 UTF-8 字符推进
+    /// （一个三字节汉字 != 三个 `?`），与旧 Vec<char> 实现语义一致
+    #[test]
+    fn glob_matcher_multibyte_granularity() {
+        // ? 恰一字符（汉字按 1 个字符计，不按 3 字节）
+        assert!(glob_match("a?c.bin", "a中c.bin"));
+        assert!(!glob_match("a??c.bin", "a中c.bin"));
+        assert!(!glob_match("a?c.bin", "a中文c.bin"));
+        // * 回溯按字符吞（吞「传感器」整段后对齐 A）
+        assert!(glob_match("*A*.bin", "传感器A.bin"));
+        assert!(glob_match("传感?A.bin", "传感器A.bin"));
+        assert!(glob_match("传感*器*.bin", "传感器A.bin"));
+    }
+
+    /// 后缀快路分流：suffix_pattern 形状判定边界 + 快路（ends_with）与
+    /// 慢路（glob 回溯）对同一批名字结果逐点等价
+    #[test]
+    fn suffix_fast_path_equivalence() {
+        // 形状判定：* 仅在开头 → 后缀形；中置 */?、无通配 → None 走 glob
+        assert_eq!(suffix_pattern("*.raw"), Some(".raw"));
+        assert_eq!(suffix_pattern("*_dump.raw"), Some("_dump.raw"));
+        assert_eq!(suffix_pattern("*"), Some(""));
+        assert_eq!(suffix_pattern("*.nv12"), Some(".nv12"));
+        assert_eq!(suffix_pattern("sensor_a_*.bin"), None);
+        assert_eq!(suffix_pattern("*_?aaa*.raw"), None);
+        assert_eq!(suffix_pattern("*a*b.raw"), None);
+        assert_eq!(suffix_pattern("cap.bin"), None);
+
+        // 快慢两路等价：覆盖命中/未命中/边界（空名、仅后缀、超集后缀）/大小写/中文
+        let names = [
+            "a.raw",
+            "A.RAW",
+            "x_dump.raw",
+            "raw",
+            ".raw",
+            "a.raws",
+            "sraw",
+            "传感器.raw",
+            "",
+        ];
+        for pat in ["*.raw", "*.RAW", "*_dump.raw", "*", "*传感器.raw"] {
+            for name in names {
+                let fast = match suffix_pattern(pat) {
+                    Some(s) => {
+                        let (f, s) = (name.as_bytes(), s.as_bytes());
+                        f.len() >= s.len() && f[f.len() - s.len()..].eq_ignore_ascii_case(s)
+                    }
+                    None => unreachable!("测试用例应为后缀形: {pat}"),
+                };
+                assert_eq!(fast, glob_match(pat, name), "pattern={pat} name={name}");
+            }
+        }
     }
 
     /// RAWVIDEO_PIXFMTS 完整性：数量快照、bayer 12 项、关键 bits 抽查、

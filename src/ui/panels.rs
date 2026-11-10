@@ -936,13 +936,18 @@ impl App {
                         Some(p) => format!("{p}{}", a.entries[i].name),
                         None => a.entries[i].name.clone(),
                     };
+                    // 琥珀黄：灰色弱化色太不显眼；与列表 S 标志/悬停气泡
+                    // 目录段同色相（dark 亮琥珀 / light 深琥珀，保对比度）
+                    let amber = if ui.visuals().dark_mode {
+                        AMBER_DARK
+                    } else {
+                        AMBER_LIGHT
+                    };
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::symmetric(6, 1))
                         .show(ui, |ui| {
                             egui::Label::new(
-                                egui::RichText::new(text)
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
+                                egui::RichText::new(text).small().color(amber),
                             )
                             .truncate()
                             .ui(ui);
