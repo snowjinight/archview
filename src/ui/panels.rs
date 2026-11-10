@@ -242,9 +242,16 @@ impl App {
             // clone 文本先释放借用——点击回调里还要 take 伴随字段并消条
             if let Some(n) = self.notice.clone() {
                 let clickable = self.encode_done_dir.is_some();
+                // 顶栏单行钉死：truncate 只限宽度，管不住显式换行（永远强制
+                // 换行，撑高面板推走预览区）——先把换行折叠掉：\r 先剥
+                // （\r\n 是两字符，egui 不视 \r 为换行会残留乱字形），\n 再
+                // 换空格；超宽时截断到右缘，全文由 elided 自动悬停气泡展示
+                // （Label 自带，勿再手动 on_hover_text——会出现第二个气泡）
+                let n = n.replace('\r', "").replace('\n', " ");
                 let lbl = egui::Label::new(
-                    egui::RichText::new(n).color(egui::Color32::LIGHT_GREEN),
+                    egui::RichText::new(&n).color(egui::Color32::LIGHT_GREEN),
                 )
+                .truncate()
                 .sense(if clickable {
                     egui::Sense::click()
                 } else {
@@ -264,7 +271,15 @@ impl App {
                 }
             }
             if let Some(e) = &self.error {
-                ui.colored_label(egui::Color32::RED, e);
+                // 单行钉死（同 notice）：显式换行撑高顶栏，先折叠（剥 \r、\n
+                // 换空格）；超宽截断后全文由 elided 自动悬停气泡展示（勿手动
+                // 加第二个）
+                let one_line = e.replace('\r', "").replace('\n', " ");
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&one_line).color(egui::Color32::RED))
+                        .truncate()
+                        .selectable(false),
+                );
             }
             let buffering = self.player.as_ref().map(|p| p.buffering()).unwrap_or(false);
             if buffering {

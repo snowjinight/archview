@@ -21,7 +21,7 @@
 | [§4 点击状态机排查手册](04_点击状态机排查手册.md) | 点击状态机排查手册（start_extract 分支链与日志对照） | [ARCHITECTURE §11.4](../架构设计/11_性能优化与虚拟列表.md) |
 | [§5 解压会话化回归测试](05_解压会话化回归测试.md) | 解压会话化回归测试细节（单测 + UI 冒烟） | [ARCHITECTURE §11.4](../架构设计/11_性能优化与虚拟列表.md) |
 | [§6 测试运行方式与覆盖矩阵](06_测试运行方式与覆盖矩阵.md) | 测试运行方式与覆盖矩阵（headless e2e 原理、外部依赖、VarTidy 冒烟环境） | 全项目 |
-| [§7 UI控制栏布局专项](07_UI控制栏布局专项.md) | UI 控制栏布局专项（五坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承） | [ARCHITECTURE §14](../架构设计/14_底部控制栏布局.md) |
+| [§7 UI控制栏布局专项](07_UI控制栏布局专项.md) | UI 控制栏布局专项（七坑：Margin i8 / add_space 垫底 / 居组≠居键 / 面板×Aligner 反馈环 / Button 文本对齐继承 / 顶栏消息显式 \n 强制换行撑高面板 / elided 自动气泡+手动气泡双 hover） | [ARCHITECTURE §14](../架构设计/14_底部控制栏布局.md) |
 | [§8 RAW媒体支持专项](08_RAW媒体支持专项.md) | RAW 媒体支持专项（pixfmt 名单计数 / imageops 签名 / END_FILE 通道三坑：STOP 伪事件 · 真"假格式" · 选项失败无 END_FILE / raw.extensions 移除——预设即唯一入口 / bayer16 低对齐发黑——bit_shift 流层修正 / 文件名 WxH 分辨率兜底 + 内置默认三预设 / bayer_auto16le Bayer 排列自动探测 / DEFAULT_TOML 节头误删与防漂移测试盲区） | [ARCHITECTURE §13.6 / §13.4](../架构设计/13_渲染架构迁移.md) |
 | [§9 encode引擎e2e攻坚](09_encode引擎e2e攻坚.md) | NV12 dump→视频 encode 引擎 e2e 攻坚（vo=lavc 隐式切换不存在 / o·ovc 非运行期 / bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠） | encode/mod.rs |
 | [§10 encode三壳接入](10_encode三壳接入.md) | encode 三壳接入（CLI·SendTo / UI 多选右键确认窗）：egui 0.36 三处 API 实测差异 + move 闭包夺所有权 + 可操作绿条与帧首点击清除的竞态 | encode/cli.rs · ui/ |
