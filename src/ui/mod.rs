@@ -618,9 +618,9 @@ impl eframe::App for App {
         // 处置：非视频播放态统一节流，按触发源分档（间隔由 [ui] 三个
         // redraw_*_fps 配置驱动，见 config.rs pacing_ms，钳制 5~240ms→4~200ms）：
         // - 拖拽中（指针按下）：redraw_drag_fps（默认 60fps），保拖拽/平移流畅；
-        // - 纯悬停移动（PointerMoved 且未按下）：redraw_hover_fps（默认
-        //   30fps）——60fps 全量重建在弱 GPU（RX 640 实测 11%）/弱 CPU 上
-        //   仍占 ~10%/11%，悬停高亮 30fps 无感知，占用减半；
+        // - 悬停/滚轮（PointerMoved/MouseWheel 且未按下）：redraw_hover_fps
+        //   （默认 30fps）——60fps 全量重建在弱 GPU（RX 640 实测 11~17%）/
+        //   弱 CPU 上仍占 ~10%，30fps 无感知，占用减半；
         // - 其余帧（线程唤醒/timer/hover 动画）：redraw_other_fps（默认
         //   60fps）——解码完成等事件延迟 ≤ 帧间隔，解压进度唤醒风暴同样封顶。
         // 视频播放态排除：vsync 主钟已封顶，节流 no-op 且睡眠会推过 vsync
@@ -632,14 +632,21 @@ impl eframe::App for App {
             && self.tex_image_key().is_none()
             && self.player.as_ref().is_some_and(|p| !p.paused());
         let dragging = ctx.input(|i| i.pointer.primary_down());
-        let pointer_moved =
-            ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        // 悬停档触发源：指针移动 + 滚轮。egui-winit 对 MouseWheel 同样无条件
+        // request_repaint，列表滚到底后滚动量被 ScrollArea 钳制、画面无变化，
+        // 但 repaint 已在事件层排掉（应用层只能节流不能取消）——快速滚轮
+        // 帧率同样可到 ~60fps 且全是 no-op 全量重建，归入悬停档 30fps
+        let motion = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. }))
+        });
         let pacing_ms = |fps: u32| {
             std::time::Duration::from_millis(crate::config::UiConfig::pacing_ms(fps))
         };
         let pacing = if dragging {
             pacing_ms(self.cfg.ui.redraw_drag_fps)
-        } else if pointer_moved {
+        } else if motion {
             pacing_ms(self.cfg.ui.redraw_hover_fps)
         } else {
             pacing_ms(self.cfg.ui.redraw_other_fps)

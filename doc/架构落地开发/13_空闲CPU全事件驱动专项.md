@@ -123,6 +123,11 @@ redraw_hover_fps 进一步省；高刷屏可调回 60。release 弱机实测（R
 档减半——即 redraw_hover_fps 默认 30 的依据。命名以"UI 重绘频率"为心智
 模型（redraw_* 而非 fps_*），避免与视频 fps 混淆——初版 fps_hover/drag/
 event 因语义不清返工一次。
+**滚轮入悬停档**：用户实测列表滚到底后持续滚轮，画面无变化但 GPU 17%/
+CPU 10%——egui-winit 对 MouseWheel 同样无条件 request_repaint，快速滚轮
+帧率到 ~60fps（滚轮帧原落 redraw_other 档 60fps），且 ScrollArea 已把滚
+动量钳制掉、每帧全是 no-op 全量重建。repaint 在事件层已排掉，应用层只能
+节流不能取消——处置：滚轮帧归入悬停档（redraw_hover_fps 30fps）。
 
 **教训**：egui "事件驱动重绘"没有事件侧节流概念，事件率 = 帧率上限；需要
 帧率上限时只能在 App 层补（睡眠 pacing 或 patch egui-winit），睡眠期间
