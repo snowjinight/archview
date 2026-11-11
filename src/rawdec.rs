@@ -8,7 +8,7 @@
 //! （与本模块 shift_u16_le 同语义，各自独立实现）。
 
 use crate::config::Config;
-use crate::imgview::{ImageSource, ImgKey};
+use crate::imgview::{Histogram, ImageSource, ImgKey};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
@@ -585,6 +585,110 @@ impl RawFrameService {
     }
 }
 
+struct HistDone {
+    key: ImgKey,
+    res: Result<Histogram, String>,
+}
+
+/// raw 直方图软解服务（Ctrl+H 单图直方图的 raw 侧入口）：单图显示走
+/// mpv dump 播放（GPU 侧，无 CPU 像素），直方图需要像素 → 按需软解
+/// 第 0 帧（复用 decode_raw_frame：同一位移/转换链，直方图与屏幕显示
+/// 逐位一致）。事件驱动旁路消费者：Ctrl+H 才发起、后台线程、不干预
+/// mpv 显示路径；只算直方图不传纹理
+pub(crate) struct HistService {
+    tx: Sender<HistDone>,
+    rx: Receiver<HistDone>,
+    /// key → 发起时刻（防重复 spawn）
+    pending: HashMap<ImgKey, Instant>,
+    /// 已就绪结果（Ok=直方图 / Err=确定性失败文案，不重试）
+    done: HashMap<ImgKey, Result<Histogram, String>>,
+    ctx: egui::Context,
+}
+
+impl HistService {
+    pub(crate) fn new(ctx: egui::Context) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            tx,
+            rx,
+            pending: HashMap::new(),
+            done: HashMap::new(),
+            ctx,
+        }
+    }
+
+    /// 确保当前 key 的直方图在途（幂等）。预设未命中（标准容器/视频）与
+    /// 配置错误（Err）直接落 done——UI 覆盖层显示状态文案，不发线程
+    pub(crate) fn request(&mut self, key: ImgKey, source: &ImageSource, name: &str, size: u64, cfg: &Config) {
+        if self.pending.contains_key(&key) || self.done.contains_key(&key) {
+            return;
+        }
+        let rl = match raw_demux_opts(cfg, name, Some(size)) {
+            Ok(Some(rl)) => rl,
+            Ok(None) => {
+                self.done.insert(key, Err("非 raw 裸数据（标准视频不支持直方图）".into()));
+                return;
+            }
+            Err(e) => {
+                self.done.insert(key, Err(format!("raw 预设错误: {e}")));
+                return;
+            }
+        };
+        let info = match raw_frame_info(&rl, size) {
+            Ok(i) => i,
+            Err(e) => {
+                self.done.insert(key, Err(format!("raw 帧参数错误: {e}")));
+                return;
+            }
+        };
+        self.pending.insert(key, Instant::now());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let (source, name) = (source.clone(), name.to_owned());
+        let r = std::thread::Builder::new()
+            .name("rawhist".into())
+            .spawn(move || {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // 第 0 帧：直方图语义是"这张 dump 长什么样"；多帧序列
+                    // 逐帧统计成本线性涨，首帧足够代表（覆盖层标注帧号）
+                    decode_raw_frame(&source, &info, 0).map(|(img, _)| Histogram::compute(&img))
+                }))
+                .map_err(|_| "raw 直方图线程 panic".to_string())
+                .and_then(|r| r);
+                tracing::debug!("raw 直方图[{name}]: {}", res.is_ok());
+                let _ = tx.send(HistDone { key, res });
+                ctx.request_repaint();
+            });
+        if r.is_err() {
+            self.pending.remove(&key);
+            self.done.insert(key, Err("直方图线程创建失败".into()));
+        }
+    }
+
+    /// UI 线程每帧排空结果
+    pub(crate) fn poll(&mut self) {
+        let mut repaint = false;
+        while let Ok(m) = self.rx.try_recv() {
+            self.pending.remove(&m.key);
+            self.done.insert(m.key, m.res);
+            repaint = true;
+        }
+        if repaint {
+            self.ctx.request_repaint();
+        }
+    }
+
+    /// Ok(Some(hist)) = 就绪；Ok(None) = 在途（软解中）；Err = 失败文案
+    pub(crate) fn histogram(&self, key: ImgKey) -> Option<&Result<Histogram, String>> {
+        self.done.get(&key)
+    }
+
+    /// 切条目后清理非当前 key（直方图按 key 即用即弃，不驻留）
+    pub(crate) fn retain(&mut self, keys: &[ImgKey]) {
+        self.pending.retain(|k, _| keys.contains(k));
+        self.done.retain(|k, _| keys.contains(k));
+    }
+}
+
 fn decode_raw_frame(
     source: &ImageSource,
     info: &RawFrameInfo,
@@ -667,6 +771,48 @@ fn decode_raw_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hist_service_非raw与预设错误直落结果() {
+        // 非线程路径即答：标准容器（预设未命中）→"非 raw"；预设配置错
+        // → 预设错误文案。两者不发软解线程，UI 覆盖层直接显示状态
+        let ctx = egui::Context::default();
+        let mut svc = HistService::new(ctx);
+        let key: ImgKey = (0, 0);
+        let src = ImageSource::File(std::path::PathBuf::from("nonexistent.bin"));
+        let cfg = crate::config::Config::default();
+
+        // 标准视频名：无 raw 预设命中 → Ok(None)
+        svc.request(key, &src, "movie.mp4", 12345, &cfg);
+        let msg = match svc.histogram(key) {
+            Some(Err(m)) => m.clone(),
+            other => panic!("应直落 Err，实际 {other:?}"),
+        };
+        assert!(msg.contains("非 raw"), "文案应指明非 raw: {msg}");
+
+        // 预设命中但 pixfmt 不在名单 → Err 带预设错误
+        let mut bad = crate::config::Config::default();
+        bad.raw.demux = vec![crate::config::RawDemux {
+            r#match: "*.bin".into(),
+            pixfmt: "notafmt".into(),
+            width: 64,
+            height: 48,
+            fps: 10.0,
+            bit_shift: 0,
+        }];
+        let key2: ImgKey = (0, 1);
+        svc.request(key2, &src, "sensor.bin", 12345, &bad);
+        let msg = match svc.histogram(key2) {
+            Some(Err(m)) => m.clone(),
+            other => panic!("应直落 Err，实际 {other:?}"),
+        };
+        assert!(msg.contains("raw 预设错误"), "文案应指明预设错误: {msg}");
+
+        // retain 清理非当前 key
+        svc.retain(&[key2]);
+        assert_eq!(svc.histogram(key), None, "retain 应清掉旧 key");
+        assert!(svc.histogram(key2).is_some(), "当前 key 保留");
+    }
 
     #[test]
     fn shift_u16_le_12bit低对齐左移4() {

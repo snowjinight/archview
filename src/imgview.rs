@@ -115,10 +115,67 @@ pub enum Decoded {
     Anim(Vec<(egui::ColorImage, Duration)>),
 }
 
+/// 直方图：R/G/B/亮度四通道 256 bin。解码 worker 在拿到 CPU 像素时
+/// 顺手计算（O(像素) 一遍，被解码耗时掩盖），随纹理一起进 LRU。
+/// 位深语义：标准 8bit 图直接计 bin；raw 由软解归一（bit_shift 左移 +
+/// 转换器取高 8 位），净效果 = 全量程均匀压缩到 0..255，无高位舍弃
+#[derive(Debug, PartialEq)]
+pub struct Histogram {
+    /// [R, G, B, 亮度] 各 256 bin
+    pub ch: [[u32; 256]; 4],
+}
+
+impl Histogram {
+    /// 从解码后像素统计。ColorImage 存储为预乘 alpha（from_rgba_unmultiplied
+    /// 内部预乘），半透明像素先去预乘还原原色——不透明图（照片主流）零开销路径
+    pub fn compute(img: &egui::ColorImage) -> Self {
+        let mut h = Self {
+            ch: [[0; 256]; 4],
+        };
+        for px in &img.pixels {
+            let (r, g, b, a) = (
+                px.r() as u32,
+                px.g() as u32,
+                px.b() as u32,
+                px.a() as u32,
+            );
+            let (r, g, b) = if a < 255 && a > 0 {
+                (
+                    r * 255 / a,
+                    g * 255 / a,
+                    b * 255 / a,
+                )
+            } else {
+                (r, g, b)
+            };
+            h.ch[0][(r as usize).min(255)] += 1;
+            h.ch[1][(g as usize).min(255)] += 1;
+            h.ch[2][(b as usize).min(255)] += 1;
+            // 整数 BT.601 亮度：0.299R + 0.587G + 0.114B
+            let y = (r * 299 + g * 587 + b * 114) / 1000;
+            h.ch[3][(y as usize).min(255)] += 1;
+        }
+        h
+    }
+
+    /// 四通道全局最大 bin（归一化用；空图返回 1 防除零）
+    pub fn max_bin(&self) -> u32 {
+        self.ch
+            .iter()
+            .flat_map(|c| c.iter())
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
 enum ImgMsg {
     Ready {
         key: ImgKey,
         decoded: Decoded,
+        /// 直方图（静态图全图 / 动图首帧；解码失败时不产生）
+        hist: Option<Histogram>,
         /// 文件短名：仅供上传日志标注
         name: String,
     },
@@ -148,6 +205,8 @@ struct Cached {
     cur: usize,
     /// 下次切帧时刻（动图专用；None = 尚未开始/静态图无时钟）
     next_at: Option<Instant>,
+    /// 直方图（静态图 = 全图；动图 = 首帧），与纹理同生命周期进 LRU
+    hist: Option<Histogram>,
 }
 
 pub struct ImageService {
@@ -237,7 +296,14 @@ impl ImageService {
                 }));
                 match r {
                     Ok(Ok(decoded)) => {
-                        let _ = tx.send(ImgMsg::Ready { key, decoded, name });
+                        // 直方图在解码线程顺手算（O(像素)，被解码耗时掩盖）：
+                        // 静态图全图；动图取首帧（逐帧统计显存外的 CPU 成本
+                        // 随帧数线性涨，且直方图语义是"这张图长什么样"）
+                        let hist = match &decoded {
+                            Decoded::Static(img) => Some(Histogram::compute(img)),
+                            Decoded::Anim(a) => a.first().map(|(f, _)| Histogram::compute(f)),
+                        };
+                        let _ = tx.send(ImgMsg::Ready { key, decoded, hist, name });
                     }
                     Ok(Err(e)) => {
                         let _ = tx.send(ImgMsg::Failed { key, error: e });
@@ -338,7 +404,7 @@ impl ImageService {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                ImgMsg::Ready { key, decoded, name } => {
+                ImgMsg::Ready { key, decoded, hist, name } => {
                     self.pending.remove(&key);
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
@@ -365,6 +431,7 @@ impl ImageService {
                             delays,
                             cur: 0,
                             next_at: None,
+                            hist,
                         },
                     );
                     tracing::debug!(
@@ -407,6 +474,15 @@ impl ImageService {
     /// `request_repaint_after(delay)` 驱动动画；命中即提至 LRU 队首
     pub fn frame(&mut self, key: ImgKey) -> Option<(egui::TextureHandle, Option<Duration>)> {
         self.frame_ex(key, true)
+    }
+
+    /// 直方图（静态图全图 / 动图首帧），随纹理进 LRU。未解码/已逐出 =
+    /// None；UI 覆盖层据此显示"解码中/不可用"。不触碰 LRU 时序（不像
+    /// frame() 提队首——只读旁路，不干扰翻页保护语义）
+    pub fn histogram(&self, key: ImgKey) -> Option<&Histogram> {
+        self.pos(key)
+            .and_then(|p| self.cache.get(p))
+            .and_then(|(_, c)| c.hist.as_ref())
     }
 
     /// 对比模式变体：非主栏调用传 `drop_stale_full=false`——多栏每帧轮流
@@ -949,6 +1025,43 @@ mod tests {
     }
 
     #[test]
+    fn 直方图_分箱与预乘还原() {
+        // 4 像素：不透明红、不透明绿、半透明白（预乘存储）、全透明
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [2, 2],
+            &[
+                255, 0, 0, 255, // 红
+                0, 255, 0, 255, // 绿
+                128, 128, 128, 128, // 半透明白（存储为预乘 64,64,64）
+                0, 0, 0, 0, // 全透明
+            ],
+        );
+        let h = Histogram::compute(&img);
+        assert_eq!(h.ch[0][255], 1, "红像素 R=255");
+        assert_eq!(h.ch[1][255], 1, "绿像素 G=255");
+        // 半透明白去预乘还原 ≈128（预乘 64.25→64 取整有 ±1 误差）：
+        // 等灰图亮度 = 灰度本身（299+587+114=1000）
+        let luma_sum: u32 = h.ch[3][120..=140].iter().sum();
+        assert_eq!(luma_sum, 1, "半透明白还原后亮度落 120..140 窗口");
+        // 每通道计满全部 4 像素（含全透明——按存储值 0 计入）
+        for c in &h.ch {
+            assert_eq!(c.iter().sum::<u32>(), 4, "每通道计满 4 像素");
+        }
+        // bin0 聚合零分量：红像素 G/B + 绿像素 R/B + 透明像素 RGB → B 通道 3 个
+        assert_eq!(h.max_bin(), 3);
+    }
+
+    #[test]
+    fn 直方图_空图防除零() {
+        let img = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+        let h = Histogram::compute(&img);
+        // 全黑图：所有像素落 bin 0，max_bin 取 bin0 计数
+        assert_eq!(h.max_bin(), 16);
+        let empty = egui::ColorImage::new([0, 0], vec![]);
+        assert_eq!(Histogram::compute(&empty).max_bin(), 1, "空图兜底 1 防除零");
+    }
+
+    #[test]
     fn fit_scale_按纵横比装进视口() {
         let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0));
         // 2000×500 → 宽度受限：0.5
@@ -1431,9 +1544,14 @@ mod tests {
 
     /// 直接塞一帧进服务缓存（跳过后台线程，同步可控）
     fn feed(svc: &mut ImageService, key: ImgKey, decoded: Decoded, name: &str) {
+        let hist = match &decoded {
+            Decoded::Static(img) => Some(Histogram::compute(img)),
+            Decoded::Anim(a) => a.first().map(|(f, _)| Histogram::compute(f)),
+        };
         let _ = svc.tx.send(ImgMsg::Ready {
             key,
             decoded,
+            hist,
             name: name.to_owned(),
         });
         svc.poll();

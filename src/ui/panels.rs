@@ -173,6 +173,7 @@ impl App {
                             ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
                             ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
                             ("+ / - / ↑ / ↓", "缩放步进（锚视口中心）"),
+                            ("Ctrl + H", "直方图开关（图片 / raw dump）"),
                             ("0", "100% 显示"),
                             ("Home", "适应窗口"),
                             ("鼠标拖拽", "平移已放大的图片"),
@@ -1323,6 +1324,63 @@ impl App {
                 }
             }
         }
+        // 直方图覆盖层（Ctrl+H）：跨图片/视频两分支绘制——render API 单平面下
+        // 本函数内的 shape 在 PaintCallback 之后提交，天然盖在画面上
+        self.paint_histogram(ui, video);
+    }
+
+    /// 直方图覆盖层（Ctrl+H 开关）：按当前条目分流取直方图。
+    /// - 标准图片（纹理直显）：imgview 解码 worker 顺手算好，LRU 直接取
+    /// - raw dump（mpv dump 播放，GPU 侧无 CPU 像素）：HistService 按需
+    ///   旁路软解第 0 帧（幂等 ensure，事件驱动——完成时 request_repaint）
+    /// - 标准视频 / mpv 兜底图：状态文案"不可用"
+    /// 覆盖层是纯绘制：不发心跳，仅随既有帧渲染；软解在后台线程不阻塞
+    fn paint_histogram(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        if !self.histogram_on {
+            return;
+        }
+        // 当前条目快照（借用分离：先取数据，后做 &mut 服务调用）
+        let cur = self.archive.as_ref().and_then(|a| {
+            self.playing.map(|i| {
+                (
+                    a.id,
+                    a.stream,
+                    a.entries[i].name.clone(),
+                    a.entries[i].size,
+                )
+            })
+        });
+        if let Some(key) = self.tex_image_key() {
+            // 标准图片：直方图随解码就绪（动图 = 首帧）
+            match self.img.histogram(key) {
+                Some(h) => draw_histogram(ui, area, h, "直方图"),
+                None => {
+                    let text = if self.img.is_pending(key) {
+                        "直方图：解码中…"
+                    } else {
+                        "直方图：不可用"
+                    };
+                    paint_hist_status(ui, area, text);
+                }
+            }
+        } else if let Some((id, stream, name, size)) = cur {
+            // mpv 分支（raw dump / 标准视频 / 兜底图）：raw 预设命中才软解
+            let key = (id, self.playing.expect("cur 存在则 playing 存在"));
+            let source = if stream {
+                let arch = self.archive.as_ref().expect("cur 存在则 archive 存在");
+                ImageSource::Stream(arch.vfs.clone(), arch.entries[key.1].clone())
+            } else {
+                let dir = crate::cache::cache_dir(&self.cfg);
+                ImageSource::File(crate::cache::dest_path(&dir, id, key.1, &name))
+            };
+            self.hist_raw.retain(&[key]);
+            self.hist_raw.request(key, &source, &name, size, &self.cfg);
+            match self.hist_raw.histogram(key) {
+                None => paint_hist_status(ui, area, "直方图：软解中…"),
+                Some(Ok(h)) => draw_histogram(ui, area, h, "直方图（raw f0）"),
+                Some(Err(msg)) => paint_hist_status(ui, area, &format!("直方图：{msg}")),
+            }
+        }
     }
 
     /// 图片纹理直显分支：Mesh + UV 绘制（zoom/pan），拖拽平移、滚轮分层
@@ -2311,5 +2369,84 @@ fn fmt_time(t: f64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+/// 直方图覆盖层状态文案（媒体区左下角小字，黑底半透明圆角底板）
+fn paint_hist_status(ui: &egui::Ui, area: egui::Rect, text: &str) {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(format!("  {text}"), font, egui::Color32::GRAY);
+    let rect = egui::Rect::from_min_size(
+        area.left_bottom() + egui::vec2(8.0, -galley.size().y - 8.0),
+        galley.size() + egui::vec2(4.0, 4.0),
+    );
+    let painter = ui.painter_at(area);
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    painter.galley(rect.left_top(), galley, egui::Color32::GRAY);
+}
+
+/// 直方图覆盖层绘制：左下角半透明底板 + 亮度填充 + RGB 折线。
+/// 归一化用四通道全局最大 bin（各通道相对幅度可比）；
+/// 空图（max=0）由 Histogram::max_bin 兜底为 1
+fn draw_histogram(ui: &egui::Ui, area: egui::Rect, h: &crate::imgview::Histogram, title: &str) {
+    const W: f32 = 320.0;
+    const H: f32 = 150.0;
+    const MARGIN: f32 = 8.0;
+    let rect = egui::Rect::from_min_size(
+        area.left_bottom() + egui::vec2(MARGIN, -(H + MARGIN)),
+        egui::vec2(W, H),
+    );
+    let painter = ui.painter_at(area);
+    painter.rect_filled(rect, 6.0, egui::Color32::from_black_alpha(180));
+    // 标题行
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_string(), font, egui::Color32::WHITE);
+    painter.galley(rect.left_top() + egui::vec2(8.0, 4.0), galley, egui::Color32::WHITE);
+    // 绘图区（标题下方留白）
+    let plot = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(6.0, 20.0),
+        rect.right_bottom() - egui::vec2(6.0, 6.0),
+    );
+    let max = h.max_bin() as f32;
+    let step = plot.width() / 255.0;
+    let points = |ci: usize| -> Vec<egui::Pos2> {
+        (0..=255)
+            .map(|b| {
+                egui::Pos2::new(
+                    plot.left() + b as f32 * step,
+                    plot.bottom() - (h.ch[ci][b] as f32 / max) * plot.height(),
+                )
+            })
+            .collect()
+    };
+    // 亮度 = 白色低透明填充（直方图轮廓非凸，convex_polygon 会错剪；
+    // 用逐 bin 三角带 Mesh：2 顶点/bin + 相邻四边形索引，无纹理纯色）
+    let mut fill = egui::Mesh::default();
+    for b in 0..=255 {
+        let x = plot.left() + b as f32 * step;
+        let y = plot.bottom() - (h.ch[3][b] as f32 / max) * plot.height();
+        fill.colored_vertex(egui::pos2(x, y), egui::Color32::from_white_alpha(38));
+        fill.colored_vertex(egui::pos2(x, plot.bottom()), egui::Color32::from_white_alpha(38));
+    }
+    for b in 0..255u32 {
+        let (a, b1, c, d) = (2 * b, 2 * b + 1, 2 * b + 2, 2 * b + 3);
+        fill.indices.extend_from_slice(&[a, b1, c, b1, d, c]);
+    }
+    painter.add(egui::Shape::mesh(fill));
+    // R/G/B 折线：红/绿/蓝高对比（半透明防叠色刺眼）
+    let channels = [
+        (0, egui::Color32::from_rgb(255, 80, 80)),
+        (1, egui::Color32::from_rgb(80, 255, 110)),
+        (2, egui::Color32::from_rgb(100, 150, 255)),
+    ];
+    for (ci, color) in channels {
+        painter.add(egui::Shape::line(
+            points(ci),
+            egui::Stroke::new(1.2, color.gamma_multiply(0.86)),
+        ));
     }
 }

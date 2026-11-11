@@ -384,6 +384,11 @@ pub struct App {
     compare: Option<CompareSession>,
     // raw 帧软解服务（对比栏专用：后台线程解码 → mpsc → UI 上传纹理）
     rawdec: RawFrameService,
+    // 直方图开关（Ctrl+H；覆盖层随当前条目绘制，状态见 panels::paint_histogram）
+    histogram_on: bool,
+    // raw 直方图软解服务（Ctrl+H 按需旁路：软解第 0 帧算直方图，不传纹理；
+    // 标准图片的直方图由 imgview 解码 worker 顺手算，不经此服务）
+    hist_raw: crate::rawdec::HistService,
 }
 
 impl App {
@@ -462,6 +467,8 @@ impl App {
             encode_job: None,
             compare: None,
             rawdec: RawFrameService::new(cc.egui_ctx.clone()),
+            histogram_on: false,
+            hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone()),
         }
     }
 
@@ -529,6 +536,8 @@ impl App {
             encode_job: None,
             compare: None,
             rawdec: RawFrameService::new(ctx.clone()),
+            histogram_on: false,
+            hist_raw: crate::rawdec::HistService::new(ctx.clone()),
         }
     }
 
@@ -724,6 +733,9 @@ impl eframe::App for App {
         // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
         self.poll_img();
         probe!("poll_img");
+        // raw 直方图软解结果轮询（Ctrl+H 旁路：后台线程 → UI 线程取直方图）
+        self.hist_raw.poll();
+        probe!("poll_hist");
         // 对比模式 tick（raw 帧轮询/对齐、image 栏自愈、非流式落地检查）
         self.compare_tick();
         probe!("compare_tick");

@@ -144,6 +144,9 @@ impl App {
         let mut fs_exit = false;
         // B=回到锚点（最后一次实际解压位置，见 App.last_focus）
         let mut go_focus = false;
+        // Ctrl+H=直方图开关（当前条目为图片或 raw dump 时覆盖层有内容；
+        // 开关本身无门控——未播放时按下只翻状态，覆盖层不绘制无副作用）
+        let mut hist_toggle = false;
         // C=进入多图对比（选中合格条目 ≥2；校验与提示在 try_enter_compare）
         let mut enter_compare = false;
         // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
@@ -287,6 +290,11 @@ impl App {
                         ask_next_key = true;
                         false
                     }
+                    // Ctrl+H=直方图开关（config 编辑器是打字密集窗口，让位）
+                    egui::Key::H if m.ctrl && self.config_editor.is_none() => {
+                        hist_toggle = true;
+                        false
+                    }
                     egui::Key::Enter if m.is_none() => {
                         fs_toggle = true;
                         false
@@ -358,6 +366,16 @@ impl App {
         // C：进入多图对比视图（选中集 ∩ 入口谓词 ≥2 才放行，校验在内部）
         if enter_compare {
             self.try_enter_compare();
+        }
+        // Ctrl+H：直方图覆盖层开关。发起是覆盖层绘制时的按需 ensure（幂等），
+        // 这里只翻状态——未播放/标准视频下翻了也不画，无副作用
+        if hist_toggle {
+            self.histogram_on = !self.histogram_on;
+            if !self.histogram_on {
+                // 关闭即清 raw 侧缓存：下次开启按当前条目重新软解，
+                // 避免长会话里历史 key 的直方图驻留内存
+                self.hist_raw.retain(&[]);
+            }
         }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
