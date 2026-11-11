@@ -1,6 +1,6 @@
 [package]
 name = "archview"
-version = "1.2.3"
+version = "1.2.5"
 authors = ["snowjinight"]
 edition = "2021"
 
