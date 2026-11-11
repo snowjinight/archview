@@ -80,11 +80,19 @@ impl App {
                 return;
             }
             let mut do_mute = false;
+            // C=进入多图对比：未播放/未显示图片但已打开压缩包（选中集可用）时
+            // 同样成立——此前该分支只放 M，C 被早退吞掉（右键菜单不走 nav，
+            // 所以菜单能进对比而 C 键无效）
+            let mut enter_compare = false;
             ctx.input_mut(|i| {
                 i.events.retain(|e| match e {
                     // IME 下字母键常只产 Text 事件（无 Key 事件），两种都要匹配
                     egui::Event::Text(t) if t == "m" || t == "M" => {
                         do_mute = true;
+                        false
+                    }
+                    egui::Event::Text(t) if t == "c" || t == "C" => {
+                        enter_compare = true;
                         false
                     }
                     egui::Event::Key {
@@ -97,12 +105,24 @@ impl App {
                         do_mute = true;
                         false
                     }
+                    egui::Event::Key {
+                        key: egui::Key::C,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => {
+                        enter_compare = true;
+                        false
+                    }
                     _ => true,
                 });
             });
             if do_mute {
                 // 播放器不在场只写 cfg（同 ♪ 按钮的未播放分支）
                 self.cfg.player.muted = !self.cfg.player.muted;
+            }
+            if enter_compare {
+                self.try_enter_compare();
             }
             return;
         }
@@ -149,6 +169,12 @@ impl App {
                     // L 同理（仅视频模式；图片有自己的自动翻页开关）
                     if (t == "l" || t == "L") && !img_mode {
                         loop_toggle = true;
+                        return false;
+                    }
+                    // C 同理：进入多图对比（无模式门控，与 Key::C 臂一致；
+                    // 校验与提示在 try_enter_compare 内部）
+                    if t == "c" || t == "C" {
+                        enter_compare = true;
                         return false;
                     }
                     return true;

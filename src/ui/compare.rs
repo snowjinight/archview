@@ -25,6 +25,8 @@ pub(super) enum PaneKind {
     Raw(RawFrameInfo),
     /// raw 预设参数错误 / 软解不支持该格式（占位显示错误文案，不阻塞其它栏）
     RawErr(String),
+    /// 图片侧不参与对比（动画 webp 嗅探命中）：占位文案，不发起解码
+    Unsupported(String),
 }
 
 #[derive(Clone)]
@@ -225,16 +227,35 @@ pub fn grow_window(domain: &[usize], panes: &[usize], n: usize) -> Option<Vec<us
 // 入口谓词与选择
 // ---------------------------------------------------------------------------
 
-/// 对比入口谓词：静态图（动图 gif/动画 webp 排除）∨ raw 预设命中。
-/// 标准视频（mpv 域）不参与——对比模式 mpv 不在场
+/// 对比入口谓词：静态图（gif 恒为动图，排除；webp 静态/动画按名不可分，
+/// 放行后在窗格构建时以 VP8X 头嗅探分流，见 [`App::build_compare_pane`]）
+/// ∨ raw 预设命中。标准视频（mpv 域）不参与——对比模式 mpv 不在场
 pub(super) fn compare_eligible(cfg: &Config, name: &str) -> bool {
     let ext = std::path::Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    let anim = ext == "gif" || ext == "webp";
+    let anim = ext == "gif";
     (cfg.is_image_ext(name) && !anim) || cfg.raw_demux(name).is_some()
+}
+
+/// 动画 webp 嗅探：与 imgview 解码分流同一判据（image crate
+/// `WebPDecoder::has_animation`，VP8X ANIM 位）。打开/解析失败一律按静态
+/// 处理（不可误拦静态图；失败图交 ImageService 走正常失败路径）
+pub(super) fn webp_animated(source: &ImageSource) -> bool {
+    fn sniff(r: impl std::io::Read + std::io::Seek) -> Option<bool> {
+        // WebPDecoder::new 要求 BufRead（imgview 同款用法），裸流套 BufReader
+        let mut br = std::io::BufReader::new(r);
+        let dec = image::codecs::webp::WebPDecoder::new(&mut br).ok()?;
+        Some(dec.has_animation())
+    }
+    match source {
+        ImageSource::Stream(vfs, e) => vfs.open_entry(e).ok().and_then(sniff).unwrap_or(false),
+        ImageSource::File(p) => {
+            std::fs::File::open(p).ok().and_then(sniff).unwrap_or(false)
+        }
+    }
 }
 
 /// 解码源就绪判定：流式包条目可直接读；非流式包（7z/RAR）条目必须已
@@ -310,7 +331,16 @@ impl App {
         };
         let kind = match self.raw_demux_opts(&e.name, Some(e.size)) {
             Err(msg) => PaneKind::RawErr(msg),
-            Ok(None) => PaneKind::Image,
+            Ok(None) => {
+                // webp 静态/动画按名不可分：动画嗅探命中 → 占位文案，
+                // 不发起解码（滑动窗口把动画 webp 带进窗格时同样命中）
+                if e.name.to_ascii_lowercase().ends_with(".webp") && webp_animated(&source) {
+                    tracing::debug!("对比窗格排除动画 webp [{}]", e.name);
+                    PaneKind::Unsupported("动画 webp 不参与对比".into())
+                } else {
+                    PaneKind::Image
+                }
+            }
             Ok(Some(rl)) => match raw_frame_info(&rl, e.size) {
                 Ok(info) => PaneKind::Raw(info),
                 Err(msg) => PaneKind::RawErr(msg),
@@ -660,6 +690,16 @@ impl App {
                         zout = true;
                         false
                     }
+                    // ↑/↓ = 缩放步进（与 +/− 同义，同单图模式心智：图片态
+                    // 上下箭头即缩放；fit 为底，↓ 在 fit 态无事可做）
+                    egui::Key::ArrowUp => {
+                        zin = true;
+                        false
+                    }
+                    egui::Key::ArrowDown => {
+                        zout = true;
+                        false
+                    }
                     egui::Key::Home => {
                         zfit = true;
                         false
@@ -668,7 +708,8 @@ impl App {
                 }
             });
         });
-        // ←/→：会话含多帧 raw 栏 → 帧游标；纯静态 → 组滑动兜底（判据确定）
+        // ←/→：仅多帧 raw 会话有语义（帧游标）；纯静态会话不响应——
+        // 组滑动专属 PgUp/PgDn 与 fit 态滚轮，避免与"帧步进"心智混淆
         if step != 0 {
             let multi = self
                 .compare
@@ -685,8 +726,6 @@ impl App {
                         s.cursor = nc;
                     }
                 }
-            } else {
-                slide = step;
             }
         }
         if slide != 0 {
@@ -726,6 +765,37 @@ impl App {
 mod tests {
     use super::*;
     use egui::vec2;
+
+    // ---- 动画 webp 嗅探 ----
+
+    #[test]
+    fn webp_animated_静态为否() {
+        let img = image::DynamicImage::new_rgb8(8, 6);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::WebP).unwrap();
+        let dir = std::env::temp_dir().join(format!("archview_cmptest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("static.webp");
+        std::fs::write(&p, buf.into_inner()).unwrap();
+        assert!(!webp_animated(&ImageSource::File(p.clone())));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn webp_animated_动画为是() {
+        // 夹具同 imgview::decode_动画webp逐帧：testdata/anim2.webp（ffmpeg
+        // libwebp 2 帧动画，生成命令见该测试注释），缺失时跳过
+        let Ok(bytes) = std::fs::read("testdata/anim2.webp") else {
+            eprintln!("跳过：testdata/anim2.webp 不存在（生成命令见 imgview 测试注释）");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("archview_cmptest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("anim2.webp");
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(webp_animated(&ImageSource::File(p.clone())));
+        std::fs::remove_file(&p).ok();
+    }
 
     // ---- 方案 A 几何 ----
 

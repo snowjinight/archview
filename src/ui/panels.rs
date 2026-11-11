@@ -143,12 +143,12 @@ impl App {
                 ui.set_min_width(280.0);
                 ui.strong("快捷键");
                 ui.separator();
-                // 分三组：通用在前，视频 / 图片专属各成一块
+                // 分四组：通用在前，视频 / 图片 / 对比模式各成一块
                 let groups: &[(&str, &[(&str, &str)])] = &[
                     (
                         "通用",
                         &[
-                            ("PgUp / PgDn", "上一个 / 下一个"),
+                            ("PgUp / PgDn", "上一个 / 下一个（对比模式 = 整组滑动）"),
                             ("鼠标滚轮（预览窗口内）", "上一个 / 下一个媒体"),
                             ("N", "打开下一个压缩包（连续看包）"),
                             ("B", "回到锚点（最后一次解压位置）"),
@@ -179,14 +179,32 @@ impl App {
                             ("双击图片", "适应窗口 ↔ 100%"),
                         ],
                     ),
+                    (
+                        // 键位与图片模式大面积同构（↑↓/+/−/Home/滚轮/拖拽
+                        // 同义），只列差异——避免帮助面板越长越没人看；
+                        // PgUp/PgDn 是通用键，见通用组
+                        "对比模式（其余键同图片模式）",
+                        &[
+                            ("C", "进入对比：先 Ctrl+点选 2~6 个静态图 / raw 预设文件"),
+                            ("← / →", "多帧 raw：同步帧游标（纯静态不响应）——不再翻页"),
+                            ("2 ~ 6", "切换栏数"),
+                            ("点击某栏", "设为主栏（full 高清升级跟随）"),
+                            ("Esc", "先退全屏，再退对比"),
+                        ],
+                    ),
                 ];
                 // 分组配色：通用原色，视频金黄，图片亮蓝（蓝取应用
-                // 现有 ACCENT，黄与对话框提示同款）
+                // 现有 ACCENT，黄与对话框提示同款），对比琥珀（主栏同款）
                 const HELP_YELLOW: egui::Color32 = egui::Color32::from_rgb(232, 178, 72);
                 const HELP_BLUE: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
-                let colors = [None, Some(HELP_YELLOW), Some(HELP_BLUE)];
-                // 单一 Grid 渲染三组：列宽全表统一（键列 = 全部组里
-                // 最宽的键），三组描述垂直对齐；组间用空行分隔
+                let help_amber = if ui.visuals().dark_mode {
+                    AMBER_DARK
+                } else {
+                    AMBER_LIGHT
+                };
+                let colors = [None, Some(HELP_YELLOW), Some(HELP_BLUE), Some(help_amber)];
+                // 单一 Grid 渲染四组：列宽全表统一（键列 = 全部组里
+                // 最宽的键），各组描述垂直对齐；组间用空行分隔
                 egui::Grid::new("help_grid")
                     .num_columns(2)
                     .spacing([8.0, 2.0])
@@ -807,14 +825,11 @@ impl App {
                             if ui
                                 .add_enabled(
                                     cmp_ok,
-                                    egui::Button::new(format!(
-                                        "对比显示（C）{}",
-                                        if sel.is_empty() {
-                                            "：先 Ctrl+点选 2~6 张"
-                                        } else {
-                                            ""
-                                        }
-                                    )),
+                                    egui::Button::new(if sel.is_empty() {
+                                        "对比显示：先 Ctrl+点选 2~6 张"
+                                    } else {
+                                        "对比显示"
+                                    }),
                                 )
                                 .clicked()
                             {
@@ -1601,7 +1616,12 @@ impl App {
     /// 交互语义（方案 A）：zoom = 相对各栏 fit 的倍率（None=适应窗口），
     /// center = 视口中心指向的归一化图像坐标——不同分辨率图内容对齐；
     /// 滚轮 fit 态=整组滑动（与单图翻页习惯一致），缩放态/Ctrl=悬停栏锚缩放
-    pub(super) fn compare_view(&mut self, ui: &mut egui::Ui, resp: &egui::Response, video: egui::Rect) {
+    pub(super) fn compare_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        _resp: &egui::Response,
+        video: egui::Rect,
+    ) {
         let n = match self.compare.as_ref() {
             Some(s) => s.panes.len(),
             None => return,
@@ -1614,9 +1634,12 @@ impl App {
             AMBER_LIGHT
         };
         // ---- 滚轮先取（fit 态=整组滑动，缩放态留给栏内锚缩放）----
+        // 闸门必须是"矩形含指针"而非父响应 hovered()：对比各栏
+        // allocate_rect(click_and_drag) 是交互子控件，会把父控件 hover 劫走
+        // （单图模式图片是纯 Mesh 无交互子控件，故无此问题）
         let mut wheel = 0.0f32;
         let mut wheel_pos = None;
-        if resp.hovered() {
+        if ui.rect_contains_pointer(video) {
             let (dy, pos, ctrl) = ui.input(|i| {
                 let mut dy = 0.0_f32;
                 let mut ctrl = i.modifiers.ctrl;
@@ -1770,8 +1793,8 @@ impl App {
                         self.paint_badge(ui, *cell, &format!("{}/{}", cur, info.frame_count));
                     }
                 }
-                PaneKind::RawErr(msg) => {
-                    // 错误文案直接占整栏（配置错误：预设参数不支持软解）
+                PaneKind::RawErr(msg) | PaneKind::Unsupported(msg) => {
+                    // 错误/不参与文案直接占整栏（raw 配置错误 / 动画 webp）
                     let rect = egui::Rect::from_min_size(
                         cell.left_top() + egui::vec2(4.0, 18.0),
                         egui::vec2(cell.width() - 8.0, cell.height() - 22.0),
@@ -1831,7 +1854,10 @@ impl App {
         // 拖拽平移：图像跟手 → 视口中心指向的图像坐标反向移动，
         // 按本栏 clamp（用户看到的即所限，其它栏绘制时各自 clamp）
         if drag != egui::Vec2::ZERO {
-            let disp = native * zoom_in.unwrap_or(fit);
+            // zoom 语义 = 相对各栏 fit 的倍率（Some(1.0)=fit，与
+            // sync_zoom_step 底界一致）；此前误用 native*z（100% 基准），
+            // 多栏小 fit 时第一档就跳到原生大小
+            let disp = native * fit * zoom_in.unwrap_or(1.0);
             let c = center_in - drag / disp;
             self.compare.as_mut().unwrap().center = clamp_center(c, disp, cell.size());
         }
@@ -1841,8 +1867,8 @@ impl App {
             if let Some(pos) = wheel_pos.filter(|p| cell.contains(*p)) {
                 let factor = if *wheel > 0.0 { 1.25 } else { 1.0 / 1.25 };
                 if let Some(nz) = sync_zoom_step(zoom_in, factor) {
-                    let disp_b = native * zoom_in.unwrap_or(fit);
-                    let disp_a = native * nz;
+                    let disp_b = native * fit * zoom_in.unwrap_or(1.0);
+                    let disp_a = native * fit * nz;
                     let delta = pos - cell.center();
                     let c = sync_zoom_center(center_in, delta, disp_b, disp_a);
                     let s = self.compare.as_mut().unwrap();
@@ -1862,7 +1888,7 @@ impl App {
             let s = self.compare.as_ref().unwrap();
             (s.zoom, s.center)
         };
-        let disp = native * zoom_v.unwrap_or(fit);
+        let disp = native * fit * zoom_v.unwrap_or(1.0);
         let center = clamp_center(center_v, disp, cell.size());
         let mut raw = pane_image_rect(*cell, disp, center);
         // 物理像素 snap（同 image_view：100% 态防双线性发糊/拖拽亚像素爬动）
