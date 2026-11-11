@@ -322,6 +322,10 @@ pub struct App {
     slideshow_on: bool,
     slideshow_idx: Option<usize>,
     slideshow_anchor: f64,
+    // 上一帧起始时刻（空闲输入帧节流用，见 ui() 的 MOTION_PACING）
+    frame_start: Option<std::time::Instant>,
+    // 帧率自检累计：(窗口起点, 帧数)，每 5s 输出一条 debug 日志
+    fps_acc: (std::time::Instant, u32),
     // 视频播放模式（三态，图片不适用——图片用 slideshow）：默认定格
     //（播完停在末帧），L 键/控制栏按钮循环切换 Hold→List→Loop
     play_mode: PlayMode,
@@ -432,6 +436,8 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
+            frame_start: None,
+            fps_acc: (std::time::Instant::now(), 0),
             play_mode: PlayMode::Hold,
             eof_handled: None,
             extract: None,
@@ -497,6 +503,8 @@ impl App {
             slideshow_on: false,
             slideshow_idx: None,
             slideshow_anchor: 0.0,
+            frame_start: None,
+            fps_acc: (std::time::Instant::now(), 0),
             play_mode: PlayMode::Hold,
             eof_handled: None,
             extract: None,
@@ -602,6 +610,59 @@ impl eframe::App for App {
     #[allow(unused_assignments)]
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // —— 输入帧节流 ——
+        // egui-winit 对 CursorMoved 无条件 request_repaint（egui-winit 0.36
+        // lib.rs:352-358，无内置节流；eframe 的 max_fps 仅 web 后端实现），
+        // 鼠标事件率（125~1000Hz）直接驱动帧率：空闲态每帧便宜，帧率可达
+        // 数百 fps → 悬停 CPU/GPU 各 ~10%（随移动速度攀升）。
+        // 处置：非视频播放态统一节流，按触发源分档（间隔由 [ui] 三个
+        // redraw_*_fps 配置驱动，见 config.rs pacing_ms，钳制 5~240ms→4~200ms）：
+        // - 拖拽中（指针按下）：redraw_drag_fps（默认 60fps），保拖拽/平移流畅；
+        // - 纯悬停移动（PointerMoved 且未按下）：redraw_hover_fps（默认
+        //   30fps）——60fps 全量重建在弱 GPU（RX 640 实测 11%）/弱 CPU 上
+        //   仍占 ~10%/11%，悬停高亮 30fps 无感知，占用减半；
+        // - 其余帧（线程唤醒/timer/hover 动画）：redraw_other_fps（默认
+        //   60fps）——解码完成等事件延迟 ≤ 帧间隔，解压进度唤醒风暴同样封顶。
+        // 视频播放态排除：vsync 主钟已封顶，节流 no-op 且睡眠会推过 vsync
+        // 线制造 judder。幻灯片/动图 timer 帧间隔为秒级/帧延迟，远大于悬停
+        // 间隔上限（pacing 钳制最大 200ms），不触发睡眠，翻页精度不受影响。
+        // frame_start 记录**补眠后**的实际帧起始：若记补眠前时刻，帧间距
+        // 会漂移成"短+长"交替（平均 ~100fps 而非 60fps）
+        let video_live = self.playing.is_some()
+            && self.tex_image_key().is_none()
+            && self.player.as_ref().is_some_and(|p| !p.paused());
+        let dragging = ctx.input(|i| i.pointer.primary_down());
+        let pointer_moved =
+            ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        let pacing_ms = |fps: u32| {
+            std::time::Duration::from_millis(crate::config::UiConfig::pacing_ms(fps))
+        };
+        let pacing = if dragging {
+            pacing_ms(self.cfg.ui.redraw_drag_fps)
+        } else if pointer_moved {
+            pacing_ms(self.cfg.ui.redraw_hover_fps)
+        } else {
+            pacing_ms(self.cfg.ui.redraw_other_fps)
+        };
+        let frame_t = std::time::Instant::now();
+        if !video_live {
+            if let Some(prev) = self.frame_start {
+                let elapsed = frame_t.duration_since(prev);
+                if elapsed < pacing {
+                    std::thread::sleep(pacing - elapsed);
+                }
+            }
+        }
+        self.frame_start = Some(std::time::Instant::now());
+        // —— 帧率自检（debug 级，每 5s 一条）：验证节流生效的观测手段，
+        // RUST_LOG=archview=debug 可见；release 默认关闭零输出。
+        // 合理区间：悬停 ~30fps，拖拽 ≤60fps，空闲 0
+        self.fps_acc.1 += 1;
+        if frame_t.duration_since(self.fps_acc.0) >= std::time::Duration::from_secs(5) {
+            let fps = self.fps_acc.1 as f64 / frame_t.duration_since(self.fps_acc.0).as_secs_f64();
+            tracing::debug!("[帧率自检] {fps:.0}fps");
+            self.fps_acc = (frame_t, 0);
+        }
         // —— 帧探针（常驻条件诊断，debug 级）——
         // 分段 ≥30ms 打点、帧总 ≥50ms 两个出口打点，平时零输出。
         // segments 覆盖每帧属性读：eof_tick=eof_reached、top/controls=
@@ -622,14 +683,18 @@ impl eframe::App for App {
         // render() 已设 BLOCK_FOR_TARGET_TIME=0 不再阻塞到目标时刻，每次渲染
         // "当前应显示"的帧，换帧时刻锁定 vsync 边界，消除"mpv 回调唤醒 →
         // 事件循环调度"链路上 1~15ms 抖动导致的帧节奏不均（可感知卡顿）。
-        // 非播放/图片模式/暂停（含 keep-open EOF 粘滞）回落 100ms 慢节拍。
-        let video_live = self.playing.is_some()
-            && self.tex_image_key().is_none()
-            && self.player.as_ref().is_some_and(|p| !p.paused());
+        // 暂停/EOF 粘滞/装载期不排帧：EOF 与错误由 mpv 泵线程 send 后主动
+        // 唤醒（player/mod.rs），装载期首帧轮询由 panels.rs 装载窗 16ms
+        // 条件排帧覆盖。图片/对比/空闲态完全不排帧——解码（imgview/rawdec）、
+        // 打开/解压/编码线程完成时各自 request_repaint 唤醒，输入事件由
+        // egui 自动出帧；幻灯片开启时精确排到下次翻页（slideshow_rest）。
+        // 全事件驱动：空闲/暂停/对比静置 CPU 趋近 0（无 10 FPS 全量重绘）；
+        // 空闲态鼠标移动帧由帧首 MOTION_PACING 节流封顶 ~60Hz
         if video_live {
             ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        } else if self.slideshow_on && self.tex_image_key().is_some() {
+            let now = ctx.input(|i| i.time);
+            ctx.request_repaint_after(self.slideshow_rest(now));
         }
         probe!("repaint决策");
         // 任意鼠标点击即清绿色提示（见 clear_notice_on_click；键盘操作

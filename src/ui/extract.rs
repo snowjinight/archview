@@ -758,6 +758,9 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
         let session_for_thread = session;
+        // 消息 send 后主动唤醒 UI 立即 poll：空闲时 UI 不再有心跳排帧
+        // （全事件驱动），落地即播与终态套用全靠此唤醒
+        let egui_ctx = self.egui_ctx.clone();
         std::thread::Builder::new()
             .name("extract".into())
             .spawn(move || {
@@ -766,14 +769,17 @@ impl App {
                     &cancel_for_thread,
                     &|done, stage| {
                         let _ = tx.send(ExtMsg::Progress(done, stage.to_string()));
+                        egui_ctx.request_repaint();
                     },
                     &|idx, _path| {
                         let _ = tx.send(ExtMsg::FileDone(idx));
+                        egui_ctx.request_repaint();
                     },
                 );
                 match r {
                     Ok(()) => {
                         let _ = tx.send(ExtMsg::Done);
+                        egui_ctx.request_repaint();
                     }
                     Err(_) if cancel_for_thread.load(std::sync::atomic::Ordering::Relaxed) => {
                         // 切换压缩包（cancel 置位）：会话随旧包丢弃，静默退出
@@ -781,6 +787,7 @@ impl App {
                     Err(e) => {
                         let is_pwd = matches!(e, VfsError::Password);
                         let _ = tx.send(ExtMsg::Failed(e.to_string(), is_pwd));
+                        egui_ctx.request_repaint();
                     }
                 }
             })
@@ -869,6 +876,16 @@ impl App {
                                 && self.compare.is_none()
                             {
                                 play = Some((d, i));
+                            }
+                        }
+                    }
+                    // 对比栏落地事件：置位 landed 标志（本帧 poll_extract 先于
+                    // compare_tick 执行，该帧 compare_tick 即拾取），替代旧的
+                    // 每帧 fs::metadata 轮询
+                    if let Some(s) = &mut self.compare {
+                        for p in &mut s.panes {
+                            if p.idx == i && !p.landed {
+                                p.landed = true;
                             }
                         }
                     }

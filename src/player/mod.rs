@@ -252,6 +252,10 @@ impl PlayerService {
             // 最近一条 ≤ERROR 级日志行（§4.6.3）：END_FILE(ERROR) 回显附带。
             // 同一闭包内读写，单份 Arc 即可；不设 TTL，下一条 error 覆盖
             let last_err_log = Arc::new(std::sync::Mutex::new(String::new()));
+            // 事件唤醒 UI：空闲/暂停态 UI 不再有心跳排帧（全事件驱动），
+            // EOF 粘滞推进（video_eof_tick）、错误回显（poll_mpv_err）、
+            // opening 门解除均靠泵线程在事件到达时主动 request_repaint
+            let egui_wake = egui_ctx.clone();
             // 裸指针以 usize 过线程边界（mpv client API 线程安全）
             let ctx_addr = ctx as usize;
             let t0 = Instant::now();
@@ -272,6 +276,7 @@ impl PlayerService {
                         // 打开完成：opening 门控解除信号（常驻泵的核心职责）
                         mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
                             ready_flag.store(true, Ordering::Relaxed);
+                            egui_wake.request_repaint();
                         }
                         // 属性订阅推送：更新本地缓存（FLAG: pause/eof-reached/
                         // pause-for-cache，DOUBLE: time-pos/duration）。变更源含
@@ -290,7 +295,14 @@ impl PlayerService {
                                         let v = unsafe { *(p.data as *const c_int) } != 0;
                                         match name {
                                             b"pause" => paused_flag.store(v, Ordering::Relaxed),
-                                            b"eof-reached" => eof_flag.store(v, Ordering::Relaxed),
+                                            b"eof-reached" => {
+                                                eof_flag.store(v, Ordering::Relaxed);
+                                                // EOF 置位唤醒：暂停态 UI 无心跳，video_eof_tick
+                                                //（List 模式自动下一个）靠此帧推进
+                                                if v {
+                                                    egui_wake.request_repaint();
+                                                }
+                                            }
                                             b"pause-for-cache" => {
                                                 buffering_flag.store(v, Ordering::Relaxed)
                                             }
@@ -346,6 +358,9 @@ impl PlayerService {
                                     let log =
                                         std::mem::take(&mut *last_err_log.lock().unwrap());
                                     let _ = load_err_tx.send((ef.error, log));
+                                    // 装载失败唤醒：mpv 出错后停止渲染（update 回调
+                                    // 不再触发），错误横幅回显靠此帧
+                                    egui_wake.request_repaint();
                                 }
                             }
                             tracing::debug!(

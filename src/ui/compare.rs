@@ -36,9 +36,11 @@ pub(super) struct ComparePane {
     pub key: ImgKey,
     pub name: String,
     pub source: ImageSource,
-    /// 条目尺寸（非流式落地判定：dest 文件 len == size）
-    pub size: u64,
     pub kind: PaneKind,
+    /// 非流式源"已完整落地"缓存：流式恒 true；非流式在 build_compare_pane
+    /// 时查一次 metadata，此后由 poll_extract 的 FileDone 事件置位——
+    /// 替代旧版 compare_tick 每帧每栏 fs::metadata 轮询（空闲 CPU 优化）
+    pub landed: bool,
 }
 
 #[derive(Default)]
@@ -346,16 +348,17 @@ impl App {
                 Err(msg) => PaneKind::RawErr(msg),
             },
         };
+        // landed 先于 source move 计算（ImageSource 非 Copy）
+        let landed = a.stream || source_ready(&source, e.size);
         ComparePane {
             idx,
             key,
             name: e.name.clone(),
             source,
-            size: e.size,
             kind,
+            landed,
         }
     }
-
     fn enter_compare_with(&mut self, domain: Vec<usize>, panes: Vec<ComparePane>) {
         // 停播 + 清单图模式状态（对比模式 mpv 不在场）
         if let Some(p) = &self.player {
@@ -390,7 +393,7 @@ impl App {
                 .panes
                 .iter()
                 .filter(|p| matches!(p.kind, PaneKind::Image))
-                .filter(|p| source_ready(&p.source, p.size))
+                .filter(|p| p.landed)
                 .map(|p| (p.key, p.source.clone(), p.name.clone()))
                 .collect();
             let stream_prefetch = self.archive.as_ref().is_some_and(|a| a.stream);
@@ -441,15 +444,16 @@ impl App {
     }
 
     /// raw 栏帧请求对齐共享游标（compare_tick 每帧调用；幂等）。
-    /// 源就绪判定：流式恒可读；非流式须已完整落地——半截文件解码必失败，
-    /// 且 RawFrameService.errs 是确定性失败不重试，落地前请求会永久污染
+    /// 源就绪判定读 `landed` 缓存（build 时/FileDone 事件置位）——半截文件
+    /// 解码必失败，且 RawFrameService.errs 是确定性失败不重试，落地前请求
+    /// 会永久污染
     fn compare_request_raw_frames(&mut self) {
         let wants: Vec<(ImgKey, ImageSource, RawFrameInfo, usize)> = {
             let Some(s) = &self.compare else { return };
             s.panes
                 .iter()
                 .filter_map(|p| match &p.kind {
-                    PaneKind::Raw(info) if source_ready(&p.source, p.size) => {
+                    PaneKind::Raw(info) if p.landed => {
                         let want = s.cursor.min(info.frame_count.saturating_sub(1));
                         Some((p.key, p.source.clone(), info.clone(), want))
                     }
@@ -471,7 +475,7 @@ impl App {
         self.rawdec.poll();
         self.compare_request_raw_frames();
         // image 栏自愈（被挤出/在途丢失一帧内补发，同 heal_current_image）；
-        // 源未就绪（非流式未落地）不请求——防 img_fallback 确定性污染
+        // 源未落地（landed=false）不请求——防 img_fallback 确定性污染
         let (heals, master_idx, master_landed): (Vec<(ImgKey, ImageSource, String)>, Option<usize>, Option<bool>) = {
             let Some(s) = &self.compare else { return };
             let heals = s
@@ -479,20 +483,15 @@ impl App {
                 .iter()
                 .filter(|p| matches!(p.kind, PaneKind::Image))
                 .filter(|p| !self.img.has(p.key) && !self.img.is_pending(p.key))
-                .filter(|p| source_ready(&p.source, p.size))
+                .filter(|p| p.landed)
                 .map(|p| (p.key, p.source.clone(), p.name.clone()))
                 .collect();
+            // 主栏是否已落地（landed 缓存）：false = 未落地 → 可触发解压会话
             let mi = s.panes.get(s.master).map(|p| p.idx);
-            // 主栏是否已落地：None = 主栏是流式源（无需落地判定，返回 None
-            // 使下方会话触发短路）；Some(false) = 未落地 → 可触发解压会话
-            let landed = mi.map(|i| {
-                s.panes
-                    .iter()
-                    .filter(|p| p.idx == i)
-                    .map(|p| source_ready(&p.source, p.size))
-                    .next()
-                    .unwrap_or(true)
-            });
+            let landed = s
+                .panes
+                .get(s.master)
+                .map(|p| p.landed);
             (heals, mi, landed)
         };
         let max_dim = self.cfg.ui.image_max_dim;

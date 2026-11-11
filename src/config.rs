@@ -546,6 +546,17 @@ pub struct UiConfig {
     /// 高清档 Lanczos 放大后叠加 unsharp mask 锐化（放大插值会把边缘
     /// 坡度摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关闭可对比）
     pub image_full_sharpen: bool,
+    /// UI 重绘频率三档（fps）——悬停移动（指针滑过 UI、未按下）上限。
+    /// egui-winit 对鼠标移动无条件 request_repaint，事件率（125~1000Hz）
+    /// 直接驱动重绘频率，而立即模式 UI 每帧全量重建+present，低端机上悬停
+    /// 占用可观。30fps 高亮跟随无感知、占用减半；弱机可再调低。钳制 5~240
+    pub redraw_hover_fps: u32,
+    /// UI 重绘频率三档——拖拽中（指针按下：平移/缩放/拖动进度条/拖列表）
+    /// 上限：需要更高跟手度，默认 60
+    pub redraw_drag_fps: u32,
+    /// UI 重绘频率三档——其余情况（线程唤醒/timer/hover 动画/后台事件
+    /// 刷新）上限：解码完成显示等事件延迟 ≤ 帧间隔，默认 60 平衡占用与响应
+    pub redraw_other_fps: u32,
 }
 
 impl Default for UiConfig {
@@ -563,7 +574,18 @@ impl Default for UiConfig {
             image_max_dim: 4096,
             image_full_threshold: 2.0,
             image_full_sharpen: true,
+            redraw_hover_fps: 30,
+            redraw_drag_fps: 60,
+            redraw_other_fps: 60,
         }
+    }
+}
+
+impl UiConfig {
+    /// 帧率上限 → 节流间隔（毫秒）。fps 钳制 5~240：下限防 0 除/超长睡眠，
+    /// 上限防配置误填导致节流失效退回事件风暴
+    pub fn pacing_ms(fps: u32) -> u64 {
+        (1000.0 / fps.clamp(5, 240) as f64).round() as u64
     }
 }
 
@@ -944,6 +966,22 @@ image_full_threshold = 2.0
 # 摊平，锐化补偿观感；强对比边缘可能有轻微光晕，关掉可对比）
 image_full_sharpen = true
 
+# ============ UI 重绘频率 ============
+# egui 立即模式 UI 每帧全量重建，鼠标移动/线程唤醒会按事件率驱动重绘。
+# 三档重绘频率上限把重绘封顶，静置/悬停时 CPU/GPU 占用可控（弱机显著
+# 受益）。取值钳制 5~240；视频播放不受影响（vsync 主钟）
+
+# 悬停移动（指针滑过 UI、未按下）重绘频率上限。30 = 高亮跟随无感知、
+# 占用约为 60fps 的一半；弱机可调 20；高刷屏想更顺滑可调回 60
+redraw_hover_fps = 30
+
+# 拖拽中（指针按下：对比栏平移/缩放、拖进度条、拖列表）重绘频率上限
+redraw_drag_fps = 60
+
+# 其余情况（解码完成显示、解压进度刷新、hover 动画等）重绘频率上限。
+# 调低会让后台事件显示延迟变大（间隔 = 1000/该值 毫秒）
+redraw_other_fps = 60
+
 # ============ 解压预取 ============
 [extract]
 
@@ -1029,6 +1067,26 @@ prefetch_prev_mb = 9",
         .unwrap();
         assert_eq!(cfg.extract.prefetch_downstream_mb, 7);
         assert_eq!(cfg.extract.prefetch_upstream_mb, 9);
+    }
+
+    /// UI 重绘频率三键：自定义值可解析；pacing_ms 越界钳制 5~240fps
+    #[test]
+    fn ui_redraw_fps_keys() {
+        let cfg: Config = toml::from_str(
+            "[ui]
+redraw_hover_fps = 20
+redraw_drag_fps = 144
+redraw_other_fps = 0",
+        )
+        .unwrap();
+        assert_eq!(cfg.ui.redraw_hover_fps, 20);
+        assert_eq!(cfg.ui.redraw_drag_fps, 144);
+        assert_eq!(cfg.ui.redraw_other_fps, 0); // 解析不钳制，取间隔时才钳
+        assert_eq!(UiConfig::pacing_ms(cfg.ui.redraw_hover_fps), 50);
+        assert_eq!(UiConfig::pacing_ms(cfg.ui.redraw_drag_fps), 7); // 1000/144 ≈ 6.9
+        assert_eq!(UiConfig::pacing_ms(0), 200); // 0 → 钳 5fps → 200ms
+        assert_eq!(UiConfig::pacing_ms(999), 4); // 999 → 钳 240fps → ~4ms
+        assert_eq!(UiConfig::pacing_ms(60), 17); // 1000/60 ≈ 16.7 → 17
     }
 
     /// 含特殊字符（#、空格、中文）的密码在 TOML 双引号内原样保留

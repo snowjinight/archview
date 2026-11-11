@@ -434,7 +434,9 @@ impl App {
         self.play(ei);
     }
 
-    /// 图片自动播放（PPT 式翻页）：间隔到了切下一张；手动切换会重置计时
+    /// 图片自动播放（PPT 式翻页）：间隔到了切下一张；手动切换会重置计时。
+    /// 到期翻页由精确排帧唤醒（mod.rs 心跳决策 `request_repaint_after
+    /// (slideshow_rest)`），无需周期心跳轮询
     pub(super) fn slideshow_tick(&mut self, ctx: &egui::Context) {
         if !self.slideshow_on || !self.playing_is_image() {
             return;
@@ -450,6 +452,15 @@ impl App {
             // 自动翻页不触发"打开下一个压缩包"询问（到最后一张停住）
             self.play_adjacent(1, false);
         }
+    }
+
+    /// 距下次幻灯片翻页的剩余时长（saturating；UI 心跳决策据此精确排帧，
+    /// 每个翻页间隔只醒一次而非 10 FPS 轮询）。`now` = ctx.input time（秒，
+    /// 与 slideshow_tick 计时同源同帧同值）
+    pub(super) fn slideshow_rest(&self, now: f64) -> std::time::Duration {
+        let rest = (self.cfg.ui.slideshow_secs - (now - self.slideshow_anchor)).max(0.0);
+        // 下限 1ms 防零时长忙转；上限防病态配置撑爆 Duration
+        std::time::Duration::from_millis(((rest * 1000.0) as u64).clamp(1, 3_600_000))
     }
 
     /// 循环切换视频播放模式（三态）：Hold（定格，默认，播完停末帧）→
@@ -481,8 +492,9 @@ impl App {
         tracing::info!("视频播放模式: {m:?}");
     }
 
-    /// 列表播放：视频播到末尾自动切下一个（每帧轮询，EOF 后 keep-open
-    /// 粘滞暂停使节拍回落 100ms，推进延迟 ≤100ms 不可感知）。
+    /// 列表播放：视频播到末尾自动切下一个（事件驱动：mpv 泵线程在
+    /// eof-reached 置位时 request_repaint 唤醒一帧，本 tick 在该帧内推进，
+    /// 延迟为事件到达即帧，不可感知）。
     /// 仅 List 模式推进；Loop 下 eof-reached 恒 false（mpv 原生循环不
     /// 触发 EOF）；Hold 下 eof 可为 true 但不推进——切回 List 时立即
     /// 推进（Hold 门控在读取 eof 之前 return，不写 eof_handled）。

@@ -138,7 +138,11 @@ impl App {
         };
         let spawned = std::thread::Builder::new()
             .name("open_archive".into())
-            .spawn(move || {
+            .spawn({
+                // 消息 send 后主动唤醒 UI 立即 poll：空闲时 UI 不再有心跳
+                // 排帧（全事件驱动），进度显示与终态套用全靠此唤醒
+                let egui_ctx = self.egui_ctx.clone();
+                move || {
                 // 阶段 1（目录递归扫描 / crate 内部解析头/CD，无法细分）：不定进度
                 let stage = if path_t.is_dir() {
                     "正在扫描目录"
@@ -149,6 +153,7 @@ impl App {
                     fraction: None,
                     stage: stage.into(),
                 });
+                egui_ctx.request_repaint();
                 // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
                 // doc/架构设计/04_VFS层.md §4.2）——无加密概念，不走密码探测链；文件模式照旧
                 let opened = if path_t.is_dir() {
@@ -170,6 +175,11 @@ impl App {
                                     fraction: f,
                                     stage: s.to_string(),
                                 });
+                                // 进度回调由 VFS 层节流（zip 每 256 条目
+                                // 1 次，zip_vfs.rs list_from_central_directory），
+                                // 频率极低；request_repaint 仅置内部标志，
+                                // 开销可忽略
+                                egui_ctx.request_repaint();
                             });
                         OpenMsg::Done {
                             vfs: arc,
@@ -184,6 +194,8 @@ impl App {
                     Err(e) => OpenMsg::Failed(format!("Failed to open {}: {e}", path_t.display())),
                 };
                 let _ = tx.send(msg);
+                egui_ctx.request_repaint();
+                }
             })
             .is_ok();
         if spawned {
