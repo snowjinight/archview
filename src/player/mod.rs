@@ -720,17 +720,15 @@ impl PlayerService {
     }
 
     /// 逐帧步进：dir>0 = frame-step（下一帧），dir<0 = frame-back-step（上一帧）。
-    /// mpv 语义：播放中调 frame-step 会自动暂停；UI 侧只在暂停时映射方向键，
-    /// 播放中误触发也安全（等效暂停 + 步进）。opening 短路同 toggle_pause
+    /// 前向必须用 flags=1（seek）：默认 flags=0 会被 mpv 内部真解除暂停播一帧
+    /// 再重新暂停（playloop.c add_step_frame 先 set_pause_state(false)，video.c
+    /// step_frames 归零时再 set_pause_state(true)），pause 属性两次推送让控制栏
+    /// 图标闪"播放→暂停"。flags=1 走 MPSEEK_FRAMESTEP 精确 seek 且保持 pause=yes，
+    /// 与 back-step（内部即 seek 语义）对称。播放中误触发也安全（等效暂停 + 步进）。
+    /// opening 短路同 toggle_pause
     pub fn frame_step(&self, dir: i32) {
-        if self.opening() {
-            return;
-        }
-        let cmd = if dir >= 0 {
-            "no-osd frame-step"
-        } else {
-            "no-osd frame-back-step"
-        };
+        if self.opening() { return; }
+        let cmd = if dir >= 0 { "no-osd frame-step 1 seek" } else { "no-osd frame-back-step" };
         if let Err(e) = mpv_ffi::command_string(self.ctx, cmd) {
             tracing::error!("逐帧步进失败: {e}");
         }

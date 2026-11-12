@@ -133,6 +133,70 @@ CPU 10%——egui-winit 对 MouseWheel 同样无条件 request_repaint，快速�
 帧率上限时只能在 App 层补（睡眠 pacing 或 patch egui-winit），睡眠期间
 winit 事件队列天然合并批处理，是免 patch 的最小实现。
 
+## 追加：暂停逐帧图标闪烁 + 方向键长按连发（用户实测）
+
+**现象**：视频暂停态按 → 单帧步进，底部控制栏播放/暂停按钮图标先闪成
+"播放"（||）再切回"暂停"（▶）；且逐帧只能一下一下按，长按无连发。
+
+**根因**（mpv 源码取证，项目自带 libmpv v0.41.0-1107）：前向逐帧命令
+`frame-step`（默认 flags=0/play）在 mpv 内部是**"真解除暂停播一帧再重新暂停"**：
+
+1. [player/command.c](https://github.com/mpv-player/mpv) `cmd_frame_step` →
+   `add_step_frame(mpctx, 1, use_seek=false)`；
+2. `playloop.c add_step_frame`：`dir>0 && !use_seek` 分支 `step_frames += 1` 后
+   **`set_pause_state(false)`**；`set_pause_state` 末尾无条件
+   `m_config_notify_change_opt_ptr(&opts->pause)`（playloop.c:198）——
+   **即使值没变也推 pause 属性通知** → 泵线程收到 pause=false 写
+   `paused_cache` → 图标闪成"播放"；
+3. 一帧播完后 `video.c`（`step_frames` 归零处）**`set_pause_state(true)`** 再推
+   pause=true → 图标切回"暂停"。
+
+上一帧 `frame-back-step` 内部就是 seek 语义（`queue_seek(MPSEEK_FRAMESTEP)` +
+`set_pause_state(true)`），保持暂停态不闪——所以闪烁只在按 → 时出现。
+顺带确认一处隐患：`vid_paused`（nav.rs）按键时读 `paused_cache`，快速连按 →
+时若恰逢上一步的 pause=false 瞬态窗口，会被误判"播放中"走 ±5s seek。
+
+**修复闪烁**（[player/mod.rs](../../src/player/mod.rs) `frame_step`）：前向命令
+改 `no-osd frame-step 1 seek`（mpv 0.41+ 的 flags 参数，`{"seek", 1}`）：
+
+- `cmd_frame_step` flags==1 分支 → `add_step_frame(frames, use_seek=true)` →
+  `queue_seek(MPSEEK_FRAMESTEP, VERY_EXACT)` + `set_pause_state(true)`；
+- 全程 pause=yes，无属性往返推送，图标恒"暂停"；与 back-step 语义对称；
+- 行为差异：原 flags=0 是"解除暂停播一帧"，flags=1 是"暂停态精确 seek 到
+  下一帧"——静止画面上视觉一致，但 flags=1 不触碰音频链（原实现播一帧时
+  可能漏出一小段声音）；项目自带 dll 锁定 0.41+，无旧版兼容顾虑。
+
+**新功能：方向键长按连发**（[ui/nav.rs](../../src/ui/nav.rs) `arrow_hold_fire`
++ [ui/mod.rs](../../src/ui/mod.rs) `App.arrow_hold`）：
+
+- 暂停=连续逐帧（40ms/发 ≈25帧/s），播放=连续 ±5s seek（150ms/发 ≈33s/s），
+  松开即停。播放态连发安全：mpv 对 `MPSEEK_RELATIVE` 入队**累加合并**
+  （`seek->amount += amount`）；暂停态逐帧连发安全：mpv 对 `MPSEEK_FRAMESTEP`
+  入队覆盖 pending seek，且上一次步进未完成（`hrseek_active`）时新命令被
+  `add_step_frame` 静默丢弃——mpv 端天然背压，UI 端固定节奏连发无需完成门控；
+- 事件模型：key-down（repeat:false）首拍落地 + 记录
+  `arrow_hold=(方向, 按下时刻, 下次连发时刻)`；key-up 新增 ArrowLeft/Right
+  pressed:false 臂清除；每帧 `handle_shortcuts` 尾部 `arrow_hold_fire` 检查
+  到点即发；
+- 暂停态 UI 无心跳：fire 时 `request_repaint_after(rate)` 排下一发——与幻灯片
+  同类的 timer 排帧场景，未破坏"仅三类主动排帧"不变量的事件驱动语义；
+- 失焦兜底：alt-tab/弹窗抢焦点收不到 key-up，按住超 10s 强制清除防永动；
+- 节奏常量硬编码（`ARROW_HOLD_DELAY/STEP/SEEK` = 300/40/150ms），手感参数
+  暂不进配置。
+
+**验证**：`cargo test --release` 180 项全绿；release 构建干净。手动验证点：
+暂停按 → 图标恒"暂停"不闪；长按 → 连续逐帧、松开停；播放态长按 → 连续快进、
+松开停；长按中切方向立即换向并重置节奏。
+
+**教训**：
+
+- mpv 命令语义要读源码取证：文档里 "play one frame, then pause" 掩盖了
+  实现是 "unpause → 播一帧 → re-pause"，而 `set_pause_state` 的**无条件**
+  属性通知把内部状态机往返泄漏给 `observe_property` 订阅者；
+- 同一命令存在 flags 参数替代路径时，优先选不触碰全局状态（pause）的
+  实现——flags=1 seek 语义不仅修了闪烁，也顺带消除了 `paused_cache` 瞬态
+  误判的隐患。
+
 ## 验证
 
 - `cargo test`：176 项全绿（改动不涉纯函数逻辑，compare 结构体加字段）。

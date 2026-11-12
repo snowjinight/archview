@@ -137,6 +137,10 @@ impl App {
         let (mut do_pause, mut do_mute, mut step_entry) = (false, false, 0i32);
         // 视频暂停时的方向键 = 逐帧步进（上一帧/下一帧）
         let mut frame_dir = 0i32;
+        // 方向键长按连发：本次按下的方向（-1/+1，0=无新按下）
+        let mut hold_press = 0i32;
+        // 方向键释放（清除连发）
+        let mut hold_release = false;
         // L=视频播放模式三态循环（定格→列表→循环）
         let mut loop_toggle = false;
         // 回车=切换全屏；Esc=退出全屏（仅全屏时消费，避免抢其它控件的 Esc）
@@ -182,6 +186,15 @@ impl App {
                     }
                     return true;
                 }
+                // 方向键释放：清除长按连发（保留事件不消费，其它控件可读）
+                if let egui::Event::Key {
+                    key: egui::Key::ArrowLeft | egui::Key::ArrowRight,
+                    pressed: false,
+                    ..
+                } = e
+                {
+                    hold_release = true;
+                }
                 let egui::Event::Key {
                     key,
                     pressed: true,
@@ -208,7 +221,8 @@ impl App {
                         false
                     }
                     egui::Key::ArrowLeft => {
-                        // 暂停时=上一帧（逐帧），播放中=快退 5s
+                        // 暂停时=上一帧（逐帧），播放中=快退 5s；两种都登记长按连发
+                        hold_press = -1;
                         if vid_paused {
                             frame_dir = -1;
                         } else {
@@ -217,6 +231,7 @@ impl App {
                         false
                     }
                     egui::Key::ArrowRight => {
+                        hold_press = 1;
                         if vid_paused {
                             frame_dir = 1;
                         } else {
@@ -343,6 +358,15 @@ impl App {
                 self.cfg.player.muted = false;
             }
         }
+        // 方向键长按连发登记：释放=清除；按下=记录方向与首发节奏锚点
+        //（首拍已在上面 frame_dir/seek_rel 落地，连发从 HOLD_DELAY 后起拍）
+        if hold_release {
+            self.arrow_hold = None;
+        }
+        if hold_press != 0 {
+            let now = std::time::Instant::now();
+            self.arrow_hold = Some((hold_press, now, now + Self::ARROW_HOLD_DELAY));
+        }
         if step_entry != 0 {
             self.play_adjacent(step_entry, step_entry > 0);
         }
@@ -390,6 +414,50 @@ impl App {
         }
         if fs_exit {
             self.set_fullscreen(false, frame);
+        }
+        // 方向键长按连发驱动：每帧检查到点即发
+        self.arrow_hold_fire(ctx);
+    }
+
+    // ---- 方向键长按连发 ----
+    // 首拍后的首发延迟（与 OS 键盘重复惯例一致）
+    const ARROW_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    // 暂停态连续逐帧间隔（≈25帧/s，高于此 mpv 解码跟不上，多发的被其
+    // hrseek_active 背压丢弃，无积压）
+    const ARROW_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(40);
+    // 播放态连续 ±5s seek 间隔（≈33s/s；mpv 对 RELATIVE seek 入队累加合并）
+    const ARROW_HOLD_SEEK: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// 方向键长按连发：暂停=连续逐帧步进，播放=连续 ±5s seek，松开即停。
+    /// 每帧由 handle_shortcuts 尾部驱动；暂停态 UI 无心跳，靠
+    /// request_repaint_after 排下一发。切方向=重置节奏锚点，换挡（暂停↔播放）
+    /// 在每次 fire 时实时读 paused() 缓存自适应
+    fn arrow_hold_fire(&mut self, ctx: &egui::Context) {
+        let Some((dir, pressed_at, next_fire)) = self.arrow_hold else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        // 失焦兜底：alt-tab/弹窗抢焦点可能收不到 key-up，超时强制清除防永动
+        if now - pressed_at > std::time::Duration::from_secs(10) {
+            self.arrow_hold = None;
+            return;
+        }
+        if now < next_fire {
+            ctx.request_repaint_after(next_fire - now);
+            return;
+        }
+        let paused = self.player.as_ref().is_some_and(|p| p.paused());
+        let rate = if paused { Self::ARROW_HOLD_STEP } else { Self::ARROW_HOLD_SEEK };
+        self.arrow_hold = Some((dir, pressed_at, now + rate));
+        // 排下一发：暂停态无心跳必须显式排帧；播放态 vsync 帧率更密，
+        // 与之取较早者，无害
+        ctx.request_repaint_after(rate);
+        if let Some(p) = &self.player {
+            if paused {
+                p.frame_step(dir);
+            } else {
+                p.seek_relative(dir as f64 * 5.0);
+            }
         }
     }
 

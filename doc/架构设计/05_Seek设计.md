@@ -36,3 +36,25 @@
 - UI 进度条：观察 mpv `time-pos` 属性驱动进度显示；拖动松手后发 `seek` 命令（拖动中不连续发）。
 - 慢 seek 期间：UI 显示 mpv buffering 状态；连续拖动产生的新 seek 取消前一个解压重定向任务。
 - 快路径上游 seek 且缓存未命中：在 read 回调中同步重解压，期间 mpv 自然缓冲。
+
+### 5.5 逐帧步进与方向键长按连发
+
+暂停态 ←/→ 逐帧步进、播放态 ±5s seek，两类操作都必须**不触碰 pause 属性**：
+
+- **前向逐帧用 `frame-step 1 seek`（flags=1）而非默认 flags=0**。默认语义在
+  mpv 内部是"真解除暂停播一帧再重新暂停"（playloop.c `add_step_frame` 先
+  `set_pause_state(false)`、video.c `step_frames` 归零时再 `set_pause_state(true)`，
+  且 `set_pause_state` 末尾**无条件**推 pause 属性通知）——两次推送经
+  `observe_property` 写 `paused_cache`，控制栏图标闪"播放→暂停"，且瞬态
+  `pause=false` 会让下一次按键被误判为播放态。flags=1 走 `MPSEEK_FRAMESTEP`
+  精确 seek + `set_pause_state(true)`，全程保持 pause=yes，与 `frame-back-step`
+  （内部即 seek 语义）对称。
+- **mpv 端天然背压**：上一次步进 seek 未完成（`hrseek_active`）时新命令被
+  `add_step_frame` 静默丢弃；`MPSEEK_FRAMESTEP` 入队覆盖 pending seek，无积压。
+  因此 UI 端固定节奏连发即可，无需完成门控。
+- **播放态连续 ±5s**：mpv 对 `MPSEEK_RELATIVE` 入队**累加合并**（`seek->amount
+  += amount`），连发速率快于消化速度时自动合并为一次大步 seek，安全。
+- **长按连发事件模型**（见 [DEVLOG §13](../架构落地开发/13_空闲CPU全事件驱动专项.md)）：
+  key-down 首拍落地 + 记录方向与节奏锚点，key-up 清除，按住期间每帧检查到点
+  即发并 `request_repaint_after` 排下一发（全事件驱动模型下与幻灯片同类的
+  timer 排帧场景）；按住超 10s 无 key-up（失焦丢释放事件）强制清除防永动。
