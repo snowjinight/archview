@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "archview"
-version = "1.2.5"
+version = "1.2.6"
 dependencies = [
  "alphanumeric-sort",
  "eframe",
