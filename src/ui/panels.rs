@@ -143,54 +143,61 @@ impl App {
                 ui.set_min_width(280.0);
                 ui.strong("快捷键");
                 ui.separator();
-                // 分四组：通用在前，视频 / 图片 / 对比模式各成一块
+                // 分四组：通用在前，视频 / 图片 / 对比模式各成一块。
+                // 文案面向最终用户：只说操作和结果，不暴露内部术语
+                // （主栏 / 滑动域 / 帧游标 / mpv 等一律不出现）
                 let groups: &[(&str, &[(&str, &str)])] = &[
                     (
                         "通用",
                         &[
-                            ("PgUp / PgDn", "上一个 / 下一个（对比模式 = 整组滑动）"),
-                            ("鼠标滚轮（预览窗口内）", "上一个 / 下一个媒体"),
-                            ("N", "打开下一个压缩包（连续看包）"),
-                            ("B", "回到锚点（最后一次解压位置）"),
-                            ("回车", "全屏切换"),
+                            ("PgUp / PgDn", "上一个 / 下一个（对比时整组一起翻）"),
+                            ("鼠标滚轮（预览窗口内）", "上一个 / 下一个"),
+                            ("N", "打开下一个压缩包"),
+                            ("B", "跳到最后播放的位置"),
+                            ("回车", "全屏 / 退出全屏"),
                             ("Esc", "退出全屏"),
                         ],
                     ),
                     (
                         "视频",
                         &[
-                            ("← / →", "seek ±5 秒"),
+                            ("← / →", "快退 / 快进 5 秒"),
                             ("← / →（暂停时）", "上一帧 / 下一帧"),
-                            ("↑ / ↓", "音量 ±5"),
-                            ("M", "静音切换"),
-                            ("L", "播放模式：单文件（默认，播完停末帧）→ 列表 → 循环"),
+                            ("↑ / ↓", "音量加大 / 减小"),
+                            ("M", "静音 / 取消静音"),
+                            ("L", "播放模式：播完即停 → 自动连播 → 单个循环"),
                         ],
                     ),
                     (
                         "图片",
                         &[
                             ("← / →", "上一张 / 下一张"),
-                            ("滚轮（缩放态）", "锚光标缩放（触底回适应）"),
-                            ("Ctrl + 滚轮", "缩放（任意状态，锚光标）"),
-                            ("+ / - / ↑ / ↓", "缩放步进（锚视口中心）"),
-                            ("Ctrl + H", "直方图开关（图片 / raw dump）"),
-                            ("0", "100% 显示"),
+                            ("滚轮（放大状态下）", "以鼠标位置为中心缩放"),
+                            ("Ctrl + 滚轮", "缩放（任何时候）"),
+                            ("+ / - / ↑ / ↓", "放大 / 缩小"),
+                            ("Ctrl + H", "直方图 开 / 关"),
+                            ("0", "按原始尺寸显示"),
                             ("Home", "适应窗口"),
-                            ("鼠标拖拽", "平移已放大的图片"),
-                            ("双击图片", "适应窗口 ↔ 100%"),
+                            ("鼠标拖拽", "移动放大的图片"),
+                            ("双击图片", "适应窗口 / 原始尺寸，来回切换"),
                         ],
                     ),
                     (
                         // 键位与图片模式大面积同构（↑↓/+/−/Home/滚轮/拖拽
                         // 同义），只列差异——避免帮助面板越长越没人看；
                         // PgUp/PgDn 是通用键，见通用组
-                        "对比模式（其余键同图片模式）",
+                        "对比模式（其余按键同图片模式）",
                         &[
-                            ("C", "进入对比：先 Ctrl+点选 2~6 个静态图 / raw 预设文件"),
-                            ("← / →", "多帧 raw：同步帧游标（纯静态不响应）——不再翻页"),
-                            ("2 ~ 6", "切换栏数"),
-                            ("点击某栏", "设为主栏（full 高清升级跟随）"),
-                            ("Esc", "先退全屏，再退对比"),
+                            ("C", "开始对比：先按住 Ctrl 点选 2~6 张图片"),
+                            ("← / →", "所有画面同步翻帧（多帧 RAW 对比时有效）"),
+                            ("B", "跳到最后播放的位置"),
+                            ("0", "按原始尺寸显示（以最近点击的那格为准）"),
+                            ("双击任意一格", "全部恢复适应窗口"),
+                            ("2 ~ 6", "调整同时对比的张数"),
+                            ("单击某一格", "选中它（大图加载跟随这一格）"),
+                            ("控制栏 < / >", "上一组 / 下一组"),
+                            ("控制栏 ▶ / ||", "对比模式下不使用"),
+                            ("Esc", "先退全屏，再退出对比"),
                         ],
                     ),
                 ];
@@ -1743,6 +1750,14 @@ impl App {
             if pr.dragged() {
                 drag = pr.drag_delta();
             }
+            // 双击 = 整组回适应（单图模式双击是"适应↔100%"切换；对比无
+            // 单一 100% 语义，双击只承担回适应一职，0 键负责主栏 100%）
+            if pr.double_clicked() {
+                if let Some(s) = self.compare.as_mut() {
+                    s.zoom = None;
+                    s.center = egui::vec2(0.5, 0.5);
+                }
+            }
             let (zoom_s, center_s) = {
                 let s = self.compare.as_ref().unwrap();
                 (s.zoom, s.center)
@@ -1767,6 +1782,12 @@ impl App {
                     }
                     let native = tex.size_vec2();
                     let fit = fit_scale(*cell, native);
+                    // 主栏 fit 记录（0 键"主栏 100%"换算依据；每帧覆盖）
+                    if i == master0 {
+                        if let Some(s) = self.compare.as_mut() {
+                            s.master_fit = Some((native * fit, native));
+                        }
+                    }
                     // full 纹理选画 + 升级触发（仅主栏，判据同单图 image_view）
                     let zoom = zoom_s.unwrap_or(fit);
                     let native_max = native.max_elem() as u32;
@@ -1812,6 +1833,13 @@ impl App {
                 }
                 PaneKind::Raw(info) => {
                     let native = egui::vec2(info.w as f32, info.h as f32);
+                    // 主栏 fit 记录（raw 栏也可为主栏；0 键换算依据）
+                    if i == master0 {
+                        let fit = fit_scale(*cell, native);
+                        if let Some(s) = self.compare.as_mut() {
+                            s.master_fit = Some((native * fit, native));
+                        }
+                    }
                     let tid = self.rawdec.frame(key).map(|t| t.tex.id());
                     match tid {
                         Some(tid) => {
@@ -2069,7 +2097,11 @@ impl App {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui) {
         #[derive(Default)]
         struct Act {
+            /// < > 按钮的方向步进（±1；对比模式 = 整组滑动）
             step: i32,
+            /// 未播放态中键 ▶「从第一项开始播放」——与 step 分立的动作
+            /// （step 在对比模式被重映射为组滑动，播放启动不能捎带）
+            start: bool,
             toggle: bool,
             slide: bool,
             loop_toggle: bool,
@@ -2231,9 +2263,11 @@ impl App {
                             }
                         } else {
                             // 未播放：播放按钮=开始当前标签页第一项
+                            // （与 < > 的 act.step 分立——对比模式 step 重映射
+                            // 为组滑动，播放启动不应捎带；对比模式本动作不响应）
                             if icon_btn(ui, "▶", "播放（从第一项开始）", false).clicked()
                             {
-                                act.step = 1;
+                                act.start = true;
                             }
                         }
                         if icon_btn(ui, ">", "下一个", false).clicked() {
@@ -2272,11 +2306,23 @@ impl App {
             },
         );
 
-        // 闭包外应用动作（避免嵌套借用 self）
+        // 闭包外应用动作（避免嵌套借用 self）。
+        // 对比模式感知：act.step = 整组滑动（与 PgUp/PgDn 同语义，
+        // play_adjacent → play() 会清掉对比会话）；act.toggle 不响应——
+        // 空格在对比模态被独立键表全权接管（主键表 return，无落点），
+        // 按钮与空格严格同义 = 完全不响应（toggle_pause 会翻转缓存
+        // 暂停态，导致 ▶/|| 图标假切换）
         if act.step != 0 {
-            self.play_adjacent(act.step, act.step > 0);
+            if self.compare.is_some() {
+                self.compare_slide(act.step);
+            } else {
+                self.play_adjacent(act.step, act.step > 0);
+            }
         }
-        if act.toggle {
+        if act.start && self.compare.is_none() {
+            self.play_adjacent(1, true);
+        }
+        if act.toggle && self.compare.is_none() {
             if let Some(p) = &self.player {
                 p.toggle_pause();
             }

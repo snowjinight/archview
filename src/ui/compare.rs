@@ -63,6 +63,20 @@ pub(super) struct CompareSession {
     pub cursor: usize,
     /// 主栏下标（full 高清档升级跟随最后交互的栏，其余栏保持 base 档）
     pub master: usize,
+    /// 挂起的整组滑动（方向, Incoming key, entry 下标, 挂起时刻, 已提示）：
+    /// PgUp/PgDn 时 Incoming 纹理未就绪且"就绪在路上"则不换屏（避免最后
+    /// 一栏"等待落地"的割裂感），compare_tick 轮询就绪后自动滑动。**提示
+    /// 延迟化**：挂起本身静默（快滑百毫秒级完成，提前提示只会闪现误导），
+    /// 等待超 300ms 才上屏"预取下一组中"。每次按键覆盖旧挂起（不排队，
+    /// 语义 = 最新意图）
+    pub pending_slide: Option<(i32, ImgKey, usize, std::time::Instant, bool)>,
+    /// 预取候选（窗口前/后各 1 张静态图，compare_after_change 维护）：
+    /// 流式已就地发起解码；非流式由 compare_tick 在文件落地后补发
+    pub prefetch: Vec<(ImgKey, ImageSource, String, u64)>,
+    /// 主栏 (fit 显示尺寸, 原生像素尺寸)：compare_view 每帧记录（纹理
+    /// 就绪的主栏才更新）。0 键"主栏 100%"的换算依据——共享 zoom 是
+    /// 相对各栏 fit 的倍率，无单一 100% 语义，只能锚定主栏换算
+    pub master_fit: Option<(egui::Vec2, egui::Vec2)>,
 }
 
 impl CompareSession {
@@ -314,10 +328,13 @@ impl App {
             .map(|i| self.build_compare_pane(a, i))
             .collect();
         self.enter_compare_with(domain, panes);
+        // 选择已转化为会话窗口：进入成功即清空选中集（右键补选的行同样
+        // 一并清掉）；失败路径（<2 合格等）早退不清，便于调整后重试
+        let sel_count = self.selected.len();
+        self.selected.clear();
         if truncated {
             self.set_notice(format!(
-                "选中 {} 张超出上限，前 {COMPARE_MAX} 张入栏",
-                self.selected.len()
+                "选中 {sel_count} 张超出上限，前 {COMPARE_MAX} 张入栏"
             ));
         }
     }
@@ -379,14 +396,17 @@ impl App {
             center: egui::vec2(0.5, 0.5),
             cursor: 0,
             master: 0,
+            pending_slide: None,
+            prefetch: Vec::new(),
+            master_fit: None,
         });
         self.compare_after_change();
     }
 
     /// 窗口变更（进入/滑动/增减栏）后的公共收尾：发起解码 + shown 集合 +
-    /// 清理不在窗口的 raw 帧 + 预取
+    /// 双向预取（"就绪再滑动"体验的前置条件）
     fn compare_after_change(&mut self) {
-        let (keys, wants, stream_prefetch, domain_after, pane_n) = {
+        let (keys, wants, cands) = {
             let Some(s) = &self.compare else { return };
             let keys = s.shown_keys();
             let wants: Vec<(ImgKey, ImageSource, String)> = s
@@ -396,51 +416,86 @@ impl App {
                 .filter(|p| p.landed)
                 .map(|p| (p.key, p.source.clone(), p.name.clone()))
                 .collect();
-            let stream_prefetch = self.archive.as_ref().is_some_and(|a| a.stream);
-            let domain_after: Vec<usize> = {
-                let last = s.panes.last().map(|p| p.idx);
-                let pos = last.and_then(|l| s.domain.iter().position(|&i| i == l));
-                pos.map(|p| s.domain[p + 1..].to_vec()).unwrap_or_default()
-            };
-            (keys, wants, stream_prefetch, domain_after, s.panes.len())
+            // 预取候选：窗口前/后各 1 张合格静态图（滑动 Incoming 恒在
+            // 其中）。深度 1 = "栏数+1"语义：稳态翻页延迟由就绪闸门 + 解码
+            // 耗时吸收，不为连续快翻预驻一整组纹理。流式包立即发起解码；
+            // 非流式包只记键——文件落地后由 compare_tick 补发（landed 前
+            // 解码必失败，污染闸门同 raw 栏）
+            let mut cands: Vec<(ImgKey, ImageSource, String, u64)> = Vec::new();
+            if let Some(a) = self.archive.as_ref() {
+                let pf = s
+                    .panes
+                    .first()
+                    .and_then(|f| s.domain.iter().position(|&i| i == f.idx));
+                let pl = s
+                    .panes
+                    .last()
+                    .and_then(|l| s.domain.iter().position(|&i| i == l.idx));
+                let push = |i: usize, cands: &mut Vec<(ImgKey, ImageSource, String, u64)>| {
+                    let e = &a.entries[i];
+                    if compare_eligible(&self.cfg, &e.name)
+                        && self
+                            .raw_demux_opts(&e.name, Some(e.size))
+                            .ok()
+                            .flatten()
+                            .is_none()
+                    {
+                        let source = if a.stream {
+                            ImageSource::Stream(a.vfs.clone(), e.clone())
+                        } else {
+                            let dir = crate::cache::cache_dir(&self.cfg);
+                            ImageSource::File(crate::cache::dest_path(&dir, a.id, i, &e.name))
+                        };
+                        cands.push(((a.id, i), source, e.name.clone(), e.size));
+                    }
+                };
+                // 回退方向（PgUp 的 Incoming = 窗口首栏前一条）
+                if let Some(p) = pf {
+                    for &i in s.domain[..p].iter().rev() {
+                        if cands.len() >= 1 {
+                            break;
+                        }
+                        push(i, &mut cands);
+                    }
+                }
+                // 前进方向（PgDn 的 Incoming = 窗口末栏后一条）
+                let base = cands.len();
+                if let Some(p) = pl {
+                    for &i in &s.domain[p + 1..] {
+                        if cands.len() - base >= 1 {
+                            break;
+                        }
+                        push(i, &mut cands);
+                    }
+                }
+            }
+            (keys, wants, cands)
         };
-        self.img.set_shown_multi(keys.clone());
+        // LRU 保护集 = 当前窗口 + 预取候选（窗口纹理与预取纹理都不被逐出，
+        // 滑动换屏时 Incoming 恒命中——6+2 语义）；候选同步入会话供
+        // compare_tick 补发非流式解码
+        let mut protect = keys.clone();
+        protect.extend(cands.iter().map(|(k, _, _, _)| *k));
+        if let Some(s) = &mut self.compare {
+            s.prefetch = cands.clone();
+        }
+        self.img.set_shown_multi(protect);
         self.rawdec.retain(&keys);
         let max_dim = self.cfg.ui.image_max_dim;
         for (key, source, name) in wants {
             self.img.request(key, source, max_dim, &name);
         }
-        // raw 帧对齐游标（进入/滑动后游标已重置/保持，按需补发）
-        self.compare_request_raw_frames();
-        // 预取窗口后继静态图（仅流式包——非流式由解压会话下游预取覆盖；
-        // raw 栏不预取：软解毫秒级，不值 LRU 占用）
-        if stream_prefetch {
-            let mut n = 0;
-            for &i in &domain_after {
-                if n >= pane_n {
-                    break;
-                }
-                let (eligible_img, src, name) = {
-                    let a = self.archive.as_ref().unwrap();
-                    let e = &a.entries[i];
-                    (
-                        compare_eligible(&self.cfg, &e.name)
-                            && self.raw_demux_opts(&e.name, Some(e.size)).ok().flatten().is_none(),
-                        ImageSource::Stream(a.vfs.clone(), e.clone()),
-                        e.name.clone(),
-                    )
-                };
-                if !eligible_img {
-                    continue;
-                }
-                let key = (self.archive.as_ref().unwrap().id, i);
-                if self.img.has(key) || self.img.is_pending(key) {
-                    continue;
-                }
-                self.img.request(key, src, max_dim, &name);
-                n += 1;
+        // 预取解码：流式立即发起；非流式候选的落地检查在 compare_tick
+        for (key, source, name, _) in &cands {
+            if matches!(source, ImageSource::Stream(..))
+                && !self.img.has(*key)
+                && !self.img.is_pending(*key)
+            {
+                self.img.request(*key, source.clone(), max_dim, name);
             }
         }
+        // raw 帧对齐游标（进入/滑动后游标已重置/保持，按需补发）
+        self.compare_request_raw_frames();
     }
 
     /// raw 栏帧请求对齐共享游标（compare_tick 每帧调用；幂等）。
@@ -499,6 +554,23 @@ impl App {
             tracing::warn!("对比栏图片不在缓存且无在途解码，补发请求: {name}");
             self.img.request(key, source, max_dim, &name);
         }
+        // 预取候选补发：非流式邻居文件落地后发起解码（流式已在
+        // compare_after_change 发起；source_ready 防半截文件污染）——
+        // 让预取纹理在用户滑动前就绪，配合滑动就绪闸门实现零等待换屏
+        let cands = self
+            .compare
+            .as_ref()
+            .map(|s| s.prefetch.clone())
+            .unwrap_or_default();
+        for (key, source, name, size) in cands {
+            if matches!(source, ImageSource::File(..))
+                && !self.img.has(key)
+                && !self.img.is_pending(key)
+                && source_ready(&source, size)
+            {
+                self.img.request(key, source, max_dim, &name);
+            }
+        }
         // 解压会话触发：主栏为非流式源、未落地、当前解压会话未覆盖主栏时
         // 重定向 start_extract（solid 包 compute_batch 滑窗通常顺带解出窗口
         // 其它栏）。防重试风暴：密码框在场（Failed(is_pwd) 已触发）或错误
@@ -514,6 +586,38 @@ impl App {
                     .is_some_and(|j| j.entry_idx == mi || j.pending.contains_key(&mi));
                 if !covered {
                     self.start_extract(mi);
+                }
+            }
+        }
+        // 挂起滑动：Incoming 就绪后自动整组滑；就绪路径消失（解码失败 /
+        // 解压会话不再排期）则放弃挂起——下次按键走"立即滑动"兜底
+        let pend = self.compare.as_ref().and_then(|s| s.pending_slide);
+        if let Some((dir, key, idx, since, noticed)) = pend {
+            if self.img.has(key) {
+                if let Some(s) = &mut self.compare {
+                    s.pending_slide = None;
+                }
+                self.compare_slide(dir);
+            } else {
+                let coming = self.img.is_pending(key)
+                    || self
+                        .extract
+                        .as_ref()
+                        .is_some_and(|j| j.pending.contains_key(&idx));
+                if !coming {
+                    if let Some(s) = &mut self.compare {
+                        s.pending_slide = None;
+                    }
+                } else if !noticed
+                    && since.elapsed() >= std::time::Duration::from_millis(300)
+                {
+                    // 真等到了才提示：快滑（百毫秒级）全程静默
+                    if let Some(s) = &mut self.compare {
+                        if let Some(p) = &mut s.pending_slide {
+                            p.4 = true;
+                        }
+                    }
+                    self.set_notice("预取下一组中，就绪后自动滑动");
                 }
             }
         }
@@ -534,6 +638,53 @@ impl App {
             self.set_notice(if dir > 0 { "已到列表末尾" } else { "已到列表开头" });
             return;
         };
+        // 就绪闸门：Incoming（新入栏条目）纹理未就绪且"就绪在路上"时挂起
+        // 整组滑动，compare_tick 轮询就绪后自动滑——换屏瞬间全栏一致，
+        // 避免"末栏等待落地"的割裂感。无就绪路径（解码失败 / 未落地且
+        // 解压会话不覆盖）时立即滑动，栏内占位文案兜底
+        let incoming = if dir > 0 {
+            idxs.last().copied()
+        } else {
+            idxs.first().copied()
+        };
+        if let Some(i) = incoming {
+            let pane = {
+                let Some(a) = self.archive.as_ref() else { return };
+                self.build_compare_pane(a, i)
+            };
+            // 闸门只管静态图（raw 软解毫秒级 / 占位文案即时呈现，不值得等）
+            if matches!(pane.kind, PaneKind::Image) && !self.img.has(pane.key) {
+                let wait_worth = match &pane.source {
+                    ImageSource::Stream(..) => {
+                        if !self.img.is_pending(pane.key) {
+                            // 预取网漏网（如刚切栏数后立即滑动）：当场发起
+                            let max_dim = self.cfg.ui.image_max_dim;
+                            self.img
+                                .request(pane.key, pane.source.clone(), max_dim, &pane.name);
+                        }
+                        true
+                    }
+                    // 非流式：解码在途或解压会话已排期（pending 表含该条）
+                    // 才值得等；会话不覆盖时挂起只会卡死翻页
+                    ImageSource::File(..) => {
+                        self.img.is_pending(pane.key)
+                            || self
+                                .extract
+                                .as_ref()
+                                .is_some_and(|j| j.pending.contains_key(&i))
+                    }
+                };
+                if wait_worth {
+                    // 静默挂起：tick 轮询就绪自动滑；等待超 300ms 才提示
+                    // （快滑百毫秒级完成，提前提示只会闪现误导——见 pending_slide 注释）
+                    if let Some(s) = &mut self.compare {
+                        s.pending_slide =
+                            Some((dir, pane.key, i, std::time::Instant::now(), false));
+                    }
+                    return;
+                }
+            }
+        }
         let Some(a) = self.archive.as_ref() else { return };
         let panes: Vec<ComparePane> = idxs
             .into_iter()
@@ -544,6 +695,7 @@ impl App {
             s.panes = panes;
             s.cursor = 0;
             s.master = s.master.min(s.panes.len() - 1);
+            s.pending_slide = None;
         }
         self.compare_after_change();
     }
@@ -594,6 +746,45 @@ impl App {
         self.compare_after_change();
     }
 
+    /// 回到锚点（对比模式语义，B 键）：锚点条目在滑动域内 → 整组滑窗
+    /// 吸附到它并设为主栏（锚点尽量靠窗口中部）；不在域内提示。
+    /// zoom/center/cursor 保持——回看锚点不该丢用户调好的视图
+    fn compare_focus_jump(&mut self) {
+        let Some(f) = self.last_focus else {
+            self.set_notice("本包尚无锚点（B 依赖最后一次解压位置）");
+            return;
+        };
+        let found: Option<(Vec<usize>, usize, usize)> = {
+            let Some(s) = &self.compare else { return };
+            let p = s.domain.iter().position(|&i| i == f);
+            let n = s.panes.len();
+            if s.domain.len() < n {
+                return;
+            }
+            // 含 f 的连续窗口：start = p − n/2（f 靠中），钳制不越界
+            p.map(|p| {
+                let start = p.saturating_sub(n / 2).min(s.domain.len() - n);
+                (s.domain[start..start + n].to_vec(), p - start, f)
+            })
+        };
+        let Some((idxs, master_pos, f)) = found else {
+            self.set_notice("锚点不在对比滑动域内");
+            return;
+        };
+        let Some(a) = self.archive.as_ref() else { return };
+        let panes: Vec<ComparePane> = idxs
+            .iter()
+            .map(|&i| self.build_compare_pane(a, i))
+            .collect();
+        if let Some(s) = &mut self.compare {
+            s.panes = panes;
+            s.master = master_pos;
+            s.pending_slide = None;
+        }
+        tracing::info!("对比模式回到锚点: entry {f} → 主栏");
+        self.compare_after_change();
+    }
+
     /// 退出对比：回落单图模式（播放主栏条目，已缓存秒开）
     pub(super) fn exit_compare(&mut self) {
         let Some(s) = self.compare.take() else { return };
@@ -625,6 +816,16 @@ impl App {
         let mut count: Option<usize> = None;
         let (mut zin, mut zout, mut zfit) = (false, false, false);
         let mut exit = false;
+        // 回车 = 全屏切换（通用键，与主键表同义；对比模态全权接管后
+        // 必须在此补位，否则主键表的 Enter 臂永远收不到事件）
+        let mut fs_toggle = false;
+        // 通用键补位（模态键表接管 = 必须盘点通用键全集）：
+        // B=回到锚点（主栏吸附）、N=下一个压缩包
+        let mut go_focus = false;
+        let mut ask_next = false;
+        // 0 = 主栏 100%：共享 zoom 是相对各栏 fit 的倍率，无单一 100%
+        // 语义——按方案 A 主栏锚定原则换算（compare_view 每帧记录主栏 fit）
+        let mut z100 = false;
         ctx.input_mut(|i| {
             i.events.retain(|e| {
                 let egui::Event::Key {
@@ -643,6 +844,10 @@ impl App {
                 match key {
                     egui::Key::Escape => {
                         exit = true;
+                        false
+                    }
+                    egui::Key::Enter => {
+                        fs_toggle = true;
                         false
                     }
                     egui::Key::PageUp => {
@@ -703,6 +908,18 @@ impl App {
                         zfit = true;
                         false
                     }
+                    egui::Key::Num0 => {
+                        z100 = true;
+                        false
+                    }
+                    egui::Key::B => {
+                        go_focus = true;
+                        false
+                    }
+                    egui::Key::N => {
+                        ask_next = true;
+                        false
+                    }
                     _ => true,
                 }
             });
@@ -749,6 +966,28 @@ impl App {
                 s.center = egui::vec2(0.5, 0.5);
             }
         }
+        if z100 {
+            // 主栏 100%：zoom = 1/主栏 fit 缩放比（compare_view 每帧记录
+            // 主栏 (fit 显示尺寸, 原生尺寸)）；其余栏按共享倍率内容对齐跟随
+            let fit_pair = self.compare.as_ref().and_then(|s| s.master_fit);
+            match fit_pair {
+                Some((fit, nat)) => {
+                    let sf = (fit.x / nat.x).min(fit.y / nat.y);
+                    if sf > 0.0 {
+                        if let Some(s) = &mut self.compare {
+                            s.zoom = Some((1.0 / sf).min(MAX_ZOOM));
+                        }
+                    }
+                }
+                None => self.set_notice("主栏尚未就绪，无法定位 100%"),
+            }
+        }
+        if go_focus {
+            self.compare_focus_jump();
+        }
+        if ask_next {
+            self.ask_next_archive(false);
+        }
         if exit {
             if self.fullscreen {
                 // 全屏时 Esc 先退全屏（主键表语义），再按一次退对比
@@ -756,6 +995,9 @@ impl App {
             } else {
                 self.exit_compare();
             }
+        }
+        if fs_toggle {
+            self.set_fullscreen(!self.fullscreen, frame);
         }
     }
 }

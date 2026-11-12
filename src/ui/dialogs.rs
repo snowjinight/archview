@@ -526,6 +526,9 @@ impl App {
             started: std::time::Instant::now(),
             progress: 0.0,
         });
+        // 任务成功启动后清空选中集："这批已提交"语义——确认窗取消路径
+        // 不清（用户可能还要调整选择重开窗），只有真正开跑才清
+        self.selected.clear();
     }
 
     /// 后台编码任务轮询（update 每帧）：Progress 刷新进度值；终态三分支

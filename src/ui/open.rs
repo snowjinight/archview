@@ -379,6 +379,12 @@ impl App {
         self.extract = None;
         self.playing = None;
         self.last_focus = None; // 旧包的锚点下标对新包无意义
+        // 对比会话随旧包失效（栏键 = (archive_id, idx)）：清会话 + 多键
+        // 驻留保护 + raw 帧缓存，防止新包渲染引用旧包键
+        if self.compare.take().is_some() {
+            self.img.clear_shown_multi();
+            self.rawdec.retain(&[]);
+        }
         self.pw_prompt = None;
         // 密码重试场景：恢复播放提交密码时想看的条目（返回调用方执行）；
         // 单媒体文件入口：跳转播放用户传入的目标文件（poll_open 执行 play，
