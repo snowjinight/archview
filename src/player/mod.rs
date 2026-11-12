@@ -149,6 +149,13 @@ pub struct PlayerService {
     eof_cache: Arc<AtomicBool>,
     /// pause-for-cache 本地缓存（FLAG 推送；缓冲暂停翻转时推）
     buffering_cache: Arc<AtomicBool>,
+    /// 逐帧步进空闲闸门：true = 上一次 frame-step 的步进 seek 已完成
+    /// （PLAYBACK_RESTART 到达），可发下一发。frame_step 成功下发后置 false，
+    /// 泵线程 PLAYBACK_RESTART 置 true——长按连发据此完成驱动链发，节奏
+    /// 自适应 mpv 逐帧消化速度，不丢命令不积压（固定定时连发会与 seek
+    /// 往返耗时错拍，快慢交替感知为卡顿）。装载/用户 seek 的 RESTART 也置
+    /// true，语义无害（本来就允许发）
+    step_idle: Arc<AtomicBool>,
     /// 配置原文 hwdec："auto" 时启用探测记忆（hwdec_fixed），其余取值原样生效
     hwdec_cfg: String,
     /// hwdec 探测记忆：首次成功解码后 hwdec-current 的取值（如 "d3d11va-copy"）。
@@ -216,6 +223,7 @@ impl PlayerService {
             duration_cache: Arc::new(AtomicU64::new(0.0f64.to_bits())),
             eof_cache: Arc::new(AtomicBool::new(false)),
             buffering_cache: Arc::new(AtomicBool::new(false)),
+            step_idle: Arc::new(AtomicBool::new(true)),
             hwdec_cfg: cfg.player.hwdec.clone(),
             hwdec_fixed: std::cell::RefCell::new(None),
             load_err_rx: std::sync::Mutex::new(load_err_rx),
@@ -245,6 +253,7 @@ impl PlayerService {
             let stop2 = stop.clone();
             let ready_flag = s.playback_ready.clone();
             let paused_flag = s.paused_cache.clone();
+            let step_idle_flag = s.step_idle.clone();
             let eof_flag = s.eof_cache.clone();
             let buffering_flag = s.buffering_cache.clone();
             let time_pos_flag = s.time_pos_cache.clone();
@@ -273,9 +282,13 @@ impl PlayerService {
                     match ev.event_id {
                         mpv_ffi::MPV_EVENT_NONE => {}
                         mpv_ffi::MPV_EVENT_SHUTDOWN => break,
-                        // 打开完成：opening 门控解除信号（常驻泵的核心职责）
+                        // 打开完成：opening 门控解除信号（常驻泵的核心职责）。
+                        // 顺带解锁逐帧步进闸门：步进 seek 的完成标志即
+                        // PLAYBACK_RESTART（暂停态 frame-step 1 seek 每次完成
+                        // 都发），长按连发据此链发下一帧
                         mpv_ffi::MPV_EVENT_PLAYBACK_RESTART => {
                             ready_flag.store(true, Ordering::Relaxed);
+                            step_idle_flag.store(true, Ordering::Relaxed);
                             egui_wake.request_repaint();
                         }
                         // 属性订阅推送：更新本地缓存（FLAG: pause/eof-reached/
@@ -725,13 +738,22 @@ impl PlayerService {
     /// step_frames 归零时再 set_pause_state(true)），pause 属性两次推送让控制栏
     /// 图标闪"播放→暂停"。flags=1 走 MPSEEK_FRAMESTEP 精确 seek 且保持 pause=yes，
     /// 与 back-step（内部即 seek 语义）对称。播放中误触发也安全（等效暂停 + 步进）。
-    /// opening 短路同 toggle_pause
+    /// opening 短路同 toggle_pause。成功下发后落 step_idle=false（完成信号
+    /// PLAYBACK_RESTART 由泵线程解锁）；下发失败保持 true，重试不被卡死
     pub fn frame_step(&self, dir: i32) {
         if self.opening() { return; }
         let cmd = if dir >= 0 { "no-osd frame-step 1 seek" } else { "no-osd frame-back-step" };
-        if let Err(e) = mpv_ffi::command_string(self.ctx, cmd) {
-            tracing::error!("逐帧步进失败: {e}");
+        match mpv_ffi::command_string(self.ctx, cmd) {
+            Ok(()) => self.step_idle.store(false, Ordering::Relaxed),
+            Err(e) => tracing::error!("逐帧步进失败: {e}"),
         }
+    }
+
+    /// 逐帧步进闸门是否空闲（true = 上一发步进 seek 已完成，可发下一发）。
+    /// 长按连发据此完成驱动：PLAYBACK_RESTART（= 步进 seek 完成、目标帧已
+    /// 显示）解锁，节奏自适应 mpv 逐帧消化速度
+    pub fn step_ready(&self) -> bool {
+        self.step_idle.load(Ordering::Relaxed)
     }
 
     /// 静音状态设置（真相在 cfg.player.muted，UI 翻转后调用此处下发 mpv；

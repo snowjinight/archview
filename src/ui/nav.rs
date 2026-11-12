@@ -27,6 +27,22 @@ impl App {
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 模态/失焦 = 长按连发状态不可信，直接清除（None 时空转无害）：
+        // 这些场景收不到 key-up——事件被编辑器/对比键表消费、搜索框接管、
+        // 或窗口失焦（alt-tab）后 winit 不再送事件。用确定性信号替代旧的
+        // 10s 超时兜底，事件驱动无任意时限
+        if self.config_editor.is_some()
+            || self.compare.is_some()
+            || self.player.is_none()
+            || ctx.memory(|m| m.focused()) == Some(search_box_id())
+            || ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::WindowFocused(false)))
+            })
+        {
+            self.arrow_hold = None;
+        }
         // config.toml 编辑器在场：键盘只归编辑器。回车/方向键/空格/字母在
         // 编辑器里都是编辑操作，全局快捷键若照常消费会抢键（实测回车误触
         // 全屏、←/→ 误触 seek）。早退后事件流不再被 retain 掉，编辑器的
@@ -365,7 +381,7 @@ impl App {
         }
         if hold_press != 0 {
             let now = std::time::Instant::now();
-            self.arrow_hold = Some((hold_press, now, now + Self::ARROW_HOLD_DELAY));
+            self.arrow_hold = Some((hold_press, now + Self::ARROW_HOLD_DELAY));
         }
         if step_entry != 0 {
             self.play_adjacent(step_entry, step_entry > 0);
@@ -422,42 +438,52 @@ impl App {
     // ---- 方向键长按连发 ----
     // 首拍后的首发延迟（与 OS 键盘重复惯例一致）
     const ARROW_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
-    // 暂停态连续逐帧间隔（≈25帧/s，高于此 mpv 解码跟不上，多发的被其
-    // hrseek_active 背压丢弃，无积压）
-    const ARROW_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(40);
+    // 暂停态连续逐帧：完成驱动 + 30fps 节流。下一发必须等上一发步进 seek
+    // 完成（step_ready，PLAYBACK_RESTART 事件唤醒），节奏自适应 mpv 逐帧消化
+    // 速度、无丢命令错拍；33ms 为最快上限（≈30fps，逐帧快过 30fps 肉眼无益）
+    const ARROW_HOLD_STEP: std::time::Duration = std::time::Duration::from_millis(33);
+    // 完成闸门的兜底强发超时：步进 seek 异常无 RESTART（如 EOF 尾帧）时不
+    // 让连发永久卡死
+    const ARROW_HOLD_STALL: std::time::Duration = std::time::Duration::from_millis(400);
     // 播放态连续 ±5s seek 间隔（≈33s/s；mpv 对 RELATIVE seek 入队累加合并）
     const ARROW_HOLD_SEEK: std::time::Duration = std::time::Duration::from_millis(150);
 
     /// 方向键长按连发：暂停=连续逐帧步进，播放=连续 ±5s seek，松开即停。
-    /// 每帧由 handle_shortcuts 尾部驱动；暂停态 UI 无心跳，靠
-    /// request_repaint_after 排下一发。切方向=重置节奏锚点，换挡（暂停↔播放）
-    /// 在每次 fire 时实时读 paused() 缓存自适应
+    /// 每帧由 handle_shortcuts 尾部驱动。切方向=重置节奏锚点，换挡（暂停↔播放）
+    /// 在每次 fire 时实时读 paused() 缓存自适应。按住失效场景（失焦/模态）
+    /// 由 handle_shortcuts 头部的清除逻辑兜底，无任意时限
     fn arrow_hold_fire(&mut self, ctx: &egui::Context) {
-        let Some((dir, pressed_at, next_fire)) = self.arrow_hold else {
+        let Some((dir, next_fire)) = self.arrow_hold else {
             return;
         };
         let now = std::time::Instant::now();
-        // 失焦兜底：alt-tab/弹窗抢焦点可能收不到 key-up，超时强制清除防永动
-        if now - pressed_at > std::time::Duration::from_secs(10) {
-            self.arrow_hold = None;
-            return;
-        }
         if now < next_fire {
             ctx.request_repaint_after(next_fire - now);
             return;
         }
         let paused = self.player.as_ref().is_some_and(|p| p.paused());
-        let rate = if paused { Self::ARROW_HOLD_STEP } else { Self::ARROW_HOLD_SEEK };
-        self.arrow_hold = Some((dir, pressed_at, now + rate));
-        // 排下一发：暂停态无心跳必须显式排帧；播放态 vsync 帧率更密，
-        // 与之取较早者，无害
-        ctx.request_repaint_after(rate);
-        if let Some(p) = &self.player {
-            if paused {
-                p.frame_step(dir);
-            } else {
-                p.seek_relative(dir as f64 * 5.0);
+        if paused {
+            // 逐帧：完成驱动。上一发步进 seek 未完成（step_ready=false）时
+            // 等 PLAYBACK_RESTART 唤醒（泵线程 request_repaint），双保险再排
+            // 一个兜底轮询；异常卡死由 STALL 超时强发兜底
+            let ready = self.player.as_ref().is_some_and(|p| p.step_ready());
+            if !ready && now - next_fire < Self::ARROW_HOLD_STALL {
+                ctx.request_repaint_after(std::time::Duration::from_millis(25));
+                return;
             }
+            self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_STEP));
+            // 正常由完成事件唤醒下一发；兜底排帧保证闸门永不失联
+            ctx.request_repaint_after(Self::ARROW_HOLD_STEP);
+            if let Some(p) = &self.player {
+                p.frame_step(dir);
+            }
+            return;
+        }
+        self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_SEEK));
+        // 播放态 vsync 帧率更密，request_repaint_after 与之取较早者，无害
+        ctx.request_repaint_after(Self::ARROW_HOLD_SEEK);
+        if let Some(p) = &self.player {
+            p.seek_relative(dir as f64 * 5.0);
         }
     }
 

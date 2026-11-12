@@ -49,12 +49,15 @@
   `pause=false` 会让下一次按键被误判为播放态。flags=1 走 `MPSEEK_FRAMESTEP`
   精确 seek + `set_pause_state(true)`，全程保持 pause=yes，与 `frame-back-step`
   （内部即 seek 语义）对称。
-- **mpv 端天然背压**：上一次步进 seek 未完成（`hrseek_active`）时新命令被
-  `add_step_frame` 静默丢弃；`MPSEEK_FRAMESTEP` 入队覆盖 pending seek，无积压。
-  因此 UI 端固定节奏连发即可，无需完成门控。
+- **mpv 端背压与完成驱动链发**：步进 seek 的完成标志是 `PLAYBACK_RESTART`
+  （目标帧已显示）。长按连发据此**完成驱动**——上一发未完成不发下一发
+  （`step_idle` 闸门 + 泵线程事件唤醒），节奏自适应 mpv 逐帧消化速度、
+  无丢命令错拍；33ms 为最快上限（≈30fps）。异常无 RESTART（如 EOF 尾帧）
+  由 400ms 超时强发兜底。
 - **播放态连续 ±5s**：mpv 对 `MPSEEK_RELATIVE` 入队**累加合并**（`seek->amount
   += amount`），连发速率快于消化速度时自动合并为一次大步 seek，安全。
 - **长按连发事件模型**（见 [DEVLOG §13](../架构落地开发/13_空闲CPU全事件驱动专项.md)）：
   key-down 首拍落地 + 记录方向与节奏锚点，key-up 清除，按住期间每帧检查到点
   即发并 `request_repaint_after` 排下一发（全事件驱动模型下与幻灯片同类的
-  timer 排帧场景）；按住超 10s 无 key-up（失焦丢释放事件）强制清除防永动。
+  timer 排帧场景）；失焦（`WindowFocused(false)`）/模态（编辑器、对比、搜索框
+  聚焦、播放器离场）即清除——这些场景 key-up 必然收不到，按住状态不可信。

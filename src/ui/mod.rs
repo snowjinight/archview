@@ -389,9 +389,10 @@ pub struct App {
     // raw 直方图软解服务（Ctrl+H 按需旁路：软解第 0 帧算直方图，不传纹理；
     // 标准图片的直方图由 imgview 解码 worker 顺手算，不经此服务）
     hist_raw: crate::rawdec::HistService,
-    // 方向键长按连发状态：Some((方向 -1/+1, 按下时刻, 下次连发时刻))。
-    // 暂停=连续逐帧、播放=连续 ±5s seek，松开/超时清除（见 nav::arrow_hold_fire）
-    arrow_hold: Option<(i32, std::time::Instant, std::time::Instant)>,
+    // 方向键长按连发状态：Some((方向 -1/+1, 下次连发时刻))。暂停=连续逐帧、
+    // 播放=连续 ±5s seek，松开/失焦/模态清除（见 nav::arrow_hold_fire 与
+    // handle_shortcuts 头部清除逻辑）
+    arrow_hold: Option<(i32, std::time::Instant)>,
 }
 
 impl App {

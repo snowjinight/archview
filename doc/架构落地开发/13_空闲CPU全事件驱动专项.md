@@ -167,22 +167,33 @@ winit 事件队列天然合并批处理，是免 patch 的最小实现。
   可能漏出一小段声音）；项目自带 dll 锁定 0.41+，无旧版兼容顾虑。
 
 **新功能：方向键长按连发**（[ui/nav.rs](../../src/ui/nav.rs) `arrow_hold_fire`
-+ [ui/mod.rs](../../src/ui/mod.rs) `App.arrow_hold`）：
++ [player/mod.rs](../../src/player/mod.rs) `PlayerService.step_idle` +
+[ui/mod.rs](../../src/ui/mod.rs) `App.arrow_hold`）：
 
-- 暂停=连续逐帧（40ms/发 ≈25帧/s），播放=连续 ±5s seek（150ms/发 ≈33s/s），
-  松开即停。播放态连发安全：mpv 对 `MPSEEK_RELATIVE` 入队**累加合并**
-  （`seek->amount += amount`）；暂停态逐帧连发安全：mpv 对 `MPSEEK_FRAMESTEP`
-  入队覆盖 pending seek，且上一次步进未完成（`hrseek_active`）时新命令被
-  `add_step_frame` 静默丢弃——mpv 端天然背压，UI 端固定节奏连发无需完成门控；
+- 暂停=连续逐帧（最快 33ms/发 ≈30fps 上限），播放=连续 ±5s seek（150ms/发
+  ≈33s/s），松开即停。播放态连发安全：mpv 对 `MPSEEK_RELATIVE` 入队**累加合并**
+  （`seek->amount += amount`）；
+- **逐帧连发为完成驱动**：初版固定 40ms 定时连发，用户实测"有点卡"——定时器
+  与 mpv 每帧步进 seek 的往返耗时（解码+显示+RESTART）不同拍，mpv 消化不完
+  的命令被 `hrseek_active` 背压丢弃，节奏忽快忽慢。改法：`frame_step` 成功
+  下发后落 `step_idle=false`，泵线程 `PLAYBACK_RESTART`（= 步进 seek 完成、
+  目标帧已显示）置回 true 并 request_repaint 唤醒——**上一发完成立即发下一发**，
+  节奏自适应 mpv 消化速度，无丢命令错拍；33ms 为最快上限（逐帧快过 30fps
+  肉眼无益）；异常无 RESTART（EOF 尾帧等）由 400ms 超时强发兜底，25ms 兜底
+  轮询双保险；
 - 事件模型：key-down（repeat:false）首拍落地 + 记录
-  `arrow_hold=(方向, 按下时刻, 下次连发时刻)`；key-up 新增 ArrowLeft/Right
+  `arrow_hold=(方向, 下次连发时刻)`；key-up 新增 ArrowLeft/Right
   pressed:false 臂清除；每帧 `handle_shortcuts` 尾部 `arrow_hold_fire` 检查
   到点即发；
-- 暂停态 UI 无心跳：fire 时 `request_repaint_after(rate)` 排下一发——与幻灯片
-  同类的 timer 排帧场景，未破坏"仅三类主动排帧"不变量的事件驱动语义；
-- 失焦兜底：alt-tab/弹窗抢焦点收不到 key-up，按住超 10s 强制清除防永动；
-- 节奏常量硬编码（`ARROW_HOLD_DELAY/STEP/SEEK` = 300/40/150ms），手感参数
-  暂不进配置。
+- 暂停态 UI 无心跳：fire 后 `request_repaint_after` 排帧——与幻灯片同类的
+  timer 排帧场景，未破坏"仅三类主动排帧"不变量的事件驱动语义；
+- 按住失效兜底（**事件驱动，无任意时限**）：初版用"按住超 10s 强制清除"防
+  失焦后 key-up 丢失导致的永动，用户要求取消任意时限——改为 handle_shortcuts
+  头部的确定性信号清除：config 编辑器/对比模态在场、播放器不在场、搜索框
+  聚焦、`WindowFocused(false)` 任一命中即清 `arrow_hold`（这些场景 key-up
+  必然收不到，状态不可信；None 时空转无害）；
+- 节奏常量硬编码（`ARROW_HOLD_DELAY/STEP/STALL/SEEK` = 300/33/400/150ms），
+  手感参数暂不进配置。
 
 **验证**：`cargo test --release` 180 项全绿；release 构建干净。手动验证点：
 暂停按 → 图标恒"暂停"不闪；长按 → 连续逐帧、松开停；播放态长按 → 连续快进、
