@@ -278,16 +278,21 @@ impl App {
             };
             let ve: Vec<VirtualEntry> =
                 entries_idx.iter().map(|&i| a.entries[i].clone()).collect();
+            let (fmt, bw) = cli::resolve_encode_format(preset, &ve, &a.vfs)?;
             Ok(EncodeDialog {
                 entries: entries_idx,
                 alt_entries: alt,
                 whole: true,
                 preset_match: preset.r#match.clone(),
-                fmt: cli::encode_format(preset),
+                fmt,
                 out: cli::default_output(&base, &ve[0].name)
                     .display()
                     .to_string(),
-                warnings: cli::numbering_gaps(&ve),
+                warnings: {
+                    let mut w = cli::numbering_gaps(&ve);
+                    w.extend(bw);
+                    w
+                },
             })
         })();
         match assembled {

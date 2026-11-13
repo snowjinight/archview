@@ -42,6 +42,18 @@ N 个 dump 条目（壳负责按文件名升序排序过滤，引擎只做校验
   会让 muxer 写 elst 补偿——只修其一仍裁帧。bf 必须用 ffmpeg 通用名（x264
   私有名 bframes 会被 libx264 包装层用 avctx 覆写，设了不生效）。用户 ovcopts
   显式指定 bf=/bframes= 时以其为准。细节见 [DEVLOG §9](../架构落地开发/09_encode引擎e2e攻坚.md) 坑3/坑4。
+- **序列格式解析（文件名分辨率兜底 + auto bayer）**：`resolve_encode_format`
+  编排层直接引用 rawdec 媒体能力层的共享原语（`dims_candidates` 候选链 /
+  `frame_divisible` 帧整除 / `detect_bayer_layout` 排列探测）——与播放链路
+  raw_demux_opts 共用同一份口径（[13.6](13_渲染架构迁移.md)）：预设
+  width/height 非 0 在前、全体成员文件名内嵌 WxH 候选在后，逐候选对
+  **整序列**做帧整除校验，首个全过者胜出；预设填 0（省略）或配错分辨率
+  时由文件名救回。bayer_auto16le 伪格式在收集期读首条目探测排列并替换为
+  具体排列；探测置信不足时与播放预览**同款兜底 RGGB + 确认窗警告区显式
+  提示**（不静默、不拒编）——兜底语义与播放链路对齐保证所见即所得：预览
+  颜色即产物颜色，用户依预览判断排列是否正确，不对则在预设写明具体排列。
+  整除校验因此前移到序列收集期，参数不匹配在开窗/CLI 收集期即报，不启动
+  引擎。
 - **校验先行**：pixfmt 名单（config raw.pixfmts）、帧对齐（总字节须为帧大小
   整数倍，不匹配即报"序列与格式参数不匹配或混入非 dump 文件"）、fps/宽高/
   bit_shift 越界、加密条目拒绝——错误文案与播放链路 raw_demux_opts 同口径。
@@ -62,9 +74,10 @@ N 个 dump 条目（壳负责按文件名升序排序过滤，引擎只做校验
 | stream_cb 四回调 + REGISTRY | `player/stream_cb.rs` | zcat 仅换协议名与 open_cb，回调桥接/装箱约定原样复用（§4 两约束） |
 | mpv 最小 FFI | `player/mpv_ffi.rs` | 新增 create_uninit；dll 加载/错误处理同源 |
 | rawvideo demuxer 选项口径 + raw_pixfmt_bits | `config.rs` + 13.6 | 与播放 raw 链路同一套 pixfmt 名单与位深表 |
+| raw 媒体能力原语（候选链/整除/auto bayer 探测） | `rawdec.rs` | `dims_candidates` / `frame_divisible` / `detect_bayer_layout` 与播放链路共用——编排层引用 L2 媒体能力的标准姿势（encode → rawdec 单向，rawdec 只依赖 config，不成环） |
 | 输入能力（四 VFS + 密码探测 + 分卷 RAR） | `vfs/` 全部 | dump 序列在压缩包内或磁盘目录均可编码 |
 
-单向依赖：encode → vfs / player / config，零反向依赖；与播放器、VarTidy 互不感知。
+单向依赖：encode → vfs / player / config / rawdec，零反向依赖；与播放器、VarTidy 互不感知。
 
 ### 15.4 实施状态
 

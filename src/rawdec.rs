@@ -42,6 +42,31 @@ impl RawLoad {
     }
 }
 
+/// 宽高候选链（文件名分辨率兜底，方案 §13.6）：预设宽高非 0 在前，
+/// 文件名内嵌 WxH 候选按出现顺序去重在后——播放 raw_demux_opts 与编码
+/// resolve_encode_format 两条消费链共享的候选口径，参数解析语义必须对齐
+pub(crate) fn dims_candidates(pw: u32, ph: u32, name: &str) -> Vec<(u32, u32)> {
+    let mut candidates: Vec<(u32, u32)> = Vec::new();
+    if pw > 0 && ph > 0 {
+        candidates.push((pw, ph));
+    }
+    for c in crate::config::parse_filename_dims(name) {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+    candidates
+}
+
+/// 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式）：
+/// size*8 是否为 w*h*bits 整数倍；size 未知（None）视为通过
+pub(crate) fn frame_divisible(size: Option<u64>, w: u32, h: u32, bits: u32) -> bool {
+    match size {
+        Some(s) => s * 8 % (u64::from(w) * u64::from(h) * u64::from(bits)) == 0,
+        None => true,
+    }
+}
+
 /// raw dump 预设解析 + 不读文件的整除校验（方案 §4.5）：
 /// Ok(Some(load)) = 命中预设且校验通过（loadfile 第四参数 + 流层
 /// bit_shift）；Ok(None) = 非裸数据（标准容器，无需选项）；
@@ -87,15 +112,7 @@ pub(crate) fn raw_demux_opts(
     }
     // 3) 宽高候选：预设非 0 优先，文件名内嵌 WxH 兜底（预设配错分辨率
     //    时整除校验会失败，文件名分辨率是 dump 工具写进名字的可靠参数）
-    let mut candidates: Vec<(u32, u32)> = Vec::new();
-    if d.width > 0 && d.height > 0 {
-        candidates.push((d.width, d.height));
-    }
-    for c in crate::config::parse_filename_dims(name) {
-        if !candidates.contains(&c) {
-            candidates.push(c);
-        }
-    }
+    let candidates = dims_candidates(d.width, d.height, name);
     if candidates.is_empty() {
         return Err(format!(
             "raw 预设 match='{}' 的 width/height 未填（pixfmt={}），且文件名\
@@ -107,11 +124,8 @@ pub(crate) fn raw_demux_opts(
     // 4) 帧整除校验（位数为基，兼容 yuv410p=9bit 等非整数字节格式），
     //    逐候选取首个通过者
     for &(w, h) in &candidates {
-        let frame_bits = w as u64 * h as u64 * bits as u64;
-        if let Some(size) = size {
-            if size * 8 % frame_bits != 0 {
-                continue;
-            }
+        if !frame_divisible(size, w, h, bits) {
+            continue;
         }
         return Ok(Some(RawLoad {
             w,
@@ -138,13 +152,20 @@ pub(crate) fn raw_demux_opts(
 // Bayer 排列自动探测（伪格式 bayer_auto16le 专用）
 // ---------------------------------------------------------------------------
 
-/// 读首帧前若干行按 LE u16 解析（12bit 低对齐数据用容器原值即可，统计
-/// 不受影响），两级启发式：
-/// ① 主/反对角逐对均值差——G 同色强相关、R-B 跨色弱相关，差值小的对角线
-///    即 G-G 对角：反对角 → {rggb, bggr}，主对角 → {gbrg, grbg}；
-/// ② 组内两非 G 位置采样均值，大者判为 R（自然图像/彩条下 R>B 统计成立；
-///    相对差 <1% 视为不可分辨）。置信不足返回 None，调用方按 RGGB 兜底。
-/// None 另见：帧过小（<8x4）/ 读取失败
+/// 读首帧前若干行按 LE u16 解析。所有门限均为**无量纲比值**——有效位深
+/// （8/10/12/14bit）与高/低对齐只决定数值尺度，不改比值统计，因此探测
+/// 不需要知道位深。按 2x2 块累加四个位置的采样均值（n≈数千块：噪声被
+/// 平均掉、纹理不改变均值——逐像素差分类方案在细纹理/高噪声下会把
+/// "跨通道差异"淹没在"像素间涨落"里而误判不可靠，故弃用）：
+/// ① G 对角判别：G 两位置同通道 → 均值差只剩统计涨落；非 G 对角是 R/B
+///    跨通道 → 均值差显著。均值差小的对角线即 G 对角：反对角 → {rggb,
+///    bggr}，主对角 → {gbrg, grbg}。判别须过两重门限：
+///    - 结构性：较大对角均值差 > 四位置总均值 × 0.5%（排除纯灰/平场）；
+///    - 分离度：较小对角均值差 < 较大者 × 40%（同通道均值差须远小于
+///      跨通道差，防两对角亮度凑巧接近的题材误判）。
+/// ② 组内 R/B 均值判别：大者判为 R（自然图像/彩条下 R>B 统计成立；
+///    相对差 <1% 视为不可分辨）。
+/// 置信不足返回 None，调用方按 RGGB 兜底。None 另见：帧过小（<8x4）/ 读取失败
 pub(crate) fn detect_bayer_layout(read: &mut impl std::io::Read, w: u32, h: u32) -> Option<&'static str> {
     use std::io::Read as _;
     const MAX_ROWS: usize = 128; // 采样行数上限（1920 宽 ≈ 512KB，zip 头部解压开销可忽略）
@@ -165,56 +186,48 @@ pub(crate) fn detect_bayer_layout(read: &mut impl std::io::Read, w: u32, h: u32)
     let px = |r: usize, c: usize| -> u16 {
         u16::from_le_bytes([buf[r * stride + c * 2], buf[r * stride + c * 2 + 1]])
     };
-    // 偶对齐 2x2 块内统计：d_main=|(0,0)-(1,1)|，d_anti=|(0,1)-(1,0)|；
-    // 同时累加四个位置的均值（组内 R/B 判别用）
-    let (mut d_main, mut d_anti) = (0u64, 0u64);
+    // 2x2 块内按位置累加（均值统计，对噪声/纹理稳健）
     let (mut s00, mut s01, mut s10, mut s11) = (0u64, 0u64, 0u64, 0u64);
     let mut n = 0u64;
     for br in (0..rows - 1).step_by(2) {
         for bc in (0..w - 1).step_by(2) {
-            let (p00, p01) = (px(br, bc) as u64, px(br, bc + 1) as u64);
-            let (p10, p11) = (px(br + 1, bc) as u64, px(br + 1, bc + 1) as u64);
-            d_main += p00.abs_diff(p11);
-            d_anti += p01.abs_diff(p10);
-            s00 += p00;
-            s01 += p01;
-            s10 += p10;
-            s11 += p11;
+            s00 += px(br, bc) as u64;
+            s01 += px(br, bc + 1) as u64;
+            s10 += px(br + 1, bc) as u64;
+            s11 += px(br + 1, bc + 1) as u64;
             n += 1;
         }
     }
     if n == 0 {
         return None;
     }
-    // ① G-G 对角（需明显差距，噪声/纯灰数据不可靠 → 交由调用方兜底）
-    let (gg_is_main, d_small, d_large) = if d_main < d_anti {
-        (true, d_main, d_anti)
-    } else {
-        (false, d_anti, d_main)
-    };
-    if d_large == 0 || d_small * 100 > d_large * 95 {
+    let mean = |s: u64| s as f64 / n as f64;
+    let (m00, m01, m10, m11) = (mean(s00), mean(s01), mean(s10), mean(s11));
+    let level = (m00 + m01 + m10 + m11) / 4.0;
+    let dm = (m00 - m11).abs(); // 主对角对内均值差
+    let da = (m01 - m10).abs(); // 反对角对内均值差
+    let (small, large) = if dm < da { (dm, da) } else { (da, dm) };
+    // ① 结构性 + 分离度（无量纲门限，位深/对齐无关）
+    if large <= level * 0.005 || small * 100.0 > large * 40.0 {
         return None;
     }
-    // ② 组内 R/B 均值判别（R>B 统计；相对差 <1% 或均值近零不可分辨）
-    let mean = |s: u64| s as f64 / n as f64;
-    let rggb_or_bggr = |m00: f64, m11: f64| -> Option<&'static str> {
-        if (m00 + m11).abs() < 2.0 || (m00 - m11).abs() * 100.0 < (m00 + m11) * 0.5 {
+    // ② R/B 判别（相对差 <1% 不可分辨；对内均值和为 0 即全黑对 → 不可分辨）
+    let rb = |a: f64, b: f64| -> Option<bool> {
+        if a + b <= 0.0 || (a - b).abs() * 100.0 < (a + b) * 0.5 {
             return None;
         }
-        Some(if m00 > m11 { "bayer_rggb16le" } else { "bayer_bggr16le" })
+        Some(a > b)
     };
-    let gbrg_or_grbg = |m01: f64, m10: f64| -> Option<&'static str> {
-        if (m01 + m10).abs() < 2.0 || (m01 - m10).abs() * 100.0 < (m01 + m10) * 0.5 {
-            return None;
-        }
-        Some(if m01 > m10 { "bayer_grbg16le" } else { "bayer_gbrg16le" })
-    };
-    if gg_is_main {
-        // G 在主对角 (0,0)/(1,1)，R/B 在 (0,1)/(1,0)
-        gbrg_or_grbg(mean(s01), mean(s10))
+    if dm > da {
+        // G 在反对角 (0,1)/(1,0)，R/B 在 (0,0)/(1,1)；亮者判 R
+        rb(m00, m11).map(|bright00| {
+            if bright00 { "bayer_rggb16le" } else { "bayer_bggr16le" }
+        })
     } else {
-        // G 在反对角 (0,1)/(1,0)，R/B 在 (0,0)/(1,1)
-        rggb_or_bggr(mean(s00), mean(s11))
+        // G 在主对角 (0,0)/(1,1)，R/B 在 (0,1)/(1,0)；亮者判 R
+        rb(m01, m10).map(|bright01| {
+            if bright01 { "bayer_grbg16le" } else { "bayer_gbrg16le" }
+        })
     }
 }
 
@@ -225,8 +238,23 @@ pub(crate) fn resolve_auto_bayer(r: &mut RawLoad, read: &mut impl std::io::Read)
         return;
     }
     r.auto_bayer = false;
-    let probed = detect_bayer_layout(read, r.w, r.h).unwrap_or("bayer_rggb16le");
-    tracing::info!("bayer 排列探测: {} ({}x{})", probed, r.w, r.h);
+    // 兜底必须显式记 WARN（与真探测区分）——此前两条路同打一条 INFO
+    // "bayer 排列探测"，用户把静默兜底误读成确认成功
+    let probed = match detect_bayer_layout(read, r.w, r.h) {
+        Some(name) => {
+            tracing::info!("bayer 排列探测: {} ({}x{})", name, r.w, r.h);
+            name
+        }
+        None => {
+            tracing::warn!(
+                "bayer 排列探测置信不足（帧过小/数据不足/纯灰数据），\
+                 按 bayer_rggb16le 兜底 ({}x{})",
+                r.w,
+                r.h
+            );
+            "bayer_rggb16le"
+        }
+    };
     r.pixfmt = probed.to_string();
 }
 
@@ -771,6 +799,92 @@ fn decode_raw_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 均值统计版探测对噪声/纹理稳健（旧逐像素差分版在这两类数据上会误判
+    /// 不可靠）+ 门限无量纲（位深/对齐缩放不变）
+    #[test]
+    fn detect_bayer_layout_均值统计对噪声纹理稳健() {
+        let (w, h) = (64u32, 64u32);
+        let mut st = 0x2545F4914F6CDD1Du64;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let ch = |r: usize, c: usize| match (r % 2, c % 2) {
+            (0, 0) => 3000u64,
+            (0, 1) | (1, 0) => 2000,
+            _ => 1000,
+        };
+        let pack = |vals: Vec<u64>| -> Vec<u8> {
+            vals.iter()
+                .flat_map(|&v| (v.min(65535) as u16).to_le_bytes())
+                .collect()
+        };
+
+        // ① 高噪声：通道基值 + 每像素 ±900 均匀噪声（逐像素差分被噪声
+        //    淹没，均值差不受影响 → 仍判 rggb）
+        let buf = pack(
+            (0..h as usize)
+                .flat_map(|r| (0..w as usize).map(move |c| (r, c)))
+                .map(|(r, c)| ch(r, c) + rnd() % 1800)
+                .collect(),
+        );
+        assert_eq!(
+            detect_bayer_layout(&mut buf.as_slice(), w, h),
+            Some("bayer_rggb16le")
+        );
+
+        // ② 高纹理：跨通道均值差(100)远小于逐像素纹理涨落(±1500)——旧算法
+        //    两对角逐像素差分比≈1 会返回 None，均值法纹理无关 → rggb
+        let buf = pack(
+            (0..h as usize)
+                .flat_map(|r| (0..w as usize).map(move |c| (r, c)))
+                .map(|(r, c)| {
+                    // 基值抬高避免贴地
+                    ch(r, c) / 10 + rnd() % 3000
+                })
+                .collect(),
+        );
+        assert_eq!(
+            detect_bayer_layout(&mut buf.as_slice(), w, h),
+            Some("bayer_rggb16le")
+        );
+
+        // ③ 干净 GBRG：G 在主对角、(0,1)=B 暗 / (1,0)=R 亮 → gbrg
+        let buf = pack(
+            (0..h as usize)
+                .flat_map(|r| (0..w as usize).map(move |c| (r, c)))
+                .map(|(r, c)| match (r % 2, c % 2) {
+                    (0, 1) => 1000u64,
+                    (1, 0) => 3000,
+                    _ => 2000,
+                })
+                .collect(),
+        );
+        assert_eq!(
+            detect_bayer_layout(&mut buf.as_slice(), w, h),
+            Some("bayer_gbrg16le")
+        );
+
+        // ④ 纯灰：结构性门限拦截 → None
+        let buf = pack(vec![2048; (w * h) as usize]);
+        assert_eq!(detect_bayer_layout(&mut buf.as_slice(), w, h), None);
+
+        // ⑤ 位深/对齐不变量：同排列整体 ×16（如 12bit 高对齐存 16bit 容器）
+        //    → 比值统计不变，判别结果不变
+        let buf = pack(
+            (0..h as usize)
+                .flat_map(|r| (0..w as usize).map(move |c| (r, c)))
+                .map(|(r, c)| ch(r, c) * 16)
+                .collect(),
+        );
+        assert_eq!(
+            detect_bayer_layout(&mut buf.as_slice(), w, h),
+            Some("bayer_rggb16le")
+        );
+    }
 
     #[test]
     fn hist_service_非raw与预设错误直落结果() {

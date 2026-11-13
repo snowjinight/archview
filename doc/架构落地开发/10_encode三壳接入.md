@@ -4,8 +4,8 @@
 
 引擎（[§9](09_encode引擎e2e攻坚.md)）之上按 [ARCHITECTURE §15.5](../架构设计/15_encode引擎.md) 接三壳：`[encode]` config 节、
 `archview encode` CLI 子命令 + SendTo 第三项、UI 多选/右键/确认窗/后台
-任务。壳侧排掉六个坑（前五个是编译期即报的 egui 0.36 / Rust 实测差异，
-第六个是纯逻辑竞态）：
+任务。壳侧排掉七个坑（前五个是编译期即报的 egui 0.36 / Rust 实测差异，
+第六个是纯逻辑竞态，第七个是 UTF-8 字节边界 panic）：
 
 **坑 1：`Event::Key` 模式必须带 `..`（E0027）**。0.36 的 Key 事件有
 `physical_key` 等字段，模式逐字段写会报"missing field"。事件匹配一律
@@ -35,6 +35,22 @@
 take 动作 + 消条）；新消息经 `set_notice`/`set_err` 统一清伴随动作，
 杜绝旧动作挂在新消息上。语义代价：可操作绿条不被无关点击消除——可接受
 （它是待执行动作，不是纯提示）。
+
+**坑 7：编号连续性校验 `trailing_number` 的 CJK 文件名 char 边界 panic
+（2026-11-13）**。**现象**：文件名含中文（如 `第2话_本文12.nv12`）时点
+「编码为视频…」软件直接崩，`start byte index 21 is not a char boundary;
+it is inside '本' (bytes 20..23)`，崩在确认窗组装期的 `numbering_gaps`——
+不是清空选中项的时机问题（清空在任务真正启动后，崩在更早的组装期）。
+**根因**：`rfind(|c: char| !c.is_ascii_digit())` 返回**字节下标**，闭包
+形式拿不到字符长度，`i + 1` 对多字节字符（中日韩占 2~3 字节）会切进
+字符内部。ASCII 文件名永远踩不到，纯中文命名一进编号校验就炸。
+**修复**：改用 `char_indices().rev().find(...)`，`map(|(i, c)| i +
+c.len_utf8())` 按字符长度推进，边界永远落在合法 char 交界。
+**教训**：Rust 对字符串切片按**字节**操作（rfind/find 返回字节下标），
+凡 `下标 + 1` 或 `下标 + N` 再切片，必须确认落在 char 边界——要么用
+`char_indices` 拿 `len_utf8`，要么限定处理 ASCII 字节（`bytes().rev()`
+配 `is_ascii_digit`）。对「文件名任意 UTF-8」的输入面，字节下标 + 常量
+步进切片是惯用 panic 源。
 
 **UI 多选语义决定**（apply_row_click，钉死在测试里）：普通点击=单选+锚点
 +播放；Ctrl=toggle 且**锚点跟随被点击行**（含移除时——与资源管理器一致，

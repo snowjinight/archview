@@ -347,14 +347,87 @@ fn single_family(
     }
 }
 
-pub(crate) fn encode_format(p: &RawDemux) -> EncodeFormat {
-    EncodeFormat {
+/// 序列格式解析：预设宽高优先，文件名内嵌 WxH 兜底（候选链与帧整除校验
+/// 直接引用 rawdec 媒体能力层的 dims_candidates / frame_divisible——与播放
+/// 链路 raw_demux_opts 共享同一份口径，架构设计 §15.2）。编码是整序列共享
+/// 一个 fmt，故候选须对**全体成员**整除通过。bayer_auto16le 伪格式在此层
+/// 解析：读首条目探测排列并替换为具体排列；探测置信不足时与播放预览同款
+/// 兜底 RGGB（所见即所得——预览颜色对，产物就对），但经返回值向确认窗
+/// 警告区显式提示，不静默。返回 (fmt, 附加警告)
+pub(crate) fn resolve_encode_format(
+    p: &RawDemux,
+    entries: &[VirtualEntry],
+    vfs: &Arc<dyn ArchiveVFS>,
+) -> Result<(EncodeFormat, Vec<String>), String> {
+    let Some(bits) = crate::config::raw_pixfmt_bits(&p.pixfmt) else {
+        return Err(format!(
+            "像素格式 [{}] 不在 rawvideo 支持名单（config.toml 的 raw.pixfmts）",
+            p.pixfmt
+        ));
+    };
+    let mut candidates: Vec<(u32, u32)> = Vec::new();
+    for e in entries {
+        for c in crate::rawdec::dims_candidates(p.width, p.height, &e.name) {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(format!(
+            "raw 预设 match='{}' 的 width/height 未填（pixfmt={}），且文件名\
+             无内嵌分辨率：宽高无法确定。\n\
+             请在预设填 width/height，或让文件名携带 WxH（如 xxx_1920x1080_00.raw）。",
+            p.r#match, p.pixfmt
+        ));
+    }
+    let Some(&(w, h)) = candidates
+        .iter()
+        .find(|&&(cw, ch)| entries.iter().all(|e| crate::rawdec::frame_divisible(Some(e.size), cw, ch, bits)))
+    else {
+        return Err(format!(
+            "预设与文件名分辨率候选（{} 个）均未通过帧整除校验（pixfmt={}）——\
+             序列与格式参数不匹配，或混入了非 dump 文件",
+            candidates.len(),
+            p.pixfmt
+        ));
+    };
+    let mut fmt = EncodeFormat {
         pixfmt: p.pixfmt.clone(),
-        width: p.width,
-        height: p.height,
+        width: w,
+        height: h,
         fps: p.fps,
         bit_shift: p.bit_shift,
+    };
+    let mut extra_warnings = Vec::new();
+    if p.pixfmt.eq_ignore_ascii_case("bayer_auto16le") {
+        let mut vf = vfs
+            .open_entry(&entries[0])
+            .map_err(|e| format!("bayer 排列探测读首帧失败（{}）: {e}", entries[0].name))?;
+        match crate::rawdec::detect_bayer_layout(&mut vf, w, h) {
+            Some(name) => {
+                tracing::info!("编码 bayer 排列探测: {} ({}x{})", name, w, h);
+                fmt.pixfmt = name.to_string();
+            }
+            None => {
+                // 与播放预览同款兜底（预览 = 同一探测 + 同一 RGGB 兜底，
+                // 预览颜色即产物颜色）；显式警告交用户判断
+                tracing::warn!(
+                    "编码 bayer 排列探测置信不足 ({}x{})，按 bayer_rggb16le 兜底",
+                    w,
+                    h
+                );
+                fmt.pixfmt = "bayer_rggb16le".to_string();
+                extra_warnings.push(format!(
+                    "bayer 排列探测置信不足（高噪声/合成数据），已按 \
+                     bayer_rggb16le 兜底（与播放预览一致）；若预览颜色不对，\
+                     请在预设 match='{}' 写明具体排列",
+                    p.r#match
+                ));
+            }
+        }
     }
+    Ok((fmt, extra_warnings))
 }
 
 /// 默认输出名：基目录 + 首帧条目基名（去扩展名）+ .mp4。
@@ -427,7 +500,8 @@ fn collect_files(cfg: &Config, paths: &[PathBuf]) -> Result<Sequence, String> {
         .unwrap_or_else(|| PathBuf::from("."));
     let dv = DirVFS::open(&root, |n| names_lc.iter().any(|x| x == &n.to_ascii_lowercase()), 1)
         .map_err(|e| e.to_string())?;
-    let entries = dv.list();
+    let vfs: Arc<dyn ArchiveVFS> = Arc::new(dv);
+    let entries = vfs.list();
     if entries.len() != paths.len() {
         return Err(format!(
             "目录收集到 {} 个文件，与输入 {} 个不符（文件读取异常）",
@@ -437,11 +511,16 @@ fn collect_files(cfg: &Config, paths: &[PathBuf]) -> Result<Sequence, String> {
     }
     let groups = families(cfg, entries);
     let (preset, entries) = single_family(cfg, groups, "所选文件")?;
+    let (fmt, bw) = resolve_encode_format(&preset, &entries, &vfs)?;
     Ok(Sequence {
         out_default: default_output(&root, &entries[0].name),
-        warnings: numbering_gaps(&entries),
-        fmt: encode_format(&preset),
-        vfs: Arc::new(dv),
+        warnings: {
+            let mut w = numbering_gaps(&entries);
+            w.extend(bw);
+            w
+        },
+        fmt,
+        vfs,
         entries,
     })
 }
@@ -449,14 +528,20 @@ fn collect_files(cfg: &Config, paths: &[PathBuf]) -> Result<Sequence, String> {
 /// 目录通道：唯一族校验（顶层直接子文件，防误发盘根全盘扫描）
 fn collect_dir(cfg: &Config, dir: &Path) -> Result<Sequence, String> {
     let dv = DirVFS::open(dir, |n| cfg.raw_demux(n).is_some(), 1).map_err(|e| e.to_string())?;
-    let entries = dv.list();
+    let vfs: Arc<dyn ArchiveVFS> = Arc::new(dv);
+    let entries = vfs.list();
     let groups = families(cfg, entries);
     let (preset, entries) = single_family(cfg, groups, "目录内")?;
+    let (fmt, bw) = resolve_encode_format(&preset, &entries, &vfs)?;
     Ok(Sequence {
         out_default: default_output(dir, &entries[0].name),
-        warnings: numbering_gaps(&entries),
-        fmt: encode_format(&preset),
-        vfs: Arc::new(dv),
+        warnings: {
+            let mut w = numbering_gaps(&entries);
+            w.extend(bw);
+            w
+        },
+        fmt,
+        vfs,
         entries,
     })
 }
@@ -481,11 +566,16 @@ fn collect_archive(
     }
     let groups = families(cfg, entries);
     let (preset, entries) = single_family(cfg, groups, "压缩包内")?;
+    let (fmt, bw) = resolve_encode_format(&preset, &entries, &vfs)?;
     let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     Ok(Sequence {
         out_default: default_output(&base, &entries[0].name),
-        warnings: numbering_gaps(&entries),
-        fmt: encode_format(&preset),
+        warnings: {
+            let mut w = numbering_gaps(&entries);
+            w.extend(bw);
+            w
+        },
+        fmt,
         vfs,
         entries,
     })
@@ -499,8 +589,15 @@ fn collect_archive(
 /// stem 按最后一个 '.' 剥离（dump.0000.nv12 → dump.0000 → 0）
 fn trailing_number(name: &str) -> Option<u64> {
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    // 尾部连续数字段：定位最后一个非数字字符之后的部分
-    let pos = stem.rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+    // 尾部连续数字段：定位最后一个非数字字符之后的部分。rfind 的闭包形式
+    // 只给字节下标，CJK 文件名按 i+1 切会落进多字节字符内部（char 边界
+    // panic），改用 char_indices 按字符粒度推进
+    let pos = stem
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
     let digits = &stem[pos..];
     if digits.is_empty() { None } else { digits.parse().ok() }
 }
@@ -745,6 +842,12 @@ mod tests {
         d
     }
 
+    /// 空目录 DirVFS（非 auto 预设的 resolve 不触 open_entry，占位即可）
+    fn empty_vfs(tag: &str) -> Arc<dyn ArchiveVFS> {
+        let d = temp_dir(tag);
+        Arc::new(DirVFS::open(&d, |_| true, 1).unwrap())
+    }
+
     #[test]
     fn parse_args_basic_and_errors() {
         let p = parse_args(&[
@@ -784,6 +887,102 @@ mod tests {
         assert_eq!(trailing_number("dump.0007.raw"), Some(7));
         assert_eq!(trailing_number("no_digits.nv12"), None);
         assert_eq!(trailing_number("trailing_not_digit_12a.nv12"), None);
+        // CJK 多字节字符紧邻尾部数字：rfind 字节下标 +1 会切进字符内部
+        //（char 边界 panic），回归
+        assert_eq!(trailing_number("第2话_本文12.nv12"), Some(12));
+        assert_eq!(trailing_number("序列_28.raw"), Some(28));
+    }
+
+    #[test]
+    fn resolve_encode_format_filename_fallback() {
+        // nv12 = 12bit/px；64x48 帧字节 4608，96x48 帧 6912，128x96 帧字节 18432
+        let mk_preset = |w: u32, h: u32, pixfmt: &str| RawDemux {
+            r#match: "*.nv12".into(),
+            pixfmt: pixfmt.into(),
+            width: w,
+            height: h,
+            fps: 25.0,
+            bit_shift: 0,
+        };
+        // 非 auto 伪格式不触探测：空 DirVFS 即可（vfs 仅 bayer_auto16le 用）
+        let vfs = empty_vfs("rf");
+        // 预设宽高整除通过 → 预设优先
+        let es = vec![entry("f_0.nv12", 64 * 48 * 12 / 8)];
+        let (f, w) = resolve_encode_format(&mk_preset(64, 48, "nv12"), &es, &vfs).unwrap();
+        assert!(w.is_empty());
+        assert_eq!((f.width, f.height), (64, 48));
+
+        // 预设宽高整除失败 → 文件名内嵌 WxH 兜底（非预设倍数，二者可分辨）
+        let es = vec![entry("dump_0_96x48.nv12", 96 * 48 * 12 / 8)];
+        let (f, w) = resolve_encode_format(&mk_preset(64, 48, "nv12"), &es, &vfs).unwrap();
+        assert!(w.is_empty());
+        assert_eq!((f.width, f.height), (96, 48));
+
+        // 预设宽高为 0 → 直接走文件名兜底
+        let es = vec![entry("dump_0_128x96.nv12", 128 * 96 * 12 / 8)];
+        let (f, _) = resolve_encode_format(&mk_preset(0, 0, "nv12"), &es, &vfs).unwrap();
+        assert_eq!((f.width, f.height), (128, 96));
+
+        // 多成员：全体整除才通过
+        let es = vec![
+            entry("dump_0_96x48.nv12", 96 * 48 * 12 / 8),
+            entry("dump_1_96x48.nv12", 96 * 48 * 12 / 8),
+        ];
+        let (f, _) = resolve_encode_format(&mk_preset(0, 0, "nv12"), &es, &vfs).unwrap();
+        assert_eq!((f.width, f.height), (96, 48));
+
+        // 预设 0 + 文件名无分辨率 → 报错指引
+        let es = vec![entry("f_0.nv12", 123)];
+        let e = resolve_encode_format(&mk_preset(0, 0, "nv12"), &es, &vfs).unwrap_err();
+        assert!(e.contains("宽高无法确定"), "{e}");
+
+        // 全体候选整除失败 → 报错
+        let es = vec![entry("dump_0_96x48.nv12", 12345)];
+        let e = resolve_encode_format(&mk_preset(64, 48, "nv12"), &es, &vfs).unwrap_err();
+        assert!(e.contains("整除校验"), "{e}");
+    }
+
+    #[test]
+    fn resolve_encode_format_auto_bayer_detection() {
+        let p = RawDemux {
+            r#match: "*.raw".into(),
+            pixfmt: "bayer_auto16le".into(),
+            width: 0,
+            height: 0,
+            fps: 25.0,
+            bit_shift: 0,
+        };
+        // 16x8 RGGB 数据：主对角 R/B 差大、反对角 G-G 强相关 → 探测 rggb
+        let (w, h) = (16u32, 8u32);
+        let frame: Vec<u8> = (0..h)
+            .flat_map(|r| (0..w).map(move |c| (r, c)))
+            .flat_map(|(r, c)| {
+                let v: u16 = match (r % 2, c % 2) {
+                    (0, 0) => 3000,          // R
+                    (0, 1) | (1, 0) => 2000, // G
+                    _ => 1000,               // B
+                };
+                v.to_le_bytes()
+            })
+            .collect();
+        let d = temp_dir("bay");
+        std::fs::write(d.join("dump_0_16x8.raw"), &frame).unwrap();
+        std::fs::write(d.join("dump_1_16x8.raw"), &frame).unwrap();
+        let vfs: Arc<dyn ArchiveVFS> = Arc::new(DirVFS::open(&d, |_| true, 1).unwrap());
+        let (f, w) = resolve_encode_format(&p, &vfs.list(), &vfs).unwrap();
+        assert!(w.is_empty());
+        assert_eq!(f.pixfmt, "bayer_rggb16le");
+        assert_eq!((f.width, f.height), (16, 8));
+
+        // 纯灰数据：探测置信不足 → 与播放预览同款兜底 RGGB + 显式警告
+        // （预览颜色即产物颜色，所见即所得；不静默、不拒编）
+        let d2 = temp_dir("bay2");
+        std::fs::write(d2.join("g_0_16x8.raw"), vec![0x11u8; 256]).unwrap();
+        let vfs2: Arc<dyn ArchiveVFS> = Arc::new(DirVFS::open(&d2, |_| true, 1).unwrap());
+        let (f, w) = resolve_encode_format(&p, &vfs2.list(), &vfs2).unwrap();
+        assert_eq!(f.pixfmt, "bayer_rggb16le");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("置信不足"), "{}", w[0]);
     }
 
     #[test]
@@ -892,7 +1091,8 @@ mod tests {
         let cfg = nv12_cfg();
         let d = temp_dir("cd");
         for n in ["g_1.nv12", "g_2.nv12"] {
-            std::fs::write(d.join(n), vec![0u8; 8]).unwrap();
+            // 真实帧大小（64x48 nv12）：序列收集期做帧整除校验
+            std::fs::write(d.join(n), vec![0u8; 64 * 48 * 3 / 2]).unwrap();
         }
         let s = collect_dir(&cfg, &d).unwrap();
         assert_eq!(s.entries.len(), 2);
@@ -929,7 +1129,9 @@ mod tests {
         let zo = zip::write::SimpleFileOptions::default();
         for n in ["z_2.nv12", "z_1.nv12"] {
             w.start_file(n, zo).unwrap();
-            w.write_all(&vec![0u8; 8]).unwrap();
+            // 真实帧大小（64x48 nv12 = 4608B）：序列收集期做帧整除校验，
+            // 假数据会被分辨率兜底逻辑拦下
+            w.write_all(&vec![0u8; 64 * 48 * 3 / 2]).unwrap();
         }
         w.start_file("readme.txt", zo).unwrap();
         w.write_all(b"hi").unwrap();
