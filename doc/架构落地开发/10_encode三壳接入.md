@@ -85,6 +85,23 @@ c.len_utf8())` 按字符长度推进，边界永远落在合法 char 交界。
   单选+锚点落地，下续 Shift 才有范围基准。测试以「play 开头清
   error/notice」为无 archive 环境下的 play 调用观测点。
 
+**坑 8：确认窗二选一帧数两连错（2026-11-13）**。**现象一**：两个 45 帧
+raw 的序列模式确认窗显示「整个序列（2 帧）/ 仅此文件（1 帧）」——数字
+是 `entries.len()`/`alt.len()`（文件数），标签却写"帧"，帧数从未参与
+计算。**修复一**：渲染期现算真实帧数 = Σ `entry.size / frame_bytes`
+（`frame_bytes` 由 fmt + `raw_pixfmt_bits` 得出；`resolve_encode_format`
+已保证全体成员**帧整除**，整除无余数）。
+**现象二**：修一后切到「仅此文件」再看不对了——「整个序列（1 个文件 ·
+50 帧）/ 仅此文件（100 帧）」。根因：swap 后 `entries↔alt` 互换
+（`whole=false` 时 entries=单文件档、alt=族集），而两组标签固定取
+`d.entries`/`alt`，语义随存储位置翻转。**修复二**：标签按 `d.whole`
+语义归位——「整个序列」恒指族集（whole? entries : alt），「仅此文件」
+恒指单文件档（whole? alt : entries）；头部行恒描述当前编码目标
+（entries），不受切换影响。**教训**：①展示"计数"前先问语义单位——
+文件数 ≠ 帧数，raw 序列帧数只有 `size/frame_bytes` 一条口径（与
+rawdec `frame_count` 同源）；②存储槽位互换（swap/轮转）后，一切按
+槽位取值的展示都必须重推语义映射，不能沿用打开时的槽位↔含义绑定。
+
 132 passed（基线 113）：CLI 11 测（parse/收集/唯一族/自然序/缺口警告/
 输出命名/选项组装/密码合并），UI 3 测（多选语义含不播放断言/切包清空/
 click_modifiers 快照），config 防漂移等 5 测。

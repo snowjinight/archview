@@ -351,25 +351,57 @@ impl App {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.set_min_width(400.0);
+                    // 真实帧数 = Σ 文件大小/帧字节（resolve_encode_format 已保证
+                    // 全体成员对 fmt 帧整除，整除无余数；切换二选一后 entries
+                    // 变了但 fmt 不变，同族同分辨率下公式仍精确）
+                    let frame_bytes = {
+                        let bits =
+                            crate::config::raw_pixfmt_bits(&d.fmt.pixfmt).unwrap_or(0) as u64;
+                        d.fmt.width as u64 * d.fmt.height as u64 * bits / 8
+                    };
+                    let frames_of = |idxs: &[usize]| -> usize {
+                        let a = self.archive.as_ref();
+                        idxs.iter()
+                            .map(|&i| {
+                                a.map_or(0, |a| (a.entries[i].size / frame_bytes.max(1)) as usize)
+                            })
+                            .sum()
+                    };
+                    let whole_frames = frames_of(&d.entries);
+                    let alt_frames = d.alt_entries.as_deref().map(frames_of);
+                    // 标签按语义归位而非存储位置：swap 后 entries↔alt 互换
+                    // （whole=false 时 entries=单文件档），"整个序列"恒指族集、
+                    // "仅此文件"恒指单文件档 = if d.whole { entries } else { alt }
+                    let (fam_n, fam_f, single_f) = if d.whole {
+                        (d.entries.len(), whole_frames, alt_frames.unwrap_or(0))
+                    } else {
+                        let fam_n = d.alt_entries.as_deref().map_or(0, |a| a.len());
+                        (fam_n, alt_frames.unwrap_or(0), whole_frames)
+                    };
                     ui.label(format!(
-                        "{} 个文件 · 预设 [{}]（{}×{} {}）",
+                        "{} 个文件 · 共 {} 帧 · 预设 [{}]（{}×{} {}）",
                         d.entries.len(),
+                        whole_frames,
                         d.preset_match,
                         d.fmt.width,
                         d.fmt.height,
                         d.fmt.pixfmt
                     ));
                     // 单选二选一（序列模式；多选精确模式无此项）
-                    if let Some(alt) = &d.alt_entries {
+                    if d.alt_entries.is_some() {
                         ui.horizontal(|ui| {
                             if ui
-                                .radio(d.whole, format!("整个序列（{} 帧）", d.entries.len()))
+                                .radio(
+                                    d.whole,
+                                    format!("整个序列（{} 个文件 · {} 帧）", fam_n, fam_f),
+                                )
                                 .clicked()
                                 && !d.whole
                             {
                                 swap = true;
                             }
-                            if ui.radio(!d.whole, format!("仅此文件（{} 帧）", alt.len()))
+                            if ui
+                                .radio(!d.whole, format!("仅此文件（{} 帧）", single_f))
                                 .clicked()
                                 && d.whole
                             {
