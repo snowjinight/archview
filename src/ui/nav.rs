@@ -27,6 +27,14 @@ impl App {
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // F12 = 控制台窗口显隐切换（诊断性质，任何模态/焦点下都可用）。
+        // 双击/资源管理器启动时控制台被隐藏（console.rs），日志仍在
+        // 写入缓冲区，需要排查时按 F12 调出。必须先于一切早退分支
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            let shown = crate::console::toggle();
+            tracing::info!("控制台窗口: {}", if shown { "显示" } else { "隐藏" });
+        }
+
         // 模态/失焦 = 长按连发状态不可信，直接清除（None 时空转无害）：
         // 这些场景收不到 key-up——事件被编辑器/对比键表消费、搜索框接管、
         // 或窗口失焦（alt-tab）后 winit 不再送事件。用确定性信号替代旧的

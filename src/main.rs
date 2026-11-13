@@ -2,6 +2,8 @@
 //! ZIP 流式播放 + egui 列表/搜索 + 进度条 seek。
 
 mod cache;
+// Windows 控制台管理：VT 颜色开启、启动来源判定、显隐切换（F12 可调回）
+mod console;
 mod config;
 // encode 引擎（dump 序列→视频）+ CLI 壳：UI 壳尚未接入（多选/右键/确认窗）
 mod encode;
@@ -16,6 +18,11 @@ mod vartidy;
 mod vfs;
 
 fn main() -> eframe::Result<()> {
+    // ANSI 颜色：tracing 默认无条件输出转义序列，legacy conhost 需先开
+    // Virtual Terminal Processing 才能渲染（否则显示 ←[32m 乱码）。
+    // 尽早调用，CLI 子命令与 GUI 日志都受益
+    console::enable_ansi();
+
     // CLI 子命令分发：`archview tidy ...` = var 资源包增量整理（doc/架构设计/12_VarTidy整理器.md），
     // `archview encode ...` = 帧序列 dump → 视频（doc/架构设计/15_encode引擎.md §15.5），
     // 无参数 = GUI 播放器（行为不变）。
@@ -29,6 +36,15 @@ fn main() -> eframe::Result<()> {
     if args.first().map(String::as_str) == Some("encode") {
         let code = encode::cli::cli_main(&args[1..]);
         std::process::exit(code);
+    }
+
+    // 控制台显隐策略：exe 是 console 子系统，Windows 必分配黑框。
+    // 从终端启动（cmd/powershell/…/cargo run）→ 保留，用户想看日志；
+    // 双击/资源管理器/sendto/拖拽 → 隐藏，GUI 用户不需要黑框。
+    // 隐藏后日志仍写入控制台缓冲区，F12 随时调出/收回（ui/nav.rs）。
+    // 放在 config 加载前：黑框在窗口创建前就消失，不闪屏
+    if !console::launched_from_terminal() {
+        console::set_visible(false);
     }
 
     // config 需在 tracing 初始化前加载（日志级别来自配置）——此时日志管线
