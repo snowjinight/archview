@@ -30,6 +30,7 @@
 | [§13 空闲CPU全事件驱动专项](13_空闲CPU全事件驱动专项.md) | 空闲/暂停/对比静置 CPU 趋近 0：全局心跳删除、open/extract/mpv 泵线程补 send 后唤醒、幻灯片精确排帧、对比落地 landed 缓存（消每帧 fs::metadata）、暂停逐帧图标闪烁根因（mpv frame-step pause 往返推送 → flags=1 seek 语义）与方向键长按连发排帧 | [ARCHITECTURE §13.2 / §5.5](../架构设计/13_渲染架构迁移.md) |
 | [§14 直方图专项](14_直方图专项.md) | Ctrl+H 图片直方图：软解旁路方案取舍（否决显示改道）/ 位深全量程压缩到 0-255 / 非凸轮廓三角带 Mesh / Color32 预乘还原 | [ARCHITECTURE §6.5](../架构设计/06_图片预览模块.md) |
 | [§15 控制台窗口显隐与ANSI颜色专项](15_控制台窗口显隐与ANSI颜色专项.md) | console 子系统黑框运行时隐藏（启动来源判定：父进程镜像 + CARGO 环境）+ F12 全局调出 + VT Processing 开启治 ANSI 乱码 | src/console.rs · [ARCHITECTURE §7](../架构设计/07_配置文件设计.md) |
+| [§16 图片高清档密度重构专项](16_图片高清档密度重构专项.md) | full 档密度 ×ppp×2→×3 + 预算制（12288/100MP）/ 原图单槽缓存免二次解码 / fast_image_resize SIMD / 锐化默认关+前移；预算 clamp 取整 floor 教训 | [ARCHITECTURE §13.4 / §6.3](../架构设计/13_渲染架构迁移.md) |
 
 ## 维护约定（强制）
 

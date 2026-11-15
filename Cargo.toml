@@ -35,6 +35,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # 相机 RAW（Sony ARW 家族 + Nikon NEF 家族）内嵌 JPEG 预览提取：
 # 纯 Rust、零依赖、forbid(unsafe)，畸形文件只报错不 panic
 raw-files = "0.6"
+# 图片重采样 SIMD 加速（同一套 Lanczos3 核，SSE4/AVX2 向量化，33MP 级
+# 600ms→~80ms）：full 高清档与基础档预放大共用
+fast_image_resize = "5"
 egui_alignments = "0.3.9"
 
 [build-dependencies]

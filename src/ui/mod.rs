@@ -403,14 +403,24 @@ impl App {
         crate::vfs::set_codepage(&cfg.codepage);
         // 清理上次中断解压留下的 .part 半截文件
         cache::cleanup_partial(&cache::cache_dir(&cfg));
-        // 图片高清升级配置回显：改 config 调阈值/锐化后，启动即可确认生效
+        // 图片高清升级配置回显：改 config 调阈值/增强链后，启动即可确认生效
         tracing::info!(
-            "图片高清升级: 阈值×{:.2} 锐化 {}",
+            "图片高清升级: 阈值×{:.2} 锐化 {}{}",
             cfg.ui.image_full_threshold,
+            if cfg.ui.image_full_sharpen { "开" } else { "关" },
             if cfg.ui.image_full_sharpen {
-                "开"
+                format!(
+                    "(amount {:.2} σ{:.1} 降噪{}[{}] 双边s{:.0} 导向s{:.0}r{})",
+                    cfg.ui.image_full_sharpen_amount,
+                    cfg.ui.image_full_sharpen_sigma,
+                    if cfg.ui.image_full_denoise { "开" } else { "关" },
+                    cfg.ui.image_full_denoise_algo,
+                    cfg.ui.image_full_bilateral_strength,
+                    cfg.ui.image_full_guided_strength,
+                    cfg.ui.image_full_guided_radius
+                )
             } else {
-                "关"
+                String::new()
             }
         );
         let img_cap = cfg.ui.image_cache_count.max(1);

@@ -1499,19 +1499,17 @@ impl App {
         let native = tex.size_vec2();
         let fit = fit_scale(video, native);
         let zoom = self.img_view.zoom.unwrap_or(fit);
-        // ---- 高清纹理升级（full 单槽，×ppp×2 clamp 8192）：深放大时从
-        // 原图二次解码换高密度纹理。资格：基础纹理最长边 ≤ image_max_dim
+        // ---- 高清纹理升级（full 单槽，×ppp×3 clamp 预算制）：深放大时从
+        // 原图（base worker 留存的单槽缓存命中即复用，无则二次解码）换
+        // 高密度纹理。资格：基础纹理最长边 ≤ image_max_dim
         // ——恒等于原图 ≤ image_max_dim（阈值型预放大的图必有 base=
         // 原图×ppp ≤ 上限；超大图原尺寸直进后 base=原图 > 上限自动出
-        // 局，二次解码秒级 + 180MB 级显存不值当）。触发判据与下方换画
+        // 局，二次解码秒级 + 300MB 级显存不值当）。触发判据与下方换画
         // 判据一致（zoom×ppp > image_full_threshold，config 可调、默认
-        // 2.0）：full 是 ×2 密度纹理，采样比（zoom×ppp/2）≥1 才有肉眼
-        // 增益——156%/195% 档它反被 0.78~0.98× 缩小采样，×2 Lanczos
-        // 的 ~2px 边缘坡与 base GPU 直放大等宽（195% 实拍 A/B 无差），
-        // 不为此白付解码+显存；滚轮/键盘 ×1.25 档位序列为
-        // 100/125/156/195/244/…%，死区取 2.0 落在 195% 档（×1.25³）与
-        // full 接管的 244% 档（×1.25⁴）之间，判据用 >，若恰取落地档值
-        // 会因浮点表示踩空，留余量防临界抖动。
+        // 2.0）：full 是 ×3 密度纹理，badge 300%（采样比 zoom×ppp/3 = 1）
+        // 起逐纹素直出、Lanczos 特征完整；200%~300% 为 0.67~1× 轻微缩
+        // 采样（静止图无感）；判据用 >，若恰取落地档值会因浮点表示踩
+        // 空，留余量防临界抖动。
         // 就绪后下帧无缝换画。img_source 由
         // play_image/load_extracted/heal 记录，切视频即清（见 extract）----
         let native_max = native.max_elem() as u32;
@@ -1526,11 +1524,11 @@ impl App {
             if let Some((src_key, source, name)) = self.img_source.as_ref() {
                 if *src_key == key {
                     let (source, name) = (source.clone(), name.clone());
-                    // 预放大倍率（ppp×2）由 ImageService 按屏幕 DPI 内部取值；
-                    // 锐化开关 = image_full_sharpen 配置（Lanczos 放大后叠加
-                    // unsharp mask 观感补偿）
-                    self.img
-                        .request_full(key, source, &name, self.cfg.ui.image_full_sharpen);
+                    // 预放大倍率（ppp×3）由 ImageService 按屏幕 DPI 内部取值；
+                    // 观感增强 = image_full_sharpen* 配置（默认开：放大前在
+                    // 原图分辨率降噪（算法可切换）+ unsharp，见 imgview::sharpen_full）
+                    let sharpen = crate::imgview::SharpenCfg::from_ui(&self.cfg.ui);
+                    self.img.request_full(key, source, &name, sharpen);
                 }
             }
         }
@@ -1596,15 +1594,14 @@ impl App {
         // full 纹理选画：矩形/UV 按基础纹理算（同宽高比 → 屏幕矩形与
         // 全图 UV 对两种分辨率通用，切换无缩放跳变）。仅当屏幕物理像素
         // 超过基础纹理 image_full_threshold 倍（与上方触发判据一致）才换
-        // full 纹理——默认 2.0 即 244% 档（×1.25⁴）起由 ×ppp×2 的 full
-        // 接管，相对 full 采样比 ≥1.22× 纯放大（无 mipmap 直采无缩小带）；
-        // 更浅档（100%~195%）base GPU 直放大与之肉眼无差（195% 实拍 A/B
-        // 证实），不白付二次解码。屏幕密度按物理像素算：DPI 缩放下
+        // full 纹理——默认 2.0 即 badge 200% 起由 ×ppp×3 的 full 接管，
+        // badge 300%（采样比 = 1）处逐纹素直出；200%~300% 轻微缩采样
+        // 静止图无感。屏幕密度按物理像素算：DPI 缩放下
         // 1 逻辑像素 = ppp 物理像素
         let ppp = ui.ctx().pixels_per_point();
         let screen_px = (native * zoom * ppp).max_elem();
         // 换画阈值同触发阈值：image_full_threshold 配置（默认 2.0 =
-        // 越过 244% 滚轮档），两处判据必须一致否则触发/换画错位
+        // badge 200% 滚轮档），两处判据必须一致否则触发/换画错位
         let want_full = screen_px > native.max_elem() * self.cfg.ui.image_full_threshold;
         let full = want_full.then(|| self.img.full_tex(key)).flatten();
         // 换画事件：同 key 下 base↔full 切换时才打印一条（切图时新 key
@@ -1802,12 +1799,8 @@ impl App {
                         let s = self.compare.as_ref().unwrap();
                         let p = &s.panes[i];
                         let (source, name2) = (p.source.clone(), p.name.clone());
-                        self.img.request_full(
-                            key,
-                            source,
-                            &name2,
-                            self.cfg.ui.image_full_sharpen,
-                        );
+                        let sharpen = crate::imgview::SharpenCfg::from_ui(&self.cfg.ui);
+                        self.img.request_full(key, source, &name2, sharpen);
                     }
                     let screen_px = (native * zoom * ppp).max_elem();
                     let want_full = screen_px > native_max as f32 * self.cfg.ui.image_full_threshold;
