@@ -1058,6 +1058,15 @@ pub struct SharpenCfg {
     /// 1.5）：调大只增强中大尺度边缘（σ 级以下的像素噪点被模糊项抹掉、
     /// 差值趋零），天然抗噪点放大，代价是锐化"颗粒感"变"体积感"
     pub sigma: f32,
+    /// 白边抑制全抑制截断点 soft（shoot_v 级 1~255，config
+    /// image_full_sharpen_white_edge_soft，默认 255，0 = 关闭）：逐点 3×3/5×5/7×7 多尺度
+    /// 亮度方差按 shoot.c mode 0 整数组合出 shoot_v ∈ 0..255 标记孤立强边
+    /// （halo 源），其正向增强按 ratio = 1 − shoot_v/soft 线性衰减——白边
+    /// 亮晕针对性抑制；细纹理 shoot_v≈0 锐度全额保留，暗侧压暗不受影响
+    /// （ratio 只乘在 d>0 上）。soft 即 ratio 降为 0 的截断点：越大抑制越
+    /// 轻（255 = 全程直线，仅极强边接近全灭），越小狠压（128 = 中强边即全
+    /// 灭）；强边显"肉" → 调大，白边仍明显 → 调小
+    pub shoot_soft: f32,
     /// 锐化前保边降噪（config image_full_denoise，默认开）：先压平坦区噪点
     /// 再 unsharp，算法由 [`DenoiseAlgo`] 切换（双边 3×3 / 导向滤波）
     pub denoise: bool,
@@ -1119,6 +1128,7 @@ impl SharpenCfg {
             on: ui.image_full_sharpen,
             amount: ui.image_full_sharpen_amount,
             sigma: ui.image_full_sharpen_sigma,
+            shoot_soft: ui.image_full_sharpen_white_edge_soft,
             denoise: ui.image_full_denoise,
             algo,
             bilateral_strength: ui.image_full_bilateral_strength,
@@ -1132,6 +1142,7 @@ impl SharpenCfg {
         on: false,
         amount: 0.0,
         sigma: 0.0,
+        shoot_soft: 0.0,
         denoise: false,
         algo: DenoiseAlgo::Bilateral,
         bilateral_strength: 0.0,
@@ -1156,13 +1167,14 @@ impl SharpenCfg {
 }
 
 /// 高清档观感增强链（仅高清档，config ui.image_full_sharpen*，默认
-/// 开+0.6+1.0）：可选降噪（算法 [`DenoiseAlgo`] 切换）→ unsharp mask——
+/// 开+0.5+1.5）：可选降噪（算法 [`DenoiseAlgo`] 切换）→ unsharp mask——
 /// **放大前在原图分辨率**
 /// 执行：先把边缘坡度变陡，Lanczos 插值按比例保持陡峭过渡，观感近似
 /// "放大后锐化"而成本从放大后千万像素级（~400ms 高斯模糊）降到原图级
 /// （2K 图降噪+锐化 ~50ms，被 74MP Lanczos 主耗时掩盖）。实测锐化对深
 /// 放大观感增益明显（用户确认默认开）；噪点同步放大由前置降噪对冲。
-/// 仅 RGB，alpha 直通。O(n) 后台线程执行
+/// 强边白晕由 **shoot 白边抑制**（[`shoot_ratios`]，多尺度方差 → 只压
+/// 正向增强）处理，`shoot_soft = 0` 关闭。仅 RGB，alpha 直通。O(n) 后台线程执行
 fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicImage {
     let mut rgba = img.to_rgba8();
     if cfg.denoise {
@@ -1175,21 +1187,142 @@ fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicIma
     }
     let amount = cfg.amount.clamp(0.0, 2.0);
     let sigma = cfg.sigma.clamp(0.1, 4.0);
+    let soft = cfg.shoot_soft.clamp(0.0, 255.0);
     let blurred = image::imageops::blur(&rgba, sigma);
-    // 过冲钳制（A/B 实测驱动）：unsharp 的差值项在强边处很大（σ1 下阶跃边
-    // 缘 diff ~±60），×amount 后光晕 20~40 级，×4.5 放大后在头发等密集细边
-    // 区呈明显亮线/暗线（用户实测两算法均有光晕）。**钳差值不钳输出**——
-    // 细纹理 diff（±5~15）不受影响锐度不变，只把强边过冲封顶在
-    // ±HALO_CLAMP×amount（~±12 级，保留少量锐感）。经典 smart-sharpen 做法
-    const HALO_CLAMP: f32 = 20.0;
-    for (p, b) in rgba.pixels_mut().zip(blurred.pixels()) {
+    // 白边抑制（shoot，见 [`shoot_ratios`]）：逐点多尺度方差标出孤立强边
+    // （halo 源），其正向增强按 ratio<1 衰减。取代旧 ±20 过冲钳制——钳差值
+    // 把强边锐感一起削平（用户实测无感弃用）；ratio 只乘在 d>0（亮侧白晕），
+    // 负向压暗与细纹理（shoot≈0，ratio≈1）全额保留。soft<=0 关闭（省方差
+    // 计算）
+    let ratios = if soft > 0.0 {
+        shoot_ratios(&rgba, soft)
+    } else {
+        Vec::new()
+    };
+    for (i, (p, b)) in rgba.pixels_mut().zip(blurred.pixels()).enumerate() {
+        let ratio = if ratios.is_empty() { 1.0 } else { ratios[i] };
         for c in 0..3 {
-            let d = (p[c] as f32 - b[c] as f32).clamp(-HALO_CLAMP, HALO_CLAMP);
-            let v = p[c] as f32 + amount * d;
+            let d = p[c] as f32 - b[c] as f32;
+            let e = if d > 0.0 { amount * ratio * d } else { amount * d };
+            let v = p[c] as f32 + e;
             p[c] = v.clamp(0.0, 255.0) as u8;
         }
     }
     image::DynamicImage::ImageRgba8(rgba)
+}
+
+/// k 尺度窗口方差（内部区固定偏移四角定址）：窗口和先收 u32（sum ≤ 255×49、
+/// sumsq ≤ 65025×49）再转 f32——u64→f32 无 AVX-512 时是多周期软序列
+#[inline(always)]
+fn window_var(sum: &[u64], sum2: &[u64], base: usize, stride: usize, k: usize, inv: f32) -> f32 {
+    let br = base + (k + 1) * stride + (k + 1);
+    let tl = base - k * stride - k;
+    let tr = base - k * stride + (k + 1);
+    let bl = base + (k + 1) * stride - k;
+    let mean = (sum[br] + sum[tl] - sum[tr] - sum[bl]) as u32 as f32 * inv;
+    let q = (sum2[br] + sum2[tl] - sum2[tr] - sum2[bl]) as u32 as f32 * inv;
+    q - mean * mean
+}
+
+/// shoot.c mode 0 整数组合 + 负斜率直线 ratio：跨尺度方差差（可为负）转
+/// i32 后 CLIP 0..255（对齐 shoot.c 的 uint16 差值语义——方差本身可达数千
+/// 不钳，只钳差值），组合出 shoot_v ∈ 0..255；ratio = 1 − shoot_v/soft
+/// 线性衰减到 0（`soft` = 全抑制截断点）。全程无 sqrt 无除法——shoot 检测
+/// 不吃精度，整数化零观感损失
+#[inline(always)]
+fn shoot_ratio(v3: f32, v5: f32, v7: f32, inv_soft: f32) -> f32 {
+    let s1 = (((v7 - v3) as i32) / 2).clamp(0, 255);
+    let s2 = ((v7 - v5) as i32).clamp(0, 255);
+    let shoot_v = ((s1 + s2 + 1) / 2).clamp(0, 255);
+    (1.0 - shoot_v as f32 * inv_soft).clamp(0.0, 1.0)
+}
+
+/// shoot 白边抑制比例表（每像素 0~1，1 = 不抑制）：多尺度亮度方差（3×3/
+/// 5×5/7×7）逐点求跨尺度方差差，按相机 ISP 库 shoot.c get_shoot_value
+/// mode 0 整数组合出 shoot_v ∈ 0..255——孤立强边周围 7×7 窗口方差显著高于
+/// 局部 3×3 → 方差差大 → shoot_v 大；细纹理/噪点各尺度方差相近、强边正
+/// 中心 var3≈var7 → shoot_v≈0。ratio = 1 − shoot_v/soft 负斜率直线
+/// （[`shoot_ratio`]），shoot_v 越大 ratio 越小，`soft` 为全抑制截断点
+/// （shoot_v ≥ soft 时 ratio=0）。
+///
+/// 性能：三尺度 6 个窗口量（各尺度 sum/sumsq）全部从**同一份积分图** O(1)
+/// 查表复用——前缀和一次建图（1 趟 rgba 读 + 2 个 u64 表写），替代按尺度
+/// 各跑 box_filter 的 12 趟全图扫描 + 6 次临时缓冲分配。窗口边界 clamp 到
+/// 图界，亮度 Rec.601 取整到 u8（方差检测对 ±1 亮度不敏感），u64 前缀和
+/// 精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）
+fn shoot_ratios(rgba: &image::RgbaImage, soft: f32) -> Vec<f32> {
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let stride = w + 1;
+    // 亮度及其平方的前缀和积分图：(w+1)×(h+1) 首行/首列全 0，免边界分支
+    let mut sum = vec![0u64; stride * (h + 1)];
+    let mut sum2 = vec![0u64; stride * (h + 1)];
+    for y in 0..h {
+        let (cur, prev) = ((y + 1) * stride, y * stride);
+        let (mut rs, mut rs2) = (0u64, 0u64);
+        for x in 0..w {
+            let p = rgba[(x as u32, y as u32)];
+            let l = ((u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500)
+                / 1000) as u64;
+            rs += l;
+            rs2 += l * l;
+            sum[cur + x + 1] = sum[prev + x + 1] + rs;
+            sum2[cur + x + 1] = sum2[prev + x + 1] + rs2;
+        }
+    }
+    // 三尺度方差 → shoot_v → ratio（单趟合成，无临时方差缓冲）
+    let inv_soft = 1.0 / soft;
+    let inv_n = [1.0f32 / 9.0, 1.0 / 25.0, 1.0 / 49.0];
+    let mut ratios = vec![0f32; w * h];
+    // 内部区：k 尺度窗口 [x−k, x+k+1)×[y−k, y+k+1)，四角定址固定偏移
+    // （br/tl/tr/bl），像素数倒数预算，零除法零边界分支零逐像素 if——
+    // 热循环无任何分叉，与手写基准循环结构一致（实测 closure + 逐像素
+    // 分支版本合成段慢一倍）
+    for y in 3..h.saturating_sub(3) {
+        for x in 3..w.saturating_sub(3) {
+            let base = y * stride + x;
+            let v3 = window_var(&sum, &sum2, base, stride, 1, inv_n[0]);
+            let v5 = window_var(&sum, &sum2, base, stride, 2, inv_n[1]);
+            let v7 = window_var(&sum, &sum2, base, stride, 3, inv_n[2]);
+            ratios[y * w + x] = shoot_ratio(v3, v5, v7, inv_soft);
+        }
+    }
+    // 边框窄带（3px）：窗口 clamp 到图界，通用四角查表（冷路径；四条带各
+    // 自直跑，免全图扫描；h/w < 6 时带重叠，同值重复写无害）
+    let mut band = |y: usize, x: usize| {
+        let var = |r: usize| -> f32 {
+            let xa = x.saturating_sub(r);
+            let ya = y.saturating_sub(r);
+            let xb = (x + r + 1).min(w);
+            let yb = (y + r + 1).min(h);
+            let inv = 1.0 / ((xb - xa) * (yb - ya)) as f32;
+            let (a, b) = (ya * stride, yb * stride);
+            let mean =
+                (sum[b + xb] + sum[a + xa] - sum[a + xb] - sum[b + xa]) as u32 as f32 * inv;
+            let q = (sum2[b + xb] + sum2[a + xa] - sum2[a + xb] - sum2[b + xa]) as u32 as f32
+                * inv;
+            q - mean * mean
+        };
+        ratios[y * w + x] = shoot_ratio(var(1), var(2), var(3), inv_soft);
+    };
+    for y in 0..h.min(3) {
+        for x in 0..w {
+            band(y, x);
+        }
+    }
+    for y in h.saturating_sub(3)..h {
+        for x in 0..w {
+            band(y, x);
+        }
+    }
+    for y in 3..h.saturating_sub(3) {
+        for x in 0..w.min(3) {
+            band(y, x);
+        }
+        for x in w.saturating_sub(3)..w {
+            band(y, x);
+        }
+    }
+    ratios
 }
 
 /// 3×3 双边滤波（保边降噪，锐化前置）：空间权重固定 3×3 高斯 σs=1.0，
@@ -1404,6 +1537,7 @@ mod tests {
             on: true,
             amount,
             sigma: 1.0,
+            shoot_soft: 255.0,
             denoise: false,
             algo: DenoiseAlgo::Bilateral,
             bilateral_strength: 15.0,
@@ -1747,9 +1881,9 @@ mod tests {
     }
 
     #[test]
-    fn sharpen_full_过冲钳制() {
-        // 垂直阶跃（128 级差）：无钳制时强边增量 ~±40 级（0.6×diff60+），
-        // 钳制后增量封顶 amount×20 = 12 级——强边光晕可见地压制
+    fn sharpen_full_白边抑制() {
+        // 垂直阶跃（128 级差）：同一边缘两侧 blur 对称、差值幅度相同——
+        // shoot 白边抑制只压正向增强（亮侧），亮侧提亮必须小于暗侧压暗
         let mut img = image::GrayImage::new(16, 8);
         for row in img.rows_mut() {
             for (x, p) in row.enumerate() {
@@ -1759,16 +1893,28 @@ mod tests {
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
-        assert!(hi <= 13, "强边过冲未钳住: 高侧 +{hi}");
-        assert!(lo <= 13, "强边过冲未钳住: 低侧 −{lo}");
-        assert!(hi >= 5 && lo >= 5, "过冲全灭=强边锐感丢失: +{hi}/−{lo}");
-        // 细纹理不受钳制影响：幅度 8 的单像素凸起，diff ≤ 8 < 20 →
-        // 增量 = amount×diff 全额保留
+        assert!(hi > 0, "强边亮侧提亮全灭=锐感丢失: +{hi}");
+        assert!(hi < lo, "白边未抑制（亮侧应弱于暗侧）: +{hi}/−{lo}");
+        // shoot_soft = 0 关闭：恢复对称 unsharp，两侧幅度一致（±1 给取整）
+        let mut img = image::GrayImage::new(16, 8);
+        for row in img.rows_mut() {
+            for (x, p) in row.enumerate() {
+                *p = image::Luma([if x < 8 { 64 } else { 192 }]);
+            }
+        }
+        let mut cfg = sharpen_on(0.6);
+        cfg.shoot_soft = 0.0;
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg).to_rgba8();
+        let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
+        let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
+        assert!((hi - lo).abs() <= 1, "关闭 shoot 后两侧应恢复对称: +{hi}/−{lo}");
+        // 细纹理不受抑制：幅度 8 的单像素凸起 shoot≈0（各尺度方差相近），
+        // 正向增强全额保留
         let mut img = image::GrayImage::from_pixel(16, 16, image::Luma([128]));
         *img.get_pixel_mut(8, 8) = image::Luma([136]);
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
         let up = i32::from(out.get_pixel(8, 8)[0]) - 128;
-        assert!(up >= 3, "细纹理锐化被钳伤: +{up}");
+        assert!(up >= 3, "细纹理锐化被 shoot 误伤: +{up}");
     }
 
     #[test]

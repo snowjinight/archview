@@ -549,9 +549,8 @@ pub struct UiConfig {
     /// 光晕，关掉可 A/B 对比）
     pub image_full_sharpen: bool,
     /// unsharp 锐化强度 amount（0~2，默认 0.5）：out = px + amount×
-    /// clamp(px − blur(px), ±20)——差值（原图 − 模糊参照）的放大倍数，强边
-    /// 差值钳制在 ±20 级内（过冲钳制：细纹理锐化全额保留，只压强边光晕——
-    /// 实测两降噪算法下头发边缘光晕的共同解）。越大"细节提出再加回"的
+    /// (px − blur(px))——差值（原图 − 模糊参照）的放大倍数，正向增强另乘
+    /// 白边抑制比（见 image_full_sharpen_white_edge_soft）。越大"细节提出再加回"的
     /// 力度越猛：边缘越脆，超 ~0.8 光晕/振铃明显；噪点随 amount 同步放大
     /// ——控噪优先调 sigma/降噪，而不是减 amount
     pub image_full_sharpen_amount: f32,
@@ -565,6 +564,17 @@ pub struct UiConfig {
     /// σ，而不是只降 σ。JPEG 块效应等低频压缩噪例外——升 σ 反而会被当
     /// 结构拾取放大，此时降 amount 或关锐化
     pub image_full_sharpen_sigma: f32,
+    /// 白边抑制（shoot）全抑制截断点（shoot_v 级 1~255，默认 255，0 = 关闭）：
+    /// 逐点 3×3/5×5/7×7 多尺度亮度方差按相机 ISP shoot.c mode 0 整数组合出
+    /// shoot_v ∈ 0..255，标记孤立强边——unsharp 白边亮晕的来源；正向增强按
+    /// ratio = 1 − shoot_v/soft 线性衰减（只压亮侧 d>0），细纹理
+    /// （shoot_v≈0）锐度全额保留、暗侧压暗不受影响。soft 即 ratio 降为 0
+    /// 的截断点，档位：
+    ///   64  = 狠：中等强度边的正向增益即大幅衰减；
+    ///   128 = 中强边全灭（狠压白边）；
+    ///   255 = 默认：全程直线，仅极强边接近全灭，白边亮晕明显缓解。
+    /// 强边显"肉" → 调大；白边仍明显 → 调小
+    pub image_full_sharpen_white_edge_soft: f32,
     /// 锐化前保边降噪（压平坦区噪点不糊边缘；默认开）
     pub image_full_denoise: bool,
     /// 降噪算法切换："guided"（导向滤波，默认——A/B 实测锯齿最弱、弱纹理
@@ -629,6 +639,7 @@ impl Default for UiConfig {
             image_full_sharpen: true,
             image_full_sharpen_amount: 0.5,
             image_full_sharpen_sigma: 1.5,
+            image_full_sharpen_white_edge_soft: 255.0,
             image_full_denoise: true,
             image_full_denoise_algo: "guided".into(),
             image_full_bilateral_strength: 10.0,
@@ -1033,12 +1044,11 @@ image_full_threshold = 2.0
 # 噪点同步放大由前置降噪对冲，强对比边缘可能有轻微光晕，关掉可 A/B 对比）
 image_full_sharpen = true
 
-# unsharp 锐化强度 amount（0~2）：out = px + amount×clamp(px − blur(px),
-# ±20)——差值（原图 − 模糊参照）的放大倍数，强边差值钳制在 ±20 级内
-# （过冲钳制：细纹理锐化全额保留，只压强边光晕——实测两降噪算法下头发
-# 边缘光晕的共同解）。越大"细节提出再加回"的力度越猛：边缘越脆，超 ~0.8
-# 光晕/振铃明显；噪点随 amount 同步放大——控噪优先调 sigma/降噪，而不是
-# 减 amount
+# unsharp 锐化强度 amount（0~2）：out = px + amount×(px − blur(px))——差值
+# （原图 − 模糊参照）的放大倍数，正向增强另乘白边抑制比（见
+# image_full_sharpen_white_edge_soft）。越大"细节提出再加回"的力度越猛：边缘越脆，
+# 超 ~0.8 光晕/振铃明显；噪点随 amount 同步放大——控噪优先调 sigma/降噪，
+# 而不是减 amount
 #
 # 场景参数参考（strength/radius 为导向算法；amount 随降噪强度联动——
 # 降噪留的高频多可锐猛些，降噪猛则锐化收敛，避免锐化把涂抹痕迹放大）：
@@ -1059,6 +1069,19 @@ image_full_sharpen_amount = 0.5
 # ——分层时优先切导向或降 σ，而不是只降 σ。JPEG 块效应等低频压缩噪例外
 # ——升 σ 反而会被当结构拾取放大，此时降 amount 或关锐化
 image_full_sharpen_sigma = 1.5
+
+# 白边抑制（shoot）全抑制截断点（shoot_v 级 1~255，0 = 关闭）：逐点 3×3/5×5/
+# 7×7 多尺度亮度方差按相机 ISP shoot.c mode 0 整数组合出 shoot_v ∈ 0..255，
+# shoot_v 大 = 孤立强边（7×7 窗口方差显著高于局部 3×3）——unsharp 白边亮晕
+# 的来源；细纹理各尺度方差相近 shoot_v≈0 不受影响。正向增强按
+# ratio = 1 − shoot_v/soft 线性衰减（无 sqrt 无除法），只压亮侧（d>0 白晕），
+# 暗侧压暗全额保留——取代旧 ±20 过冲钳制（钳差值连强边锐感一起削平）。
+# soft 即 ratio 降为 0 的截断点，档位：
+#   64  = 狠：中等强度边的正向增益即大幅衰减；
+#   128 = 中强边全灭（狠压白边）；
+#   255 = 默认：全程直线，仅极强边接近全灭，白边亮晕明显缓解。
+# 强边显"肉" → 调大；白边仍明显 → 调小
+image_full_sharpen_white_edge_soft = 255.0
 
 # 锐化前保边降噪（压平坦区噪点不糊边缘）
 image_full_denoise = true
