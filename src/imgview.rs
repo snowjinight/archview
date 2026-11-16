@@ -1051,7 +1051,7 @@ fn thumbnail_cap(img: image::DynamicImage, cap: u32) -> image::DynamicImage {
 pub struct SharpenCfg {
     /// 总开关（config image_full_sharpen，默认开）
     pub on: bool,
-    /// unsharp 强度（config image_full_sharpen_amount，0~2，默认 0.45）：
+    /// unsharp 强度（config image_full_sharpen_amount，0~2，默认 0.5）：
     /// out = px + amount×(px − blur(px))，越大边缘越脆、光晕与噪点放大越重
     pub amount: f32,
     /// unsharp 半径 σ 像素（config image_full_sharpen_sigma，0.1~4，默认
@@ -1069,10 +1069,10 @@ pub struct SharpenCfg {
     /// 噪点越多。涂抹感重 → 调小（8~15）；噪点残留 → 调大（25~50）
     pub bilateral_strength: f32,
     /// 导向降噪结构容忍度（0~100 亮度级，config image_full_guided_strength，
-    /// 默认 10，仅 Guided 生效）：内部换算 ε = D²，方差 ≪ ε 被平均（压噪）、
+    /// 默认 5，仅 Guided 生效）：内部换算 ε = D²，方差 ≪ ε 被平均（压噪）、
     /// ≫ ε 原值保留（边缘/渐变）——与双边 σc 同量纲，同值可比
     pub guided_strength: f32,
-    /// 导向滤波窗口半径（1~8，config image_full_guided_radius，默认 2 = 5×5，
+    /// 导向滤波窗口半径（1~8，config image_full_guided_radius，默认 1 = 3×3，
     /// 仅 Guided 生效）：越大降噪越强、弱纹理抹除也越强
     pub guided_radius: u32,
 }
