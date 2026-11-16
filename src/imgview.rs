@@ -100,7 +100,7 @@ pub struct ImgView {
 /// 逐帧解码、egui 定时 repaint 播放（13.4 第 4 步）。
 /// mpv 只保留视频职责与解码失败兜底
 pub fn wants_texture(cfg: &crate::config::Config, name: &str) -> bool {
-    cfg.ui.image_texture && cfg.is_image_ext(name)
+    cfg.image.image_texture && cfg.is_image_ext(name)
 }
 
 /// 图片数据来源
@@ -291,7 +291,7 @@ impl ImageService {
     }
 
     /// 请求解码（幂等：已缓存/解码中直接返回）。
-    /// 调用方负责构造 source；max_dim 来自 cfg.ui.image_max_dim；
+    /// 调用方负责构造 source；max_dim 来自 cfg.image.image_max_dim；
     /// name 仅用于日志（定位"发起了没/何时发起"）
     pub fn request(&mut self, key: ImgKey, source: ImageSource, max_dim: u32, name: &str) {
         if self.pending.contains_key(&key) || self.pos(key).is_some() {
@@ -367,7 +367,7 @@ impl ImageService {
     /// 幂等：已就绪/解码中/已放弃直接返回；动图不升级（全帧原图显存
     /// 不可控，触发方已用 is_static 前置过滤，单帧动图落到这里按
     /// FullFailed 放弃即可）
-    /// sharpen 直传 config ui.image_full_sharpen*（默认开+0.6+σ1.0+降噪）：
+    /// sharpen 直传 config image.image_full_sharpen*（默认开+0.6+σ1.0+降噪）：
     /// 放大前在原图分辨率执行（观感增强，成本 ~50ms，见 sharpen_full）
     pub fn request_full(
         &mut self,
@@ -652,7 +652,7 @@ impl ImageService {
 /// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA。
 /// full=false 基础档（factor=ppp）/ true 高清档（factor=ppp×3），
 /// 两档策略见 resample；factor 由 ImageService 按屏幕 DPI 内部取值；
-/// sharpen = 高清档放大前观感增强配置（config ui.image_full_sharpen*，
+/// sharpen = 高清档放大前观感增强配置（config image.image_full_sharpen*，
 /// 基础档传 [`SharpenCfg::OFF`]）
 /// 返回 (结果, 原图保留)：原图仅基础档静态且具备 full 资格（native×factor
 /// ≤ max_dim，同预放大判据）时带回，供 full 升级复用免二次解码
@@ -788,7 +788,7 @@ fn decode_any<R: BufRead + Seek>(
     Ok((decoded, native))
 }
 
-/// 静态图共享尾部：可选降噪+锐化（config ui.image_full_sharpen*，仅高清
+/// 静态图共享尾部：可选降噪+锐化（config image.image_full_sharpen*，仅高清
 /// 档，**放大前**在原图分辨率执行——把边缘坡度先变陡，Lanczos 插值保持
 /// 陡峭过渡，成本从放大后千万像素级降到原图级，见 [`sharpen_full`]）→
 /// 两档尺寸适配（见 [`resample`]）→ RGBA，并按 full 资格判据
@@ -1115,33 +1115,33 @@ impl DenoiseAlgo {
 }
 
 impl SharpenCfg {
-    /// config ui 段 → 观感增强配置（panels 两处组装点收敛到此；algo 非法
+    /// config [image] 段 → 观感增强配置（panels 两处组装点收敛到此；algo 非法
     /// 值 WARN 回退导向，不静默）
-    pub fn from_ui(ui: &crate::config::UiConfig) -> Self {
-        let (algo, ok) = DenoiseAlgo::parse(&ui.image_full_denoise_algo);
+    pub fn from_cfg(img: &crate::config::ImageConfig) -> Self {
+        let (algo, ok) = DenoiseAlgo::parse(&img.image_full_denoise_algo);
         if !ok {
             tracing::warn!(
                 "image_full_denoise_algo = {:?} 无效（仅 bilateral/guided），回退导向",
-                ui.image_full_denoise_algo
+                img.image_full_denoise_algo
             );
         }
         let (white_edge, ok) =
-            parse_white_edge_curve(&ui.image_full_sharpen_white_edge_curve);
+            parse_white_edge_curve(&img.image_full_sharpen_white_edge_curve);
         if !ok {
             tracing::warn!(
                 "image_full_sharpen_white_edge_curve 折点非法（需 x∈(0,255] 严格递增、y∈[0,1]），回退默认曲线"
             );
         }
         Self {
-            on: ui.image_full_sharpen,
-            amount: ui.image_full_sharpen_amount,
-            sigma: ui.image_full_sharpen_sigma,
+            on: img.image_full_sharpen,
+            amount: img.image_full_sharpen_amount,
+            sigma: img.image_full_sharpen_sigma,
             white_edge,
-            denoise: ui.image_full_denoise,
+            denoise: img.image_full_denoise,
             algo,
-            bilateral_strength: ui.image_full_bilateral_strength,
-            guided_strength: ui.image_full_guided_strength,
-            guided_radius: ui.image_full_guided_radius,
+            bilateral_strength: img.image_full_bilateral_strength,
+            guided_strength: img.image_full_guided_strength,
+            guided_radius: img.image_full_guided_radius,
         }
     }
 
@@ -1174,7 +1174,7 @@ impl SharpenCfg {
     }
 }
 
-/// 高清档观感增强链（仅高清档，config ui.image_full_sharpen*，默认
+/// 高清档观感增强链（仅高清档，config image.image_full_sharpen*，默认
 /// 开+0.5+1.5）：可选降噪（算法 [`DenoiseAlgo`] 切换）→ unsharp mask——
 /// **放大前在原图分辨率**
 /// 执行：先把边缘坡度变陡，Lanczos 插值按比例保持陡峭过渡，观感近似
@@ -1577,7 +1577,7 @@ mod tests {
 
     fn test_cfg(image_texture: bool) -> crate::config::Config {
         let mut c = crate::config::Config::default();
-        c.ui.image_texture = image_texture;
+        c.image.image_texture = image_texture;
         c
     }
 

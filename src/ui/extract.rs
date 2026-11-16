@@ -156,7 +156,7 @@ impl App {
         if let Some(p) = &self.player {
             p.stop();
         }
-        let max_dim = self.cfg.ui.image_max_dim;
+        let max_dim = self.cfg.image.image_max_dim;
         // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
         self.img_source = Some((key, source.clone(), name.clone()));
         if !self.img.has(key) && !self.img.is_pending(key) {
@@ -249,7 +249,7 @@ impl App {
         let e = &arch.entries[key.1];
         let src = ImageSource::Stream(arch.vfs.clone(), e.clone());
         let name = e.name.clone();
-        let max_dim = self.cfg.ui.image_max_dim;
+        let max_dim = self.cfg.image.image_max_dim;
         tracing::warn!("当前图不在缓存且无在途解码，补发请求: {name}");
         self.img_source = Some((key, src.clone(), name.clone()));
         self.img.request(key, src, max_dim, &name);
@@ -329,7 +329,7 @@ impl App {
         };
         // 阶段二（可变借用）：已缓存/解码中的跳过（has 不打乱 LRU）；
         // 曾回退 mpv 的条目跳过（mpv 链路显示，不再纹理解码）
-        let max_dim = self.cfg.ui.image_max_dim;
+        let max_dim = self.cfg.image.image_max_dim;
         for (key, src, name) in cands {
             if self.img_fallback.contains(&key) {
                 continue;
@@ -989,7 +989,7 @@ impl App {
             if let Some(p) = &self.player {
                 p.stop();
             }
-            let max_dim = self.cfg.ui.image_max_dim;
+            let max_dim = self.cfg.image.image_max_dim;
             let src = ImageSource::File(dest.to_path_buf());
             // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
             self.img_source = Some((key, src.clone(), name.clone()));

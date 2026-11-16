@@ -385,7 +385,7 @@ impl App {
         // 字体链（ui.font_path 变化）：重装
         Self::install_cjk_font(&new_cfg, &self.egui_ctx);
         // 图片 LRU 容量：收缩在下次推入时生效
-        self.img.set_cap(new_cfg.ui.image_cache_count.max(1));
+        self.img.set_cap(new_cfg.image.image_cache_count.max(1));
         // 播放器：未播放时销毁 → 下次播放按新 player.* 重建；播放中只下发音量/
         // 静音（set_* 走 async 入队即返回，不拿 mpv core 锁，不断流）
         let had_player = self.player.is_some();
@@ -1514,8 +1514,8 @@ impl App {
         // play_image/load_extracted/heal 记录，切视频即清（见 extract）----
         let native_max = native.max_elem() as u32;
         let ppp = ui.ctx().pixels_per_point();
-        if native_max <= self.cfg.ui.image_max_dim
-            && zoom * ppp > self.cfg.ui.image_full_threshold
+        if native_max <= self.cfg.image.image_max_dim
+            && zoom * ppp > self.cfg.image.image_full_threshold
             && self.img.is_static(key)
             && !self.img.has_full(key)
             && !self.img.is_full_pending(key)
@@ -1527,7 +1527,7 @@ impl App {
                     // 预放大倍率（ppp×3）由 ImageService 按屏幕 DPI 内部取值；
                     // 观感增强 = image_full_sharpen* 配置（默认开：放大前在
                     // 原图分辨率降噪（算法可切换）+ unsharp，见 imgview::sharpen_full）
-                    let sharpen = crate::imgview::SharpenCfg::from_ui(&self.cfg.ui);
+                    let sharpen = crate::imgview::SharpenCfg::from_cfg(&self.cfg.image);
                     self.img.request_full(key, source, &name, sharpen);
                 }
             }
@@ -1602,7 +1602,7 @@ impl App {
         let screen_px = (native * zoom * ppp).max_elem();
         // 换画阈值同触发阈值：image_full_threshold 配置（默认 2.0 =
         // badge 200% 滚轮档），两处判据必须一致否则触发/换画错位
-        let want_full = screen_px > native.max_elem() * self.cfg.ui.image_full_threshold;
+        let want_full = screen_px > native.max_elem() * self.cfg.image.image_full_threshold;
         let full = want_full.then(|| self.img.full_tex(key)).flatten();
         // 换画事件：同 key 下 base↔full 切换时才打印一条（切图时新 key
         // 静默重置，不逐帧刷屏），与"发起高清解码/纹理上传 full"串联成链
@@ -1789,8 +1789,8 @@ impl App {
                     let zoom = zoom_s.unwrap_or(fit);
                     let native_max = native.max_elem() as u32;
                     if i == master0
-                        && native_max <= self.cfg.ui.image_max_dim
-                        && zoom * ppp > self.cfg.ui.image_full_threshold
+                        && native_max <= self.cfg.image.image_max_dim
+                        && zoom * ppp > self.cfg.image.image_full_threshold
                         && self.img.is_static(key)
                         && !self.img.has_full(key)
                         && !self.img.is_full_pending(key)
@@ -1799,11 +1799,11 @@ impl App {
                         let s = self.compare.as_ref().unwrap();
                         let p = &s.panes[i];
                         let (source, name2) = (p.source.clone(), p.name.clone());
-                        let sharpen = crate::imgview::SharpenCfg::from_ui(&self.cfg.ui);
+                        let sharpen = crate::imgview::SharpenCfg::from_cfg(&self.cfg.image);
                         self.img.request_full(key, source, &name2, sharpen);
                     }
                     let screen_px = (native * zoom * ppp).max_elem();
-                    let want_full = screen_px > native_max as f32 * self.cfg.ui.image_full_threshold;
+                    let want_full = screen_px > native_max as f32 * self.cfg.image.image_full_threshold;
                     let full = if want_full { self.img.full_tex(key) } else { None };
                     let tex = full.unwrap_or(tex);
                     let tid = tex.id();

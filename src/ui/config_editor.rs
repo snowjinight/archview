@@ -1,6 +1,8 @@
 //! 内嵌 config.toml 编辑器（简单版）：纯文本编辑 + '#' 注释灰色高亮，
 //! Ctrl+C/V/A/Z 与主流编辑器一致（egui 原生），另支持 Ctrl+S 保存与
 //! Ctrl+/ 多行注释切换（加注/解除由选中行整体状态决定，VSCode 惯例）。
+//! 顶部节头导航条列出全部 [section] / [[array]]，点击跳转（光标落节头行 +
+//! 外层 ScrollArea 滚到该行）。
 //! 「保存并生效」走与启动完全相同的解析路径校验（toml::from_str::<Config>，
 //! 语法与类型错都拦在写盘前），通过才写盘并复用 reload_config 热生效。
 //!
@@ -35,6 +37,31 @@ impl ConfigEditor {
             },
         }
     }
+}
+
+/// 节头行提取（文档顺序）：trim 后以 '[' 开头且含 ']' 的行视为 TOML 节头
+/// （[section] 与 [[array.of.tables]] 都算；取首个 ']' 前的内容为节名，
+/// 行尾注释不影响；注释行以 '#' 开头天然排除）。返回 (节名, 行号)。
+/// 纯函数，单测覆盖
+fn section_headers(text: &str) -> Vec<(String, usize)> {
+    text.split('\n')
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let rest = line.trim().strip_prefix('[')?;
+            let end = rest.find(']')?;
+            let inner = rest[..end].trim_matches('[').trim();
+            (!inner.is_empty()).then(|| (inner.to_string(), i))
+        })
+        .collect()
+}
+
+/// 行号 → 行首 char 偏移（CCursor 以字符计数；split('\n') 口径与注释切换
+/// 一致，'\r' 归属上一行不影响行首定位）。纯函数，单测覆盖
+fn line_char_offset(text: &str, line: usize) -> usize {
+    text.split('\n')
+        .take(line)
+        .map(|l| l.chars().count() + 1)
+        .sum()
 }
 
 /// 行内注释起点（'#' 字节下标）：跟踪双引号字符串与 '\' 转义，字符串内
@@ -165,6 +192,42 @@ impl App {
                 if let Some(err) = &ed.error {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
+                // 节头导航条：列出全部 [section] / [[array]]，点击跳转。重名节头
+                // （如多条 [[raw.demux]] 预设）按出现序标 ×N 区分；长窗口放不下
+                // 时自动折行
+                let edit_id = egui::Id::new("config_editor_text");
+                let mut jump = None;
+                let headers = section_headers(&ed.text);
+                if !headers.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak("跳转:");
+                        let mut seen = std::collections::HashMap::new();
+                        for (name, line) in &headers {
+                            let n = seen
+                                .entry(name.as_str())
+                                .and_modify(|n| *n += 1)
+                                .or_insert(0usize);
+                            let label =
+                                if *n == 0 { name.clone() } else { format!("{name} ×{}", *n + 1) };
+                            if ui.small_button(label).clicked() {
+                                jump = Some(line_char_offset(&ed.text, *line));
+                            }
+                        }
+                    });
+                }
+                if let Some(off) = jump {
+                    // 光标落节头行并抢焦点（request_focus 同帧生效）。TextEdit
+                    // 内部自动滚动只在按键事件后触发（selection_changed 判定，
+                    // 见 egui text_edit builder.rs），外部设光标不滚——跳转滚动
+                    // 在下方 TextEdit::show 之后自做
+                    let mut state =
+                        egui::text_edit::TextEditState::load(ctx, edit_id).unwrap_or_default();
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(off),
+                    )));
+                    state.store(ctx, edit_id);
+                    ctx.memory_mut(|mem| mem.request_focus(edit_id));
+                }
                 // Ctrl+S：编辑器肌肉记忆，防"以为存了"（写盘/校验失败会保留窗口提示）。
                 // 修饰键取 Key 事件内联字段（原子快照，免疫失焦清零——doc/架构落地开发/11_修饰键两条数据路径.md §11）
                 if ui.input(|i| {
@@ -195,10 +258,27 @@ impl App {
                         };
                         let rows = ed.text.lines().count().max(20) + 1;
                         let out = egui::TextEdit::multiline(&mut ed.text)
+                            .id(edit_id)
                             .desired_width(f32::INFINITY)
                             .desired_rows(rows)
                             .layouter(&mut layouter)
                             .show(ui);
+
+                        // 节头跳转：点击 chip 的同帧把目标行滚入视野。光标屏幕
+                        // 位置精确复刻 text_edit 内部平移式（builder.rs cursor_rect：
+                        // galley_pos - galley.rect.left）。Align::Min = 目标行贴视口
+                        // 顶部（None 只保证可见，向下跳会落在底部一行还要再翻页）；
+                        // 临近文末时 egui 自动钳制
+                        if let Some(off) = jump {
+                            let rect = out
+                                .galley
+                                .pos_from_cursor(egui::text::CCursor::new(off))
+                                .translate(
+                                    out.galley_pos.to_vec2()
+                                        - egui::vec2(out.galley.rect.left(), 0.0),
+                                );
+                            ui.scroll_to_rect(rect, Some(egui::Align::Min));
+                        }
 
                         // Ctrl+/：选中行注释切换（无选区 = 光标所在行）。
                         // TextEdit 无此内置命令不消费按键；cursor_range 仅在
@@ -301,7 +381,46 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{comment_start, toggle_comment_lines};
+    use super::{comment_start, line_char_offset, section_headers, toggle_comment_lines};
+
+    #[test]
+    fn 节头提取() {
+        let text = "# 前言\n[cache]\nsize = 1\n# [fake]\n[raw]\n[[raw.demux]]\n\
+                    match = \"*.raw\"\n[[raw.demux]]\n[cache] # 尾注释";
+        assert_eq!(
+            section_headers(text),
+            vec![
+                ("cache".to_string(), 1),
+                ("raw".to_string(), 4),
+                ("raw.demux".to_string(), 5),
+                ("raw.demux".to_string(), 7),
+                ("cache".to_string(), 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn 节头提取_空与畸形与CRLF() {
+        assert_eq!(section_headers(""), Vec::<(String, usize)>::new());
+        // 无 ']' / 空节名 / 非 ']' 结尾但含 ']' 的畸形行
+        assert_eq!(
+            section_headers("[\n[]\n[a\n[b\r\n"),
+            Vec::<(String, usize)>::new()
+        );
+        // CRLF 行尾
+        assert_eq!(section_headers("[cache]\r\nx"), vec![("cache".to_string(), 0)]);
+    }
+
+    #[test]
+    fn 行首char偏移() {
+        assert_eq!(line_char_offset("ab\ncd\n", 0), 0);
+        assert_eq!(line_char_offset("ab\ncd\n", 1), 3);
+        assert_eq!(line_char_offset("ab\ncd\n", 2), 6);
+        // 行号越界收敛到文末
+        assert_eq!(line_char_offset("ab", 5), 3);
+        // 中文字符按 char 计（CCursor 口径）
+        assert_eq!(line_char_offset("路径 = 1\n[cache]", 1), 7);
+    }
 
     #[test]
     fn 注释起点识别() {

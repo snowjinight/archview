@@ -481,7 +481,7 @@ impl App {
         }
         self.img.set_shown_multi(protect);
         self.rawdec.retain(&keys);
-        let max_dim = self.cfg.ui.image_max_dim;
+        let max_dim = self.cfg.image.image_max_dim;
         for (key, source, name) in wants {
             self.img.request(key, source, max_dim, &name);
         }
@@ -549,7 +549,7 @@ impl App {
                 .map(|p| p.landed);
             (heals, mi, landed)
         };
-        let max_dim = self.cfg.ui.image_max_dim;
+        let max_dim = self.cfg.image.image_max_dim;
         for (key, source, name) in heals {
             tracing::warn!("对比栏图片不在缓存且无在途解码，补发请求: {name}");
             self.img.request(key, source, max_dim, &name);
@@ -658,7 +658,7 @@ impl App {
                     ImageSource::Stream(..) => {
                         if !self.img.is_pending(pane.key) {
                             // 预取网漏网（如刚切栏数后立即滑动）：当场发起
-                            let max_dim = self.cfg.ui.image_max_dim;
+                            let max_dim = self.cfg.image.image_max_dim;
                             self.img
                                 .request(pane.key, pane.source.clone(), max_dim, &pane.name);
                         }

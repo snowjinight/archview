@@ -406,24 +406,24 @@ impl App {
         // 图片高清升级配置回显：改 config 调阈值/增强链后，启动即可确认生效
         tracing::info!(
             "图片高清升级: 阈值×{:.2} 锐化 {}{}",
-            cfg.ui.image_full_threshold,
-            if cfg.ui.image_full_sharpen { "开" } else { "关" },
-            if cfg.ui.image_full_sharpen {
+            cfg.image.image_full_threshold,
+            if cfg.image.image_full_sharpen { "开" } else { "关" },
+            if cfg.image.image_full_sharpen {
                 format!(
                     "(amount {:.2} σ{:.1} 降噪{}[{}] 双边s{:.0} 导向s{:.0}r{})",
-                    cfg.ui.image_full_sharpen_amount,
-                    cfg.ui.image_full_sharpen_sigma,
-                    if cfg.ui.image_full_denoise { "开" } else { "关" },
-                    cfg.ui.image_full_denoise_algo,
-                    cfg.ui.image_full_bilateral_strength,
-                    cfg.ui.image_full_guided_strength,
-                    cfg.ui.image_full_guided_radius
+                    cfg.image.image_full_sharpen_amount,
+                    cfg.image.image_full_sharpen_sigma,
+                    if cfg.image.image_full_denoise { "开" } else { "关" },
+                    cfg.image.image_full_denoise_algo,
+                    cfg.image.image_full_bilateral_strength,
+                    cfg.image.image_full_guided_strength,
+                    cfg.image.image_full_guided_radius
                 )
             } else {
                 String::new()
             }
         );
-        let img_cap = cfg.ui.image_cache_count.max(1);
+        let img_cap = cfg.image.image_cache_count.max(1);
         Self {
             cfg,
             archive: None,
@@ -493,7 +493,7 @@ impl App {
     fn new_for_test(cfg: Config) -> Self {
         cache::cleanup_partial(&cache::cache_dir(&cfg));
         let ctx = egui::Context::default();
-        let img_cap = cfg.ui.image_cache_count.max(1);
+        let img_cap = cfg.image.image_cache_count.max(1);
         Self {
             cfg,
             archive: None,

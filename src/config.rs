@@ -17,6 +17,11 @@ pub struct Config {
     /// 相机 RAW 照片与非标裸数据（raw dump）配置（PLAN_raw_media.md）
     pub raw: RawConfig,
     pub player: PlayerConfig,
+    /// 图片预览管线（纹理直显/缓存/高清档与观感增强调参）——原在 [ui] 节，
+    /// 键多且含算法调参，独立成节。旧配置 [ui] 下遗留的 image_* 键被 serde
+    /// 静默忽略（值失效），缺键由 backfill 按默认值补进 [image]；
+    /// 旧布局文件需手动搬移一次（个人工具不做常驻迁移代码）
+    pub image: ImageConfig,
     pub ui: UiConfig,
     pub extract: ExtractConfig,
     /// 非 UTF-8 字节兜底代码页（WHATWG 标签，如 "gbk"/"big5"/"shift_jis"/"euc-kr"）：
@@ -515,30 +520,11 @@ pub const DEFAULT_WHITE_EDGE_CURVE: [(f32, f32); 4] = [
     (255.0, 0.0),
 ];
 
+/// 图片预览管线配置（[image] 节）：纹理直显开关/缓存/尺寸档位 + 高清档
+/// 观感增强（降噪+锐化）算法调参。键名沿用旧 image_* 前缀（迁移纯搬移不重命名）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct UiConfig {
-    /// CJK 字体文件路径；"auto" = 在系统字体目录依次尝试候选字体
-    pub font_path: String,
-    /// 图片自动播放（PPT 式翻页）间隔秒数
-    pub slideshow_secs: f64,
-    /// 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
-    pub wheel_switch_secs: f64,
-    /// 翻到本包最后一个媒体项再往后导航时，是否询问打开同目录下一个压缩包
-    pub ask_next_archive: bool,
-    /// 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
-    /// false（默认）= 保持压缩包内部顺序：7z/RAR 固态包下内部顺序 == 物理码流顺序，
-    /// 预取直接命中物理相邻文件（性能最优）。注意 7-Zip 工具打的包内部本来就是
-    /// 字典序，关闭排序对这类包显示无变化。
-    /// true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10）
-    pub sort_files: bool,
-    /// 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤重建
-    /// （万级条目的大包逐键重建才有感卡顿）。0 = 不防抖，每键即时过滤
-    pub search_debounce_ms: u64,
-    /// 解压覆盖层显示前的宽限期（毫秒）：正在播放视频时切换到需解压的条目，
-    /// 超过该时长仍未解完才隐藏视频窗口并显示进度覆盖层——快速解压
-    /// （缓存命中/小文件）全程不打扰播放，避免窗口闪烁
-    pub extract_overlay_delay_ms: u64,
+pub struct ImageConfig {
     /// 图片 egui 纹理直显（后台 image crate 解码 → 纹理，跳过 mpv；静图
     /// 与动图 gif 均走此链路，解码失败自动回退 mpv）
     pub image_texture: bool,
@@ -619,6 +605,52 @@ pub struct UiConfig {
     ///   5~8 = 低频色斑也能压，但平坦区涂抹感明显、弱纹理发糊。
     /// 时间与半径无关（O(1)/px 滑动均值），内存亦无关
     pub image_full_guided_radius: u32,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            image_texture: true,
+            image_cache_count: 3,
+            image_max_dim: 4096,
+            image_full_threshold: 2.0,
+            image_full_sharpen: true,
+            image_full_sharpen_amount: 0.5,
+            image_full_sharpen_sigma: 1.5,
+            image_full_sharpen_white_edge_curve: DEFAULT_WHITE_EDGE_CURVE.to_vec(),
+            image_full_denoise: true,
+            image_full_denoise_algo: "guided".into(),
+            image_full_bilateral_strength: 10.0,
+            image_full_guided_strength: 5.0,
+            image_full_guided_radius: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// CJK 字体文件路径；"auto" = 在系统字体目录依次尝试候选字体
+    pub font_path: String,
+    /// 图片自动播放（PPT 式翻页）间隔秒数
+    pub slideshow_secs: f64,
+    /// 预览窗口内滚轮切换媒体的最小间隔秒数（防惯性/触控板连跳）
+    pub wheel_switch_secs: f64,
+    /// 翻到本包最后一个媒体项再往后导航时，是否询问打开同目录下一个压缩包
+    pub ask_next_archive: bool,
+    /// 文件列表是否按自然序排序（数字段按数值：1/2/10；不区分大小写）。
+    /// false（默认）= 保持压缩包内部顺序：7z/RAR 固态包下内部顺序 == 物理码流顺序，
+    /// 预取直接命中物理相邻文件（性能最优）。注意 7-Zip 工具打的包内部本来就是
+    /// 字典序，关闭排序对这类包显示无变化。
+    /// true = 自然序：看漫画/图集时开启，编号文件按人类预期排列（1/2/10）
+    pub sort_files: bool,
+    /// 文件列表搜索防抖（毫秒）：停止输入该时长后才执行一次过滤重建
+    /// （万级条目的大包逐键重建才有感卡顿）。0 = 不防抖，每键即时过滤
+    pub search_debounce_ms: u64,
+    /// 解压覆盖层显示前的宽限期（毫秒）：正在播放视频时切换到需解压的条目，
+    /// 超过该时长仍未解完才隐藏视频窗口并显示进度覆盖层——快速解压
+    /// （缓存命中/小文件）全程不打扰播放，避免窗口闪烁
+    pub extract_overlay_delay_ms: u64,
     /// UI 重绘频率三档（fps）——悬停移动（指针滑过 UI、未按下）上限。
     /// egui-winit 对鼠标移动无条件 request_repaint，事件率（125~1000Hz）
     /// 直接驱动重绘频率，而立即模式 UI 每帧全量重建+present，低端机上悬停
@@ -642,19 +674,6 @@ impl Default for UiConfig {
             sort_files: false,
             search_debounce_ms: 200,
             extract_overlay_delay_ms: 500,
-            image_texture: true,
-            image_cache_count: 3,
-            image_max_dim: 4096,
-            image_full_threshold: 2.0,
-            image_full_sharpen: true,
-            image_full_sharpen_amount: 0.5,
-            image_full_sharpen_sigma: 1.5,
-            image_full_sharpen_white_edge_curve: DEFAULT_WHITE_EDGE_CURVE.to_vec(),
-            image_full_denoise: true,
-            image_full_denoise_algo: "guided".into(),
-            image_full_bilateral_strength: 10.0,
-            image_full_guided_strength: 5.0,
-            image_full_guided_radius: 1,
             redraw_hover_fps: 30,
             redraw_drag_fps: 60,
             redraw_other_fps: 60,
@@ -677,6 +696,7 @@ impl Default for Config {
             media: MediaConfig::default(),
             raw: RawConfig::default(),
             player: PlayerConfig::default(),
+            image: ImageConfig::default(),
             ui: UiConfig::default(),
             extract: ExtractConfig::default(),
             codepage: "gbk".into(),
@@ -1031,6 +1051,26 @@ search_debounce_ms = 200
 # 超过该时长仍未解完才隐藏视频窗口显示进度；快速解压全程不打扰播放
 extract_overlay_delay_ms = 500
 
+# ============ UI 重绘频率 ============
+# egui 立即模式 UI 每帧全量重建，鼠标移动/线程唤醒会按事件率驱动重绘。
+# 三档重绘频率上限把重绘封顶，静置/悬停时 CPU/GPU 占用可控（弱机显著
+# 受益）。取值钳制 5~240；视频播放不受影响（vsync 主钟）
+
+# 悬停/滚轮（指针滑过 UI、滚动列表，未按下）重绘频率上限。30 = 高亮
+# 跟随与列表滚动无感知、占用约为 60fps 的一半；弱机可调 20；高刷屏
+# 想更顺滑可调回 60
+redraw_hover_fps = 30
+
+# 拖拽中（指针按下：对比栏平移/缩放、拖进度条、拖列表）重绘频率上限
+redraw_drag_fps = 60
+
+# 其余情况（解码完成显示、解压进度刷新、hover 动画等）重绘频率上限。
+# 调低会让后台事件显示延迟变大（间隔 = 1000/该值 毫秒）
+redraw_other_fps = 60
+
+# ============ 图片预览管线 ============
+[image]
+
 # 图片 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均
 # 走此链路）。解码失败的图片自动回退 mpv
 image_texture = true
@@ -1139,23 +1179,6 @@ image_full_guided_strength = 5.0
 # 时间与半径无关（O(1)/px 滑动均值）
 image_full_guided_radius = 1
 
-# ============ UI 重绘频率 ============
-# egui 立即模式 UI 每帧全量重建，鼠标移动/线程唤醒会按事件率驱动重绘。
-# 三档重绘频率上限把重绘封顶，静置/悬停时 CPU/GPU 占用可控（弱机显著
-# 受益）。取值钳制 5~240；视频播放不受影响（vsync 主钟）
-
-# 悬停/滚轮（指针滑过 UI、滚动列表，未按下）重绘频率上限。30 = 高亮
-# 跟随与列表滚动无感知、占用约为 60fps 的一半；弱机可调 20；高刷屏
-# 想更顺滑可调回 60
-redraw_hover_fps = 30
-
-# 拖拽中（指针按下：对比栏平移/缩放、拖进度条、拖列表）重绘频率上限
-redraw_drag_fps = 60
-
-# 其余情况（解码完成显示、解压进度刷新、hover 动画等）重绘频率上限。
-# 调低会让后台事件显示延迟变大（间隔 = 1000/该值 毫秒）
-redraw_other_fps = 60
-
 # ============ 解压预取 ============
 [extract]
 
@@ -1211,7 +1234,7 @@ mod tests {
     /// 会假通过（实际发生过），节头缺失必须在这里先炸
     #[test]
     fn default_template_matches_config_default() {
-        for head in ["[cache]", "[media]", "[raw]", "[player]", "[ui]", "[extract]", "[vartidy]", "[encode]"] {
+        for head in ["[cache]", "[media]", "[raw]", "[player]", "[image]", "[ui]", "[extract]", "[vartidy]", "[encode]"] {
             assert!(
                 DEFAULT_TOML.contains(&format!("\n{head}\n")),
                 "DEFAULT_TOML 缺少节头 {head}（键会静默落到顶层被忽略）"
@@ -1316,7 +1339,7 @@ slideshow_secs = 2.0
         assert_eq!(cfg.codepage, "big5");
         assert_eq!(cfg.ui.slideshow_secs, 2.0);
         assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.ui.image_max_dim, 4096);
+        assert_eq!(cfg.image.image_max_dim, 4096);
         // 幂等：再跑一遍补全 0 项，输出不变
         let mut doc2: DocumentMut = out.parse().unwrap();
         assert_eq!(backfill_table(doc2.as_table_mut(), def.as_table()), 0);
