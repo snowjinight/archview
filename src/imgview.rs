@@ -1058,15 +1058,16 @@ pub struct SharpenCfg {
     /// 1.5）：调大只增强中大尺度边缘（σ 级以下的像素噪点被模糊项抹掉、
     /// 差值趋零），天然抗噪点放大，代价是锐化"颗粒感"变"体积感"
     pub sigma: f32,
-    /// 白边抑制全抑制截断点 soft（shoot_v 级 1~255，config
-    /// image_full_sharpen_white_edge_soft，默认 255，0 = 关闭）：逐点 3×3/5×5/7×7 多尺度
-    /// 亮度方差按 shoot.c mode 0 整数组合出 shoot_v ∈ 0..255 标记孤立强边
-    /// （halo 源），其正向增强按 ratio = 1 − shoot_v/soft 线性衰减——白边
-    /// 亮晕针对性抑制；细纹理 shoot_v≈0 锐度全额保留，暗侧压暗不受影响
-    /// （ratio 只乘在 d>0 上）。soft 即 ratio 降为 0 的截断点：越大抑制越
-    /// 轻（255 = 全程直线，仅极强边接近全灭），越小狠压（128 = 中强边即全
-    /// 灭）；强边显"肉" → 调大，白边仍明显 → 调小
-    pub shoot_soft: f32,
+    /// 白边抑制曲线查表（config image_full_sharpen_white_edge_curve 折点
+    /// 分段线性插值预计算，None = 关闭）：逐点 3×3/5×5/7×7 多尺度亮度方差
+    /// 按 shoot.c mode 0 整数组合出 shoot_v ∈ 0..255 标记孤立强边（halo
+    /// 源），其正向增强乘 ratio = LUT[shoot_v]——shoot_v 小 ratio≈1（细
+    /// 纹理锐度全额保留），到压制拐点后渐进衰减。曲线比单斜率直线观感好
+    /// （用户实测直线低段压太多）：低段平缓、强边段陡降；shoot_v 只有
+    /// 256 个可能值，任何曲线运行时都收敛为 256 项查表（1 load + 1 add），
+    /// 形状自由度零性能代价。ratio 只乘在 d>0 上（亮侧白晕），暗侧压暗
+    /// 不受影响
+    pub white_edge: Option<[f32; 256]>,
     /// 锐化前保边降噪（config image_full_denoise，默认开）：先压平坦区噪点
     /// 再 unsharp，算法由 [`DenoiseAlgo`] 切换（双边 3×3 / 导向滤波）
     pub denoise: bool,
@@ -1124,11 +1125,18 @@ impl SharpenCfg {
                 ui.image_full_denoise_algo
             );
         }
+        let (white_edge, ok) =
+            parse_white_edge_curve(&ui.image_full_sharpen_white_edge_curve);
+        if !ok {
+            tracing::warn!(
+                "image_full_sharpen_white_edge_curve 折点非法（需 x∈(0,255] 严格递增、y∈[0,1]），回退默认曲线"
+            );
+        }
         Self {
             on: ui.image_full_sharpen,
             amount: ui.image_full_sharpen_amount,
             sigma: ui.image_full_sharpen_sigma,
-            shoot_soft: ui.image_full_sharpen_white_edge_soft,
+            white_edge,
             denoise: ui.image_full_denoise,
             algo,
             bilateral_strength: ui.image_full_bilateral_strength,
@@ -1142,7 +1150,7 @@ impl SharpenCfg {
         on: false,
         amount: 0.0,
         sigma: 0.0,
-        shoot_soft: 0.0,
+        white_edge: None,
         denoise: false,
         algo: DenoiseAlgo::Bilateral,
         bilateral_strength: 0.0,
@@ -1174,7 +1182,7 @@ impl SharpenCfg {
 /// （2K 图降噪+锐化 ~50ms，被 74MP Lanczos 主耗时掩盖）。实测锐化对深
 /// 放大观感增益明显（用户确认默认开）；噪点同步放大由前置降噪对冲。
 /// 强边白晕由 **shoot 白边抑制**（[`shoot_ratios`]，多尺度方差 → 只压
-/// 正向增强）处理，`shoot_soft = 0` 关闭。仅 RGB，alpha 直通。O(n) 后台线程执行
+/// 正向增强）处理，曲线为空（None）关闭。仅 RGB，alpha 直通。O(n) 后台线程执行
 fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicImage {
     let mut rgba = img.to_rgba8();
     if cfg.denoise {
@@ -1187,17 +1195,15 @@ fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicIma
     }
     let amount = cfg.amount.clamp(0.0, 2.0);
     let sigma = cfg.sigma.clamp(0.1, 4.0);
-    let soft = cfg.shoot_soft.clamp(0.0, 255.0);
     let blurred = image::imageops::blur(&rgba, sigma);
     // 白边抑制（shoot，见 [`shoot_ratios`]）：逐点多尺度方差标出孤立强边
-    // （halo 源），其正向增强按 ratio<1 衰减。取代旧 ±20 过冲钳制——钳差值
-    // 把强边锐感一起削平（用户实测无感弃用）；ratio 只乘在 d>0（亮侧白晕），
-    // 负向压暗与细纹理（shoot≈0，ratio≈1）全额保留。soft<=0 关闭（省方差
-    // 计算）
-    let ratios = if soft > 0.0 {
-        shoot_ratios(&rgba, soft)
-    } else {
-        Vec::new()
+    // （halo 源），其正向增强按曲线 LUT[shoot_v] 衰减。取代旧 ±20 过冲钳制
+    // ——钳差值把强边锐感一起削平（用户实测无感弃用）；ratio 只乘在 d>0
+    // （亮侧白晕），负向压暗与细纹理（shoot_v≈0，ratio≈1）全额保留。
+    // curve 空（None）关闭（省方差计算）
+    let ratios = match &cfg.white_edge {
+        Some(lut) => shoot_ratios(&rgba, lut),
+        None => Vec::new(),
     };
     for (i, (p, b)) in rgba.pixels_mut().zip(blurred.pixels()).enumerate() {
         let ratio = if ratios.is_empty() { 1.0 } else { ratios[i] };
@@ -1224,33 +1230,79 @@ fn window_var(sum: &[u64], sum2: &[u64], base: usize, stride: usize, k: usize, i
     q - mean * mean
 }
 
-/// shoot.c mode 0 整数组合 + 负斜率直线 ratio：跨尺度方差差（可为负）转
-/// i32 后 CLIP 0..255（对齐 shoot.c 的 uint16 差值语义——方差本身可达数千
-/// 不钳，只钳差值），组合出 shoot_v ∈ 0..255；ratio = 1 − shoot_v/soft
-/// 线性衰减到 0（`soft` = 全抑制截断点）。全程无 sqrt 无除法——shoot 检测
-/// 不吃精度，整数化零观感损失
+/// shoot.c mode 0 整数组合：跨尺度方差差（可为负）转 i32 后 CLIP 0..255
+/// （对齐 shoot.c 的 uint16 差值语义——方差本身可达数千不钳，只钳差值），
+/// 组合出 shoot_v ∈ 0..255。全程无 sqrt 无除法——shoot 检测不吃精度，
+/// 整数化零观感损失
 #[inline(always)]
-fn shoot_ratio(v3: f32, v5: f32, v7: f32, inv_soft: f32) -> f32 {
+fn shoot_v_of(v3: f32, v5: f32, v7: f32) -> usize {
     let s1 = (((v7 - v3) as i32) / 2).clamp(0, 255);
     let s2 = ((v7 - v5) as i32).clamp(0, 255);
-    let shoot_v = ((s1 + s2 + 1) / 2).clamp(0, 255);
-    (1.0 - shoot_v as f32 * inv_soft).clamp(0.0, 1.0)
+    (((s1 + s2 + 1) / 2).clamp(0, 255)) as usize
+}
+
+/// config 曲线解析：折点校验（x ∈ (0,255] 严格递增、y ∈ [0,1]），非法回退
+/// 默认曲线并返回 false（调用方 WARN，不静默，同 [`DenoiseAlgo::parse`]
+/// 先例）；空表 = 关闭（连方差计算都跳过）返回 (None, true)
+fn parse_white_edge_curve(curve: &[(f32, f32)]) -> (Option<[f32; 256]>, bool) {
+    use crate::config::DEFAULT_WHITE_EDGE_CURVE;
+    if curve.is_empty() {
+        return (None, true);
+    }
+    let valid = curve[0].0 > 0.0
+        && curve
+            .iter()
+            .all(|&(x, y)| (0.0..=255.0).contains(&x) && (0.0..=1.0).contains(&y))
+        && curve.windows(2).all(|w| w[0].0 < w[1].0);
+    if valid {
+        (Some(build_white_edge_lut(curve)), true)
+    } else {
+        (Some(build_white_edge_lut(&DEFAULT_WHITE_EDGE_CURVE)), false)
+    }
+}
+
+/// 折点曲线 → 256 项 ratio 查表：隐含首点 [0, 1]（shoot_v 低于首折点从 1
+/// 渐变到首点 y——细纹理轻压不误伤），折点间**分段线性插值**，折点精确
+/// 落值，末点后平坦 = 末点 y。前提：curve 非空且已通过校验（x>0 严格递增）
+fn build_white_edge_lut(curve: &[(f32, f32)]) -> [f32; 256] {
+    let mut lut = [1.0f32; 256];
+    let (mut px, mut py) = (0.0f32, 1.0f32); // 隐含首点 [0, 1]
+    let mut vi = 0usize; // 下一个待填的 shoot_v
+    for &(x, y) in curve {
+        let y = y.clamp(0.0, 1.0);
+        let xi = (x.round() as usize).clamp(1, 255);
+        // [vi, xi) 区间从 (px,py) 到 (x,y) 线性插值（x−px>0 由严格递增保证）
+        while vi < xi {
+            let t = (vi as f32 - px) / (x - px);
+            lut[vi] = (py + (y - py) * t).clamp(0.0, 1.0);
+            vi += 1;
+        }
+        lut[xi] = y; // 折点精确落值
+        vi = xi + 1;
+        px = x;
+        py = y;
+    }
+    while vi <= 255 {
+        lut[vi] = py; // 末点后平坦延伸
+        vi += 1;
+    }
+    lut[0] = 1.0; // shoot_v=0（细纹理）恒不抑制，机制保证
+    lut
 }
 
 /// shoot 白边抑制比例表（每像素 0~1，1 = 不抑制）：多尺度亮度方差（3×3/
 /// 5×5/7×7）逐点求跨尺度方差差，按相机 ISP 库 shoot.c get_shoot_value
 /// mode 0 整数组合出 shoot_v ∈ 0..255——孤立强边周围 7×7 窗口方差显著高于
 /// 局部 3×3 → 方差差大 → shoot_v 大；细纹理/噪点各尺度方差相近、强边正
-/// 中心 var3≈var7 → shoot_v≈0。ratio = 1 − shoot_v/soft 负斜率直线
-/// （[`shoot_ratio`]），shoot_v 越大 ratio 越小，`soft` 为全抑制截断点
-/// （shoot_v ≥ soft 时 ratio=0）。
+/// 中心 var3≈var7 → shoot_v≈0。ratio 由曲线查表给出（[`build_white_edge_lut`]，
+/// `lut[shoot_v]`），shoot_v 越大 ratio 越小。
 ///
 /// 性能：三尺度 6 个窗口量（各尺度 sum/sumsq）全部从**同一份积分图** O(1)
 /// 查表复用——前缀和一次建图（1 趟 rgba 读 + 2 个 u64 表写），替代按尺度
 /// 各跑 box_filter 的 12 趟全图扫描 + 6 次临时缓冲分配。窗口边界 clamp 到
 /// 图界，亮度 Rec.601 取整到 u8（方差检测对 ±1 亮度不敏感），u64 前缀和
 /// 精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）
-fn shoot_ratios(rgba: &image::RgbaImage, soft: f32) -> Vec<f32> {
+fn shoot_ratios(rgba: &image::RgbaImage, lut: &[f32; 256]) -> Vec<f32> {
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     let stride = w + 1;
     // 亮度及其平方的前缀和积分图：(w+1)×(h+1) 首行/首列全 0，免边界分支
@@ -1269,8 +1321,7 @@ fn shoot_ratios(rgba: &image::RgbaImage, soft: f32) -> Vec<f32> {
             sum2[cur + x + 1] = sum2[prev + x + 1] + rs2;
         }
     }
-    // 三尺度方差 → shoot_v → ratio（单趟合成，无临时方差缓冲）
-    let inv_soft = 1.0 / soft;
+    // 三尺度方差 → shoot_v → 曲线查表（单趟合成，无临时方差缓冲）
     let inv_n = [1.0f32 / 9.0, 1.0 / 25.0, 1.0 / 49.0];
     let mut ratios = vec![0f32; w * h];
     // 内部区：k 尺度窗口 [x−k, x+k+1)×[y−k, y+k+1)，四角定址固定偏移
@@ -1283,7 +1334,7 @@ fn shoot_ratios(rgba: &image::RgbaImage, soft: f32) -> Vec<f32> {
             let v3 = window_var(&sum, &sum2, base, stride, 1, inv_n[0]);
             let v5 = window_var(&sum, &sum2, base, stride, 2, inv_n[1]);
             let v7 = window_var(&sum, &sum2, base, stride, 3, inv_n[2]);
-            ratios[y * w + x] = shoot_ratio(v3, v5, v7, inv_soft);
+            ratios[y * w + x] = lut[shoot_v_of(v3, v5, v7)];
         }
     }
     // 边框窄带（3px）：窗口 clamp 到图界，通用四角查表（冷路径；四条带各
@@ -1302,7 +1353,7 @@ fn shoot_ratios(rgba: &image::RgbaImage, soft: f32) -> Vec<f32> {
                 * inv;
             q - mean * mean
         };
-        ratios[y * w + x] = shoot_ratio(var(1), var(2), var(3), inv_soft);
+        ratios[y * w + x] = lut[shoot_v_of(var(1), var(2), var(3))];
     };
     for y in 0..h.min(3) {
         for x in 0..w {
@@ -1531,13 +1582,13 @@ mod tests {
     }
 
     /// 开启锐化的测试配置（denoise 关：降噪滤波对合成阶跃图基本不动，
-    /// 测试只验 unsharp 行为）
+    /// 测试只验 unsharp 行为；白边抑制用默认曲线）
     fn sharpen_on(amount: f32) -> SharpenCfg {
         SharpenCfg {
             on: true,
             amount,
             sigma: 1.0,
-            shoot_soft: 255.0,
+            white_edge: Some(build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE)),
             denoise: false,
             algo: DenoiseAlgo::Bilateral,
             bilateral_strength: 15.0,
@@ -1895,7 +1946,7 @@ mod tests {
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
         assert!(hi > 0, "强边亮侧提亮全灭=锐感丢失: +{hi}");
         assert!(hi < lo, "白边未抑制（亮侧应弱于暗侧）: +{hi}/−{lo}");
-        // shoot_soft = 0 关闭：恢复对称 unsharp，两侧幅度一致（±1 给取整）
+        // curve = []（None）关闭：恢复对称 unsharp，两侧幅度一致（±1 给取整）
         let mut img = image::GrayImage::new(16, 8);
         for row in img.rows_mut() {
             for (x, p) in row.enumerate() {
@@ -1903,7 +1954,7 @@ mod tests {
             }
         }
         let mut cfg = sharpen_on(0.6);
-        cfg.shoot_soft = 0.0;
+        cfg.white_edge = None;
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg).to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
@@ -1915,6 +1966,36 @@ mod tests {
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
         let up = i32::from(out.get_pixel(8, 8)[0]) - 128;
         assert!(up >= 3, "细纹理锐化被 shoot 误伤: +{up}");
+    }
+
+    #[test]
+    fn 白边曲线LUT构建() {
+        // 折点精确落值 + 分段线性插值 + 隐含首点 [0,1] + 末点平坦延伸
+        let lut = build_white_edge_lut(&[(100.0, 0.8), (200.0, 0.6), (240.0, 0.2), (255.0, 0.05)]);
+        assert_eq!(lut[0], 1.0, "shoot_v=0（细纹理）恒不抑制");
+        assert!((lut[50] - 0.9).abs() < 1e-6, "首段插值 0→100 中点应为 0.9");
+        assert_eq!(lut[100], 0.8, "折点精确落值");
+        assert_eq!(lut[200], 0.6, "折点精确落值");
+        assert!((lut[220] - 0.4).abs() < 1e-6, "200→240 段中点应为 0.4");
+        assert_eq!(lut[240], 0.2, "折点精确落值");
+        assert_eq!(lut[255], 0.05, "末点落值");
+        // 解析：空表 = 关闭；非法折点回退默认曲线（x 重复不递增 / x 越界 /
+        // y 越界三种）；合法曲线原样构建
+        assert_eq!(parse_white_edge_curve(&[]), (None, true), "空数组 = 关闭");
+        let (lut, ok) = parse_white_edge_curve(&[(100.0, 0.8), (100.0, 0.5)]);
+        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        assert!(!ok && lut[100] != 0.5, "x 不递增应回退默认曲线");
+        let (lut, ok) = parse_white_edge_curve(&[(300.0, 0.8)]);
+        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        assert!(!ok && lut[255] != 0.8, "x 越界应回退默认曲线");
+        let (lut, ok) = parse_white_edge_curve(&[(100.0, 1.5)]);
+        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        assert!(!ok && lut[100] != 1.5, "y 越界应回退默认曲线");
+        let default = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
+        assert_eq!(lut, default, "回退值应等于默认曲线 LUT");
+        let (lut, ok) = parse_white_edge_curve(&[(100.0, 0.8)]);
+        let Some(lut) = lut else { panic!("合法曲线应为 Some") };
+        assert!(ok && lut[100] == 0.8, "合法折点原样构建");
     }
 
     #[test]
