@@ -620,6 +620,14 @@ impl ImageService {
             .map(|t| t.saturating_duration_since(Instant::now()));
         let frame = c.frames[c.cur].clone();
         self.cache.push_front((key, c));
+        // 原图同步提队首：native 生命周期跟随纹理 LRU 时序（"纹理在 ⇔ 原图
+        // 在"不变量）。否则来回浏览后两队列顺序分叉——纹理因最近查看留在
+        // tex-lru，native 却因解码较早被挤出且切回时 has() 命中纹理不重解码，
+        // native 永不回归 → 像素探针永久"原图未保留"（shoot dump 实测踩中）
+        if let Some(i) = self.natives.iter().position(|(k, _)| *k == key) {
+            let n = self.natives.remove(i).expect("i 有效");
+            self.natives.push_front(n);
+        }
         Some((frame, rest))
     }
 

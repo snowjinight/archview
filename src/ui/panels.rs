@@ -2164,12 +2164,12 @@ impl App {
                     .and_then(|e| e.res.as_ref().cloned())
                 {
                     Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => (
-                        format!("x={x} y={y}  YUV({yv},{u},{v}) (4:2:0)"),
+                        format!("[{x}, {y}]  4:2:0\nY({yv}) U({u}) V({v})"),
                         u32::from(yv) * 299 + u32::from(u) * 587 + u32::from(v) * 114
                             >= 128_000,
                     ),
                     Some(Ok(rawdec::RawProbe::Gray { v, bits })) => (
-                        format!("x={x} y={y}  GRAY({v}, {bits}bit)"),
+                        format!("[{x}, {y}]  {bits}bit\nGRAY({v})"),
                         lum_ok(u32::from(v), bits),
                     ),
                     Some(Ok(rawdec::RawProbe::Bayer { layout, block, bits })) => {
@@ -2177,7 +2177,7 @@ impl App {
                         let v = block[(y & 1) as usize][(x & 1) as usize];
                         (
                             format!(
-                                "x={x} y={y}  BAYER {layout} {bits}bit\n[{} {} / {} {}]",
+                                "[{x}, {y}]  {layout} {bits}bit\n[{} {}]\n[{} {}]",
                                 block[0][0], block[0][1], block[1][0], block[1][1]
                             ),
                             lum_ok(u32::from(v), bits),
@@ -2191,8 +2191,9 @@ impl App {
                 Some(((x, y), rgb)) => {
                     let (ty, tu, tv) = yuv_from_rgb(rgb);
                     (
+                        // 三行紧凑：坐标 / RGB / YUV（BT.601）
                         format!(
-                            "x={x} y={y}  RGB({},{},{})  YUV({ty},{tu},{tv})",
+                            "[{x}, {y}]\nR({}) G({}) B({})\nY({ty}) U({tu}) V({tv})",
                             rgb[0], rgb[1], rgb[2]
                         ),
                         // 取样像素亮度 ≥128 → 背景偏白用黑字
