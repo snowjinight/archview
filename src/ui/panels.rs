@@ -1,6 +1,7 @@
 //! 各面板绘制：顶栏（菜单/标签页/搜索/提示）、左侧文件列表（虚拟化）、中央媒体区（mpv 纹理 blit/解压进度覆盖层）、底部控制栏与进度条。
 
 use super::*;
+use crate::rawdec;
 use egui::AtomExt;
 
 /// 进度条/播放头主题色
@@ -1684,7 +1685,7 @@ impl App {
         }
         let probe = self.probe.clone().filter(|p| p.key == key);
         if let Some(p) = probe {
-            self.paint_probe(ui, video, rect, &p);
+            self.paint_probe(ui, video, rect, &p, &PaneKind::Image);
         }
         // ---- 模式指示徽标（媒体区右下角）：缩放态常驻倍率百分比（100% =
         // 纹素:物理像素 1:1 基准，故乘 ppp）；落回适应窗口闪现"适应窗口"
@@ -1783,7 +1784,7 @@ impl App {
             if pr.clicked() {
                 set_master = true;
                 // Alt+左键像素探针取点（原始屏幕坐标，uv 换算在栏内图像
-                // 矩形算出后做；raw 软解无 CPU 像素，探针只对图像栏生效）
+                // 矩形算出后做；图像栏读 orig-lru、raw 栏走 rawdec 按需读源）
                 if ui.input(Self::click_modifiers).alt {
                     probe_click = pr.interact_pointer_pos();
                 }
@@ -1874,6 +1875,7 @@ impl App {
                         &wheel_used,
                         probe_click,
                         ppp,
+                        &kind,
                     );
                 }
                 PaneKind::Raw(info) => {
@@ -1903,8 +1905,9 @@ impl App {
                                 &wheel,
                                 wheel_pos,
                                 &wheel_used,
-                                None,
+                                probe_click,
                                 ppp,
+                                &kind,
                             );
                         }
                         None => {
@@ -1980,6 +1983,7 @@ impl App {
         wheel_used: &std::cell::Cell<bool>,
         probe_click: Option<egui::Pos2>,
         ppp: f32,
+        kind: &PaneKind,
     ) {
         let fit = fit_scale(*cell, native);
         // ---- 交互先于绘制（同 image_view：改完 zoom/center 绘制统一 clamp）----
@@ -2042,22 +2046,51 @@ impl App {
         );
         ui.painter_at(*cell).add(egui::Shape::mesh(mesh));
         // ---- Alt+左键像素探针（单图/对比共用）：取点 + 绘制 ----
-        // uv 归一化坐标在栏内图像矩形上换算（raw 栏 probe_click 恒 None）
+        // uv 归一化坐标在栏内图像矩形上换算；图像栏读 orig-lru，raw 栏走
+        // rawdec 按需读源解析（rawprobe 线程，读存储原值不做转换）
         if let Some(pos) = probe_click.filter(|_| raw.width() > 0.0 && raw.height() > 0.0) {
             self.probe = Some(PixelProbe {
                 uv: (pos - raw.min) / raw.size(),
                 key,
             });
         }
-        // 绘制条件：本栏是发起栏（原图未保留也显示"原图未保留"），或与本栏
-        // 原图分辨率相同（跨栏同步语义——同分辨率下同一 uv 即同一像素坐标）
+        // 绘制条件：本栏是发起栏恒显示；跨栏同步 = 同类栏且分辨率相同——
+        // 图像↔图像按 orig-lru native 尺寸、raw↔raw 按 RawFrameInfo 尺寸
+        // （同分辨率下同一 uv 即同一像素坐标）；图像与 raw 读数语义不同
+        // （RGB/YUV 插值产物 vs 存储原值），互不同步
         let probe = self.probe.clone().filter(|p| {
-            p.key == key
-                || (self.img.native_size(p.key).is_some()
-                    && self.img.native_size(p.key) == self.img.native_size(key))
+            if p.key == key {
+                return true;
+            }
+            let s = self.compare.as_ref().unwrap();
+            let Some(ka) = s.panes.iter().find(|q| q.key == p.key).map(|q| q.kind.clone())
+            else {
+                return false;
+            };
+            match (&ka, kind) {
+                (PaneKind::Image, PaneKind::Image) => {
+                    self.img.native_size(p.key).is_some()
+                        && self.img.native_size(p.key) == self.img.native_size(key)
+                }
+                (PaneKind::Raw(a), PaneKind::Raw(b)) => a.w == b.w && a.h == b.h,
+                _ => false,
+            }
         });
         if let Some(p) = probe {
-            self.paint_probe(ui, *cell, raw, &p);
+            // raw 栏探针按需读源（异步）：帧游标或取样点变化即重发，未
+            // 就绪期间显示"读取中…"；同步显示的 raw 栏各取各的文件像素
+            if let PaneKind::Raw(info) = kind {
+                let idx = self.rawdec.frame(key).map(|t| t.idx).unwrap_or(0);
+                if !self
+                    .rawdec
+                    .probe(key)
+                    .is_some_and(|e| e.idx == idx && e.uv == p.uv)
+                {
+                    let source = self.compare.as_ref().unwrap().panes[i].source.clone();
+                    self.rawdec.request_probe(key, &source, info, idx, p.uv);
+                }
+            }
+            self.paint_probe(ui, *cell, raw, &p, kind);
         }
     }
 
@@ -2092,11 +2125,20 @@ impl App {
     }
 
     /// 像素探针绘制（单图媒体区 / 对比栏共用）：十字标记 + 悬浮信息文字。
-    /// 像素值取自原图缓存（`ImageService::original_pixel`，非显示纹理插值）；
-    /// 文字全透明背景，颜色按取样像素亮度自动黑白（偏黑白字/偏白黑字），
-    /// 叠反色 1px 阴影兜底（悬浮点附近背景可能与取样点亮度不同）。锚定点
-    /// 右下偏移 12px，超界折回左/上。clip = 裁剪区（媒体区或栏）
-    fn paint_probe(&self, ui: &egui::Ui, clip: egui::Rect, rect: egui::Rect, probe: &PixelProbe) {
+    /// 像素值按栏类型取真实值：图像栏读 orig-lru（`ImageService::original_pixel`
+    /// 非显示纹理插值）；raw 栏读 rawdec 按需读源的**存储原值**（未位移
+    /// 未插值，帧游标/取样点变化即重取，在途显示"读取中…"）。
+    /// 文字全透明背景，颜色按取样亮度自动黑白，叠反色 1px 阴影兜底（悬浮
+    /// 点附近背景可能与取样点亮度不同）。锚定点右下偏移 12px，超界折回
+    /// 左/上。clip = 裁剪区（媒体区或栏）
+    fn paint_probe(
+        &self,
+        ui: &egui::Ui,
+        clip: egui::Rect,
+        rect: egui::Rect,
+        probe: &PixelProbe,
+        target: &PaneKind,
+    ) {
         let pos = rect.min + probe.uv * rect.size();
         let painter = ui.painter_at(clip);
         // 十字标记：圆圈 + 四段短线（不遮取样点中心）
@@ -2106,19 +2148,60 @@ impl App {
         painter.line_segment([pos + egui::vec2(6.0, 0.0), pos + egui::vec2(11.0, 0.0)], stroke);
         painter.line_segment([pos - egui::vec2(0.0, 11.0), pos - egui::vec2(0.0, 6.0)], stroke);
         painter.line_segment([pos + egui::vec2(0.0, 6.0), pos + egui::vec2(0.0, 11.0)], stroke);
-        // 信息文字：原图像素坐标 + RGB + YUV（BT.601）；原图未保留（动图/
-        // 超大图/已逐出）只提示不显示数值
-        let (text, dark_bg) = match self.img.original_pixel(probe.key, probe.uv) {
-            Some(((x, y), rgb)) => {
-                let (ty, tu, tv) = yuv_from_rgb(rgb);
-                (
-                    format!("x={x} y={y}  RGB({},{},{})  YUV({ty},{tu},{tv})", rgb[0], rgb[1], rgb[2]),
-                    // 取样像素亮度 ≥128 → 背景偏白用黑字
-                    u32::from(rgb[0]) * 299 + u32::from(rgb[1]) * 587 + u32::from(rgb[2]) * 114
-                        >= 128_000,
-                )
+        // 信息文字按栏类型分流：图像栏 = 原图坐标 + RGB + YUV（BT.601）；
+        // raw 栏 = 存储原值按格式分流（NV12→YUV / GRAY→亮度 / BAYER→2×2）
+        let (text, dark_bg) = match target {
+            PaneKind::Raw(info) => {
+                let (w, h) = (info.w.max(1) as f32, info.h.max(1) as f32);
+                let x = ((probe.uv.x * w) as u32).min(info.w.saturating_sub(1));
+                let y = ((probe.uv.y * h) as u32).min(info.h.saturating_sub(1));
+                let lum_ok = |v: u32, bits: u32| {
+                    (if bits <= 8 { v } else { v >> (bits - 8) }) >= 128
+                };
+                match self
+                    .rawdec
+                    .probe(probe.key)
+                    .and_then(|e| e.res.as_ref().cloned())
+                {
+                    Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => (
+                        format!("x={x} y={y}  YUV({yv},{u},{v}) (4:2:0)"),
+                        u32::from(yv) * 299 + u32::from(u) * 587 + u32::from(v) * 114
+                            >= 128_000,
+                    ),
+                    Some(Ok(rawdec::RawProbe::Gray { v, bits })) => (
+                        format!("x={x} y={y}  GRAY({v}, {bits}bit)"),
+                        lum_ok(u32::from(v), bits),
+                    ),
+                    Some(Ok(rawdec::RawProbe::Bayer { layout, block, bits })) => {
+                        // 取样点亮度按其在 2×2 块内的位置取
+                        let v = block[(y & 1) as usize][(x & 1) as usize];
+                        (
+                            format!(
+                                "x={x} y={y}  BAYER {layout} {bits}bit\n[{} {} / {} {}]",
+                                block[0][0], block[0][1], block[1][0], block[1][1]
+                            ),
+                            lum_ok(u32::from(v), bits),
+                        )
+                    }
+                    Some(Err(e)) => (format!("探针失败：{e}"), false),
+                    None => ("读取中…".to_string(), false),
+                }
             }
-            None => ("原图未保留".to_string(), false),
+            _ => match self.img.original_pixel(probe.key, probe.uv) {
+                Some(((x, y), rgb)) => {
+                    let (ty, tu, tv) = yuv_from_rgb(rgb);
+                    (
+                        format!(
+                            "x={x} y={y}  RGB({},{},{})  YUV({ty},{tu},{tv})",
+                            rgb[0], rgb[1], rgb[2]
+                        ),
+                        // 取样像素亮度 ≥128 → 背景偏白用黑字
+                        u32::from(rgb[0]) * 299 + u32::from(rgb[1]) * 587 + u32::from(rgb[2]) * 114
+                            >= 128_000,
+                    )
+                }
+                None => ("原图未保留".to_string(), false),
+            },
         };
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let color = if dark_bg {

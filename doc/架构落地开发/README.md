@@ -26,7 +26,7 @@
 | [§9 encode引擎e2e攻坚](09_encode引擎e2e攻坚.md) | NV12 dump→视频 encode 引擎 e2e 攻坚（vo=lavc 隐式切换不存在 / o·ovc 非运行期 / bf 命名覆写 / edit list 裁末帧 / 命令串反斜杠） | encode/mod.rs |
 | [§10 encode三壳接入](10_encode三壳接入.md) | encode 三壳接入（CLI·SendTo / UI 多选右键确认窗）：egui 0.36 三处 API 实测差异 + move 闭包夺所有权 + 可操作绿条与帧首点击清除的竞态 | encode/cli.rs · ui/ |
 | [§11 修饰键两条数据路径](11_修饰键两条数据路径.md) | Ctrl/Shift「间歇性不生效」根因：InputState.modifiers 跨帧状态失焦清零且 winit 不重发（事件内联快照优先修法） | [ARCHITECTURE §15.5](../架构设计/15_encode引擎.md) |
-| [§12 多图对比视图专项](12_多图对比视图专项.md) | 多图对比视图（2~6 栏同步缩放）：方案 A 几何纯函数 / RawFrameService 线程模型 / source_ready 防污染闸门 / 三处防播放劫持守卫 / egui 0.36 差异 / 像素探针（orig-lru 单槽→自适应 LRU 栏数+2）/ 对比 full 重采样使能默认关 | [ARCHITECTURE §16](../架构设计/16_多图对比视图.md) |
+| [§12 多图对比视图专项](12_多图对比视图专项.md) | 多图对比视图（2~6 栏同步缩放）：方案 A 几何纯函数 / RawFrameService 线程模型 / source_ready 防污染闸门 / 三处防播放劫持守卫 / egui 0.36 差异 / 像素探针（orig-lru 单槽→自适应 LRU 栏数+2；raw 栏按格式读存储原值走 rawprobe 直读磁盘）/ 对比 full 重采样使能默认关 | [ARCHITECTURE §16](../架构设计/16_多图对比视图.md) |
 | [§13 空闲CPU全事件驱动专项](13_空闲CPU全事件驱动专项.md) | 空闲/暂停/对比静置 CPU 趋近 0：全局心跳删除、open/extract/mpv 泵线程补 send 后唤醒、幻灯片精确排帧、对比落地 landed 缓存（消每帧 fs::metadata）、暂停逐帧图标闪烁根因（mpv frame-step pause 往返推送 → flags=1 seek 语义）与方向键长按连发排帧 | [ARCHITECTURE §13.2 / §5.5](../架构设计/13_渲染架构迁移.md) |
 | [§14 直方图专项](14_直方图专项.md) | Ctrl+H 图片直方图：软解旁路方案取舍（否决显示改道）/ 位深全量程压缩到 0-255 / 非凸轮廓三角带 Mesh / Color32 预乘还原 | [ARCHITECTURE §6.5](../架构设计/06_图片预览模块.md) |
 | [§15 控制台窗口显隐与ANSI颜色专项](15_控制台窗口显隐与ANSI颜色专项.md) | console 子系统黑框运行时隐藏（启动来源判定：父进程镜像 + CARGO 环境）+ F12 全局调出 + VT Processing 开启治 ANSI 乱码 | src/console.rs · [ARCHITECTURE §7](../架构设计/07_配置文件设计.md) |

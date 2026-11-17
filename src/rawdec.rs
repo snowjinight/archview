@@ -431,7 +431,10 @@ pub(crate) fn bayer16le_to_rgb(
 // ---------------------------------------------------------------------------
 
 /// 软解支持的格式判定（预设命中即可见可对比；冷门 pixfmt 入栏显示占位
-/// 错误，播放路径不受影响）
+/// 错误，播放路径不受影响）。
+/// **新增格式约束**：此处新增支持时，必须同步扩展 `probe_raw_pixel` 的
+/// 格式分派（探针集 = 软解集，两处 match 逐条对应），否则新格式栏可看
+/// 不可探针。
 fn soft_decodable(pixfmt: &str, auto_bayer: bool) -> bool {
     let p = pixfmt.to_ascii_lowercase();
     auto_bayer
@@ -506,17 +509,60 @@ struct RawFrameDone {
     res: Result<(egui::ColorImage, [u32; 2]), String>,
 }
 
+/// raw 探针读数（三种内建格式各自的"真实值"，全部为**文件存储原值**——
+/// 未做 bit_shift 位移、未插值成 RGB；显示 RGB 是转换产物，探针要的是
+/// 传感器/编码前的原始采样值）
+#[derive(Clone, Debug)]
+pub(crate) enum RawProbe {
+    /// gray/gray16le：单点亮度存储值 + 有效位深（gray=8；gray16le 位移后
+    /// = 16-bit_shift，如 12bit 数据）
+    Gray { v: u16, bits: u32 },
+    /// nv12：该点 Y + 覆盖它的 2×2 块共享的 U/V（4:2:0 色度半采样，UV 按
+    /// (x/2, y/2) 取）
+    Nv12 { y: u8, u: u8, v: u8 },
+    /// bayer*_16le：采样点对齐 2×2 块的 4 个存储原值（CFA 排列位序）+ 排列
+    /// 名 + 有效位深
+    Bayer {
+        layout: String,
+        block: [[u16; 2]; 2],
+        bits: u32,
+    },
+}
+
+struct RawProbeDone {
+    key: ImgKey,
+    idx: usize,
+    uv: egui::Vec2,
+    res: Result<RawProbe, String>,
+}
+
+enum RawMsg {
+    Frame(RawFrameDone),
+    Probe(RawProbeDone),
+}
+
 /// raw 帧解码服务（与 ImageService 并列，同一数据源不同消费者）
 pub(crate) struct RawFrameService {
-    tx: Sender<RawFrameDone>,
-    rx: Receiver<RawFrameDone>,
+    tx: Sender<RawMsg>,
+    rx: Receiver<RawMsg>,
     /// (key, 帧号) → 发起时刻（防重复 spawn）
     pending: HashMap<(ImgKey, usize), Instant>,
     /// 每栏已就绪帧（保留上一帧直到新帧就绪，切换无闪烁）
     frames: HashMap<ImgKey, RawFrameTex>,
     /// 确定性失败（格式不支持/数据坏）：不再重试
     errs: HashMap<ImgKey, String>,
+    /// 像素探针取数状态（key → 最近一次请求；res None = 在途）。不做缓存
+    /// 语义——帧游标或取样点变化由 UI 重发（request_probe 幂等），读源
+    /// 直接按字节偏移取所需几个字节，无解码成本
+    probes: HashMap<ImgKey, ProbeEntry>,
     ctx: egui::Context,
+}
+
+/// 探针取数条目：请求时的 (帧号, 取样点 uv)；res None = 在途
+pub(crate) struct ProbeEntry {
+    pub(crate) idx: usize,
+    pub(crate) uv: egui::Vec2,
+    pub(crate) res: Option<Result<RawProbe, String>>,
 }
 
 impl RawFrameService {
@@ -528,6 +574,7 @@ impl RawFrameService {
             pending: HashMap::new(),
             frames: HashMap::new(),
             errs: HashMap::new(),
+            probes: HashMap::new(),
             ctx,
         }
     }
@@ -558,29 +605,81 @@ impl RawFrameService {
                 }))
                 .map_err(|_| "raw 帧解码线程 panic".to_string())
                 .and_then(|r| r);
-                let _ = tx.send(RawFrameDone { key, idx: fi, res });
+                let _ = tx.send(RawMsg::Frame(RawFrameDone { key, idx: fi, res }));
                 ctx.request_repaint();
             })
             .ok();
+    }
+
+    /// 像素探针取数（Alt+点击 raw 栏）：异步读源解析单点/2×2 块存储原值。
+    /// 幂等——同 key 同帧同点不重发；帧游标或取样点变化由 UI 重发覆盖
+    pub(crate) fn request_probe(
+        &mut self,
+        key: ImgKey,
+        source: &ImageSource,
+        info: &RawFrameInfo,
+        frame_idx: usize,
+        uv: egui::Vec2,
+    ) {
+        let fi = frame_idx.min(info.frame_count.saturating_sub(1));
+        if self
+            .probes
+            .get(&key)
+            .is_some_and(|e| e.idx == fi && e.uv == uv)
+        {
+            return;
+        }
+        self.probes.insert(key, ProbeEntry { idx: fi, uv, res: None });
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let (source, info) = (source.clone(), info.clone());
+        std::thread::Builder::new()
+            .name("rawprobe".into())
+            .spawn(move || {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    probe_raw_pixel(&source, &info, fi, uv)
+                }))
+                .map_err(|_| "raw 探针线程 panic".to_string())
+                .and_then(|r| r);
+                let _ = tx.send(RawMsg::Probe(RawProbeDone { key, idx: fi, uv, res }));
+                ctx.request_repaint();
+            })
+            .ok();
+    }
+
+    /// 探针取数状态（None = 无请求；res None = 在途）
+    pub(crate) fn probe(&self, key: ImgKey) -> Option<&ProbeEntry> {
+        self.probes.get(&key)
     }
 
     /// UI 线程每帧排空结果并上传纹理
     pub(crate) fn poll(&mut self) {
         let mut repaint = false;
         while let Ok(m) = self.rx.try_recv() {
-            self.pending.remove(&(m.key, m.idx));
-            match m.res {
-                Ok((img, _native)) => {
-                    let tex = self.ctx.load_texture(
-                        format!("raw-{}-{}-f{}", m.key.0, m.key.1, m.idx),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.frames.insert(m.key, RawFrameTex { idx: m.idx, tex });
+            match m {
+                RawMsg::Frame(m) => {
+                    self.pending.remove(&(m.key, m.idx));
+                    match m.res {
+                        Ok((img, _native)) => {
+                            let tex = self.ctx.load_texture(
+                                format!("raw-{}-{}-f{}", m.key.0, m.key.1, m.idx),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.frames.insert(m.key, RawFrameTex { idx: m.idx, tex });
+                        }
+                        Err(e) => {
+                            tracing::warn!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);
+                            self.errs.insert(m.key, e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);
-                    self.errs.insert(m.key, e);
+                RawMsg::Probe(m) => {
+                    // 只收当前请求的 (帧号, 点)：UI 已换请求后迟到的结果丢弃
+                    if let Some(e) = self.probes.get_mut(&m.key) {
+                        if e.idx == m.idx && e.uv == m.uv {
+                            e.res = Some(m.res);
+                        }
+                    }
                 }
             }
             repaint = true;
@@ -610,6 +709,7 @@ impl RawFrameService {
         self.frames.retain(|k, _| keys.contains(k));
         self.errs.retain(|k, _| keys.contains(k));
         self.pending.retain(|(k, _), _| keys.contains(k));
+        self.probes.retain(|k, _| keys.contains(k));
     }
 }
 
@@ -717,40 +817,49 @@ impl HistService {
     }
 }
 
+/// 帧读取器：VFS 条目（压缩包流式）或缓存文件（非流式已落盘）统一
+/// Read+Seek 抽象（decode_raw_frame / probe_raw_pixel 共用）
+enum FrameReader {
+    V(Box<dyn crate::vfs::VirtualFile>),
+    F(std::fs::File),
+}
+
+impl std::io::Read for FrameReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            FrameReader::V(v) => v.read(buf),
+            FrameReader::F(f) => f.read(buf),
+        }
+    }
+}
+
+impl std::io::Seek for FrameReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            FrameReader::V(v) => v.seek(pos),
+            FrameReader::F(f) => f.seek(pos),
+        }
+    }
+}
+
+fn open_frame_reader(source: &ImageSource) -> Result<FrameReader, String> {
+    match source {
+        ImageSource::Stream(vfs, e) => Ok(FrameReader::V(
+            vfs.open_entry(e).map_err(|er| format!("打开条目失败: {er}"))?,
+        )),
+        ImageSource::File(p) => Ok(FrameReader::F(
+            std::fs::File::open(p).map_err(|er| format!("打开缓存文件失败: {er}"))?,
+        )),
+    }
+}
+
 fn decode_raw_frame(
     source: &ImageSource,
     info: &RawFrameInfo,
     frame_idx: usize,
 ) -> Result<(egui::ColorImage, [u32; 2]), String> {
     use std::io::{Read, Seek, SeekFrom};
-    enum Reader {
-        V(Box<dyn crate::vfs::VirtualFile>),
-        F(std::fs::File),
-    }
-    impl Read for Reader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            match self {
-                Reader::V(v) => v.read(buf),
-                Reader::F(f) => f.read(buf),
-            }
-        }
-    }
-    impl Seek for Reader {
-        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-            match self {
-                Reader::V(v) => v.seek(pos),
-                Reader::F(f) => f.seek(pos),
-            }
-        }
-    }
-    let mut r = match source {
-        ImageSource::Stream(vfs, e) => {
-            Reader::V(vfs.open_entry(e).map_err(|er| format!("打开条目失败: {er}"))?)
-        }
-        ImageSource::File(p) => Reader::F(
-            std::fs::File::open(p).map_err(|er| format!("打开缓存文件失败: {er}"))?,
-        ),
-    };
+    let mut r = open_frame_reader(source)?;
     // 伪格式 bayer_auto16le：读首帧探测排列（先探测后转换，encode 侧
     // "拒绝伪格式"约束不涉及本路径）
     let mut rl = info.to_raw_load();
@@ -794,6 +903,88 @@ fn decode_raw_frame(
         egui::ColorImage::new([w as usize, h as usize], pixels),
         [info.w, info.h],
     ))
+}
+
+/// 像素探针读数（Alt+点击 raw 栏）：按格式解析采样点的**存储原值**——
+/// 不做 bit_shift 位移、不插值 RGB（显示 RGB 是转换产物，探针要原始采样
+/// 值）。按字节偏移直读所需几个字节（auto_bayer 需先读首帧探测排列），
+/// 无整帧读取/转换成本：
+/// - gray/gray16le：单点亮度值；
+/// - nv12：该点 Y + 覆盖 2×2 块共享的 U/V（4:2:0 半采样，按 (x/2, y/2) 取）；
+/// - bayer*_16le：采样点对齐 2×2 块的 4 个 u16 原值（CFA 排列位序）。
+///
+/// **新增格式约束**：与 `soft_decodable`/`decode_raw_frame` 的格式分派
+/// 逐条对应（探针集 = 软解集），软解新增支持时此处必须同步加分支。
+fn probe_raw_pixel(
+    source: &ImageSource,
+    info: &RawFrameInfo,
+    frame_idx: usize,
+    uv: egui::Vec2,
+) -> Result<RawProbe, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (w, h) = (info.w as usize, info.h as usize);
+    let x = ((uv.x * w as f32) as usize).clamp(0, w.saturating_sub(1));
+    let y = ((uv.y * h as f32) as usize).clamp(0, h.saturating_sub(1));
+    let mut r = open_frame_reader(source)?;
+    let mut rl = info.to_raw_load();
+    if rl.auto_bayer {
+        r.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek 失败: {e}"))?;
+        resolve_auto_bayer(&mut rl, &mut r);
+    }
+    let pixfmt = rl.pixfmt.to_ascii_lowercase();
+    // 帧内按字节偏移直读（帧寻址同 decode：第 k 帧 = k×frame_bytes）
+    let frame_off = frame_idx as u64 * info.frame_bytes;
+    let mut read_at = |off: u64, len: usize| -> Result<Vec<u8>, String> {
+        r.seek(SeekFrom::Start(frame_off + off))
+            .map_err(|e| format!("seek 失败: {e}"))?;
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)
+            .map_err(|e| format!("读探针数据失败: {e}"))?;
+        Ok(buf)
+    };
+    let bits = 16u32.saturating_sub(info.bit_shift);
+    match pixfmt.as_str() {
+        "gray" => {
+            let b = read_at((y * w + x) as u64, 1)?;
+            Ok(RawProbe::Gray { v: u16::from(b[0]), bits: 8 })
+        }
+        "gray16le" => {
+            let b = read_at(((y * w + x) * 2) as u64, 2)?;
+            Ok(RawProbe::Gray {
+                v: u16::from_le_bytes([b[0], b[1]]),
+                bits,
+            })
+        }
+        "nv12" => {
+            let yp = w * h;
+            let cw = (w / 2).max(1);
+            let ch = (h / 2).max(1);
+            let (cx, cy) = ((x / 2).min(cw - 1), (y / 2).min(ch - 1));
+            let yb = read_at((y * w + x) as u64, 1)?;
+            let ub = read_at((yp + cy * cw + cx) as u64, 1)?;
+            let vb = read_at((yp + yp / 4 + cy * cw + cx) as u64, 1)?;
+            Ok(RawProbe::Nv12 { y: yb[0], u: ub[0], v: vb[0] })
+        }
+        p if p.starts_with("bayer_") && p.ends_with("16le") => {
+            let name = &p["bayer_".len()..p.len() - "16le".len()];
+            bayer_layout_of(name)
+                .ok_or_else(|| format!("未知 bayer 排列: {name}"))?;
+            let (bx, by) = (x & !1, y & !1);
+            let row0 = read_at(((by * w + bx) * 2) as u64, 4)?;
+            let row1 = read_at((((by + 1) * w + bx) * 2) as u64, 4)?;
+            let at = |b: &[u8], i: usize| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
+            Ok(RawProbe::Bayer {
+                layout: name.to_ascii_uppercase(),
+                block: [[at(&row0, 0), at(&row0, 1)], [at(&row1, 0), at(&row1, 1)]],
+                bits,
+            })
+        }
+        _ => Err(format!(
+            "暂不支持探针该格式：{}（支持 nv12 / gray / gray16le / bayer*_16le）",
+            rl.pixfmt
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -943,6 +1134,124 @@ mod tests {
         let d = vec![0u8, 128, 255];
         let rgb = gray8_to_rgb(&d);
         assert_eq!(rgb, vec![0, 0, 0, 128, 128, 128, 255, 255, 255]);
+    }
+
+    /// 探针读数 = 文件存储原值（未位移未转换）+ 按格式取数位置正确：
+    /// nv12 取 Y(x,y) + (x/2,y/2) 共享 U/V；bayer 取对齐 2×2 块 4 原值
+    /// （bit_shift=4 时读出的是低 12bit 原值而非位移后的显示值）；帧寻址
+    /// = k×frame_bytes
+    #[test]
+    fn probe_raw_pixel_按格式取存储原值() {
+        let dir = std::env::temp_dir().join(format!(
+            "rawdec_probe_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ---- nv12：2 帧 4×4，第 1 帧 Y(3,2)=77、色度块 (1,1) U/V=(66,88) ----
+        let (w, h) = (4u32, 4u32);
+        let mk_nv12 = |yv: u8, u: u8, v: u8| {
+            let (yp, cw) = ((w * h) as usize, (w / 2) as usize);
+            let mut d = vec![0u8; yp + yp / 2];
+            d[2 * w as usize + 3] = yv; // Y(3,2)
+            let cc = 1 * cw + 1; // 色度坐标 (1,1)（覆盖 (3,2) 的 2×2 块）
+            d[yp + cc] = u;
+            d[yp + yp / 4 + cc] = v;
+            d
+        };
+        let mut data = mk_nv12(11, 22, 33);
+        data.extend(mk_nv12(77, 66, 88));
+        let p = dir.join("t.nv12");
+        std::fs::write(&p, &data).unwrap();
+        let info = RawFrameInfo {
+            w,
+            h,
+            pixfmt: "nv12".into(),
+            fps: 10.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: (w * h * 3 / 2) as u64,
+            frame_count: 2,
+        };
+        let src = ImageSource::File(p.clone());
+        let uv = egui::vec2(3.0 / 4.0, 2.0 / 4.0);
+        match probe_raw_pixel(&src, &info, 0, uv).unwrap() {
+            RawProbe::Nv12 { y, u, v } => assert_eq!((y, u, v), (11, 22, 33), "第 0 帧"),
+            o => panic!("应 Nv12，实际 {o:?}"),
+        }
+        match probe_raw_pixel(&src, &info, 1, uv).unwrap() {
+            RawProbe::Nv12 { y, u, v } => {
+                assert_eq!((y, u, v), (77, 66, 88), "第 1 帧帧寻址正确")
+            }
+            o => panic!("应 Nv12，实际 {o:?}"),
+        }
+
+        // ---- bayer_rggb16le + bit_shift=4：读存储原值（低 12bit）非显示值 ----
+        // 4×2 图（frame_bytes=16B=8 样本），RGGB：行 0 = R G R G、行 1 = G B G B
+        let raw16 = |v: u16| v.to_le_bytes();
+        let mut d = Vec::new();
+        for v in [100u16, 200, 101, 201, 300, 400, 301, 401] {
+            d.extend(raw16(v));
+        }
+        let p = dir.join("t.raw");
+        std::fs::write(&p, &d).unwrap();
+        let info = RawFrameInfo {
+            w: 4,
+            h: 2,
+            pixfmt: "bayer_rggb16le".into(),
+            fps: 10.0,
+            bit_shift: 4,
+            auto_bayer: false,
+            frame_bytes: 16,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(p);
+        // 采样 (3,1) → 对齐 2×2 块起点 (2,0)：行 0 [101,201]、行 1 [301,401]
+        let uv = egui::vec2(3.0 / 4.0, 1.0 / 2.0);
+        match probe_raw_pixel(&src, &info, 0, uv).unwrap() {
+            RawProbe::Bayer { layout, block, bits } => {
+                assert_eq!(layout, "RGGB");
+                assert_eq!(bits, 12, "bit_shift=4 → 有效位深 12");
+                assert_eq!(block, [[101, 201], [301, 401]], "对齐块 4 个存储原值");
+            }
+            o => panic!("应 Bayer，实际 {o:?}"),
+        }
+
+        // 采样 (0,0)：块 = 前 4 个样本（未位移——bit_shift=4 不影响读数）
+        let uv = egui::vec2(0.0, 0.0);
+        match probe_raw_pixel(&src, &info, 0, uv).unwrap() {
+            RawProbe::Bayer { block, .. } => assert_eq!(block, [[100, 200], [300, 400]]),
+            o => panic!("应 Bayer，实际 {o:?}"),
+        }
+
+        // ---- gray16le：单点原值 ----
+        let mut d = Vec::new();
+        d.extend(raw16(1234));
+        d.extend(raw16(5678));
+        let p = dir.join("t.g16");
+        std::fs::write(&p, &d).unwrap();
+        let info = RawFrameInfo {
+            w: 2,
+            h: 1,
+            pixfmt: "gray16le".into(),
+            fps: 10.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: 4,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(p);
+        match probe_raw_pixel(&src, &info, 0, egui::vec2(0.5, 0.0)).unwrap() {
+            RawProbe::Gray { v, bits } => {
+                assert_eq!((v, bits), (5678, 16));
+            }
+            o => panic!("应 Gray，实际 {o:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
