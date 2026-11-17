@@ -801,7 +801,18 @@ fn finish_static(
     factor: f64,
     sharpen: &SharpenCfg,
 ) -> Result<(Decoded, Option<image::DynamicImage>), String> {
-    let img = if full && sharpen.on { sharpen_full(img, sharpen) } else { img };
+    // shoot_v 边缘掩码暂存（sharpen_full 产出 → resample 后的 antiring_step
+    // 消费——两步夹着 resample，用局部 Option 中转）
+    let mut shoot_mask_holder = None;
+    // 观感增强入口判定：降噪独立于锐化开关（sharpen.on || denoise）——
+    // 全关时零开销直通
+    let img = if full && (sharpen.on || sharpen.denoise) {
+        let (enhanced, shoot_mask) = sharpen_full(img, sharpen);
+        shoot_mask_holder = shoot_mask;
+        enhanced
+    } else {
+        img
+    };
     // 原图保留（仅基础档）：full=true 时原图即输入，无需缓存
     let native = if full {
         None
@@ -809,16 +820,38 @@ fn finish_static(
         let longest = img.width().max(img.height());
         ((longest as f64 * factor).round() <= max_dim as f64).then(|| img.clone())
     };
+    // 防振铃源 rgba 提取（掩码存在的充要前提：antiring 开 + 锐化开 + 白边
+    // 抑制开——三者缺一掩码为 None，antiring_step 直通，src 提取也跳过）
+    let src_rgba = if full && sharpen.antiring && sharpen.on && sharpen.white_edge.is_some() {
+        Some(img.to_rgba8())
+    } else {
+        None
+    };
     let out = resample(img, max_dim, full, factor);
+    let out = antiring_step(src_rgba, shoot_mask_holder.take(), out);
     Ok((Decoded::Static(color_image(out)), native))
 }
 
 /// full 槽构建（原图缓存命中路径，免读源）：可选降噪+锐化（原图分辨率）
-/// → ×factor Lanczos 上采样（clamp + 像素预算）→ RGBA。与解码路径的
-/// finish_static 同语义
+/// → ×factor Lanczos 上采样（clamp + 像素预算）→ 防振铃 → RGBA。
+/// 与解码路径的 finish_static 同语义（含耗时打印，缓存命中路径同样可见）
 fn build_full(img: image::DynamicImage, factor: f64, sharpen: &SharpenCfg) -> egui::ColorImage {
-    let img = if sharpen.on { sharpen_full(img, sharpen) } else { img };
-    color_image(resample(img, FULL_MAX_DIM, true, factor))
+    let (img, shoot_mask) = if sharpen.on || sharpen.denoise {
+        let (enhanced, mask) = sharpen_full(img, sharpen);
+        (enhanced, mask)
+    } else {
+        (img, None)
+    };
+    // 防振铃源 rgba 提取（掩码存在前提同 finish_static：antiring + 锐化 +
+    // 白边抑制三者齐备，否则 antiring_step 直通且免拷贝）
+    let src_rgba = if sharpen.antiring && sharpen.on && sharpen.white_edge.is_some() {
+        Some(img.to_rgba8())
+    } else {
+        None
+    };
+    let out = resample(img, FULL_MAX_DIM, true, factor);
+    let out = antiring_step(src_rgba, shoot_mask, out);
+    color_image(out)
 }
 
 /// 相机 RAW 家族扩展名（Sony ARW 家族 + Nikon NEF 家族），与 config
@@ -1031,6 +1064,150 @@ fn fir_resize(img: image::DynamicImage, nw: u32, nh: u32) -> image::DynamicImage
     )
 }
 
+/// 防振铃包装：resample 输出原地 clamp（full 放大档专属）。
+/// 两个前置缺失其一即直通（零开销）：①源 rgba 未提取（antiring 关）
+/// ②shoot_v 边缘掩码缺失（锐化关/白边抑制关——防振铃依赖锐化链产出的
+/// 同一份边缘检测结果做定向，不独立重扫）。独立计时打印——finish_static
+/// 解码路径与 build_full 缓存命中路径都走这里，两链路耗时均可见
+fn antiring_step(
+    src_rgba: Option<image::RgbaImage>,
+    shoot_mask: Option<image::GrayImage>,
+    out: image::DynamicImage,
+) -> image::DynamicImage {
+    let (Some(src), Some(mask)) = (src_rgba, shoot_mask) else { return out };
+    let t = std::time::Instant::now();
+    // full 路径 resample 恒产 ImageRgba8（fir_resize），原地改免二次拷贝
+    let mut rgba = match out {
+        image::DynamicImage::ImageRgba8(rgba) => rgba,
+        other => other.to_rgba8(),
+    };
+    antiring(&src, &mut rgba, &mask);
+    tracing::info!("防振铃耗时: {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
+    image::DynamicImage::ImageRgba8(rgba)
+}
+
+/// 强边阈值：shoot_v ≥ 此值的源像素（±1 邻域 cell）才参与防振铃——振铃
+/// 幅度 ∝ 边缘对比度，弱边（shoot_v 小）振铃本就 ≤2 级无需处理；强边
+/// 像素占比通常 ~5-15%，**边缘定向**把源侧统计与输出侧扫描都收敛到边缘
+/// 邻域（shoot_v 图来自锐化链 [`sharpen_step`]，边缘定位零重复扫描）
+const SHOOT_RING_THRESHOLD: u8 = 32;
+
+/// anti-ringing（Lanczos 负瓣振铃抑制，放大后处理，**边缘定向**）：把
+/// 输出像素 clamp 回源对应 cell 的逐通道 min/max。
+///
+/// 原理：放大锐度 = 源边缘过渡等比保持，是**域内**属性；振铃 = 负瓣加权
+/// 和越过源邻域值域的过冲/欠冲（Gibbs），是**域外**属性——越界值在源图中
+/// 不存在，必为插值伪像。clamp 对域内像素恒等映射（边缘过渡/细纹理/
+/// 1px 亮线极值全部不动），只剪伪像，锐度无损（mpv zscale antiring 同思路）。
+///
+/// 实现：shoot_v 掩码标出强边源像素（振铃只发生在强边旁），±1 膨胀为
+/// 标记 cell 集——源侧只对标记 cell 统计 3×3 逐通道 min/max（3×3 恰覆盖
+/// tap 近邻：线性渐变等合法插值输出严格落在值域内，2×2 会因取整噪声
+/// ±1 级误伤），输出侧无标记行整行跳过（O(1) 行和检查）、行内未标记
+/// cell 跳过，仅边缘邻域做 6 次比较、越界罕见才 clamp。O(边缘区) 而非
+/// O(全图)，热路径零分配
+fn antiring(
+    src: &image::RgbaImage,
+    out: &mut image::RgbaImage,
+    shoot_mask: &image::GrayImage,
+) {
+    let (sw, sh) = (src.width() as usize, src.height() as usize);
+    let (ow, oh) = (out.width() as usize, out.height() as usize);
+    if sw == 0 || sh == 0 || ow == 0 || oh == 0 {
+        return;
+    }
+    // 标记 cell 表（shoot_v≥阈值 的 ±1 膨胀）+ 每源行标记数（输出侧行级
+    // O(1) 快速跳过）
+    let mv = shoot_mask.as_raw();
+    let mut marked = vec![0u8; sw * sh];
+    let mut rowsum = vec![0u32; sh];
+    for sy in 0..sh {
+        for sx in 0..sw {
+            if mv[sy * sw + sx] >= SHOOT_RING_THRESHOLD {
+                for dy in sy.saturating_sub(1)..=(sy + 1).min(sh - 1) {
+                    for dx in sx.saturating_sub(1)..=(sx + 1).min(sw - 1) {
+                        let i = dy * sw + dx;
+                        if marked[i] == 0 {
+                            marked[i] = 1;
+                            rowsum[dy] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 源侧标记 cell 的 3×3 逐通道 min/max（图界 clamp；cmin/cmax 全尺寸
+    // 分配但仅标记 cell 被填写，未标记 cell 输出侧不扫不碰）
+    let mut cmin = vec![255u8; sw * sh * 3];
+    let mut cmax = vec![0u8; sw * sh * 3];
+    for sy in 0..sh {
+        if rowsum[sy] == 0 {
+            continue;
+        }
+        let y0 = sy.saturating_sub(1);
+        let y1 = (sy + 1).min(sh - 1);
+        for sx in 0..sw {
+            if marked[sy * sw + sx] == 0 {
+                continue;
+            }
+            let x0 = sx.saturating_sub(1);
+            let x1 = (sx + 1).min(sw - 1);
+            let mut mn = [255u8; 3];
+            let mut mx = [0u8; 3];
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    let p = src[(nx as u32, ny as u32)];
+                    for c in 0..3 {
+                        mn[c] = mn[c].min(p[c]);
+                        mx[c] = mx[c].max(p[c]);
+                    }
+                }
+            }
+            let base = (sy * sw + sx) * 3;
+            cmin[base..base + 3].copy_from_slice(&mn);
+            cmax[base..base + 3].copy_from_slice(&mx);
+        }
+    }
+    let inv_x = sw as f64 / ow as f64;
+    let inv_y = sh as f64 / oh as f64;
+    // 列映射预计算（ow 项，全部输出行共享）：热路径免逐像素 f64 反算
+    let sx_map: Vec<usize> = (0..ow)
+        .map(|ox| (((ox as f64 + 0.5) * inv_x) as usize).min(sw - 1))
+        .collect();
+    let all: &mut [u8] = out; // ImageBuffer DerefMut 直出原始字节（RGBA8 交错的 4 字节/像素）
+    for oy in 0..oh {
+        let syrow = (((oy as f64 + 0.5) * inv_y) as usize).min(sh - 1);
+        if rowsum[syrow] == 0 {
+            continue; // 本输出行对应的源行无任何标记 cell，整行免扫
+        }
+        let sy = syrow * sw * 3;
+        let row = &mut all[oy * ow * 4..(oy + 1) * ow * 4];
+        // 行内按 cell 分组：min/max 每 cell 只 load 一次，其输出列区间连续
+        // 直跑（免逐像素随机 load 与 get_pixel_mut 边界检查）；alpha 直通
+        let mut ox = 0;
+        while ox < ow {
+            let sx = sx_map[ox];
+            let end = ox + sx_map[ox..].iter().take_while(|&&s| s == sx).count();
+            if marked[syrow * sw + sx] == 0 {
+                ox = end;
+                continue; // 未标记 cell 不碰（平坦/纹理区，无振铃）
+            }
+            let ci = sy + sx * 3;
+            let (mn0, mn1, mn2) = (cmin[ci], cmin[ci + 1], cmin[ci + 2]);
+            let (mx0, mx1, mx2) = (cmax[ci], cmax[ci + 1], cmax[ci + 2]);
+            for q in row[ox * 4..end * 4].chunks_exact_mut(4) {
+                let (r, g, b) = (q[0], q[1], q[2]);
+                if r < mn0 || r > mx0 || g < mn1 || g > mx1 || b < mn2 || b > mx2 {
+                    q[0] = r.clamp(mn0, mx0);
+                    q[1] = g.clamp(mn1, mx1);
+                    q[2] = b.clamp(mn2, mx2);
+                }
+            }
+            ox = end;
+        }
+    }
+}
+
 /// 等比降到 cap 内（快速 box 采样，缩小超一倍时 mipmap 消摩尔纹）
 fn thumbnail_cap(img: image::DynamicImage, cap: u32) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
@@ -1085,6 +1262,21 @@ pub struct SharpenCfg {
     /// 导向滤波窗口半径（1~8，config image_full_guided_radius，默认 1 = 3×3，
     /// 仅 Guided 生效）：越大降噪越强、弱纹理抹除也越强
     pub guided_radius: u32,
+    /// debug：dump shoot 边缘图（config image_full_dump_shoot，默认关）——
+    /// shoot_v 直出灰度 bmp 到缓存目录 debug/ 下，验证强边检测是否正确
+    pub dump_shoot: bool,
+    /// debug：dump 白边抑制曲线查表（config image_full_dump_curve，默认关）
+    /// ——256 行 shoot_v→ratio 文本到缓存目录 debug/ 下，验证折点插值生效
+    pub dump_curve: bool,
+    /// 防振铃（config image_full_antiring，默认开）：Lanczos3 负瓣在强边
+    /// 两侧产生越出源邻域值域的过冲/欠冲（Gibbs 振铃，×4.5 放大后白线/
+    /// 暗线，与 unsharp 白边同向叠加——shoot 治的是放大前、这个治放大时）。
+    /// 输出像素 clamp 回源对应 cell 的逐通道 min/max——**域内合法信号
+    /// （边缘过渡/细纹理/1px 亮线）恒等映射不动**（锐度是域内属性），越界
+    /// 值在源图中不存在必为插值伪像（域外属性），数学上正交不伤锐度
+    /// （mpv zscale antiring / FFmpeg 同款思路）。仅放大档（full）生效，
+    /// 缩小不处理；独立计时打印
+    pub antiring: bool,
 }
 
 /// 高清档降噪算法（config image_full_denoise_algo："bilateral"/"guided"）
@@ -1142,6 +1334,9 @@ impl SharpenCfg {
             bilateral_strength: img.image_full_bilateral_strength,
             guided_strength: img.image_full_guided_strength,
             guided_radius: img.image_full_guided_radius,
+            dump_shoot: img.image_full_dump_shoot,
+            dump_curve: img.image_full_dump_curve,
+            antiring: img.image_full_antiring,
         }
     }
 
@@ -1156,22 +1351,45 @@ impl SharpenCfg {
         bilateral_strength: 0.0,
         guided_strength: 0.0,
         guided_radius: 0,
+        dump_shoot: false,
+        dump_curve: false,
+        antiring: false,
     };
 
-    /// 降噪+锐化的日志标记（空 = 关；降噪带算法名，A/B 对比时看日志即可
-    /// 分辨本次解码走了哪条链）
+    /// 降噪/锐化的日志标记（空 = 全关；降噪独立于锐化开关生效，组合四种
+    /// 全覆盖；降噪带算法名，A/B 对比时看日志即可分辨本次解码走了哪条链）
     fn tag(&self) -> &'static str {
-        if !self.on {
-            return "";
-        }
-        match self.denoise {
-            true => match self.algo {
+        match (self.denoise, self.on) {
+            (true, true) => match self.algo {
                 DenoiseAlgo::Bilateral => " 降噪[双边]+锐化",
                 DenoiseAlgo::Guided => " 降噪[导向]+锐化",
             },
-            false => " 锐化",
+            (true, false) => match self.algo {
+                DenoiseAlgo::Bilateral => " 降噪[双边]",
+                DenoiseAlgo::Guided => " 降噪[导向]",
+            },
+            (false, true) => " 锐化",
+            (false, false) => "",
         }
     }
+}
+
+/// debug dump 目录（缓存目录，panels 组装解码参数时 set 一次；OnceLock
+/// 全局量同 [`crate::vfs::set_codepage`] 先例——dump 路径不进 SharpenCfg
+/// 以保住其 Copy derive，worker 线程 dump 时读取）
+static DUMP_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// 设置 debug dump 落盘目录（缓存目录下 debug/ 子目录，dump 文件固定名覆盖）
+pub fn set_dump_dir(dir: &std::path::Path) {
+    let _ = DUMP_DIR.set(dir.join("debug"));
+}
+
+/// debug dump 路径（未 set_dump_dir 或建目录失败返回 None，dump 静默跳过
+/// ——debug 功能不影响正常解码）
+fn dump_path(name: &str) -> Option<std::path::PathBuf> {
+    let dir = DUMP_DIR.get()?;
+    std::fs::create_dir_all(dir).ok()?;
+    Some(dir.join(name))
 }
 
 /// 高清档观感增强链（仅高清档，config image.image_full_sharpen*，默认
@@ -1181,30 +1399,83 @@ impl SharpenCfg {
 /// "放大后锐化"而成本从放大后千万像素级（~400ms 高斯模糊）降到原图级
 /// （2K 图降噪+锐化 ~50ms，被 74MP Lanczos 主耗时掩盖）。实测锐化对深
 /// 放大观感增益明显（用户确认默认开）；噪点同步放大由前置降噪对冲。
-/// 强边白晕由 **shoot 白边抑制**（[`shoot_ratios`]，多尺度方差 → 只压
-/// 正向增强）处理，曲线为空（None）关闭。仅 RGB，alpha 直通。O(n) 后台线程执行
-fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicImage {
+/// **降噪独立于锐化开关**（image_full_denoise 单独生效，锐化关不连带关
+/// 降噪）；两步分别计耗时打日志（tracing info）。
+/// 强边白晕由 **shoot 白边抑制**（[`sharpen_step`] 内 [`shoot_ratios`]，
+/// 多尺度方差 → 只压正向增强）处理，曲线为空（None）关闭。仅 RGB，alpha
+/// 直通。O(n) 后台线程执行。返回 (增强图, shoot_v 边缘掩码)——掩码供
+/// 防振铃边缘定向复用（同一份边缘检测结果，避免对放大后大图的重复扫描）
+fn sharpen_full(
+    img: image::DynamicImage,
+    cfg: &SharpenCfg,
+) -> (image::DynamicImage, Option<image::GrayImage>) {
     let mut rgba = img.to_rgba8();
-    if cfg.denoise {
-        rgba = match cfg.algo {
-            DenoiseAlgo::Bilateral => {
-                bilateral_3x3(&rgba, cfg.bilateral_strength.clamp(0.1, 100.0))
-            }
-            DenoiseAlgo::Guided => guided_denoise(&rgba, cfg.guided_strength, cfg.guided_radius),
-        };
+    // 降噪与锐化两步独立计时：相互遮掩时看日志拆分定位
+    let denoise_ms = denoise_step(&mut rgba, cfg).map(|d| d.as_millis());
+    let (sharpen_ms, shoot_mask) = sharpen_step(&mut rgba, cfg);
+    let sharpen_ms = sharpen_ms.map(|d| d.as_millis());
+    match (denoise_ms, sharpen_ms) {
+        (Some(dn), Some(sh)) => tracing::info!(
+            "观感增强耗时: 降噪[{:?}] {dn}ms + 锐化 {sh}ms",
+            cfg.algo
+        ),
+        (Some(dn), None) => {
+            tracing::info!("观感增强耗时: 降噪[{:?}] {dn}ms（锐化关）", cfg.algo)
+        }
+        (None, Some(sh)) => tracing::info!("观感增强耗时: 锐化 {sh}ms（降噪关）"),
+        (None, None) => {}
+    }
+    (image::DynamicImage::ImageRgba8(rgba), shoot_mask)
+}
+
+/// 降噪步骤（独立于锐化开关生效）：算法 [`DenoiseAlgo`] 切换，None = 关闭
+fn denoise_step(rgba: &mut image::RgbaImage, cfg: &SharpenCfg) -> Option<std::time::Duration> {
+    if !cfg.denoise {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    *rgba = match cfg.algo {
+        DenoiseAlgo::Bilateral => bilateral_3x3(rgba, cfg.bilateral_strength.clamp(0.1, 100.0)),
+        DenoiseAlgo::Guided => guided_denoise(rgba, cfg.guided_strength, cfg.guided_radius),
+    };
+    Some(t.elapsed())
+}
+
+/// 锐化步骤（unsharp + shoot 白边抑制 + debug dump）：
+/// (None, _) = 关闭；Some 掩码 = shoot_v 边缘图（防振铃定向 + debug dump
+/// 共用，need_shoot = dump_shoot || antiring 时才产出）
+fn sharpen_step(
+    rgba: &mut image::RgbaImage,
+    cfg: &SharpenCfg,
+) -> (Option<std::time::Duration>, Option<image::GrayImage>) {
+    if !cfg.on {
+        return (None, None);
+    }
+    let t = std::time::Instant::now();
+    // debug dump 曲线查表（在算出本次实际使用的 LUT 后落盘，验证折点插值）
+    if cfg.dump_curve {
+        if let Some(lut) = &cfg.white_edge {
+            dump_curve_txt(lut);
+        }
     }
     let amount = cfg.amount.clamp(0.0, 2.0);
     let sigma = cfg.sigma.clamp(0.1, 4.0);
-    let blurred = image::imageops::blur(&rgba, sigma);
+    let blurred = image::imageops::blur(rgba, sigma);
     // 白边抑制（shoot，见 [`shoot_ratios`]）：逐点多尺度方差标出孤立强边
     // （halo 源），其正向增强按曲线 LUT[shoot_v] 衰减。取代旧 ±20 过冲钳制
     // ——钳差值把强边锐感一起削平（用户实测无感弃用）；ratio 只乘在 d>0
     // （亮侧白晕），负向压暗与细纹理（shoot_v≈0，ratio≈1）全额保留。
-    // curve 空（None）关闭（省方差计算）
-    let ratios = match &cfg.white_edge {
-        Some(lut) => shoot_ratios(&rgba, lut),
-        None => Vec::new(),
+    // curve 空（None）关闭（省方差计算）。shoot_v 图同时是防振铃的边缘
+    // 定向掩码——锐化与防振铃共用同一份边缘检测结果，不重复扫描
+    let need_shoot = cfg.dump_shoot || cfg.antiring;
+    let (ratios, shoot_img) = match &cfg.white_edge {
+        Some(lut) => shoot_ratios(rgba, lut, need_shoot),
+        None => (Vec::new(), None),
     };
+    // debug dump shoot 边缘图（shoot_v 直出灰度，白 = 强边、黑 = 细纹理）
+    if let Some(g) = &shoot_img {
+        dump_shoot_bmp(g);
+    }
     for (i, (p, b)) in rgba.pixels_mut().zip(blurred.pixels()).enumerate() {
         let ratio = if ratios.is_empty() { 1.0 } else { ratios[i] };
         for c in 0..3 {
@@ -1214,7 +1485,31 @@ fn sharpen_full(img: image::DynamicImage, cfg: &SharpenCfg) -> image::DynamicIma
             p[c] = v.clamp(0.0, 255.0) as u8;
         }
     }
-    image::DynamicImage::ImageRgba8(rgba)
+    (Some(t.elapsed()), shoot_img)
+}
+
+/// debug dump：shoot 边缘图 bmp（缓存目录 debug/shoot_dump.bmp，固定名覆盖）
+fn dump_shoot_bmp(shoot: &image::GrayImage) {
+    let Some(path) = dump_path("shoot_dump.bmp") else { return };
+    match shoot.save(&path) {
+        Ok(()) => tracing::info!("debug dump: shoot 边缘图 {:?}", path),
+        Err(e) => tracing::warn!("debug dump shoot 失败: {e}"),
+    }
+}
+
+/// debug dump：白边抑制曲线查表 256 行（缓存目录 debug/curve_dump.txt，
+/// shoot_v→ratio，验证折点分段线性插值生效；固定名覆盖）
+fn dump_curve_txt(lut: &[f32; 256]) {
+    let Some(path) = dump_path("curve_dump.txt") else { return };
+    let mut s = String::with_capacity(256 * 16);
+    s.push_str("# 白边抑制曲线查表 dump：shoot_v -> ratio（折点分段线性插值）\n");
+    for (v, r) in lut.iter().enumerate() {
+        s.push_str(&format!("{v} {:.4}\n", *r));
+    }
+    match std::fs::write(&path, s) {
+        Ok(()) => tracing::info!("debug dump: 白边曲线查表 {:?}", path),
+        Err(e) => tracing::warn!("debug dump curve 失败: {e}"),
+    }
 }
 
 /// k 尺度窗口方差（内部区固定偏移四角定址）：窗口和先收 u32（sum ≤ 255×49、
@@ -1301,10 +1596,19 @@ fn build_white_edge_lut(curve: &[(f32, f32)]) -> [f32; 256] {
 /// 查表复用——前缀和一次建图（1 趟 rgba 读 + 2 个 u64 表写），替代按尺度
 /// 各跑 box_filter 的 12 趟全图扫描 + 6 次临时缓冲分配。窗口边界 clamp 到
 /// 图界，亮度 Rec.601 取整到 u8（方差检测对 ±1 亮度不敏感），u64 前缀和
-/// 精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）
-fn shoot_ratios(rgba: &image::RgbaImage, lut: &[f32; 256]) -> Vec<f32> {
+/// 精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）。`need_shoot` 时同步产出
+/// shoot_v 灰度图（debug dump 验证强边检测 + **防振铃边缘定向掩码**共用；
+/// 关闭时不分配零开销）
+fn shoot_ratios(
+    rgba: &image::RgbaImage,
+    lut: &[f32; 256],
+    need_shoot: bool,
+) -> (Vec<f32>, Option<image::GrayImage>) {
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     let stride = w + 1;
+    // shoot_v 直出灰度（白 = 强边/halo 源，黑 = 细纹理）；DerefMut 直写
+    // 原始字节（put_pixel 逐点边界检查在 dev 下是热路径负担）
+    let mut shoot_dump = need_shoot.then(|| image::GrayImage::new(w as u32, h as u32));
     // 亮度及其平方的前缀和积分图：(w+1)×(h+1) 首行/首列全 0，免边界分支
     let mut sum = vec![0u64; stride * (h + 1)];
     let mut sum2 = vec![0u64; stride * (h + 1)];
@@ -1334,7 +1638,12 @@ fn shoot_ratios(rgba: &image::RgbaImage, lut: &[f32; 256]) -> Vec<f32> {
             let v3 = window_var(&sum, &sum2, base, stride, 1, inv_n[0]);
             let v5 = window_var(&sum, &sum2, base, stride, 2, inv_n[1]);
             let v7 = window_var(&sum, &sum2, base, stride, 3, inv_n[2]);
-            ratios[y * w + x] = lut[shoot_v_of(v3, v5, v7)];
+            let sv = shoot_v_of(v3, v5, v7);
+            ratios[y * w + x] = lut[sv];
+            if let Some(g) = &mut shoot_dump {
+                let raw: &mut [u8] = g;
+                raw[y * w + x] = sv as u8;
+            }
         }
     }
     // 边框窄带（3px）：窗口 clamp 到图界，通用四角查表（冷路径；四条带各
@@ -1353,7 +1662,12 @@ fn shoot_ratios(rgba: &image::RgbaImage, lut: &[f32; 256]) -> Vec<f32> {
                 * inv;
             q - mean * mean
         };
-        ratios[y * w + x] = lut[shoot_v_of(var(1), var(2), var(3))];
+        let sv = shoot_v_of(var(1), var(2), var(3));
+        ratios[y * w + x] = lut[sv];
+        if let Some(g) = &mut shoot_dump {
+            let raw: &mut [u8] = g;
+            raw[y * w + x] = sv as u8;
+        }
     };
     for y in 0..h.min(3) {
         for x in 0..w {
@@ -1373,7 +1687,7 @@ fn shoot_ratios(rgba: &image::RgbaImage, lut: &[f32; 256]) -> Vec<f32> {
             band(y, x);
         }
     }
-    ratios
+    (ratios, shoot_dump)
 }
 
 /// 3×3 双边滤波（保边降噪，锐化前置）：空间权重固定 3×3 高斯 σs=1.0，
@@ -1594,12 +1908,69 @@ mod tests {
             bilateral_strength: 15.0,
             guided_strength: 15.0,
             guided_radius: 2,
+            dump_shoot: false,
+            dump_curve: false,
+            antiring: false,
         }
     }
 
     #[test]
+    fn antiring_振铃钳回源值域() {
+        // 灰底 128 + 白块 255（强边对比 127）：Lanczos ×4 放大后强边旁必有
+        // 越界振铃（欠冲 <128 / 过冲 >255→被 fir 输出 clamp 到 255 后仍高于
+        // 源 cell 值域判断需要），antiring 后所有像素钳回源全局值域 [128,255]
+        let mut src = image::RgbaImage::new(16, 16);
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let v = if (4..12).contains(&x) && (4..12).contains(&y) {
+                    255
+                } else {
+                    128
+                };
+                src.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+            }
+        }
+        let out = fir_resize(image::DynamicImage::ImageRgba8(src.clone()), 64, 64).to_rgba8();
+        let mut fixed = out.clone();
+        // 掩码来自锐化链同一份 shoot_v 边缘检测（防振铃边缘定向的真实链路）
+        let lut = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
+        let (_, mask) = shoot_ratios(&src, &lut, true);
+        assert!(mask.is_some(), "棋盘强边应产出掩码");
+        antiring(&src, &mut fixed, &mask.unwrap());
+        assert_ne!(out.as_raw(), fixed.as_raw(), "强边振铃应被 clamp 修正");
+        assert!(
+            fixed.pixels().all(|p| p[0] >= 128 && p[1] >= 128 && p[2] >= 128),
+            "欠冲振铃应钳回源值域下界 128"
+        );
+        // 无强边的线性渐变：shoot_v 全部低于阈值 → 掩码全空 → 完全恒等
+        // （边缘定向的整行/整 cell 跳过路径验证）
+        let mut ramp = image::RgbaImage::new(16, 16);
+        for y in 0..16u32 {
+            for x in 0..16u32 {
+                let v = (x * 16) as u8;
+                ramp.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+            }
+        }
+        let r_out = fir_resize(image::DynamicImage::ImageRgba8(ramp.clone()), 64, 64).to_rgba8();
+        let mut r_fixed = r_out.clone();
+        let (_, r_mask) = shoot_ratios(&ramp, &lut, true);
+        antiring(&ramp, &mut r_fixed, &r_mask.unwrap());
+        // 陡渐变（16 级/px）的方差跨尺度差同样大 → shoot_v≥阈值被标记
+        // （shoot 检测的是方差梯度非孤立强边）——但渐变无 unsharp 白边
+        // 问题，且 fir 的 Lanczos3 对陡渐变自身有 ±2 级实现误差（f32 权重
+        // 精度限制），clamp 把越界处拉回源 cell 值域 = 纠偏向真实线性值，
+        // 非误伤：clamp 量 = fir 越界量，≤2 级不可感知
+        let maxdiff = r_out
+            .pixels()
+            .zip(r_fixed.pixels())
+            .map(|(a, b)| (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap())
+            .max()
+            .unwrap();
+        assert!(maxdiff <= 2, "渐变 clamp 幅度应仅限 fir 实现误差级别: {maxdiff}");
+    }
+
+    #[test]
     fn box_filter_滑动均值与朴素参考一致() {
-        // 小随机图全量比对朴素 O(n·win²) 双重 clamp 窗口——钉死滑窗增量
         // 推进与可分离两段式（水平⊗垂直 = 2D box）的正确性
         let (w, h, r) = (17, 13, 2);
         let src: Vec<f32> = (0..w * h).map(|i| (i * 37 % 91) as f32 - 45.0).collect();
@@ -1715,9 +2086,9 @@ mod tests {
         cfg.denoise = true;
         let src = image::DynamicImage::ImageRgba8(img);
         cfg.algo = DenoiseAlgo::Guided;
-        let guided = sharpen_full(src.clone(), &cfg).to_rgba8();
+        let guided = sharpen_full(src.clone(), &cfg).0.to_rgba8();
         cfg.algo = DenoiseAlgo::Bilateral;
-        let bilateral = sharpen_full(src, &cfg).to_rgba8();
+        let bilateral = sharpen_full(src, &cfg).0.to_rgba8();
         let diff = guided
             .pixels()
             .zip(bilateral.pixels())
@@ -1834,6 +2205,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn fir_诊断_指令集与耗时() {
+        // 临时诊断：dev 下 fir_resize 吞吐异常（~4s/40MP，AVX2 基准应为
+        // ~0.1s/40MP）——打印实际选中的指令集 + 分档计时 + 强制各指令集
+        // 对比，定位 SIMD 是否真正生效。cargo test fir_诊断 -- --ignored --nocapture
+        use fast_image_resize as fir;
+        use std::time::Instant;
+        println!("fir 默认指令集: {:?}", fir::Resizer::new().cpu_extensions());
+        for (nw, nh) in [(3840, 2160u32), (7680, 4320), (11520, 6480)] {
+            let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2560, 1440));
+            let t = Instant::now();
+            let out = fir_resize(img, nw, nh);
+            println!(
+                "fir_resize 2560x1440 → {}x{} ({}MP): {}ms",
+                nw,
+                nh,
+                nw as u64 * nh as u64 / 1_000_000,
+                t.elapsed().as_millis()
+            );
+            std::hint::black_box(&out);
+        }
+        // 强制指令集对比（11520×6480 档）
+        let src = fir::images::Image::from_vec_u8(
+            2560,
+            1440,
+            vec![0u8; 2560 * 1440 * 4],
+            fir::PixelType::U8x4,
+        )
+        .unwrap();
+        for ext in [
+            fir::CpuExtensions::None,
+            fir::CpuExtensions::Sse4_1,
+            fir::CpuExtensions::Avx2,
+        ] {
+            if !ext.is_supported() {
+                println!("{ext:?}: CPU 不支持，跳过");
+                continue;
+            }
+            let mut dst = fir::images::Image::new(11520, 6480, fir::PixelType::U8x4);
+            let mut resizer = fir::Resizer::new();
+            unsafe { resizer.set_cpu_extensions(ext) };
+            let opts = fir::ResizeOptions::new()
+                .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
+            let t = Instant::now();
+            resizer.resize(&src, &mut dst, &opts).unwrap();
+            println!("强制 {ext:?}: {}ms", t.elapsed().as_millis());
+            std::hint::black_box(&dst);
+        }
+    }
+
+    #[test]
     fn resample_基础档按密度预放大() {
         // 阈值型：native×factor ≤ max_dim 才 Lanczos ×factor（factor=ppp，
         // 150% 屏 ×1.5）——翻页即 100% 密度直出
@@ -1916,7 +2338,7 @@ mod tests {
             16,
             image::Luma([128]),
         ));
-        let out = sharpen_full(flat, &sharpen_on(0.6)).to_rgba8();
+        let out = sharpen_full(flat, &sharpen_on(0.6)).0.to_rgba8();
         assert!(out.pixels().all(|p| p[0] == 128));
         // 垂直阶跃：左 64 右 192（取中灰区间防 0/255 饱和掩盖效果），
         // 边缘内侧低侧压暗、高侧提亮 = 坡度变陡
@@ -1926,7 +2348,7 @@ mod tests {
                 *p = image::Luma([if x < 8 { 64 } else { 192 }]);
             }
         }
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         assert!(out.get_pixel(7, 4)[0] < 64, "边缘低侧应压暗");
         assert!(out.get_pixel(8, 4)[0] > 192, "边缘高侧应提亮");
     }
@@ -1941,7 +2363,7 @@ mod tests {
                 *p = image::Luma([if x < 8 { 64 } else { 192 }]);
             }
         }
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
         assert!(hi > 0, "强边亮侧提亮全灭=锐感丢失: +{hi}");
@@ -1955,7 +2377,7 @@ mod tests {
         }
         let mut cfg = sharpen_on(0.6);
         cfg.white_edge = None;
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg).to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg).0.to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
         assert!((hi - lo).abs() <= 1, "关闭 shoot 后两侧应恢复对称: +{hi}/−{lo}");
@@ -1963,7 +2385,7 @@ mod tests {
         // 正向增强全额保留
         let mut img = image::GrayImage::from_pixel(16, 16, image::Luma([128]));
         *img.get_pixel_mut(8, 8) = image::Luma([136]);
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         let up = i32::from(out.get_pixel(8, 8)[0]) - 128;
         assert!(up >= 3, "细纹理锐化被 shoot 误伤: +{up}");
     }
@@ -2037,6 +2459,43 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert_eq!(off.size, on.size);
         assert_ne!(off.pixels, on.pixels, "锐化开/关边缘像素应有差异");
+    }
+
+    #[test]
+    fn 降噪独立于锐化开关() {
+        // 锐化关（on=false）而降噪开时，降噪仍生效——两开关解耦（历史上
+        // 降噪嵌在 sharpen_full 里被 on 连带关闭，是用户报的 bug）
+        let cfg = SharpenCfg {
+            on: false,
+            denoise: true,
+            algo: DenoiseAlgo::Guided,
+            guided_strength: 50.0,
+            guided_radius: 2,
+            ..sharpen_on(0.0)
+        };
+        // 带噪平坦图：随机点噪声被导向滤波压掉
+        let mut img = image::RgbaImage::new(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let n = ((x * 7 + y * 13) % 11) as i32 - 5; // 伪随机 ±5
+                let v = (128 + n).clamp(0, 255) as u8;
+                img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+            }
+        }
+        let before = img.clone();
+        let after = sharpen_full(image::DynamicImage::ImageRgba8(img), &cfg).0.to_rgba8();
+        assert_ne!(
+            before.as_raw(),
+            after.as_raw(),
+            "锐化关时降噪仍应生效"
+        );
+        // 关闭档（全关）零开销直通
+        let (same, mask) = sharpen_full(
+            image::DynamicImage::ImageRgba8(before.clone()),
+            &SharpenCfg::OFF,
+        );
+        assert_eq!(same.to_rgba8().as_raw(), before.as_raw(), "全关应原样返回");
+        assert!(mask.is_none(), "全关不应产出 shoot 掩码");
     }
 
     /// 内存中生成 PNG 字节

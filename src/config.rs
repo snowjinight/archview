@@ -605,6 +605,22 @@ pub struct ImageConfig {
     ///   5~8 = 低频色斑也能压，但平坦区涂抹感明显、弱纹理发糊。
     /// 时间与半径无关（O(1)/px 滑动均值），内存亦无关
     pub image_full_guided_radius: u32,
+    /// 防振铃（默认开）：Lanczos3 负瓣在强边两侧产生越出源邻域值域的
+    /// 过冲/欠冲（Gibbs 振铃，深放大后白线/暗线）——放大输出像素 clamp
+    /// 回源对应 cell 逐通道 min/max：域内合法信号（边缘过渡/细纹理/1px
+    /// 亮线）恒等映射不动、越界值必为插值伪像才被剪，锐度无损（mpv
+    /// zscale antiring 同思路）。与 shoot 白边抑制互补：shoot 治放大前
+    /// unsharp 白边，这个治放大时 Lanczos 振铃。仅高清放大档生效
+    pub image_full_antiring: bool,
+    /// debug：dump shoot 边缘图（默认关）。开启后每次高清档解码把
+    /// shoot_v（多尺度方差强边标记 0~255）直出灰度 bmp 到缓存目录
+    /// debug/shoot_dump.bmp（固定名覆盖）：白 = 强边（白边抑制生效区）、
+    /// 黑 = 细纹理。用于肉眼验证边缘检测是否正确
+    pub image_full_dump_shoot: bool,
+    /// debug：dump 白边抑制曲线查表（默认关）。开启后把实际使用的
+    /// shoot_v→ratio 插值结果写缓存目录 debug/curve_dump.txt（256 行，
+    /// 固定名覆盖）：用于验证配置折点的分段线性插值是否正确生效
+    pub image_full_dump_curve: bool,
 }
 
 impl Default for ImageConfig {
@@ -623,6 +639,9 @@ impl Default for ImageConfig {
             image_full_bilateral_strength: 10.0,
             image_full_guided_strength: 5.0,
             image_full_guided_radius: 1,
+            image_full_antiring: true,
+            image_full_dump_shoot: false,
+            image_full_dump_curve: false,
         }
     }
 }
@@ -1178,6 +1197,28 @@ image_full_guided_strength = 5.0
 #   5~8 = 低频色斑也能压，但平坦区涂抹感明显、弱纹理发糊。
 # 时间与半径无关（O(1)/px 滑动均值）
 image_full_guided_radius = 1
+
+# 防振铃（默认开）：Lanczos 放大时负瓣在强边两侧产生越出源邻域值域的过冲/
+# 欠冲（Gibbs 振铃，深放大后白线/暗线）——放大输出像素 clamp 回源对应
+# 区域的逐通道 min/max：域内合法信号（边缘过渡/细纹理/1px 亮线）恒等映射
+# 不动、越界值必为插值伪像才被剪，锐度无损（mpv zscale antiring 同思路）。
+# 与 shoot 白边抑制互补：shoot 治放大前 unsharp 白边，这个治放大时
+# Lanczos 振铃。仅高清放大档生效；强边显"肉"或怀疑压细节时可关掉对比
+image_full_antiring = true
+
+# ============ debug dump（默认关，debug 完关掉）============
+# dump 文件落盘在缓存目录（[cache].cache_dir，"auto" = 系统临时目录下的
+# archview_cache）的 debug/ 子目录，固定文件名覆盖。开启后每次高清档解码
+# 都写一次（bmp 为原图分辨率灰度图，几 MB 级），调试完请关闭。
+
+# dump shoot 边缘图：shoot_v（多尺度方差强边标记）直出灰度 bmp
+# （debug/shoot_dump.bmp）——白 = 强边（白边抑制生效区），黑 = 细纹理
+# （锐度全额保留区）。用于验证边缘检测是否正确
+image_full_dump_shoot = false
+
+# dump 白边抑制曲线查表：实际使用的 shoot_v→ratio 插值结果 256 行
+# （debug/curve_dump.txt）——用于验证配置折点的分段线性插值是否正确生效
+image_full_dump_curve = false
 
 # ============ 解压预取 ============
 [extract]

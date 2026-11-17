@@ -1527,6 +1527,7 @@ impl App {
                     // 预放大倍率（ppp×3）由 ImageService 按屏幕 DPI 内部取值；
                     // 观感增强 = image_full_sharpen* 配置（默认开：放大前在
                     // 原图分辨率降噪（算法可切换）+ unsharp，见 imgview::sharpen_full）
+                    crate::imgview::set_dump_dir(&crate::cache::cache_dir(&self.cfg));
                     let sharpen = crate::imgview::SharpenCfg::from_cfg(&self.cfg.image);
                     self.img.request_full(key, source, &name, sharpen);
                 }
@@ -1799,6 +1800,7 @@ impl App {
                         let s = self.compare.as_ref().unwrap();
                         let p = &s.panes[i];
                         let (source, name2) = (p.source.clone(), p.name.clone());
+                        crate::imgview::set_dump_dir(&crate::cache::cache_dir(&self.cfg));
                         let sharpen = crate::imgview::SharpenCfg::from_cfg(&self.cfg.image);
                         self.img.request_full(key, source, &name2, sharpen);
                     }
