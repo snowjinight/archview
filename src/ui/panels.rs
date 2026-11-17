@@ -12,6 +12,16 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 156, 255);
 const AMBER_DARK: egui::Color32 = egui::Color32::from_rgb(224, 172, 76);
 const AMBER_LIGHT: egui::Color32 = egui::Color32::from_rgb(146, 102, 12);
 
+/// BT.601 RGB→YUV（0~255，U/V +128 偏移），像素探针信息显示用；
+/// 亮度定义与直方图/imgview 增强链的 Y 同一系数
+fn yuv_from_rgb(rgb: [u8; 3]) -> (i32, i32, i32) {
+    let (r, g, b) = (i32::from(rgb[0]), i32::from(rgb[1]), i32::from(rgb[2]));
+    let y = (r * 299 + g * 587 + b * 114) / 1000;
+    let u = (-169 * r - 331 * g + 500 * b) / 1000 + 128;
+    let v = (500 * r - 419 * g - 81 * b) / 1000 + 128;
+    (y, u, v)
+}
+
 // ---- 帧呈现节奏探针（常驻诊断，debug 级默认静默） ----
 // PaintCallback 闭包每帧重建，跨帧状态放 thread_local（回调恒在 UI/GL 线程）。
 // 每 5s 汇总：绘制次数与间隔 avg/max、>25ms 长帧归因（render 侧/UI 侧）、
@@ -1658,6 +1668,24 @@ impl App {
             rect,
             since: std::time::Instant::now(),
         });
+        // ---- Alt+左键像素探针（原图像素值，非显示纹理插值）----
+        // 切图即清除（探针锚定 key）；base↔full 纹理切换与缩放平移不漂移
+        // （uv 归一化坐标，rect 同宽高比变化下映射不变）
+        if self.probe.as_ref().is_some_and(|p| p.key != key) {
+            self.probe = None;
+        }
+        if resp.clicked() && ui.input(Self::click_modifiers).alt {
+            if let Some(pos) = resp.interact_pointer_pos().filter(|p| rect.contains(*p)) {
+                self.probe = Some(PixelProbe {
+                    uv: (pos - rect.min) / rect.size(),
+                    key,
+                });
+            }
+        }
+        let probe = self.probe.clone().filter(|p| p.key == key);
+        if let Some(p) = probe {
+            self.paint_probe(ui, video, rect, &p);
+        }
         // ---- 模式指示徽标（媒体区右下角）：缩放态常驻倍率百分比（100% =
         // 纹素:物理像素 1:1 基准，故乘 ppp）；落回适应窗口闪现"适应窗口"
         // 约 1s（提示"再滚=翻页"）；fit 阅读态无徽标。闪现期内驱动重绘，
@@ -1690,6 +1718,15 @@ impl App {
             None => return,
         };
         let cells = grid_cells(video, n);
+        // 探针清理：锚定图已不在当前窗口（整组滑动/改栏数）即失效
+        let probe_alive = self.probe.as_ref().is_some_and(|p| {
+            self.compare
+                .as_ref()
+                .is_some_and(|s| s.panes.iter().any(|sp| sp.key == p.key))
+        });
+        if !probe_alive {
+            self.probe = None;
+        }
         let ppp = ui.ctx().pixels_per_point();
         let amber = if ui.visuals().dark_mode {
             AMBER_DARK
@@ -1741,9 +1778,15 @@ impl App {
             };
             let pr = ui.allocate_rect(*cell, egui::Sense::click_and_drag());
             let mut set_master = false;
+            let mut probe_click: Option<egui::Pos2> = None;
             let mut drag = egui::Vec2::ZERO;
             if pr.clicked() {
                 set_master = true;
+                // Alt+左键像素探针取点（原始屏幕坐标，uv 换算在栏内图像
+                // 矩形算出后做；raw 软解无 CPU 像素，探针只对图像栏生效）
+                if ui.input(Self::click_modifiers).alt {
+                    probe_click = pr.interact_pointer_pos();
+                }
             }
             if pr.dragged() {
                 drag = pr.drag_delta();
@@ -1786,10 +1829,14 @@ impl App {
                             s.master_fit = Some((native * fit, native));
                         }
                     }
-                    // full 纹理选画 + 升级触发（仅主栏，判据同单图 image_view）
+                    // full 纹理选画 + 升级触发（仅主栏，判据同单图 image_view；
+                    // 对比视图受 image_compare_full_resample_enable 开关控制，
+                    // 默认关——对比的目的是同屏看差异，base 档纹理已够用，
+                    // full 档主栏与 base 档副栏锐度不一致反而干扰判断）
                     let zoom = zoom_s.unwrap_or(fit);
                     let native_max = native.max_elem() as u32;
-                    if i == master0
+                    if self.cfg.image.image_compare_full_resample_enable
+                        && i == master0
                         && native_max <= self.cfg.image.image_max_dim
                         && zoom * ppp > self.cfg.image.image_full_threshold
                         && self.img.is_static(key)
@@ -1805,7 +1852,8 @@ impl App {
                         self.img.request_full(key, source, &name2, sharpen);
                     }
                     let screen_px = (native * zoom * ppp).max_elem();
-                    let want_full = screen_px > native_max as f32 * self.cfg.image.image_full_threshold;
+                    let want_full = self.cfg.image.image_compare_full_resample_enable
+                        && screen_px > native_max as f32 * self.cfg.image.image_full_threshold;
                     let full = if want_full { self.img.full_tex(key) } else { None };
                     let tex = full.unwrap_or(tex);
                     let tid = tex.id();
@@ -1814,6 +1862,7 @@ impl App {
                         cell,
                         &pr,
                         i,
+                        key,
                         &tid,
                         native,
                         zoom_s,
@@ -1823,6 +1872,7 @@ impl App {
                         &wheel,
                         wheel_pos,
                         &wheel_used,
+                        probe_click,
                         ppp,
                     );
                 }
@@ -1843,6 +1893,7 @@ impl App {
                                 cell,
                                 &pr,
                                 i,
+                                key,
                                 &tid,
                                 native,
                                 zoom_s,
@@ -1852,6 +1903,7 @@ impl App {
                                 &wheel,
                                 wheel_pos,
                                 &wheel_used,
+                                None,
                                 ppp,
                             );
                         }
@@ -1916,6 +1968,7 @@ impl App {
         cell: &egui::Rect,
         pr: &egui::Response,
         i: usize,
+        key: ImgKey,
         tex_id: &egui::TextureId,
         native: egui::Vec2,
         zoom_in: Option<f32>,
@@ -1925,6 +1978,7 @@ impl App {
         wheel: &f32,
         wheel_pos: Option<egui::Pos2>,
         wheel_used: &std::cell::Cell<bool>,
+        probe_click: Option<egui::Pos2>,
         ppp: f32,
     ) {
         let fit = fit_scale(*cell, native);
@@ -1987,6 +2041,24 @@ impl App {
             egui::Color32::WHITE,
         );
         ui.painter_at(*cell).add(egui::Shape::mesh(mesh));
+        // ---- Alt+左键像素探针（单图/对比共用）：取点 + 绘制 ----
+        // uv 归一化坐标在栏内图像矩形上换算（raw 栏 probe_click 恒 None）
+        if let Some(pos) = probe_click.filter(|_| raw.width() > 0.0 && raw.height() > 0.0) {
+            self.probe = Some(PixelProbe {
+                uv: (pos - raw.min) / raw.size(),
+                key,
+            });
+        }
+        // 绘制条件：本栏是发起栏（原图未保留也显示"原图未保留"），或与本栏
+        // 原图分辨率相同（跨栏同步语义——同分辨率下同一 uv 即同一像素坐标）
+        let probe = self.probe.clone().filter(|p| {
+            p.key == key
+                || (self.img.native_size(p.key).is_some()
+                    && self.img.native_size(p.key) == self.img.native_size(key))
+        });
+        if let Some(p) = probe {
+            self.paint_probe(ui, *cell, raw, &p);
+        }
     }
 
     /// 对比栏等待/占位绘制：栏内居中一行弱化文案（解码中/解码失败/错误）
@@ -2017,6 +2089,62 @@ impl App {
             galley,
             egui::Color32::WHITE,
         );
+    }
+
+    /// 像素探针绘制（单图媒体区 / 对比栏共用）：十字标记 + 悬浮信息文字。
+    /// 像素值取自原图缓存（`ImageService::original_pixel`，非显示纹理插值）；
+    /// 文字全透明背景，颜色按取样像素亮度自动黑白（偏黑白字/偏白黑字），
+    /// 叠反色 1px 阴影兜底（悬浮点附近背景可能与取样点亮度不同）。锚定点
+    /// 右下偏移 12px，超界折回左/上。clip = 裁剪区（媒体区或栏）
+    fn paint_probe(&self, ui: &egui::Ui, clip: egui::Rect, rect: egui::Rect, probe: &PixelProbe) {
+        let pos = rect.min + probe.uv * rect.size();
+        let painter = ui.painter_at(clip);
+        // 十字标记：圆圈 + 四段短线（不遮取样点中心）
+        let stroke = egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.9));
+        painter.circle_stroke(pos, 6.0, stroke);
+        painter.line_segment([pos - egui::vec2(11.0, 0.0), pos - egui::vec2(6.0, 0.0)], stroke);
+        painter.line_segment([pos + egui::vec2(6.0, 0.0), pos + egui::vec2(11.0, 0.0)], stroke);
+        painter.line_segment([pos - egui::vec2(0.0, 11.0), pos - egui::vec2(0.0, 6.0)], stroke);
+        painter.line_segment([pos + egui::vec2(0.0, 6.0), pos + egui::vec2(0.0, 11.0)], stroke);
+        // 信息文字：原图像素坐标 + RGB + YUV（BT.601）；原图未保留（动图/
+        // 超大图/已逐出）只提示不显示数值
+        let (text, dark_bg) = match self.img.original_pixel(probe.key, probe.uv) {
+            Some(((x, y), rgb)) => {
+                let (ty, tu, tv) = yuv_from_rgb(rgb);
+                (
+                    format!("x={x} y={y}  RGB({},{},{})  YUV({ty},{tu},{tv})", rgb[0], rgb[1], rgb[2]),
+                    // 取样像素亮度 ≥128 → 背景偏白用黑字
+                    u32::from(rgb[0]) * 299 + u32::from(rgb[1]) * 587 + u32::from(rgb[2]) * 114
+                        >= 128_000,
+                )
+            }
+            None => ("原图未保留".to_string(), false),
+        };
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let color = if dark_bg {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        };
+        let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+        let shadow = painter.layout_no_wrap(
+            text,
+            font,
+            if dark_bg {
+                egui::Color32::WHITE.gamma_multiply(0.5)
+            } else {
+                egui::Color32::BLACK.gamma_multiply(0.5)
+            },
+        );
+        let mut anchor = pos + egui::vec2(14.0, 14.0);
+        if anchor.x + galley.size().x > clip.right() {
+            anchor.x = (pos.x - 14.0 - galley.size().x).max(clip.left() + 2.0);
+        }
+        if anchor.y + galley.size().y > clip.bottom() {
+            anchor.y = (pos.y - 14.0 - galley.size().y).max(clip.top() + 2.0);
+        }
+        painter.galley(anchor + egui::vec2(1.0, 1.0), shadow, color);
+        painter.galley(anchor, galley, color);
     }
 
     /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。

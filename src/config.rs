@@ -612,15 +612,34 @@ pub struct ImageConfig {
     /// zscale antiring 同思路）。与 shoot 白边抑制互补：shoot 治放大前
     /// unsharp 白边，这个治放大时 Lanczos 振铃。仅高清放大档生效
     pub image_full_antiring: bool,
-    /// debug：dump shoot 边缘图（默认关）。开启后每次高清档解码把
+    /// 对比视图 full 重采样使能（默认关）：多图对比下主栏深放大是否
+    /// 解码 ×ppp×3 高密度纹理。对比的目的是"同屏看差异"，base 档纹理
+    /// （×ppp 预放大）已够用，full 档主栏与 base 档副栏锐度不一致反而
+    /// 干扰判断，且逐次主栏切换触发的 full 解码是纯性能开销——故默认关，
+    /// 单图模式不受此键影响（恒允许升级）
+    pub image_compare_full_resample_enable: bool,
+    /// debug：锐化算法 dump shoot 边缘图（默认关）。开启后每次高清档解码把
     /// shoot_v（多尺度方差强边标记 0~255）直出灰度 bmp 到缓存目录
-    /// debug/shoot_dump.bmp（固定名覆盖）：白 = 强边（白边抑制生效区）、
-    /// 黑 = 细纹理。用于肉眼验证边缘检测是否正确
-    pub image_full_dump_shoot: bool,
-    /// debug：dump 白边抑制曲线查表（默认关）。开启后把实际使用的
-    /// shoot_v→ratio 插值结果写缓存目录 debug/curve_dump.txt（256 行，
-    /// 固定名覆盖）：用于验证配置折点的分段线性插值是否正确生效
-    pub image_full_dump_curve: bool,
+    /// debug/sharpen_shoot_dump.bmp（固定名覆盖）：白 = 强边（白边抑制
+    /// 生效区）、黑 = 细纹理。用于肉眼验证边缘检测是否正确
+    pub image_full_sharpen_dump_shoot: bool,
+    /// debug：锐化算法 dump 白边抑制曲线查表（默认关）。开启后把实际使用
+    /// 的 shoot_v→ratio 插值结果写缓存目录 debug/sharpen_curve_dump.txt
+    /// （256 行，固定名覆盖）：用于验证配置折点的分段线性插值是否正确生效
+    pub image_full_sharpen_dump_curve: bool,
+    /// debug：锐化算法 dump 前后 Y 通道（默认关）。锐化为 Y 通道单通道
+    /// unsharp（色度不锐化），开启后把锐化输入 Y（降噪后）与锐化输出 Y
+    /// 各存一张 8bit 灰度 bmp（debug/sharpen_y_before.bmp、
+    /// debug/sharpen_y_after.bmp，固定名覆盖）：用于逐点核对锐化在亮度上
+    /// 做了什么
+    pub image_full_sharpen_dump_y: bool,
+    /// debug：锐化算法 dump shoot 白边抑制前后的增强量（默认关）。开启后
+    /// 把"未抑制增强量"（amount×d）与"抑制后增强量"（amount×d×ratio）各
+    /// 存一张 8bit 灰度 bmp（debug/sharpen_delta_before.bmp、
+    /// debug/sharpen_delta_after.bmp，固定名覆盖）：差异值有正有负，**整体
+    /// +128 偏移**（128 = 零点增强），两图相减即白边抑制实际削掉的量，
+    /// 用于核对抑制效果是否对准 halo
+    pub image_full_sharpen_dump_enhance: bool,
 }
 
 impl Default for ImageConfig {
@@ -640,8 +659,11 @@ impl Default for ImageConfig {
             image_full_guided_strength: 5.0,
             image_full_guided_radius: 1,
             image_full_antiring: true,
-            image_full_dump_shoot: false,
-            image_full_dump_curve: false,
+            image_compare_full_resample_enable: false,
+            image_full_sharpen_dump_shoot: false,
+            image_full_sharpen_dump_curve: false,
+            image_full_sharpen_dump_y: false,
+            image_full_sharpen_dump_enhance: false,
         }
     }
 }
@@ -1206,19 +1228,39 @@ image_full_guided_radius = 1
 # Lanczos 振铃。仅高清放大档生效；强边显"肉"或怀疑压细节时可关掉对比
 image_full_antiring = true
 
+# 对比视图 full 重采样使能（默认关）：多图对比下主栏深放大是否解码
+# ×ppp×3 高密度纹理。对比的目的是"同屏看差异"，base 档纹理已够用，
+# full 档主栏与 base 档副栏锐度不一致反而干扰判断，主栏切换还逐次触发
+# full 解码——默认关。单图模式不受此键影响（恒允许升级）
+image_compare_full_resample_enable = false
+
 # ============ debug dump（默认关，debug 完关掉）============
 # dump 文件落盘在缓存目录（[cache].cache_dir，"auto" = 系统临时目录下的
 # archview_cache）的 debug/ 子目录，固定文件名覆盖。开启后每次高清档解码
-# 都写一次（bmp 为原图分辨率灰度图，几 MB 级），调试完请关闭。
+# 都写一次（bmp 为原图分辨率 8bit 灰度图，几 MB 级），调试完请关闭。
+# 全部为锐化算法调试用途（sharpen 前缀）。
 
-# dump shoot 边缘图：shoot_v（多尺度方差强边标记）直出灰度 bmp
-# （debug/shoot_dump.bmp）——白 = 强边（白边抑制生效区），黑 = 细纹理
-# （锐度全额保留区）。用于验证边缘检测是否正确
-image_full_dump_shoot = false
+# 锐化 dump shoot 边缘图：shoot_v（多尺度方差强边标记）直出灰度 bmp
+# （debug/sharpen_shoot_dump.bmp）——白 = 强边（白边抑制生效区），黑 =
+# 细纹理（锐度全额保留区）。用于验证边缘检测是否正确
+image_full_sharpen_dump_shoot = false
 
-# dump 白边抑制曲线查表：实际使用的 shoot_v→ratio 插值结果 256 行
-# （debug/curve_dump.txt）——用于验证配置折点的分段线性插值是否正确生效
-image_full_dump_curve = false
+# 锐化 dump 白边抑制曲线查表：实际使用的 shoot_v→ratio 插值结果 256 行
+# （debug/sharpen_curve_dump.txt）——用于验证配置折点的分段线性插值是否
+# 正确生效
+image_full_sharpen_dump_curve = false
+
+# 锐化 dump 前后 Y 通道：锐化输入 Y（降噪后）与锐化输出 Y 各存一张灰度
+# bmp（debug/sharpen_y_before.bmp、debug/sharpen_y_after.bmp）——逐点
+# 核对锐化在亮度上做了什么
+image_full_sharpen_dump_y = false
+
+# 锐化 dump shoot 白边抑制前后的增强量（差异值）：before = amount×d
+# （未抑制），after = amount×d×ratio（抑制后），各存一张灰度 bmp
+# （debug/sharpen_delta_before.bmp、debug/sharpen_delta_after.bmp）——
+# 差异值有正有负，整体 +128 偏移（128 = 零点增强）；两图相减即白边抑制
+# 实际削掉的量
+image_full_sharpen_dump_enhance = false
 
 # ============ 解压预取 ============
 [extract]

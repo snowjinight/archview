@@ -260,6 +260,16 @@ struct HoldImg {
     since: std::time::Instant,
 }
 
+/// Alt+左键像素探针状态（单图/对比共用）：uv = 归一化图像坐标（0..1，
+/// 相对全图左上角）——base/full 纹理切换与缩放平移都不会让探针漂移，
+/// 显示时按各栏原图尺寸换算回像素；key = 探针锚定的图（内容切换即清除）。
+/// 像素值取自 ImageService 原图 LRU（original_pixel），非显示纹理插值
+#[derive(Clone, Copy)]
+struct PixelProbe {
+    uv: egui::Vec2,
+    key: ImgKey,
+}
+
 pub struct App {
     cfg: Config,
     archive: Option<ArchiveState>,
@@ -297,6 +307,10 @@ pub struct App {
     // 非 solid 图片切换防闪：下一张解码期间原样重画上一张（快照见 HoldImg），
     // 超过 2s 仍未就绪才退回占位提示（避免无限解压时用户毫无感知）
     hold_img: Option<HoldImg>,
+    // Alt+左键像素探针（单图/对比共用，见 panels::PixelProbe）：单图与
+    // 对比栏各自绘制十字标记+悬浮信息；切图（key 变化）/进入对比/退出
+    // 对比时清除
+    probe: Option<PixelProbe>,
     // 当前图片的解码源 (key, source, 文件名)：放大到原尺寸附近时用同一源
     // 按需解码不降采样的原图纹理；切视频/回退 mpv 时清空
     img_source: Option<(ImgKey, ImageSource, String)>,
@@ -442,6 +456,7 @@ impl App {
             img_fit_flash: None,
             img_pick_full: None,
             hold_img: None,
+            probe: None,
             img_source: None,
             dragging: false,
             drag_pos: 0.0,
@@ -512,6 +527,7 @@ impl App {
             img_fit_flash: None,
             img_pick_full: None,
             hold_img: None,
+            probe: None,
             img_source: None,
             dragging: false,
             drag_pos: 0.0,

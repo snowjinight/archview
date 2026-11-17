@@ -388,6 +388,7 @@ impl App {
         self.dragging = false;
         self.error = None;
         self.notice = None;
+        self.probe = None; // 探针锚定单图模式内容，进对比即失效
         tracing::info!("进入对比视图: {} 栏", panes.len());
         self.compare = Some(CompareSession {
             domain,

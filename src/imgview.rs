@@ -29,7 +29,7 @@
 
 use crate::vfs::{ArchiveVFS, VirtualEntry};
 use egui::TextureOptions;
-use image::AnimationDecoder;
+use image::{AnimationDecoder, GenericImageView};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Seek};
 use std::path::PathBuf;
@@ -209,7 +209,7 @@ enum ImgMsg {
     },
 }
 
-/// LRU 缓存条目：逐帧纹理 + 播放状态（静态图 = 单帧无时钟）
+/// tex-lru 缓存条目：逐帧纹理 + 播放状态（静态图 = 单帧无时钟）
 struct Cached {
     /// 帧纹理（静态图长度 1；动图长度 = 帧数）
     frames: Vec<egui::TextureHandle>,
@@ -230,7 +230,12 @@ pub struct ImageService {
     /// 解码中集合：发起时刻 → 看门狗超时判定。防重复 spawn 同一条目
     /// （请求 → 线程 → Ready/Failed 才移除）
     pending: HashMap<ImgKey, Instant>,
-    /// LRU 纹理缓存（front = 最近使用；back = 最久未用，逐出候选）
+    /// **tex-lru**：GPU 纹理缓存 LRU（front = 最近使用；back = 最久未用，
+    /// 逐出候选）。全图的翻页缓存——条目内容 = base 档显示纹理（GPU 显存
+    /// TextureHandle）：小图 = native×ppp 预放大、大图 = native 直出、
+    /// 超大图（>8192）= 降采样缩略；±1 邻居预解码结果也进这里。容量 =
+    /// image_cache_count（默认 3）。解码线程产出的 CPU 像素在此上传 GPU
+    /// 后即丢弃，CPU 侧不驻留 ×ppp 中间产物
     cache: VecDeque<(ImgKey, Cached)>,
     cap: usize,
     /// 最近一次成功显示的条目：逐出保护。滚轮连翻时每跳 ±1 预取的推入
@@ -240,20 +245,26 @@ pub struct ImageService {
     /// 对比模式显示集合：多栏同时显示时全部受逐出保护（预取洪水不挤掉
     /// 任何一栏）；单图模式恒空，与 shown 互不干扰
     shown_multi: Vec<ImgKey>,
-    /// 原图纹理单槽：大图放大到 1:1 附近时按需解码不降采样版本无缝换画。
-    /// 单槽不进 LRU——原图显存大（12288 最长边 + 100MP 预算，峰值
-    /// ~400MB），只随当前显示条目存续
+    /// **full-slot**：GPU full 高清纹理单槽（非 LRU）：大图放大到 1:1 附近
+    /// 时按需解码不降采样版本无缝换画。单槽不进 LRU——原图显存大（12288
+    /// 最长边 + 100MP 预算，峰值 ~400MB），只随当前显示条目存续
     /// （frame() 切条目即弃）
     full: Option<(ImgKey, egui::TextureHandle)>,
     /// 原图解码中（key + 发起时刻，后者供看门狗超时判定）
     full_pending: Option<(ImgKey, Instant)>,
     /// 原图解码放弃标记（失败/超时/动图）：防止每帧重触发无限重解
     full_failed: Option<ImgKey>,
-    /// 原图单槽缓存（base worker 顺手留存，仅静态且具备 full 资格的图）：
-    /// full 升级复用免二次解码（2K 图省 ~300ms PNG 解码）。上限 ~30MB
-    /// （native ≤ image_max_dim/ppp，正方形极端 30MB），随下一张图入槽/
-    /// full 就绪/失败自然更替
-    native: Option<(ImgKey, image::DynamicImage)>,
+    /// **orig-lru**：CPU 原图缓存 LRU（base worker 顺手留存，仅静态且具备
+    /// full 资格的图）：两个消费者——① full 升级复用免二次解码（2K 图省
+    /// ~300ms PNG 解码）；② alt+点击像素探针取**原图**像素值（显示纹理是
+    /// 插值重采样结果，取样会拿到缩放插值而非真实像素，见
+    /// [`ImageService::original_pixel`]）。容量随当前栏数自适应（tex-lru
+    /// 保护集同语义：当前栏数 + 2，单图 3、对比 n 栏 n+2），单张 ≤30MB
+    /// （native ≤ image_max_dim/ppp，正方形极端），封顶逐出最旧，随翻页
+    /// 自然更替。注：**不与 tex-lru 重复**——native 只在 native×ppp ≤
+    /// max_dim（即会被 ×ppp 预放大的小图）时保留，大图/超大图 base 纹理
+    /// 直出原图但 native = None
+    natives: VecDeque<(ImgKey, image::DynamicImage)>,
 }
 
 impl ImageService {
@@ -271,7 +282,7 @@ impl ImageService {
             full: None,
             full_pending: None,
             full_failed: None,
-            native: None,
+            natives: VecDeque::new(),
         }
     }
 
@@ -388,12 +399,13 @@ impl ImageService {
         let ctx = self.ctx.clone();
         let name = name.to_owned();
         self.full_pending = Some((key, Instant::now()));
-        // 原图缓存命中即取走（槽随 full 就绪/失败释放）；未命中走二次解码
-        let cached = if self.native.as_ref().is_some_and(|(k, _)| *k == key) {
-            self.native.take().map(|(_, n)| n)
-        } else {
-            None
-        };
+        // 原图缓存命中即复用（clone 一份：natives 同时服务像素探针不能
+        // take；缓冲拷贝 ~10ms 后台线程无感）；未命中走二次解码
+        let cached = self
+            .natives
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, n)| n.clone());
         let r = std::thread::Builder::new()
             .name("imgfull".into())
             .spawn(move || {
@@ -454,9 +466,21 @@ impl ImageService {
             match msg {
                 ImgMsg::Ready { key, decoded, hist, name, native } => {
                     self.pending.remove(&key);
-                    // 原图缓存：随 Ready 入槽替换旧图（None = 动图/超大图，
-                    // 清旧槽防陈图驻留）
-                    self.native = native.map(|n| (key, n));
+                    // 原图入 LRU（容量随当前栏数自适应 = 纹理缓存保护集同
+                    // 语义"栏数 + 2"，单图 3、对比 n 栏 n+2；封顶逐出最旧；
+                    // full 就绪/失败不再清空——像素探针在 full 档显示下仍需
+                    // 原图取样）
+                    if let Some(n) = native {
+                        self.natives.push_front((key, n));
+                        let cap = self
+                            .shown_multi
+                            .len()
+                            .max(if self.shown.is_some() { 1 } else { 0 })
+                            + 2;
+                        while self.natives.len() > cap {
+                            self.natives.pop_back();
+                        }
+                    }
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
                     let (frames, delays) = match decoded {
@@ -507,20 +531,42 @@ impl ImageService {
                         );
                         tracing::debug!("纹理上传[{name}] full: {}ms", t.elapsed().as_millis());
                         self.full = Some((key, tex));
-                        // 原图缓存使命完成（full 已建成），释放 ~30MB
-                        self.native = None;
+                        // 原图保留在 natives LRU（像素探针在 full 档显示下
+                        // 仍需原图取样，不再随 full 就绪释放）
                     }
                 }
                 ImgMsg::FullFailed { key } => {
                     if self.full_pending.take().is_some_and(|(k, _)| k == key) {
                         tracing::warn!("原图解码失败，保持降采样纹理: {key:?}");
                         self.full_failed = Some(key);
-                        self.native = None;
                     }
                 }
             }
         }
         out
+    }
+
+    /// 像素探针取样（alt+点击）：从原图 LRU 按归一化图像坐标 (0..1) 取
+    /// 最近像素的 RGB。显示纹理是重采样/插值结果，取样值必须来自原图；
+    /// 返回 (原图像素坐标, RGB)。原图未保留（动图/超大图/已逐出）= None
+    pub fn original_pixel(&self, key: ImgKey, uv: egui::Vec2) -> Option<((u32, u32), [u8; 3])> {
+        let (_, img) = self.natives.iter().find(|(k, _)| *k == key)?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let x = ((uv.x * w as f32) as i32).clamp(0, w as i32 - 1) as u32;
+        let y = ((uv.y * h as f32) as i32).clamp(0, h as i32 - 1) as u32;
+        let p = img.get_pixel(x, y);
+        Some(((x, y), [p[0], p[1], p[2]]))
+    }
+
+    /// 原图尺寸（像素探针跨栏同步判分辨率相等用；未保留 = None）
+    pub fn native_size(&self, key: ImgKey) -> Option<(u32, u32)> {
+        self.natives
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, img)| (img.width(), img.height()))
     }
 
     /// 当前应显示的帧（动图按 next_at 推进切帧）。返回 `(纹理, 距下次切帧)`，
@@ -1262,12 +1308,25 @@ pub struct SharpenCfg {
     /// 导向滤波窗口半径（1~8，config image_full_guided_radius，默认 1 = 3×3，
     /// 仅 Guided 生效）：越大降噪越强、弱纹理抹除也越强
     pub guided_radius: u32,
-    /// debug：dump shoot 边缘图（config image_full_dump_shoot，默认关）——
-    /// shoot_v 直出灰度 bmp 到缓存目录 debug/ 下，验证强边检测是否正确
+    /// debug：锐化 dump shoot 边缘图（config image_full_sharpen_dump_shoot，
+    /// 默认关）——shoot_v 直出灰度 bmp 到缓存目录 debug/ 下，验证强边检测
+    /// 是否正确
     pub dump_shoot: bool,
-    /// debug：dump 白边抑制曲线查表（config image_full_dump_curve，默认关）
-    /// ——256 行 shoot_v→ratio 文本到缓存目录 debug/ 下，验证折点插值生效
+    /// debug：锐化 dump 白边抑制曲线查表（config
+    /// image_full_sharpen_dump_curve，默认关）——256 行 shoot_v→ratio 文本
+    /// 到缓存目录 debug/ 下，验证折点插值生效
     pub dump_curve: bool,
+    /// debug：锐化 dump 前后 Y 通道（config image_full_sharpen_dump_y，
+    /// 默认关）——sharpen_y_before.bmp（锐化输入，降噪后）/
+    /// sharpen_y_after.bmp（锐化输出）两张 8bit 灰度 bmp，逐点核对锐化在
+    /// 亮度上做了什么
+    pub dump_y: bool,
+    /// debug：锐化 dump shoot 白边抑制前后增强量（config
+    /// image_full_sharpen_dump_enhance，默认关）——sharpen_delta_before.bmp
+    /// （未抑制增强量 amount×d）/ sharpen_delta_after.bmp（抑制后增强量
+    /// amount×d×ratio）两张 8bit 灰度 bmp，差异值有正有负**整体 +128 偏移**
+    /// （128 = 零点增强），两图相减即白边抑制实际削掉的量
+    pub dump_enhance: bool,
     /// 防振铃（config image_full_antiring，默认开）：Lanczos3 负瓣在强边
     /// 两侧产生越出源邻域值域的过冲/欠冲（Gibbs 振铃，×4.5 放大后白线/
     /// 暗线，与 unsharp 白边同向叠加——shoot 治的是放大前、这个治放大时）。
@@ -1334,8 +1393,10 @@ impl SharpenCfg {
             bilateral_strength: img.image_full_bilateral_strength,
             guided_strength: img.image_full_guided_strength,
             guided_radius: img.image_full_guided_radius,
-            dump_shoot: img.image_full_dump_shoot,
-            dump_curve: img.image_full_dump_curve,
+            dump_shoot: img.image_full_sharpen_dump_shoot,
+            dump_curve: img.image_full_sharpen_dump_curve,
+            dump_y: img.image_full_sharpen_dump_y,
+            dump_enhance: img.image_full_sharpen_dump_enhance,
             antiring: img.image_full_antiring,
         }
     }
@@ -1353,6 +1414,8 @@ impl SharpenCfg {
         guided_radius: 0,
         dump_shoot: false,
         dump_curve: false,
+        dump_y: false,
+        dump_enhance: false,
         antiring: false,
     };
 
@@ -1393,14 +1456,21 @@ fn dump_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// 高清档观感增强链（仅高清档，config image.image_full_sharpen*，默认
-/// 开+0.5+1.5）：可选降噪（算法 [`DenoiseAlgo`] 切换）→ unsharp mask——
+/// 开+0.5+1.5）：**YUV 域处理**——解码输出 RGB8 先提取 Y 平面（Rec.601，
+/// 与 shoot 方差检测同一定义），可选降噪（算法 [`DenoiseAlgo`] 切换）与
+/// unsharp 锐化都只作用于 Y；Δ = 处理后Y − 原Y 等量加回 R/G/B——YUV→RGB
+/// 是线性变换，纯 Y 变化 Δ 的逆变换恰为三通道各加 Δ（U/V 不动），数学上
+/// 等价于"YUV444 域只改 Y 再转回 RGB"，免物化 U/V 平面。收益：无彩色镶边
+/// （色度不锐化不降噪）、blur 只跑 1 通道（锐化步骤提速 ~2/3）。
 /// **放大前在原图分辨率**
 /// 执行：先把边缘坡度变陡，Lanczos 插值按比例保持陡峭过渡，观感近似
 /// "放大后锐化"而成本从放大后千万像素级（~400ms 高斯模糊）降到原图级
 /// （2K 图降噪+锐化 ~50ms，被 74MP Lanczos 主耗时掩盖）。实测锐化对深
 /// 放大观感增益明显（用户确认默认开）；噪点同步放大由前置降噪对冲。
 /// **降噪独立于锐化开关**（image_full_denoise 单独生效，锐化关不连带关
-/// 降噪）；两步分别计耗时打日志（tracing info）。
+/// 降噪）；两步分别计耗时打日志（tracing info）。行为注记：降噪变为显式
+/// Y 域——导向滤波语义不变（本来就只改亮度），双边不再顺带平滑色度
+/// （彩色噪点保留，YUV 域语义的正确行为）。
 /// 强边白晕由 **shoot 白边抑制**（[`sharpen_step`] 内 [`shoot_ratios`]，
 /// 多尺度方差 → 只压正向增强）处理，曲线为空（None）关闭。仅 RGB，alpha
 /// 直通。O(n) 后台线程执行。返回 (增强图, shoot_v 边缘掩码)——掩码供
@@ -1410,9 +1480,12 @@ fn sharpen_full(
     cfg: &SharpenCfg,
 ) -> (image::DynamicImage, Option<image::GrayImage>) {
     let mut rgba = img.to_rgba8();
+    // Y 平面：y0 = 原始亮度（Δ 基准），y = 增强链工作平面
+    let y0 = luma_plane(&rgba);
+    let mut y = y0.clone();
     // 降噪与锐化两步独立计时：相互遮掩时看日志拆分定位
-    let denoise_ms = denoise_step(&mut rgba, cfg).map(|d| d.as_millis());
-    let (sharpen_ms, shoot_mask) = sharpen_step(&mut rgba, cfg);
+    let denoise_ms = denoise_step(&mut y, cfg).map(|d| d.as_millis());
+    let (sharpen_ms, shoot_mask) = sharpen_step(&mut y, cfg);
     let sharpen_ms = sharpen_ms.map(|d| d.as_millis());
     match (denoise_ms, sharpen_ms) {
         (Some(dn), Some(sh)) => tracing::info!(
@@ -1425,27 +1498,48 @@ fn sharpen_full(
         (None, Some(sh)) => tracing::info!("观感增强耗时: 锐化 {sh}ms（降噪关）"),
         (None, None) => {}
     }
+    // Δ = 处理后Y − 原Y 等量加回 RGB（纯 Y 变化的精确逆变换，色度原样保留；
+    // 逐通道 clamp——亮度钳制与通道钳制在 ±1 舍入级内等价）
+    for (p, (yn, yo)) in rgba.pixels_mut().zip(y.pixels().zip(y0.pixels())) {
+        let delta = f32::from(yn[0]) - f32::from(yo[0]);
+        if delta != 0.0 {
+            for c in 0..3 {
+                p[c] = (f32::from(p[c]) + delta).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
     (image::DynamicImage::ImageRgba8(rgba), shoot_mask)
 }
 
-/// 降噪步骤（独立于锐化开关生效）：算法 [`DenoiseAlgo`] 切换，None = 关闭
-fn denoise_step(rgba: &mut image::RgbaImage, cfg: &SharpenCfg) -> Option<std::time::Duration> {
+/// Rec.601 亮度平面提取（u8 取整，与 [`shoot_ratios`] 积分图亮度同一定义）
+fn luma_plane(rgba: &image::RgbaImage) -> image::GrayImage {
+    image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba[(x, y)];
+        let l = (u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500)
+            / 1000;
+        image::Luma([l as u8])
+    })
+}
+
+/// 降噪步骤（独立于锐化开关生效）：算法 [`DenoiseAlgo`] 切换，作用于 Y
+/// 平面（YUV 域语义：色度不被降噪，None = 关闭）
+fn denoise_step(y: &mut image::GrayImage, cfg: &SharpenCfg) -> Option<std::time::Duration> {
     if !cfg.denoise {
         return None;
     }
     let t = std::time::Instant::now();
-    *rgba = match cfg.algo {
-        DenoiseAlgo::Bilateral => bilateral_3x3(rgba, cfg.bilateral_strength.clamp(0.1, 100.0)),
-        DenoiseAlgo::Guided => guided_denoise(rgba, cfg.guided_strength, cfg.guided_radius),
+    *y = match cfg.algo {
+        DenoiseAlgo::Bilateral => bilateral_3x3(y, cfg.bilateral_strength.clamp(0.1, 100.0)),
+        DenoiseAlgo::Guided => guided_denoise(y, cfg.guided_strength, cfg.guided_radius),
     };
     Some(t.elapsed())
 }
 
-/// 锐化步骤（unsharp + shoot 白边抑制 + debug dump）：
+/// 锐化步骤（Y 平面 unsharp + shoot 白边抑制 + debug dump）：
 /// (None, _) = 关闭；Some 掩码 = shoot_v 边缘图（防振铃定向 + debug dump
 /// 共用，need_shoot = dump_shoot || antiring 时才产出）
 fn sharpen_step(
-    rgba: &mut image::RgbaImage,
+    y: &mut image::GrayImage,
     cfg: &SharpenCfg,
 ) -> (Option<std::time::Duration>, Option<image::GrayImage>) {
     if !cfg.on {
@@ -1460,7 +1554,6 @@ fn sharpen_step(
     }
     let amount = cfg.amount.clamp(0.0, 2.0);
     let sigma = cfg.sigma.clamp(0.1, 4.0);
-    let blurred = image::imageops::blur(rgba, sigma);
     // 白边抑制（shoot，见 [`shoot_ratios`]）：逐点多尺度方差标出孤立强边
     // （halo 源），其正向增强按曲线 LUT[shoot_v] 衰减。取代旧 ±20 过冲钳制
     // ——钳差值把强边锐感一起削平（用户实测无感弃用）；ratio 只乘在 d>0
@@ -1469,38 +1562,78 @@ fn sharpen_step(
     // 定向掩码——锐化与防振铃共用同一份边缘检测结果，不重复扫描
     let need_shoot = cfg.dump_shoot || cfg.antiring;
     let (ratios, shoot_img) = match &cfg.white_edge {
-        Some(lut) => shoot_ratios(rgba, lut, need_shoot),
+        Some(lut) => shoot_ratios(y, lut, need_shoot),
         None => (Vec::new(), None),
     };
     // debug dump shoot 边缘图（shoot_v 直出灰度，白 = 强边、黑 = 细纹理）
     if let Some(g) = &shoot_img {
-        dump_shoot_bmp(g);
+        dump_gray_bmp(g, "sharpen_shoot_dump.bmp", "锐化 shoot 边缘图");
     }
-    for (i, (p, b)) in rgba.pixels_mut().zip(blurred.pixels()).enumerate() {
+    // debug dump 锐化输入 Y（降噪后）
+    if cfg.dump_y {
+        dump_gray_bmp(y, "sharpen_y_before.bmp", "锐化输入 Y");
+    }
+    let blurred = image::imageops::blur(y, sigma);
+    // debug dump 缓冲：增强量差异值（8bit 有符号 → **+128 偏移**，128 = 零点
+    // 增强）——before = amount×d（未抑制）、after = amount×d×ratio（抑制后）
+    let (w, h) = y.dimensions();
+    let n = (w * h) as usize;
+    let mut delta_before = cfg.dump_enhance.then(|| vec![0u8; n]);
+    let mut delta_after = cfg.dump_enhance.then(|| vec![0u8; n]);
+    for (i, (p, b)) in y.pixels_mut().zip(blurred.pixels()).enumerate() {
         let ratio = if ratios.is_empty() { 1.0 } else { ratios[i] };
-        for c in 0..3 {
-            let d = p[c] as f32 - b[c] as f32;
-            let e = if d > 0.0 { amount * ratio * d } else { amount * d };
-            let v = p[c] as f32 + e;
-            p[c] = v.clamp(0.0, 255.0) as u8;
+        let yv = f32::from(p[0]);
+        let d = yv - f32::from(b[0]);
+        let e = if d > 0.0 { amount * ratio * d } else { amount * d };
+        if let Some(buf) = &mut delta_before {
+            buf[i] = (amount * d + 128.0).clamp(0.0, 255.0) as u8;
         }
+        if let Some(buf) = &mut delta_after {
+            buf[i] = (e + 128.0).clamp(0.0, 255.0) as u8;
+        }
+        let v = (yv + e).clamp(0.0, 255.0);
+        p[0] = v as u8;
+    }
+    if let Some(buf) = delta_before {
+        dump_gray_bmp(
+            &gray_from(buf, w, h),
+            "sharpen_delta_before.bmp",
+            "锐化未抑制增强量",
+        );
+    }
+    if let Some(buf) = delta_after {
+        dump_gray_bmp(
+            &gray_from(buf, w, h),
+            "sharpen_delta_after.bmp",
+            "锐化抑制后增强量",
+        );
+    }
+    // debug dump 锐化输出 Y（最终增强后的亮度平面）
+    if cfg.dump_y {
+        dump_gray_bmp(y, "sharpen_y_after.bmp", "锐化输出 Y");
     }
     (Some(t.elapsed()), shoot_img)
 }
 
-/// debug dump：shoot 边缘图 bmp（缓存目录 debug/shoot_dump.bmp，固定名覆盖）
-fn dump_shoot_bmp(shoot: &image::GrayImage) {
-    let Some(path) = dump_path("shoot_dump.bmp") else { return };
-    match shoot.save(&path) {
-        Ok(()) => tracing::info!("debug dump: shoot 边缘图 {:?}", path),
-        Err(e) => tracing::warn!("debug dump shoot 失败: {e}"),
+/// 缓冲 → 灰度图（dump 辅助；缓冲尺寸与 (w,h) 自洽由调用方保证）
+fn gray_from(buf: Vec<u8>, w: u32, h: u32) -> image::GrayImage {
+    image::GrayImage::from_raw(w, h, buf).expect("缓冲与尺寸自洽")
+}
+
+/// debug dump：灰度图 bmp（缓存目录 debug/ 下固定名覆盖；失败静默 WARN，
+/// debug 功能不影响正常解码）
+fn dump_gray_bmp(img: &image::GrayImage, name: &str, desc: &str) {
+    let Some(path) = dump_path(name) else { return };
+    match img.save(&path) {
+        Ok(()) => tracing::info!("debug dump: {desc} {:?}", path),
+        Err(e) => tracing::warn!("debug dump {desc} 失败: {e}"),
     }
 }
 
-/// debug dump：白边抑制曲线查表 256 行（缓存目录 debug/curve_dump.txt，
+/// debug dump：白边抑制曲线查表 256 行（缓存目录 debug/sharpen_curve_dump.txt，
 /// shoot_v→ratio，验证折点分段线性插值生效；固定名覆盖）
 fn dump_curve_txt(lut: &[f32; 256]) {
-    let Some(path) = dump_path("curve_dump.txt") else { return };
+    let Some(path) = dump_path("sharpen_curve_dump.txt") else { return };
     let mut s = String::with_capacity(256 * 16);
     s.push_str("# 白边抑制曲线查表 dump：shoot_v -> ratio（折点分段线性插值）\n");
     for (v, r) in lut.iter().enumerate() {
@@ -1593,18 +1726,19 @@ fn build_white_edge_lut(curve: &[(f32, f32)]) -> [f32; 256] {
 /// `lut[shoot_v]`），shoot_v 越大 ratio 越小。
 ///
 /// 性能：三尺度 6 个窗口量（各尺度 sum/sumsq）全部从**同一份积分图** O(1)
-/// 查表复用——前缀和一次建图（1 趟 rgba 读 + 2 个 u64 表写），替代按尺度
+/// 查表复用——前缀和一次建图（1 趟 Y 读 + 2 个 u64 表写），替代按尺度
 /// 各跑 box_filter 的 12 趟全图扫描 + 6 次临时缓冲分配。窗口边界 clamp 到
-/// 图界，亮度 Rec.601 取整到 u8（方差检测对 ±1 亮度不敏感），u64 前缀和
-/// 精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）。`need_shoot` 时同步产出
+/// 图界，输入 = Y 平面（YUV 域增强链的亮度，u8；方差检测对 ±1 亮度不
+/// 敏感），u64 前缀和精确无损（sumsq ≤ 65025×像素数 ≪ u64 溢出）。
+/// `need_shoot` 时同步产出
 /// shoot_v 灰度图（debug dump 验证强边检测 + **防振铃边缘定向掩码**共用；
 /// 关闭时不分配零开销）
 fn shoot_ratios(
-    rgba: &image::RgbaImage,
+    y_img: &image::GrayImage,
     lut: &[f32; 256],
     need_shoot: bool,
 ) -> (Vec<f32>, Option<image::GrayImage>) {
-    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let (w, h) = (y_img.width() as usize, y_img.height() as usize);
     let stride = w + 1;
     // shoot_v 直出灰度（白 = 强边/halo 源，黑 = 细纹理）；DerefMut 直写
     // 原始字节（put_pixel 逐点边界检查在 dev 下是热路径负担）
@@ -1616,9 +1750,7 @@ fn shoot_ratios(
         let (cur, prev) = ((y + 1) * stride, y * stride);
         let (mut rs, mut rs2) = (0u64, 0u64);
         for x in 0..w {
-            let p = rgba[(x as u32, y as u32)];
-            let l = ((u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500)
-                / 1000) as u64;
+            let l = u64::from(y_img[(x as u32, y as u32)][0]);
             rs += l;
             rs2 += l * l;
             sum[cur + x + 1] = sum[prev + x + 1] + rs;
@@ -1691,48 +1823,40 @@ fn shoot_ratios(
 }
 
 /// 3×3 双边滤波（保边降噪，锐化前置）：空间权重固定 3×3 高斯 σs=1.0，
-/// 颜色权重按中心与邻点 RGB 亮度差的指数衰减——`sigma_c`（亮度级 0~100）
+/// 颜色权重按中心与邻点**亮度差的指数衰减**——`sigma_c`（亮度级 0~100）
 /// 是颜色容忍度：亮度差小于它的邻点参与平均。sigma_c 越大平均越猛，皮肤
 /// 渐变/毛孔等弱纹理也被抹掉（涂抹感）；越小只压最细噪点、弱纹理全保。
-/// 亮度差用 RGB 感知加权（Rec.601 系数），三通道共用同一权重保持色彩不
-/// 偏。中心权重恒 1.0 无除零；O(n·9) 纯 Rust，2K 图 ~30ms 后台执行
-fn bilateral_3x3(img: &image::RgbaImage, sigma_c: f32) -> image::RgbaImage {
+/// YUV 域语义：作用于 Y 平面，色度不被降噪（彩色噪点保留）。中心权重恒
+/// 1.0 无除零；O(n·9) 纯 Rust，2K 图 ~10ms 后台执行
+fn bilateral_3x3(img: &image::GrayImage, sigma_c: f32) -> image::GrayImage {
     // 3×3 高斯 σs=1.0：exp(-0.5/2σs²)=0.6065（正交）、exp(-1/2σs²)=0.3679（对角）
     const SW: [f32; 9] = [0.3679, 0.6065, 0.3679, 0.6065, 1.0, 0.6065, 0.3679, 0.6065, 0.3679];
     let (w, h) = (img.width() as i64, img.height() as i64);
     let src = img.as_raw();
-    let lum = |px: &[u8]| f32::from(px[0]) * 0.299 + f32::from(px[1]) * 0.587 + f32::from(px[2]) * 0.114;
     let mut out = Vec::with_capacity(src.len());
     for y in 0..h {
         for x in 0..w {
-            let idx = ((y * w + x) * 4) as usize;
-            let c = &src[idx..idx + 4];
-            let lc = lum(c);
-            let (mut r, mut g, mut b, mut wsum) = (0f32, 0f32, 0f32, 0f32);
+            let idx = (y * w + x) as usize;
+            let lc = f32::from(src[idx]);
+            let (mut acc, mut wsum) = (0f32, 0f32);
             let mut k = 0;
             for dy in -1i64..=1 {
                 for dx in -1i64..=1 {
                     // 边界钳位到图内（边缘邻点重复采样，简单且够用）
                     let (ny, nx) = ((y + dy).clamp(0, h - 1), (x + dx).clamp(0, w - 1));
-                    let j = ((ny * w + nx) * 4) as usize;
-                    let p = &src[j..j + 4];
-                    let d = lum(p) - lc;
+                    let j = (ny * w + nx) as usize;
+                    let d = f32::from(src[j]) - lc;
                     let wgt = SW[k]
                         * (-(d * d) / (2.0 * sigma_c * sigma_c)).exp();
-                    r += wgt * f32::from(p[0]);
-                    g += wgt * f32::from(p[1]);
-                    b += wgt * f32::from(p[2]);
+                    acc += wgt * f32::from(src[j]);
                     wsum += wgt;
                     k += 1;
                 }
             }
-            out.push((r / wsum).clamp(0.0, 255.0) as u8);
-            out.push((g / wsum).clamp(0.0, 255.0) as u8);
-            out.push((b / wsum).clamp(0.0, 255.0) as u8);
-            out.push(c[3]);
+            out.push((acc / wsum).clamp(0.0, 255.0) as u8);
         }
     }
-    image::RgbaImage::from_raw(img.width(), img.height(), out).expect("缓冲与尺寸自洽")
+    image::GrayImage::from_raw(img.width(), img.height(), out).expect("缓冲与尺寸自洽")
 }
 
 /// 导向滤波（self-guided 灰度版，保边降噪可选项）：引导图 = 自身亮度 I。
@@ -1752,18 +1876,13 @@ fn bilateral_3x3(img: &image::RgbaImage, sigma_c: f32) -> image::RgbaImage {
 /// 双边的核心增益；孤立强噪点抑制弱于双边（噪点抬高了局部方差，a 不趋零）
 /// ——噪点类型按图源 A/B 选择
 ///
-/// 输出只取平滑后的亮度校正量 Δ = q − I 加回 RGB 三通道（色度比例原样
-/// 保留，与双边"RGB 共用亮度权重"同效）。alpha 直通。边缘 clamp 重复采样
-fn guided_denoise(img: &image::RgbaImage, strength: f32, radius: u32) -> image::RgbaImage {
+/// 输出 = 平滑后的 Y（YUV 域语义：只改亮度，色度原样保留）。边缘 clamp 重复采样
+fn guided_denoise(img: &image::GrayImage, strength: f32, radius: u32) -> image::GrayImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let r = radius.clamp(1, 8) as usize;
     let eps = strength.clamp(0.1, 100.0) * strength.clamp(0.1, 100.0);
-    let src = img.as_raw();
-    // Rec.601 亮度（与 bilateral_3x3 的 lum 同系数，两链路语义对齐）
-    let lum: Vec<f32> = src
-        .chunks_exact(4)
-        .map(|p| f32::from(p[0]) * 0.299 + f32::from(p[1]) * 0.587 + f32::from(p[2]) * 0.114)
-        .collect();
+    // 输入即 Y 平面（f32 视图）
+    let lum: Vec<f32> = img.as_raw().iter().map(|v| f32::from(*v)).collect();
     let mut mean_i = box_filter(&lum, w, h, r);
     // corr = box(I·I) − mean_I² → 原地换算成 a = cov/(cov+ε)
     let sq: Vec<f32> = lum.iter().map(|v| v * v).collect();
@@ -1780,16 +1899,17 @@ fn guided_denoise(img: &image::RgbaImage, strength: f32, radius: u32) -> image::
     let mean_a = box_filter(&a, w, h, r);
     drop(a);
     let mean_b = box_filter(&mean_i, w, h, r);
-    // q = mean_a·I + mean_b → Δ = q − I 加回 RGB（逐像素，无需 q 缓冲）
-    let mut out = Vec::with_capacity(src.len());
-    for (p, i) in src.chunks_exact(4).zip(lum.iter()) {
-        let delta = mean_a[out.len() / 4] * i + mean_b[out.len() / 4] - i;
-        out.push((f32::from(p[0]) + delta).clamp(0.0, 255.0) as u8);
-        out.push((f32::from(p[1]) + delta).clamp(0.0, 255.0) as u8);
-        out.push((f32::from(p[2]) + delta).clamp(0.0, 255.0) as u8);
-        out.push(p[3]);
-    }
-    image::RgbaImage::from_raw(img.width(), img.height(), out).expect("缓冲与尺寸自洽")
+    // q = mean_a·I + mean_b → 逐像素回写 Y（无需 q 缓冲）
+    let out = img
+        .as_raw()
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let delta = mean_a[i] * lum[i] + mean_b[i] - lum[i];
+            (f32::from(*v) + delta).clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    image::GrayImage::from_raw(img.width(), img.height(), out).expect("缓冲与尺寸自洽")
 }
 
 /// 一维滑动 box 均值两段式（水平→垂直），边缘 clamp 重复采样（窗口恒
@@ -1910,6 +2030,8 @@ mod tests {
             guided_radius: 2,
             dump_shoot: false,
             dump_curve: false,
+            dump_y: false,
+            dump_enhance: false,
             antiring: false,
         }
     }
@@ -1934,7 +2056,7 @@ mod tests {
         let mut fixed = out.clone();
         // 掩码来自锐化链同一份 shoot_v 边缘检测（防振铃边缘定向的真实链路）
         let lut = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
-        let (_, mask) = shoot_ratios(&src, &lut, true);
+        let (_, mask) = shoot_ratios(&luma_plane(&src), &lut, true);
         assert!(mask.is_some(), "棋盘强边应产出掩码");
         antiring(&src, &mut fixed, &mask.unwrap());
         assert_ne!(out.as_raw(), fixed.as_raw(), "强边振铃应被 clamp 修正");
@@ -1953,7 +2075,7 @@ mod tests {
         }
         let r_out = fir_resize(image::DynamicImage::ImageRgba8(ramp.clone()), 64, 64).to_rgba8();
         let mut r_fixed = r_out.clone();
-        let (_, r_mask) = shoot_ratios(&ramp, &lut, true);
+        let (_, r_mask) = shoot_ratios(&luma_plane(&ramp), &lut, true);
         antiring(&ramp, &mut r_fixed, &r_mask.unwrap());
         // 陡渐变（16 级/px）的方差跨尺度差同样大 → shoot_v≥阈值被标记
         // （shoot 检测的是方差梯度非孤立强边）——但渐变无 unsharp 白边
@@ -1999,9 +2121,9 @@ mod tests {
     fn guided_denoise_压噪与保边() {
         // 左右平坦区叠 ±10 确定性噪点，中带为无噪强边（与两侧差 120）：
         // ε = strength² = 225 ≫ 噪点窗口方差 → 平坦区平均压噪；强边窗口
-        // 方差 ~3600 ≫ ε → a→1、q→I 原值保留
+        // 方差 ~3600 ≫ ε → a→1、q→I 原值保留（YUV 域：输入即 Y 平面）
         let (w, h) = (48, 16);
-        let mut img = image::RgbaImage::new(w, h);
+        let mut img = image::GrayImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
                 let base: i16 = if (20..28).contains(&x) { 200 } else { 80 };
@@ -2011,13 +2133,10 @@ mod tests {
                     ((x * 7 + y * 13) % 23) as i16 - 11
                 };
                 let v = (base + noise).clamp(0, 255) as u8;
-                img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+                img.put_pixel(x, y, image::Luma([v]));
             }
         }
-        let lum = |im: &image::RgbaImage, x: u32, y: u32| {
-            let p = im.get_pixel(x, y);
-            f32::from(p[0]) * 0.299 + f32::from(p[1]) * 0.587 + f32::from(p[2]) * 0.114
-        };
+        let lum = |im: &image::GrayImage, x: u32, y: u32| f32::from(im[(x, y)][0]);
         let out = guided_denoise(&img, 15.0, 2);
         // 强边竖带基本保留：导向滤波的 box(a)/box(b) 二次平滑允许边缘
         // ~几个百分点的过渡（区别于双边的权重压零硬保留），但绝不允许
@@ -2029,7 +2148,7 @@ mod tests {
             }
         }
         // 平坦区噪点能量（相对区域均值的均方差）下降 >60%
-        let noise_energy = |im: &image::RgbaImage| {
+        let noise_energy = |im: &image::GrayImage| {
             let mut sum = 0f64;
             let mut sum2 = 0f64;
             let mut n = 0u64;
