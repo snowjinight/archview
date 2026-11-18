@@ -1685,7 +1685,7 @@ impl App {
         }
         let probe = self.probe.clone().filter(|p| p.key == key);
         if let Some(p) = probe {
-            self.paint_probe(ui, video, rect, &p, &PaneKind::Image);
+            self.paint_probe(ui, video, rect, &p, p.key, &PaneKind::Image);
         }
         // ---- 模式指示徽标（媒体区右下角）：缩放态常驻倍率百分比（100% =
         // 纹素:物理像素 1:1 基准，故乘 ppp）；落回适应窗口闪现"适应窗口"
@@ -2090,7 +2090,7 @@ impl App {
                     self.rawdec.request_probe(key, &source, info, idx, p.uv);
                 }
             }
-            self.paint_probe(ui, *cell, raw, &p, kind);
+            self.paint_probe(ui, *cell, raw, &p, key, kind);
         }
     }
 
@@ -2128,6 +2128,8 @@ impl App {
     /// 像素值按栏类型取真实值：图像栏读 orig-lru（`ImageService::original_pixel`
     /// 非显示纹理插值）；raw 栏读 rawdec 按需读源的**存储原值**（未位移
     /// 未插值，帧游标/取样点变化即重取，在途显示"读取中…"）。
+    /// pane_key = **当前绘制栏**的 key——跨栏同步时各栏用同一个 uv 各取
+    /// 各的原图像素（发起栏的 probe.key 只提供 uv，不提供读数来源）。
     /// 文字全透明背景，颜色按取样亮度自动黑白，叠反色 1px 阴影兜底（悬浮
     /// 点附近背景可能与取样点亮度不同）。锚定点右下偏移 12px，超界折回
     /// 左/上。clip = 裁剪区（媒体区或栏）
@@ -2137,6 +2139,7 @@ impl App {
         clip: egui::Rect,
         rect: egui::Rect,
         probe: &PixelProbe,
+        pane_key: ImgKey,
         target: &PaneKind,
     ) {
         let pos = rect.min + probe.uv * rect.size();
@@ -2160,7 +2163,7 @@ impl App {
                 };
                 match self
                     .rawdec
-                    .probe(probe.key)
+                    .probe(pane_key)
                     .and_then(|e| e.res.as_ref().cloned())
                 {
                     Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => (
@@ -2187,7 +2190,7 @@ impl App {
                     None => ("读取中…".to_string(), false),
                 }
             }
-            _ => match self.img.original_pixel(probe.key, probe.uv) {
+            _ => match self.img.original_pixel(pane_key, probe.uv) {
                 Some(((x, y), rgb)) => {
                     let (ty, tu, tv) = yuv_from_rgb(rgb);
                     (

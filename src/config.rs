@@ -510,14 +510,16 @@ impl Default for PlayerConfig {
     }
 }
 
-/// 白边抑制默认曲线（imgview 构建查表与本 Default/模板共用，单一来源）：
-/// shoot_v < 150 几乎不抑制（细纹理不误伤），150→200 轻压，200→240 渐进，
-/// 240→255 压没
-pub const DEFAULT_WHITE_EDGE_CURVE: [(f32, f32); 4] = [
-    (150.0, 1.0),
-    (200.0, 0.7),
-    (240.0, 0.25),
-    (255.0, 0.0),
+/// 白边抑制默认曲线（imgview 构建查表与本 Default/模板共用，单一来源，
+/// 2026-11-18 用户 release 实测定版）：100 前几乎不抑制（细纹理不误伤），
+/// 100→150 轻压，150→200/200→240 渐进，240→255 收到 0.05（极强边保留
+/// 5% 锐感防钝化）
+pub const DEFAULT_WHITE_EDGE_CURVE: [(f32, f32); 5] = [
+    (100.0, 1.0),
+    (150.0, 0.9),
+    (200.0, 0.6),
+    (240.0, 0.3),
+    (255.0, 0.05),
 ];
 
 /// 图片预览管线配置（[image] 节）：纹理直显开关/缓存/尺寸档位 + 高清档
@@ -571,6 +573,20 @@ pub struct ImageConfig {
     /// 递增、y ∈ [0,1]，非法回退默认曲线并 WARN；空数组 = 关闭（连方差
     /// 计算都跳过）。末点 [255, 0.05] = 极强边保留 5% 增强不掉锐感
     pub image_full_sharpen_white_edge_curve: Vec<(f32, f32)>,
+    /// shoot 敏感度增益（config image_full_sharpen_white_edge_gain，默认
+    /// 1.0）：乘在跨尺度方差差（v7−v3、v7−v5，**方向保留不取 abs**——实测
+    /// abs 响应毛躁、点亮细结构反转差值导致结构紊乱；方向保留只响应宽边
+    /// flank，边缘带干净但偏在真边缘外侧 1~2px）上再组合 shoot_v。缓坡等
+    /// 边缘的方差差量级小、落在 0..255 低段——增益把它线性展宽到全程，
+    /// 让默认曲线拐点（150 起）对得上。1.0 = 最接近原始 shoot.c 语义；
+    /// 使用 clamp [1, 1024]
+    pub image_full_sharpen_white_edge_gain: f32,
+    /// shoot flank 带外扩半径（config image_full_sharpen_white_edge_dilate，
+    /// 0~4 默认 1，0 = 关）：方向保留的方差差响应呈"高亮带在真边缘外侧
+    /// 1~2px"（边缘正中 v3≈v7≈v5 差值收敛为低值）——max 膨胀外扩
+    /// （1 = 外扩 1px，2 = 外扩 2px）覆盖真边缘线本身。ratio、dump、防振铃
+    /// 掩码都吃外扩后的 shoot_v（所见即所得）；clamp [0, 4]
+    pub image_full_sharpen_white_edge_dilate: u32,
     /// 锐化前保边降噪（压平坦区噪点不糊边缘；默认开）
     pub image_full_denoise: bool,
     /// 降噪算法切换："guided"（导向滤波，默认——A/B 实测锯齿最弱、弱纹理
@@ -650,13 +666,15 @@ impl Default for ImageConfig {
             image_max_dim: 4096,
             image_full_threshold: 2.0,
             image_full_sharpen: true,
-            image_full_sharpen_amount: 0.5,
+            image_full_sharpen_amount: 1.0,
             image_full_sharpen_sigma: 1.5,
             image_full_sharpen_white_edge_curve: DEFAULT_WHITE_EDGE_CURVE.to_vec(),
+            image_full_sharpen_white_edge_gain: 1.0,
+            image_full_sharpen_white_edge_dilate: 1,
             image_full_denoise: true,
             image_full_denoise_algo: "guided".into(),
             image_full_bilateral_strength: 10.0,
-            image_full_guided_strength: 5.0,
+            image_full_guided_strength: 10.0,
             image_full_guided_radius: 1,
             image_full_antiring: true,
             image_compare_full_resample_enable: false,
@@ -1143,13 +1161,13 @@ image_full_sharpen = true
 #
 # 场景参数参考（strength/radius 为导向算法；amount 随降噪强度联动——
 # 降噪留的高频多可锐猛些，降噪猛则锐化收敛，避免锐化把涂抹痕迹放大）：
-#   室内人像（默认）        strength 5    radius 1   amount 0.5
+#   室内人像（默认）        strength 10   radius 1   amount 1.0
 #   暗光/高ISO（夜景弱光）  strength 15~25  radius 1~2  amount 0.4~0.45
 #   风景/建筑（白天低ISO）  strength 3 或降噪关  radius 1  amount 0.5
 #   漫画/线稿/截图          降噪关（image_full_denoise = false）  amount 0.3~0.4
 #   JPEG 重压缩网络图       strength 8~10  radius 2  amount 0.3~0.35
 #   胶片扫描/老照片颗粒     strength 20~30  radius 2  amount 0.3~0.4
-image_full_sharpen_amount = 0.5
+image_full_sharpen_amount = 1
 
 # unsharp 半径 σ 像素（0.1~4）：blur_σ 在 σ 尺度上做加权平均，σ 越大平均
 # 范围越大——细高频（噪点、细纹理）模糊后剩得越少，差值项里占比越低、
@@ -1168,12 +1186,27 @@ image_full_sharpen_sigma = 1.5
 # 方差相近 shoot_v≈0。正向增强乘 ratio（只压亮侧 d>0 白晕），暗侧压暗全额
 # 保留——取代旧 ±20 过冲钳制（钳差值连强边锐感一起削平）。
 # 曲线语义：shoot_v 小时 ratio≈1（细纹理全额保留），到拐点后渐进压制——
-# 比单斜率直线观感好（直线低段把弱边也压太多，实测弃用）。默认曲线：
-#   150 前几乎不动 → 200 降到 0.7 → 240 降到 0.25 → 255 压没；
-# 想保留极强边一点锐感可把末点改 [255, 0.05]；狠压白边改 [120,0.9],[180,0.5],
-# [220,0.15],[255,0.0]；校验 x∈(0,255] 严格递增、y∈[0,1]，非法回退默认并 WARN；
+# 比单斜率直线观感好（直线低段把弱边也压太多，实测弃用）。默认曲线（2026-
+# 11-18 用户 release 实测定版）：
+#   100 前几乎不动 → 150 降到 0.9 → 200 降到 0.6 → 240 降到 0.3 → 255 收
+#   到 0.05（极强边保留 5% 锐感防钝化）；
+# 更狠压白边改 [120,0.9],[180,0.5],[220,0.15],[255,0.0]；想完全压灭极强边把
+# 末点改 [255, 0.0]；校验 x∈(0,255] 严格递增、y∈[0,1]，非法回退默认并 WARN；
 # 空数组 [] = 关闭（连方差计算都跳过）
-image_full_sharpen_white_edge_curve = [[150.0, 1.0], [200.0, 0.7], [240.0, 0.25], [255.0, 0.0]]
+image_full_sharpen_white_edge_curve = [[100.0, 1.0], [150.0, 0.9], [200.0, 0.6], [240.0, 0.3], [255.0, 0.05]]
+
+# shoot 敏感度增益（1~1024，默认 1.0 = 最接近原始 shoot.c 语义）：乘在跨尺度
+# 方差差（v7−v3、v7−v5，方向保留不取 abs——abs 实测响应毛躁、结构紊乱已弃
+# 用）上再组合 shoot_v。缓坡等边缘的方差差量级小、落在 0..255 低段——增益
+# 把它线性展宽，让默认曲线拐点（150 起）对得上。弱边缘压不住时调大，典型
+# 2~16；过大（>64）细纹理方差差也被放大，曲线低段开始误伤——配合曲线拐点
+# 一起调
+image_full_sharpen_white_edge_gain = 1.0
+
+# shoot flank 带外扩半径（0~4，默认 1，0 = 关）：方向保留的方差差响应呈
+# "高亮带在真边缘外侧 1~2px"——max 膨胀外扩（1 = 外扩 1px，2 = 外扩 2px）
+# 覆盖真边缘线本身。dump 图显示的就是外扩后的值（所见即所得）
+image_full_sharpen_white_edge_dilate = 1
 
 # 锐化前保边降噪（压平坦区噪点不糊边缘）
 image_full_denoise = true
@@ -1204,12 +1237,12 @@ image_full_bilateral_strength = 10.0
 # 被平均压噪，方差 ≫ ε 的区域（边缘/渐变）原值保留，皮肤渐变、头发过渡带
 # 不被吸干。数值与双边 σc 同量纲，同值对比即可。影响档位（同等数值下涂抹感
 # 轻于双边——判据是整窗方差而非点到点差）：
-#   3~8 = 温和（默认 5）：只压细噪点，皮肤渐变/头发过渡带完整保留；
+#   3~8 = 温和：只压细噪点，皮肤渐变/头发过渡带完整保留；
 #   15~30 = 通用（高 ISO 重噪）：噪点幅度大，ε 提到 std 10~15 级才压得住；
 #   30~60 = 激进（胶片颗粒/老照片）：中尺度斑块也压，弱纹理明显涂抹；
 # 注意噪点本身抬高局部方差——重噪图需要更大 D 才压得住。
 # 涂抹感重 → 调小；噪点残留 → 调大
-image_full_guided_strength = 5.0
+image_full_guided_strength = 10
 
 # 导向滤波窗口半径（1~8，仅 algo = "guided" 生效）。影响档位：
 #   1（3×3）= 默认（人像实测定版）：刚好覆盖 1~2px 噪点自相关尺度，方差

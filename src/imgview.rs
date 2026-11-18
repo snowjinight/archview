@@ -1299,6 +1299,16 @@ pub struct SharpenCfg {
     /// 形状自由度零性能代价。ratio 只乘在 d>0 上（亮侧白晕），暗侧压暗
     /// 不受影响
     pub white_edge: Option<[f32; 256]>,
+    /// shoot 敏感度增益（config image_full_sharpen_white_edge_gain，默认
+    /// 1.0，clamp [1,1024]）：乘在跨尺度方差差（方向保留，不取 abs）上再
+    /// 组合 shoot_v。缓坡等边缘的方差差量级小、落在 0..255 低段——增益
+    /// 线性展宽，让曲线拐点对得上
+    pub shoot_gain: f32,
+    /// shoot flank 带外扩半径（config image_full_sharpen_white_edge_dilate，
+    /// 0~4 默认 1，0 = 关）：方向保留的方差差响应呈"高亮带在真边缘外侧
+    /// 1~2px"——max 膨胀外扩（1 = 外扩 1px）覆盖真边缘线本身；dump/ratio/
+    /// 防振铃掩码都吃外扩后值（所见即所得）
+    pub shoot_dilate: u32,
     /// 锐化前保边降噪（config image_full_denoise，默认开）：先压平坦区噪点
     /// 再 unsharp，算法由 [`DenoiseAlgo`] 切换（双边 3×3 / 导向滤波）
     pub denoise: bool,
@@ -1396,6 +1406,8 @@ impl SharpenCfg {
             amount: img.image_full_sharpen_amount,
             sigma: img.image_full_sharpen_sigma,
             white_edge,
+            shoot_gain: img.image_full_sharpen_white_edge_gain.clamp(1.0, 1024.0),
+            shoot_dilate: img.image_full_sharpen_white_edge_dilate.clamp(0, 4),
             denoise: img.image_full_denoise,
             algo,
             bilateral_strength: img.image_full_bilateral_strength,
@@ -1415,6 +1427,8 @@ impl SharpenCfg {
         amount: 0.0,
         sigma: 0.0,
         white_edge: None,
+        shoot_gain: 1.0,
+        shoot_dilate: 1,
         denoise: false,
         algo: DenoiseAlgo::Bilateral,
         bilateral_strength: 0.0,
@@ -1570,7 +1584,7 @@ fn sharpen_step(
     // 定向掩码——锐化与防振铃共用同一份边缘检测结果，不重复扫描
     let need_shoot = cfg.dump_shoot || cfg.antiring;
     let (ratios, shoot_img) = match &cfg.white_edge {
-        Some(lut) => shoot_ratios(y, lut, need_shoot),
+        Some(lut) => shoot_ratios(y, lut, cfg.shoot_gain, cfg.shoot_dilate, need_shoot),
         None => (Vec::new(), None),
     };
     // debug dump shoot 边缘图（shoot_v 直出灰度，白 = 强边、黑 = 细纹理）
@@ -1666,14 +1680,17 @@ fn window_var(sum: &[u64], sum2: &[u64], base: usize, stride: usize, k: usize, i
     q - mean * mean
 }
 
-/// shoot.c mode 0 整数组合：跨尺度方差差（可为负）转 i32 后 CLIP 0..255
-/// （对齐 shoot.c 的 uint16 差值语义——方差本身可达数千不钳，只钳差值），
-/// 组合出 shoot_v ∈ 0..255。全程无 sqrt 无除法——shoot 检测不吃精度，
-/// 整数化零观感损失
+/// shoot.c mode 0 整数组合：跨尺度方差差（**方向保留，不取 abs**——实测
+/// abs 响应毛躁、点亮细结构两侧反转差值导致结构紊乱；方向保留只响应
+/// v7>v3 的宽边 flank，边缘带干净）乘敏感度增益后转 i32 CLIP 0..255，
+/// 组合出 shoot_v ∈ 0..255。增益语义：缓坡等边缘的方差差量级小（如
+/// 4 级/px 坡 v7−v3≈53），1.0 时落在 0..255 低段够不到曲线拐点——gain
+/// 线性展宽让拐点对得上，1.0 = 最接近原始 shoot.c 语义。全程无 sqrt
+/// 无除法——shoot 检测不吃精度，整数化零观感损失
 #[inline(always)]
-fn shoot_v_of(v3: f32, v5: f32, v7: f32) -> usize {
-    let s1 = (((v7 - v3) as i32) / 2).clamp(0, 255);
-    let s2 = ((v7 - v5) as i32).clamp(0, 255);
+fn shoot_v_of(v3: f32, v5: f32, v7: f32, gain: f32) -> usize {
+    let s1 = ((((v7 - v3) * gain) as i32) / 2).clamp(0, 255);
+    let s2 = (((v7 - v5) * gain) as i32).clamp(0, 255);
     (((s1 + s2 + 1) / 2).clamp(0, 255)) as usize
 }
 
@@ -1744,13 +1761,12 @@ fn build_white_edge_lut(curve: &[(f32, f32)]) -> [f32; 256] {
 fn shoot_ratios(
     y_img: &image::GrayImage,
     lut: &[f32; 256],
+    gain: f32,
+    dilate: u32,
     need_shoot: bool,
 ) -> (Vec<f32>, Option<image::GrayImage>) {
     let (w, h) = (y_img.width() as usize, y_img.height() as usize);
     let stride = w + 1;
-    // shoot_v 直出灰度（白 = 强边/halo 源，黑 = 细纹理）；DerefMut 直写
-    // 原始字节（put_pixel 逐点边界检查在 dev 下是热路径负担）
-    let mut shoot_dump = need_shoot.then(|| image::GrayImage::new(w as u32, h as u32));
     // 亮度及其平方的前缀和积分图：(w+1)×(h+1) 首行/首列全 0，免边界分支
     let mut sum = vec![0u64; stride * (h + 1)];
     let mut sum2 = vec![0u64; stride * (h + 1)];
@@ -1765,9 +1781,9 @@ fn shoot_ratios(
             sum2[cur + x + 1] = sum2[prev + x + 1] + rs2;
         }
     }
-    // 三尺度方差 → shoot_v → 曲线查表（单趟合成，无临时方差缓冲）
+    // 三尺度方差 → shoot_v 字节图（膨胀/查表/dump 三消费者共用一份）
     let inv_n = [1.0f32 / 9.0, 1.0 / 25.0, 1.0 / 49.0];
-    let mut ratios = vec![0f32; w * h];
+    let mut sv_map = vec![0u8; w * h];
     // 内部区：k 尺度窗口 [x−k, x+k+1)×[y−k, y+k+1)，四角定址固定偏移
     // （br/tl/tr/bl），像素数倒数预算，零除法零边界分支零逐像素 if——
     // 热循环无任何分叉，与手写基准循环结构一致（实测 closure + 逐像素
@@ -1778,12 +1794,7 @@ fn shoot_ratios(
             let v3 = window_var(&sum, &sum2, base, stride, 1, inv_n[0]);
             let v5 = window_var(&sum, &sum2, base, stride, 2, inv_n[1]);
             let v7 = window_var(&sum, &sum2, base, stride, 3, inv_n[2]);
-            let sv = shoot_v_of(v3, v5, v7);
-            ratios[y * w + x] = lut[sv];
-            if let Some(g) = &mut shoot_dump {
-                let raw: &mut [u8] = g;
-                raw[y * w + x] = sv as u8;
-            }
+            sv_map[y * w + x] = shoot_v_of(v3, v5, v7, gain) as u8;
         }
     }
     // 边框窄带（3px）：窗口 clamp 到图界，通用四角查表（冷路径；四条带各
@@ -1802,12 +1813,7 @@ fn shoot_ratios(
                 * inv;
             q - mean * mean
         };
-        let sv = shoot_v_of(var(1), var(2), var(3));
-        ratios[y * w + x] = lut[sv];
-        if let Some(g) = &mut shoot_dump {
-            let raw: &mut [u8] = g;
-            raw[y * w + x] = sv as u8;
-        }
+        sv_map[y * w + x] = shoot_v_of(var(1), var(2), var(3), gain) as u8;
     };
     for y in 0..h.min(3) {
         for x in 0..w {
@@ -1827,7 +1833,50 @@ fn shoot_ratios(
             band(y, x);
         }
     }
+    // flank 带外扩：方向保留的方差差响应天然呈"高亮带在真边缘外侧 1~2px"
+    // （边缘正中 v3≈v7≈v5 差值收敛为低值）——小半径 max 膨胀把干净的
+    // flank 带向外扩（1 = 外扩 1px，2 = 外扩 2px），覆盖真边缘线本身。
+    // 0 = 关（原始逐点语义）
+    if dilate > 0 {
+        max_dilate(&mut sv_map, w, h, dilate as usize);
+    }
+    // 曲线查表（膨胀后的 sv 驱动 ratio 与 dump——dump 显示的就是实际
+    // 参与抑制的值，验证覆盖时所见即所得）
+    let mut ratios = vec![0f32; w * h];
+    for (r, &sv) in ratios.iter_mut().zip(sv_map.iter()) {
+        *r = lut[sv as usize];
+    }
+    let shoot_dump = need_shoot.then(|| {
+        let mut g = image::GrayImage::new(w as u32, h as u32);
+        let raw: &mut [u8] = &mut g;
+        raw.copy_from_slice(&sv_map);
+        g
+    });
     (ratios, shoot_dump)
+}
+
+/// 分离式最大值滤波（水平一趟 + 垂直一趟，窗口 clamp 图界）——两趟各
+/// O(n·(2r+1))，n 为像素数；r≤4 的窄窗口远优于逐像素方形扫描。把 flank
+/// 高亮带向外扩 r 像素（1 = 外扩 1px），覆盖真边缘线本身
+fn max_dilate(map: &mut [u8], w: usize, h: usize, r: usize) {
+    let mut tmp = vec![0u8; map.len()];
+    for y in 0..h {
+        let row = &map[y * w..(y + 1) * w];
+        let out = &mut tmp[y * w..(y + 1) * w];
+        for (x, o) in out.iter_mut().enumerate() {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            *o = row[lo..hi].iter().max().copied().unwrap_or(0);
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let lo = y.saturating_sub(r);
+            let hi = (y + r + 1).min(h);
+            let m = (lo..hi).map(|yy| tmp[yy * w + x]).max().unwrap_or(0);
+            map[y * w + x] = m;
+        }
+    }
 }
 
 /// 3×3 双边滤波（保边降噪，锐化前置）：空间权重固定 3×3 高斯 σs=1.0，
@@ -2031,6 +2080,8 @@ mod tests {
             amount,
             sigma: 1.0,
             white_edge: Some(build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE)),
+            shoot_gain: 1.0,
+            shoot_dilate: 1,
             denoise: false,
             algo: DenoiseAlgo::Bilateral,
             bilateral_strength: 15.0,
@@ -2064,7 +2115,7 @@ mod tests {
         let mut fixed = out.clone();
         // 掩码来自锐化链同一份 shoot_v 边缘检测（防振铃边缘定向的真实链路）
         let lut = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
-        let (_, mask) = shoot_ratios(&luma_plane(&src), &lut, true);
+        let (_, mask) = shoot_ratios(&luma_plane(&src), &lut, 1.0, 1, true);
         assert!(mask.is_some(), "棋盘强边应产出掩码");
         antiring(&src, &mut fixed, &mask.unwrap());
         assert_ne!(out.as_raw(), fixed.as_raw(), "强边振铃应被 clamp 修正");
@@ -2083,7 +2134,7 @@ mod tests {
         }
         let r_out = fir_resize(image::DynamicImage::ImageRgba8(ramp.clone()), 64, 64).to_rgba8();
         let mut r_fixed = r_out.clone();
-        let (_, r_mask) = shoot_ratios(&luma_plane(&ramp), &lut, true);
+        let (_, r_mask) = shoot_ratios(&luma_plane(&ramp), &lut, 1.0, 1, true);
         antiring(&ramp, &mut r_fixed, &r_mask.unwrap());
         // 陡渐变（16 级/px）的方差跨尺度差同样大 → shoot_v≥阈值被标记
         // （shoot 检测的是方差梯度非孤立强边）——但渐变无 unsharp 白边
@@ -2468,7 +2519,8 @@ mod tests {
         let out = sharpen_full(flat, &sharpen_on(0.6)).0.to_rgba8();
         assert!(out.pixels().all(|p| p[0] == 128));
         // 垂直阶跃：左 64 右 192（取中灰区间防 0/255 饱和掩盖效果），
-        // 边缘内侧低侧压暗、高侧提亮 = 坡度变陡
+        // 边缘内侧低侧压暗 = 坡度变陡；高侧在 flank 带抑制区内（dilate=1
+        // 合并夹缝覆盖边界），正向增强被压 = 白边抑制生效、无过冲
         let mut img = image::GrayImage::new(16, 8);
         for row in img.rows_mut() {
             for (x, p) in row.enumerate() {
@@ -2477,13 +2529,15 @@ mod tests {
         }
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         assert!(out.get_pixel(7, 4)[0] < 64, "边缘低侧应压暗");
-        assert!(out.get_pixel(8, 4)[0] > 192, "边缘高侧应提亮");
+        assert!(out.get_pixel(8, 4)[0] <= 195, "边缘高侧过冲应被压制（默认曲线末点保留 5% 锐感，残余 ≤2 级）");
     }
 
     #[test]
     fn sharpen_full_白边抑制() {
         // 垂直阶跃（128 级差）：同一边缘两侧 blur 对称、差值幅度相同——
-        // shoot 白边抑制只压正向增强（亮侧），亮侧提亮必须小于暗侧压暗
+        // shoot 白边抑制只压正向增强（亮侧），dilate=1 合并 flank 夹缝后
+        // 亮侧边界像素落在抑制区内：过冲全额压灭（白边消失），暗侧压暗
+        // （负向增强不受 ratio）保留 = 边缘对比仍增强
         let mut img = image::GrayImage::new(16, 8);
         for row in img.rows_mut() {
             for (x, p) in row.enumerate() {
@@ -2493,8 +2547,8 @@ mod tests {
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
-        assert!(hi > 0, "强边亮侧提亮全灭=锐感丢失: +{hi}");
-        assert!(hi < lo, "白边未抑制（亮侧应弱于暗侧）: +{hi}/−{lo}");
+        assert!(hi <= 2, "亮侧过冲应被压制（默认曲线末点 0.05 残余 ≤2 级）: +{hi}");
+        assert!(lo > 0, "暗侧压暗应保留（锐感来源）: −{lo}");
         // curve = []（None）关闭：恢复对称 unsharp，两侧幅度一致（±1 给取整）
         let mut img = image::GrayImage::new(16, 8);
         for row in img.rows_mut() {
@@ -2515,6 +2569,58 @@ mod tests {
         let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
         let up = i32::from(out.get_pixel(8, 8)[0]) - 128;
         assert!(up >= 3, "细纹理锐化被 shoot 误伤: +{up}");
+    }
+
+    #[test]
+    fn shoot_敏感度增益展宽缓坡() {
+        // 方向保留（不取 abs）语义：缓坡（4 级/px，v7−v3≈3.33·slope²≈53）
+        // 方差差量级小，gain=1 落在 0..255 低段够不到曲线拐点；高 gain 线性
+        // 展宽到 255（白边抑制生效区）。宽边阶跃 flank（差值大）不受增益影响
+        let mut img = image::GrayImage::new(32, 16);
+        for row in img.rows_mut() {
+            for (x, p) in row.enumerate() {
+                *p = image::Luma([64 + (4 * x as u32).min(128) as u8]);
+            }
+        }
+        let lut = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
+        let (_, lo) = shoot_ratios(&img, &lut, 1.0, 1, true);
+        let (_, hi) = shoot_ratios(&img, &lut, 16.0, 1, true);
+        let (lo, hi) = (lo.unwrap(), hi.unwrap());
+        let (lo, hi): (&[u8], &[u8]) = (&lo, &hi);
+        let (m, e) = (4 * 32 + 16, 4 * 32 + 20);
+        assert!(lo[m] < 255, "增益前缓坡方差差不应顶满: {}", lo[m]);
+        assert_eq!(hi[m], 255, "高增益应把缓坡方差差展宽到满");
+        assert_eq!(hi[e], 255, "缓坡中部全域（7×7 完整窗口内）同样展宽");
+        // 阶跃强边 flank 在 gain=1 就已拉满（增益只影响低段）
+        let mut img = image::GrayImage::new(16, 8);
+        for row in img.rows_mut() {
+            for (x, p) in row.enumerate() {
+                *p = image::Luma([if x < 8 { 64 } else { 192 }]);
+            }
+        }
+        let (_, m) = shoot_ratios(&img, &lut, 1.0, 1, true);
+        let m: &[u8] = &m.unwrap();
+        assert_eq!(m[4 * 16 + 9], 255, "宽边 flank 在低增益下即应拉满");
+        // flank 带外扩：半径 1 把边缘外侧 1~2px 的高亮带向外扩，覆盖真边缘
+        // 线本身（膨胀前边缘正中 v3≈v7 差值收敛、落在低段）；0 = 关时可见偏移
+        let (_, d0) = shoot_ratios(&img, &lut, 1.0, 0, true);
+        let (_, d1) = shoot_ratios(&img, &lut, 1.0, 1, true);
+        let (d0, d1) = (d0.unwrap(), d1.unwrap());
+        let (d0, d1): (&[u8], &[u8]) = (&d0, &d1);
+        assert!(d0[4 * 16 + 8] < 255, "外扩前边缘正中是低值（flank 偏外 1~2px）");
+        assert_eq!(d1[4 * 16 + 8], 255, "外扩后 flank 带覆盖边缘正中");
+        // 方向保留的已知取舍（用户裁定）：细于窗口的结构（2px 亮线）方差差
+        // 方向反转（v5>v3>v7），clamp 负值为 0——线上与两侧 flank 全部无响应，
+        // 靠宽边 flank 带与外扩覆盖；abs 方案实测毛躁紊乱已弃用
+        let mut img = image::GrayImage::from_pixel(16, 16, image::Luma([64]));
+        for y in 0..16u32 {
+            img.put_pixel(8, y, image::Luma([192]));
+            img.put_pixel(9, y, image::Luma([192]));
+        }
+        let (_, m) = shoot_ratios(&img, &lut, 16.0, 0, true);
+        let m: &[u8] = &m.unwrap();
+        assert_eq!(m[4 * 16 + 8], 0, "2px 细线在方向保留语义下无响应（线上）");
+        assert_eq!(m[4 * 16 + 10], 0, "2px 细线在方向保留语义下无响应（flank）");
     }
 
     #[test]
@@ -2545,6 +2651,47 @@ mod tests {
         let (lut, ok) = parse_white_edge_curve(&[(100.0, 0.8)]);
         let Some(lut) = lut else { panic!("合法曲线应为 Some") };
         assert!(ok && lut[100] == 0.8, "合法折点原样构建");
+    }
+
+    #[test]
+    fn shoot_黑方块方向对称性诊断() {
+        // 白底黑方块四条边的 shoot 响应必须旋转对称——方差与窗口定址都是
+        // 方向无关的，任何方向差异都是实现缺陷。用户在真实照片 dump 上观察
+        // 到的"上/右 255、左/下 160"类不对称来自背景侧差异（v3 吃掉方差差，
+        // 见架构 13.4），合成均匀图上不存在
+        let lut = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
+        for (name, sq) in [("黑0", 0u8), ("黑128", 128u8), ("黑192", 192u8)] {
+            let mut img = image::GrayImage::from_pixel(32, 32, image::Luma([255]));
+            for y in 11..21u32 {
+                for x in 11..21u32 {
+                    img.put_pixel(x, y, image::Luma([sq]));
+                }
+            }
+            for dilate in [0u32, 1] {
+                let (_, m) = shoot_ratios(&img, &lut, 1.0, dilate, true);
+                let raw: Vec<u8> = m.unwrap().into_raw();
+                // 旋转 90°（(x,y)→(31−y,x) 映射回同尺寸）逐点比对
+                for y in 0..32usize {
+                    for x in 0..32usize {
+                        let rotated = raw[x * 32 + (31 - y)];
+                        assert_eq!(
+                            raw[y * 32 + x],
+                            rotated,
+                            "{name} dilate={dilate} ({x},{y}) 旋转后不一致"
+                        );
+                    }
+                }
+                if dilate == 0 {
+                    println!("== {name} 方块 sv 网格（7..25）==");
+                    for y in 7..25usize {
+                        let row: String = (7..25usize)
+                            .map(|x| format!("{:4}", raw[y * 32 + x]))
+                            .collect();
+                        println!("{row}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
