@@ -827,6 +827,9 @@ impl App {
         // 0 = 主栏 100%：共享 zoom 是相对各栏 fit 的倍率，无单一 100%
         // 语义——按方案 A 主栏锚定原则换算（compare_view 每帧记录主栏 fit）
         let mut z100 = false;
+        // Ctrl+H = 直方图开关（通用键补位）：与单图模式共用同一开关状态，
+        // 每栏各画缩小版覆盖层（图片栏读 LRU、raw 栏读软解帧顺手算的直方图）
+        let mut hist_toggle = false;
         ctx.input_mut(|i| {
             i.events.retain(|e| {
                 let egui::Event::Key {
@@ -839,6 +842,11 @@ impl App {
                 else {
                     return true;
                 };
+                // Ctrl+H 先于"带修饰键放行"判定（否则被当编辑类组合键漏掉）
+                if modifiers.ctrl && !modifiers.shift && !modifiers.alt && *key == egui::Key::H {
+                    hist_toggle = true;
+                    return false;
+                }
                 if !modifiers.is_none() {
                     return true;
                 }
@@ -988,6 +996,11 @@ impl App {
         }
         if ask_next {
             self.ask_next_archive(false);
+        }
+        // Ctrl+H：直方图开关只翻状态（覆盖层绘制时按栏取数，未就绪静默）；
+        // 与单图模式共用 histogram_on，退出对比后单图覆盖层跟随同一开关
+        if hist_toggle {
+            self.histogram_on = !self.histogram_on;
         }
         if exit {
             if self.fullscreen {

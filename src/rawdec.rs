@@ -501,12 +501,15 @@ pub(crate) fn raw_frame_info(rl: &RawLoad, size: u64) -> Result<RawFrameInfo, St
 pub(crate) struct RawFrameTex {
     pub(crate) idx: usize,
     pub(crate) tex: egui::TextureHandle,
+    /// 本帧直方图（软解线程顺手算，与纹理同源同帧）：对比模式 Ctrl+H
+    /// 直方图覆盖层用，显示帧与直方图永远一致（保留旧帧时直方图同旧）
+    pub(crate) hist: Histogram,
 }
 
 struct RawFrameDone {
     key: ImgKey,
     idx: usize,
-    res: Result<(egui::ColorImage, [u32; 2]), String>,
+    res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
 }
 
 /// raw 探针读数（三种内建格式各自的"真实值"，全部为**文件存储原值**——
@@ -601,7 +604,12 @@ impl RawFrameService {
             .name("rawdec".into())
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_raw_frame(&source, &info, fi)
+                    // 直方图顺手算（O(像素)，被解码耗时掩盖；与 imgview 解码
+                    // worker 同款先例）：对比模式 Ctrl+H 直方图与显示帧同源
+                    decode_raw_frame(&source, &info, fi).map(|(img, native)| {
+                        let hist = Histogram::compute(&img);
+                        (img, native, hist)
+                    })
                 }))
                 .map_err(|_| "raw 帧解码线程 panic".to_string())
                 .and_then(|r| r);
@@ -659,13 +667,14 @@ impl RawFrameService {
                 RawMsg::Frame(m) => {
                     self.pending.remove(&(m.key, m.idx));
                     match m.res {
-                        Ok((img, _native)) => {
+                        Ok((img, _native, hist)) => {
                             let tex = self.ctx.load_texture(
                                 format!("raw-{}-{}-f{}", m.key.0, m.key.1, m.idx),
                                 img,
                                 egui::TextureOptions::LINEAR,
                             );
-                            self.frames.insert(m.key, RawFrameTex { idx: m.idx, tex });
+                            self.frames
+                                .insert(m.key, RawFrameTex { idx: m.idx, tex, hist });
                         }
                         Err(e) => {
                             tracing::warn!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);

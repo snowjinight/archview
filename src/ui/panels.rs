@@ -187,6 +187,7 @@ impl App {
                             ("Ctrl + 滚轮", "缩放（任何时候）"),
                             ("+ / - / ↑ / ↓", "放大 / 缩小"),
                             ("Ctrl + H", "直方图 开 / 关"),
+                            ("Alt + 左键", "取点查看像素值（坐标与颜色）"),
                             ("0", "按原始尺寸显示"),
                             ("Home", "适应窗口"),
                             ("鼠标拖拽", "移动放大的图片"),
@@ -1371,7 +1372,7 @@ impl App {
         if let Some(key) = self.tex_image_key() {
             // 标准图片：直方图随解码就绪（动图 = 首帧）
             match self.img.histogram(key) {
-                Some(h) => draw_histogram(ui, area, h, "直方图"),
+                Some(h) => draw_histogram(ui, area, hist_rect_single(area), h, "直方图"),
                 None => {
                     let text = if self.img.is_pending(key) {
                         "直方图：解码中…"
@@ -1395,7 +1396,9 @@ impl App {
             self.hist_raw.request(key, &source, &name, size, &self.cfg);
             match self.hist_raw.histogram(key) {
                 None => paint_hist_status(ui, area, "直方图：软解中…"),
-                Some(Ok(h)) => draw_histogram(ui, area, h, "直方图（raw f0）"),
+                Some(Ok(h)) => {
+                    draw_histogram(ui, area, hist_rect_single(area), h, "直方图（raw f0）")
+                }
                 Some(Err(msg)) => paint_hist_status(ui, area, &format!("直方图：{msg}")),
             }
         }
@@ -1875,6 +1878,7 @@ impl App {
                         &wheel_used,
                         probe_click,
                         ppp,
+                        video.width(),
                         &kind,
                     );
                 }
@@ -1907,6 +1911,7 @@ impl App {
                                 &wheel_used,
                                 probe_click,
                                 ppp,
+                                video.width(),
                                 &kind,
                             );
                         }
@@ -1983,6 +1988,7 @@ impl App {
         wheel_used: &std::cell::Cell<bool>,
         probe_click: Option<egui::Pos2>,
         ppp: f32,
+        media_w: f32,
         kind: &PaneKind,
     ) {
         let fit = fit_scale(*cell, native);
@@ -2045,6 +2051,32 @@ impl App {
             egui::Color32::WHITE,
         );
         ui.painter_at(*cell).add(egui::Shape::mesh(mesh));
+        // ---- 直方图覆盖层（Ctrl+H，与单图模式共用开关）：每栏各画缩小版 ----
+        // 尺寸按 栏宽/媒体区宽 比例缩放——直方图占所在区域的显示比例与单图
+        // 模式一致（单图 320/媒体宽），2~6 栏自然逐级缩小、6 栏最小；下限
+        // 64px 防小窗下完全不可读。未就绪静默跳过（多栏不堆状态文案）
+        if self.histogram_on {
+            let hw = (cell.width() * 320.0 / media_w).clamp(64.0, 320.0);
+            let hh = hw * (150.0 / 320.0);
+            let rect = egui::Rect::from_min_size(
+                cell.left_bottom() + egui::vec2(6.0, -(hh + 6.0)),
+                egui::vec2(hw, hh),
+            );
+            match kind {
+                PaneKind::Image => {
+                    if let Some(h) = self.img.histogram(key) {
+                        draw_histogram(ui, *cell, rect, h, "直方图");
+                    }
+                }
+                PaneKind::Raw(_) => {
+                    // 与显示纹理同源同帧（保留旧帧期间直方图同旧，无错位）
+                    if let Some(t) = self.rawdec.frame(key) {
+                        draw_histogram(ui, *cell, rect, &t.hist, "直方图");
+                    }
+                }
+                _ => {}
+            }
+        }
         // ---- Alt+左键像素探针（单图/对比共用）：取点 + 绘制 ----
         // uv 归一化坐标在栏内图像矩形上换算；图像栏读 orig-lru，raw 栏走
         // rawdec 按需读源解析（rawprobe 线程，读存储原值不做转换）
@@ -2643,17 +2675,30 @@ fn paint_hist_status(ui: &egui::Ui, area: egui::Rect, text: &str) {
     painter.galley(rect.left_top(), galley, egui::Color32::GRAY);
 }
 
-/// 直方图覆盖层绘制：左下角半透明底板 + 亮度填充 + RGB 折线。
-/// 归一化用四通道全局最大 bin（各通道相对幅度可比）；
-/// 空图（max=0）由 Histogram::max_bin 兜底为 1
-fn draw_histogram(ui: &egui::Ui, area: egui::Rect, h: &crate::imgview::Histogram, title: &str) {
+/// 单图模式直方图覆盖层矩形：媒体区左下角固定 320×150 + 8px 边距
+/// （对比模式不用此函数——按栏宽比例算，见 draw_pane_and_interact）
+fn hist_rect_single(area: egui::Rect) -> egui::Rect {
     const W: f32 = 320.0;
     const H: f32 = 150.0;
     const MARGIN: f32 = 8.0;
-    let rect = egui::Rect::from_min_size(
+    egui::Rect::from_min_size(
         area.left_bottom() + egui::vec2(MARGIN, -(H + MARGIN)),
         egui::vec2(W, H),
-    );
+    )
+}
+
+/// 直方图覆盖层绘制：左下角半透明底板 + 亮度填充 + RGB 折线。
+/// 归一化用四通道全局最大 bin（各通道相对幅度可比）；
+/// 空图（max=0）由 Histogram::max_bin 兜底为 1。
+/// area = 裁剪区（单图媒体区 / 对比栏），rect = 覆盖层矩形（调用方按
+/// 场景算尺寸：单图固定 320×150，对比栏按栏宽比例缩小，见 compare 侧）
+fn draw_histogram(
+    ui: &egui::Ui,
+    area: egui::Rect,
+    rect: egui::Rect,
+    h: &crate::imgview::Histogram,
+    title: &str,
+) {
     let painter = ui.painter_at(area);
     painter.rect_filled(rect, 6.0, egui::Color32::from_black_alpha(180));
     // 标题行
