@@ -35,8 +35,11 @@ mkdir "%ARCHVIEW_DIST%"
 copy /y target\release\archview.exe "%ARCHVIEW_DIST%\" >nul
 if errorlevel 1 goto :fail
 
-rem SendTo shortcut setup script: runs from exe's own folder (auto-detects exe)
-copy /y sendto_setup.bat "%ARCHVIEW_DIST%\" >nul
+rem Setup scripts (SendTo shortcuts + per-user file associations):
+rem runs from exe's own folder (auto-detects exe); uninstall.bat reverts both
+copy /y install.bat "%ARCHVIEW_DIST%\" >nul
+if errorlevel 1 goto :fail
+copy /y uninstall.bat "%ARCHVIEW_DIST%\" >nul
 if errorlevel 1 goto :fail
 
 if /i "%ARCHVIEW_MPV%"=="no-mpv" (

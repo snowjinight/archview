@@ -29,20 +29,32 @@
 
 ### 快速上手（直接运行）
 
-1. 解压发布包（archview.exe + libmpv-2.dll + config.toml），双击 `archview.exe`。
+1. 解压发布包（archview.exe + libmpv-2.dll + config.toml + install.bat + uninstall.bat），双击 `archview.exe`。
 2. 点击左上角 **Open Archive…** 选择压缩包，或直接把压缩包文件拖入窗口。
 3. 左侧标签页切换 **视频 / 图片**，顶部搜索框可过滤文件名；点击文件即开始播放，悬停行的完整文件名显示在列表底部状态行。
 4. 右侧播放区底部为进度条，拖动到目标位置松手即跳转。
 
+5. （可选）双击同目录 `install.bat`，注册「发送到」菜单与压缩包/图片/视频的文件关联（详见下节）；卸载用 `uninstall.bat`。
+
 > 首次启动若 exe 同目录没有 config.toml，会自动生成一份默认配置。
 
-### 「发送到」快捷方式
+### 「发送到」与文件关联
 
-`sendto_setup.bat` 一键创建三个菜单项——放在 archview.exe 同目录（package.bat 打包后即如此）双击即可，exe 路径自动检测；也可用 bat 顶部的 `EXE_PATH` 覆盖：
+`install.bat` 一次完成两项用户级集成（无需管理员权限，放在 archview.exe 同目录——package.bat 打包后即如此——双击即可，exe 路径自动检测；也可用 bat 顶部的 `EXE_PATH` 覆盖；卸载用同目录 `uninstall.bat`）：
+
+**1. 「发送到」菜单**，一键创建三个菜单项：
 
 - **Archview player**：右键压缩包（可多选）→ 发送 → 直接用播放器打开（多选时打开第一个，同目录其余包按 N 键切换）。也适用于把压缩包/目录拖到 exe 上、文件关联等任意「带路径启动」场景。
 - **Archview tidy**：右键压缩包（可多选）→ 发送 → 按 config.toml 的 `vartidy.repo_dir` 增量整理（见下文「VarTidy」）。
 - **Archview encode**：右键帧文件/目录/压缩包（可多选）→ 发送 → 按 CLI encode 语义编码为视频（见下文「Encode」；多选帧文件即精确模式）。
+
+**2. 文件关联**：按「压缩包 / 视频 / 图片」注册三个 ProgID（`Archview.Archive` / `Archview.Video` / `Archview.Image`，`shell\open\command` 指向 exe `"%1"`），再把全部受支持扩展名以 `OpenWithProgids` 写入对应键——**只进右键「打开方式」推荐列表，不抢系统默认**。覆盖范围与 config 内置清单一致：
+
+- 压缩包：`zip` `7z` `rar`；
+- 视频：`mp4` `mkv` `avi` `mov` `flv` `ts` `webm` `wmv` `m4v`，加非标 raw dump 三后缀 `nv12` `yuv400` `raw`（`[[raw.demux]]` 默认预设；raw 走 `is_video_ext` 的 raw 预设命中，双击即打开父目录媒体集合并跳转该文件）；
+- 图片：`jpg` `jpeg` `png` `gif` `webp` `bmp` `tif` `tiff`，加相机 RAW `arw` `nef` `nrw` `srf` `sr2` `arq`。
+
+要把某类型设为默认打开方式，右键文件 → 打开方式 → 选择其他应用 → 始终（`UserChoice` 由 Windows 管理，脚本不代写）。exe 移动位置后重跑 install.bat 刷新路径；卸载跑 `uninstall.bat`（删 ProgID、逐扩展名摘除 OpenWithProgids 值、删 SendTo 快捷方式；已设默认的类型需在 设置 → 应用 → 默认应用 手动清除）。
 
 已存在则覆盖重建（换 exe 位置重跑一次即可）。手动创建也可以：在 `shell:sendto` 文件夹（`%APPDATA%\Microsoft\Windows\SendTo`）新建快捷方式，目标分别填 `"<archview.exe 完整路径>"`、`"<archview.exe 完整路径>" tidy`、`"<archview.exe 完整路径>" encode`——**不要带 `"%1"`**（那是注册表 shell 命令的语法，快捷方式里会当字面量传入；选中文件由 Windows 自动追加为参数）。
 

@@ -76,7 +76,7 @@ archview.exe tidy <包或目录> [更多包...] [选项]
 ```
 
 `repo_dir` 收进 config.toml 后，资源管理器「发送到」菜单即可承载整理入口——零注册表写入、零管理员权限、
-卸载无残留（SendTo 本就是 `%APPDATA%\Microsoft\Windows\SendTo` 文件夹的快捷方式枚举）。`sendto_setup.bat`
+卸载无残留（SendTo 本就是 `%APPDATA%\Microsoft\Windows\SendTo` 文件夹的快捷方式枚举）。`install.bat`
 一键创建两个菜单项：放在 archview.exe 同目录（package.bat 打包后即如此）双击即可，exe 路径自动检测
 （bat 顶部 `EXE_PATH` 可覆盖；同名覆盖重建，换 exe 位置重跑即可）；bat 内嵌 PowerShell `WScript.Shell`
 COM 调用创建 .lnk（bat 无原生建快捷方式能力）。手动创建等价：`shell:sendto` 里新建快捷方式，目标填
@@ -131,7 +131,7 @@ report_dir = "auto"        # 报告目录；"auto" = 首个输入包所在目录
 |---|---|---|
 | 1 | `src/vartidy/classify.rs` 移植 class_var.py 全部规则 | ✅ 完成（单测覆盖 5 类非法 + 合法 + 特殊字符命名） |
 | 2 | 流水线：两级去重（CRC 判重）、余量预检、批量抽取直写、报告、dry-run | ✅ 完成（含仓库只读三道闸、密码耗尽零痕迹回收） |
-| 3 | CLI 分发入口 + config `vartidy` 节 + 「发送到」（`sendto_setup.bat` 一键创建）+ `-q` 防脚本阻塞 | ✅ 完成（34/34 测试 + setup.bat 6 包冒烟全链路） |
+| 3 | CLI 分发入口 + config `vartidy` 节 + 「发送到」（`install.bat` 一键创建）+ `-q` 防脚本阻塞 | ✅ 完成（34/34 测试 + setup.bat 6 包冒烟全链路） |
 | 3.5 | 密码打开期锁定：`open_with_password_probe`（三格式 verify_password，7z folder 级 AES 检测）+ passwords 提为播放器/CLI 公用顶层配置 | ✅ 完成（CLI 删执行期重开循环；播放器 OpenJob 探测链，弹框降级为兜底） |
 | 4（可选） | 失败续跑（记录已完成包清单，重跑跳过） | 按需 |
 | 5（可选） | hash 级去重（防"同名不同内容"漏判）、多包并发 | 按需 |

@@ -44,7 +44,7 @@ const USAGE: &str = r#"archview encode — 帧序列 dump → 视频（libmpv �
   -h, --help           本帮助
 
 编码参数在 config.toml [encode] 节（vcodec / crf / preset / ovcopts）。
-「发送到」快捷方式: 运行 sendto_setup.bat 一键创建（Archview encode 项）。
+「发送到」快捷方式: 运行 install.bat 一键创建（Archview encode 项）。
 提示: 大序列请发目录——「发送到」多文件受命令行 32767 字符上限约束，
       超限时 explorer 可能静默截断（丢尾帧且无提示）"#;
 
