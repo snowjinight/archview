@@ -140,22 +140,11 @@ impl Histogram {
     /// 从解码后像素统计。ColorImage 存储为预乘 alpha（from_rgba_unmultiplied
     /// 内部预乘），半透明像素先去预乘还原原色——不透明图（照片主流）零开销路径
     pub fn compute(img: &egui::ColorImage) -> Self {
-        let mut h = Self {
-            ch: [[0; 256]; 4],
-        };
+        let mut h = Self { ch: [[0; 256]; 4] };
         for px in &img.pixels {
-            let (r, g, b, a) = (
-                px.r() as u32,
-                px.g() as u32,
-                px.b() as u32,
-                px.a() as u32,
-            );
+            let (r, g, b, a) = (px.r() as u32, px.g() as u32, px.b() as u32, px.a() as u32);
             let (r, g, b) = if a < 255 && a > 0 {
-                (
-                    r * 255 / a,
-                    g * 255 / a,
-                    b * 255 / a,
-                )
+                (r * 255 / a, g * 255 / a, b * 255 / a)
             } else {
                 (r, g, b)
             };
@@ -415,15 +404,16 @@ impl ImageService {
                         tracing::debug!("高清解码复用原图缓存{} {name}", sharpen.tag());
                         Ok(build_full(img, factor, &sharpen))
                     }
-                    None => match decode_image(&source, FULL_MAX_DIM, true, factor, &name, &sharpen)
-                    {
-                        Ok((Decoded::Static(img), _)) => Ok(img),
-                        // 单帧动图取唯一帧当静态原图
-                        Ok((Decoded::Anim(mut a), _)) if a.len() == 1 => {
-                            Ok(a.pop().expect("len==1").0)
+                    None => {
+                        match decode_image(&source, FULL_MAX_DIM, true, factor, &name, &sharpen) {
+                            Ok((Decoded::Static(img), _)) => Ok(img),
+                            // 单帧动图取唯一帧当静态原图
+                            Ok((Decoded::Anim(mut a), _)) if a.len() == 1 => {
+                                Ok(a.pop().expect("len==1").0)
+                            }
+                            Ok(_) | Err(_) => Err(()),
                         }
-                        Ok(_) | Err(_) => Err(()),
-                    },
+                    }
                 }));
                 let msg = match r {
                     Ok(Ok(img)) => ImgMsg::FullReady { key, img, name },
@@ -464,7 +454,13 @@ impl ImageService {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                ImgMsg::Ready { key, decoded, hist, name, native } => {
+                ImgMsg::Ready {
+                    key,
+                    decoded,
+                    hist,
+                    name,
+                    native,
+                } => {
                     self.pending.remove(&key);
                     // 原图入 LRU（容量随当前栏数自适应 = 纹理缓存保护集同
                     // 语义"栏数 + 2"，单图 3、对比 n 栏 n+2；封顶逐出最旧；
@@ -472,11 +468,11 @@ impl ImageService {
                     // 原图取样）
                     if let Some(n) = native {
                         self.natives.push_front((key, n));
-                        let cap = self
-                            .shown_multi
-                            .len()
-                            .max(if self.shown.is_some() { 1 } else { 0 })
-                            + 2;
+                        let cap =
+                            self.shown_multi
+                                .len()
+                                .max(if self.shown.is_some() { 1 } else { 0 })
+                                + 2;
                         while self.natives.len() > cap {
                             self.natives.pop_back();
                         }
@@ -925,10 +921,11 @@ fn is_raw_photo_ext(name: &str) -> bool {
 /// JPEG 预览再交 image 解码——成本与普通 jpg 同量级，LRU/高清档/
 /// 看门狗机制照常生效。识别/解码失败返回 Err，调用方 fall through
 fn decode_raw_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
-    let mut f = raw_files::RawFile::from_bytes(bytes)
-        .map_err(|e| format!("RAW 识别失败: {e}"))?;
+    let mut f = raw_files::RawFile::from_bytes(bytes).map_err(|e| format!("RAW 识别失败: {e}"))?;
     let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
-    let jpeg = f.read_preview(&pv).map_err(|e| format!("读预览失败: {e}"))?;
+    let jpeg = f
+        .read_preview(&pv)
+        .map_err(|e| format!("读预览失败: {e}"))?;
     let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
     Ok(apply_orientation(img, pv.orientation()))
 }
@@ -938,7 +935,9 @@ fn decode_raw_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
 fn decode_raw_preview_path(path: &std::path::Path) -> Result<image::DynamicImage, String> {
     let mut f = raw_files::RawFile::open(path).map_err(|e| format!("RAW 识别失败: {e}"))?;
     let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
-    let jpeg = f.read_preview(&pv).map_err(|e| format!("读预览失败: {e}"))?;
+    let jpeg = f
+        .read_preview(&pv)
+        .map_err(|e| format!("读预览失败: {e}"))?;
     let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
     Ok(apply_orientation(img, pv.orientation()))
 }
@@ -1128,7 +1127,9 @@ fn antiring_step(
     shoot_mask: Option<image::GrayImage>,
     out: image::DynamicImage,
 ) -> image::DynamicImage {
-    let (Some(src), Some(mask)) = (src_rgba, shoot_mask) else { return out };
+    let (Some(src), Some(mask)) = (src_rgba, shoot_mask) else {
+        return out;
+    };
     let t = std::time::Instant::now();
     // full 路径 resample 恒产 ImageRgba8（fir_resize），原地改免二次拷贝
     let mut rgba = match out {
@@ -1160,11 +1161,7 @@ const SHOOT_RING_THRESHOLD: u8 = 32;
 /// ±1 级误伤），输出侧无标记行整行跳过（O(1) 行和检查）、行内未标记
 /// cell 跳过，仅边缘邻域做 6 次比较、越界罕见才 clamp。O(边缘区) 而非
 /// O(全图)，热路径零分配
-fn antiring(
-    src: &image::RgbaImage,
-    out: &mut image::RgbaImage,
-    shoot_mask: &image::GrayImage,
-) {
+fn antiring(src: &image::RgbaImage, out: &mut image::RgbaImage, shoot_mask: &image::GrayImage) {
     let (sw, sh) = (src.width() as usize, src.height() as usize);
     let (ow, oh) = (out.width() as usize, out.height() as usize);
     if sw == 0 || sh == 0 || ow == 0 || oh == 0 {
@@ -1394,8 +1391,7 @@ impl SharpenCfg {
                 img.image_full_denoise_algo
             );
         }
-        let (white_edge, ok) =
-            parse_white_edge_curve(&img.image_full_sharpen_white_edge_curve);
+        let (white_edge, ok) = parse_white_edge_curve(&img.image_full_sharpen_white_edge_curve);
         if !ok {
             tracing::warn!(
                 "image_full_sharpen_white_edge_curve 折点非法（需 x∈(0,255] 严格递增、y∈[0,1]），回退默认曲线"
@@ -1510,10 +1506,9 @@ fn sharpen_full(
     let (sharpen_ms, shoot_mask) = sharpen_step(&mut y, cfg);
     let sharpen_ms = sharpen_ms.map(|d| d.as_millis());
     match (denoise_ms, sharpen_ms) {
-        (Some(dn), Some(sh)) => tracing::info!(
-            "观感增强耗时: 降噪[{:?}] {dn}ms + 锐化 {sh}ms",
-            cfg.algo
-        ),
+        (Some(dn), Some(sh)) => {
+            tracing::info!("观感增强耗时: 降噪[{:?}] {dn}ms + 锐化 {sh}ms", cfg.algo)
+        }
         (Some(dn), None) => {
             tracing::info!("观感增强耗时: 降噪[{:?}] {dn}ms（锐化关）", cfg.algo)
         }
@@ -1537,8 +1532,8 @@ fn sharpen_full(
 fn luma_plane(rgba: &image::RgbaImage) -> image::GrayImage {
     image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| {
         let p = rgba[(x, y)];
-        let l = (u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500)
-            / 1000;
+        let l =
+            (u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114 + 500) / 1000;
         image::Luma([l as u8])
     })
 }
@@ -1606,7 +1601,11 @@ fn sharpen_step(
         let ratio = if ratios.is_empty() { 1.0 } else { ratios[i] };
         let yv = f32::from(p[0]);
         let d = yv - f32::from(b[0]);
-        let e = if d > 0.0 { amount * ratio * d } else { amount * d };
+        let e = if d > 0.0 {
+            amount * ratio * d
+        } else {
+            amount * d
+        };
         if let Some(buf) = &mut delta_before {
             buf[i] = (amount * d + 128.0).clamp(0.0, 255.0) as u8;
         }
@@ -1655,7 +1654,9 @@ fn dump_gray_bmp(img: &image::GrayImage, name: &str, desc: &str) {
 /// debug dump：白边抑制曲线查表 256 行（缓存目录 debug/sharpen_curve_dump.txt，
 /// shoot_v→ratio，验证折点分段线性插值生效；固定名覆盖）
 fn dump_curve_txt(lut: &[f32; 256]) {
-    let Some(path) = dump_path("sharpen_curve_dump.txt") else { return };
+    let Some(path) = dump_path("sharpen_curve_dump.txt") else {
+        return;
+    };
     let mut s = String::with_capacity(256 * 16);
     s.push_str("# 白边抑制曲线查表 dump：shoot_v -> ratio（折点分段线性插值）\n");
     for (v, r) in lut.iter().enumerate() {
@@ -1807,10 +1808,8 @@ fn shoot_ratios(
             let yb = (y + r + 1).min(h);
             let inv = 1.0 / ((xb - xa) * (yb - ya)) as f32;
             let (a, b) = (ya * stride, yb * stride);
-            let mean =
-                (sum[b + xb] + sum[a + xa] - sum[a + xb] - sum[b + xa]) as u32 as f32 * inv;
-            let q = (sum2[b + xb] + sum2[a + xa] - sum2[a + xb] - sum2[b + xa]) as u32 as f32
-                * inv;
+            let mean = (sum[b + xb] + sum[a + xa] - sum[a + xb] - sum[b + xa]) as u32 as f32 * inv;
+            let q = (sum2[b + xb] + sum2[a + xa] - sum2[a + xb] - sum2[b + xa]) as u32 as f32 * inv;
             q - mean * mean
         };
         sv_map[y * w + x] = shoot_v_of(var(1), var(2), var(3), gain) as u8;
@@ -1887,7 +1886,9 @@ fn max_dilate(map: &mut [u8], w: usize, h: usize, r: usize) {
 /// 1.0 无除零；O(n·9) 纯 Rust，2K 图 ~10ms 后台执行
 fn bilateral_3x3(img: &image::GrayImage, sigma_c: f32) -> image::GrayImage {
     // 3×3 高斯 σs=1.0：exp(-0.5/2σs²)=0.6065（正交）、exp(-1/2σs²)=0.3679（对角）
-    const SW: [f32; 9] = [0.3679, 0.6065, 0.3679, 0.6065, 1.0, 0.6065, 0.3679, 0.6065, 0.3679];
+    const SW: [f32; 9] = [
+        0.3679, 0.6065, 0.3679, 0.6065, 1.0, 0.6065, 0.3679, 0.6065, 0.3679,
+    ];
     let (w, h) = (img.width() as i64, img.height() as i64);
     let src = img.as_raw();
     let mut out = Vec::with_capacity(src.len());
@@ -1903,8 +1904,7 @@ fn bilateral_3x3(img: &image::GrayImage, sigma_c: f32) -> image::GrayImage {
                     let (ny, nx) = ((y + dy).clamp(0, h - 1), (x + dx).clamp(0, w - 1));
                     let j = (ny * w + nx) as usize;
                     let d = f32::from(src[j]) - lc;
-                    let wgt = SW[k]
-                        * (-(d * d) / (2.0 * sigma_c * sigma_c)).exp();
+                    let wgt = SW[k] * (-(d * d) / (2.0 * sigma_c * sigma_c)).exp();
                     acc += wgt * f32::from(src[j]);
                     wsum += wgt;
                     k += 1;
@@ -2079,7 +2079,9 @@ mod tests {
             on: true,
             amount,
             sigma: 1.0,
-            white_edge: Some(build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE)),
+            white_edge: Some(build_white_edge_lut(
+                &crate::config::DEFAULT_WHITE_EDGE_CURVE,
+            )),
             shoot_gain: 1.0,
             shoot_dilate: 1,
             denoise: false,
@@ -2120,7 +2122,9 @@ mod tests {
         antiring(&src, &mut fixed, &mask.unwrap());
         assert_ne!(out.as_raw(), fixed.as_raw(), "强边振铃应被 clamp 修正");
         assert!(
-            fixed.pixels().all(|p| p[0] >= 128 && p[1] >= 128 && p[2] >= 128),
+            fixed
+                .pixels()
+                .all(|p| p[0] >= 128 && p[1] >= 128 && p[2] >= 128),
             "欠冲振铃应钳回源值域下界 128"
         );
         // 无强边的线性渐变：shoot_v 全部低于阈值 → 掩码全空 → 完全恒等
@@ -2144,10 +2148,18 @@ mod tests {
         let maxdiff = r_out
             .pixels()
             .zip(r_fixed.pixels())
-            .map(|(a, b)| (0..3).map(|c| (a[c] as i32 - b[c] as i32).abs()).max().unwrap())
+            .map(|(a, b)| {
+                (0..3)
+                    .map(|c| (a[c] as i32 - b[c] as i32).abs())
+                    .max()
+                    .unwrap()
+            })
             .max()
             .unwrap();
-        assert!(maxdiff <= 2, "渐变 clamp 幅度应仅限 fir 实现误差级别: {maxdiff}");
+        assert!(
+            maxdiff <= 2,
+            "渐变 clamp 幅度应仅限 fir 实现误差级别: {maxdiff}"
+        );
     }
 
     #[test]
@@ -2236,7 +2248,10 @@ mod tests {
     fn denoise_algo_解析回退与标记() {
         assert_eq!(DenoiseAlgo::parse("guided"), (DenoiseAlgo::Guided, true));
         assert_eq!(DenoiseAlgo::parse(" Guided "), (DenoiseAlgo::Guided, true));
-        assert_eq!(DenoiseAlgo::parse("bilateral"), (DenoiseAlgo::Bilateral, true));
+        assert_eq!(
+            DenoiseAlgo::parse("bilateral"),
+            (DenoiseAlgo::Bilateral, true)
+        );
         // 非法值回退导向（默认算法）+ 标记 false（调用方 WARN 不静默）
         assert_eq!(DenoiseAlgo::parse("nlmeans"), (DenoiseAlgo::Guided, false));
         // tag 降噪标记带算法名：A/B 对比时看解码日志即可分辨走了哪条链
@@ -2485,8 +2500,8 @@ mod tests {
         // 基础档兜底：>8192 病图等比降到 8192（快速 box 采样 + mipmap）
         let out = resample(image::DynamicImage::new_rgb8(9000, 7000), 4096, false, 1.0);
         assert_eq!((out.width(), out.height()), (8192, 6372)); // 7000×8192/9000=6371.6→6372
-        // 高清档：最长边封顶 12288 + 像素预算兜底（防御性路径，full 资格
-        // 图理论到不了这）
+                                                               // 高清档：最长边封顶 12288 + 像素预算兜底（防御性路径，full 资格
+                                                               // 图理论到不了这）
         let out = resample(image::DynamicImage::new_rgb8(10000, 8000), 8192, true, 3.0);
         assert!(out.width() <= FULL_MAX_DIM && out.height() <= FULL_MAX_DIM);
         assert!(
@@ -2527,9 +2542,14 @@ mod tests {
                 *p = image::Luma([if x < 8 { 64 } else { 192 }]);
             }
         }
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6))
+            .0
+            .to_rgba8();
         assert!(out.get_pixel(7, 4)[0] < 64, "边缘低侧应压暗");
-        assert!(out.get_pixel(8, 4)[0] <= 195, "边缘高侧过冲应被压制（默认曲线末点保留 5% 锐感，残余 ≤2 级）");
+        assert!(
+            out.get_pixel(8, 4)[0] <= 195,
+            "边缘高侧过冲应被压制（默认曲线末点保留 5% 锐感，残余 ≤2 级）"
+        );
     }
 
     #[test]
@@ -2544,10 +2564,15 @@ mod tests {
                 *p = image::Luma([if x < 8 { 64 } else { 192 }]);
             }
         }
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6))
+            .0
+            .to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
-        assert!(hi <= 2, "亮侧过冲应被压制（默认曲线末点 0.05 残余 ≤2 级）: +{hi}");
+        assert!(
+            hi <= 2,
+            "亮侧过冲应被压制（默认曲线末点 0.05 残余 ≤2 级）: +{hi}"
+        );
         assert!(lo > 0, "暗侧压暗应保留（锐感来源）: −{lo}");
         // curve = []（None）关闭：恢复对称 unsharp，两侧幅度一致（±1 给取整）
         let mut img = image::GrayImage::new(16, 8);
@@ -2558,15 +2583,22 @@ mod tests {
         }
         let mut cfg = sharpen_on(0.6);
         cfg.white_edge = None;
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg).0.to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &cfg)
+            .0
+            .to_rgba8();
         let hi = i32::from(out.get_pixel(8, 4)[0]) - 192;
         let lo = 64 - i32::from(out.get_pixel(7, 4)[0]);
-        assert!((hi - lo).abs() <= 1, "关闭 shoot 后两侧应恢复对称: +{hi}/−{lo}");
+        assert!(
+            (hi - lo).abs() <= 1,
+            "关闭 shoot 后两侧应恢复对称: +{hi}/−{lo}"
+        );
         // 细纹理不受抑制：幅度 8 的单像素凸起 shoot≈0（各尺度方差相近），
         // 正向增强全额保留
         let mut img = image::GrayImage::from_pixel(16, 16, image::Luma([128]));
         *img.get_pixel_mut(8, 8) = image::Luma([136]);
-        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6)).0.to_rgba8();
+        let out = sharpen_full(image::DynamicImage::ImageLuma8(img), &sharpen_on(0.6))
+            .0
+            .to_rgba8();
         let up = i32::from(out.get_pixel(8, 8)[0]) - 128;
         assert!(up >= 3, "细纹理锐化被 shoot 误伤: +{up}");
     }
@@ -2607,7 +2639,10 @@ mod tests {
         let (_, d1) = shoot_ratios(&img, &lut, 1.0, 1, true);
         let (d0, d1) = (d0.unwrap(), d1.unwrap());
         let (d0, d1): (&[u8], &[u8]) = (&d0, &d1);
-        assert!(d0[4 * 16 + 8] < 255, "外扩前边缘正中是低值（flank 偏外 1~2px）");
+        assert!(
+            d0[4 * 16 + 8] < 255,
+            "外扩前边缘正中是低值（flank 偏外 1~2px）"
+        );
         assert_eq!(d1[4 * 16 + 8], 255, "外扩后 flank 带覆盖边缘正中");
         // 方向保留的已知取舍（用户裁定）：细于窗口的结构（2px 亮线）方差差
         // 方向反转（v5>v3>v7），clamp 负值为 0——线上与两侧 flank 全部无响应，
@@ -2638,18 +2673,26 @@ mod tests {
         // y 越界三种）；合法曲线原样构建
         assert_eq!(parse_white_edge_curve(&[]), (None, true), "空数组 = 关闭");
         let (lut, ok) = parse_white_edge_curve(&[(100.0, 0.8), (100.0, 0.5)]);
-        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        let Some(lut) = lut else {
+            panic!("非法应回退默认曲线而非关闭")
+        };
         assert!(!ok && lut[100] != 0.5, "x 不递增应回退默认曲线");
         let (lut, ok) = parse_white_edge_curve(&[(300.0, 0.8)]);
-        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        let Some(lut) = lut else {
+            panic!("非法应回退默认曲线而非关闭")
+        };
         assert!(!ok && lut[255] != 0.8, "x 越界应回退默认曲线");
         let (lut, ok) = parse_white_edge_curve(&[(100.0, 1.5)]);
-        let Some(lut) = lut else { panic!("非法应回退默认曲线而非关闭") };
+        let Some(lut) = lut else {
+            panic!("非法应回退默认曲线而非关闭")
+        };
         assert!(!ok && lut[100] != 1.5, "y 越界应回退默认曲线");
         let default = build_white_edge_lut(&crate::config::DEFAULT_WHITE_EDGE_CURVE);
         assert_eq!(lut, default, "回退值应等于默认曲线 LUT");
         let (lut, ok) = parse_white_edge_curve(&[(100.0, 0.8)]);
-        let Some(lut) = lut else { panic!("合法曲线应为 Some") };
+        let Some(lut) = lut else {
+            panic!("合法曲线应为 Some")
+        };
         assert!(ok && lut[100] == 0.8, "合法折点原样构建");
     }
 
@@ -2757,12 +2800,10 @@ mod tests {
             }
         }
         let before = img.clone();
-        let after = sharpen_full(image::DynamicImage::ImageRgba8(img), &cfg).0.to_rgba8();
-        assert_ne!(
-            before.as_raw(),
-            after.as_raw(),
-            "锐化关时降噪仍应生效"
-        );
+        let after = sharpen_full(image::DynamicImage::ImageRgba8(img), &cfg)
+            .0
+            .to_rgba8();
+        assert_ne!(before.as_raw(), after.as_raw(), "锐化关时降噪仍应生效");
         // 关闭档（全关）零开销直通
         let (same, mask) = sharpen_full(
             image::DynamicImage::ImageRgba8(before.clone()),
@@ -3322,15 +3363,14 @@ mod tests {
     fn finish_static_抽取后行为不变() {
         // 共享尾部抽取回归：基础档阈值内 ×factor 预放大；原图资格命中时
         // 顺带带回供 full 升级复用
-        let (out, native) =
-            finish_static(
-                image::DynamicImage::new_rgb8(100, 50),
-                4096,
-                false,
-                2.0,
-                &SharpenCfg::OFF,
-            )
-            .unwrap();
+        let (out, native) = finish_static(
+            image::DynamicImage::new_rgb8(100, 50),
+            4096,
+            false,
+            2.0,
+            &SharpenCfg::OFF,
+        )
+        .unwrap();
         let Decoded::Static(out) = out else {
             panic!("finish_static 恒返回 Static");
         };

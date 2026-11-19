@@ -51,7 +51,7 @@ mod tests;
 // raw 软解服务住在 crate::rawdec 媒体层（与 ImageService 平级）
 use crate::rawdec::RawFrameService;
 use compare::{
-    compare_eligible, grid_cells, pane_image_rect, clamp_center, sync_zoom_center, sync_zoom_step,
+    clamp_center, compare_eligible, grid_cells, pane_image_rect, sync_zoom_center, sync_zoom_step,
     CompareSession, PaneKind,
 };
 
@@ -421,13 +421,21 @@ impl App {
         tracing::info!(
             "图片高清升级: 阈值×{:.2} 锐化 {}{}",
             cfg.image.image_full_threshold,
-            if cfg.image.image_full_sharpen { "开" } else { "关" },
+            if cfg.image.image_full_sharpen {
+                "开"
+            } else {
+                "关"
+            },
             if cfg.image.image_full_sharpen {
                 format!(
                     "(amount {:.2} σ{:.1} 降噪{}[{}] 双边s{:.0} 导向s{:.0}r{})",
                     cfg.image.image_full_sharpen_amount,
                     cfg.image.image_full_sharpen_sigma,
-                    if cfg.image.image_full_denoise { "开" } else { "关" },
+                    if cfg.image.image_full_denoise {
+                        "开"
+                    } else {
+                        "关"
+                    },
                     cfg.image.image_full_denoise_algo,
                     cfg.image.image_full_bilateral_strength,
                     cfg.image.image_full_guided_strength,
@@ -678,13 +686,15 @@ impl eframe::App for App {
         // 但 repaint 已在事件层排掉（应用层只能节流不能取消）——快速滚轮
         // 帧率同样可到 ~60fps 且全是 no-op 全量重建，归入悬停档 30fps
         let motion = ctx.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. }))
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. }
+                )
+            })
         });
-        let pacing_ms = |fps: u32| {
-            std::time::Duration::from_millis(crate::config::UiConfig::pacing_ms(fps))
-        };
+        let pacing_ms =
+            |fps: u32| std::time::Duration::from_millis(crate::config::UiConfig::pacing_ms(fps));
         let pacing = if dragging {
             pacing_ms(self.cfg.ui.redraw_drag_fps)
         } else if motion {

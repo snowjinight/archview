@@ -871,9 +871,7 @@ impl App {
                             }
                             // 缓存命中路径已直接播放该条目时不重播
                             // （重播会让视频闪断、图片重置动画）
-                            if i == j.entry_idx
-                                && self.playing != Some(i)
-                                && self.compare.is_none()
+                            if i == j.entry_idx && self.playing != Some(i) && self.compare.is_none()
                             {
                                 play = Some((d, i));
                             }
@@ -1020,7 +1018,7 @@ impl App {
             }
         };
         // 伪格式 bayer_auto16le：落地文件完整可读，读首帧探测排列
-        //（bit_shift 慢路径不支持的设计定案不变，探测不受影响）
+        //（探测读原始容器数据，在 bit_shift 分流之前完成，不受影响）
         if let Some(r) = raw_opts.as_mut() {
             if r.auto_bayer {
                 match std::fs::File::open(dest) {
@@ -1035,11 +1033,36 @@ impl App {
             }
         }
         if let Some(p) = &self.player {
-            // 慢路径不做 bit_shift（设计定案）：bayer 位移适用面窄，不为
-            // 它给落盘文件增设 zvf:// 单文件通道或改写解压缓存——shift
-            // 静默忽略，走原装载行为（取舍详见 doc/架构设计/13_渲染架构迁移.md §13.6）
-            let opts = raw_opts.as_ref().map(|r| r.opts()).unwrap_or_default();
-            p.load_path(dest, &opts);
+            let (opts, shift) = match raw_opts.as_ref() {
+                Some(r) => (r.opts(), r.bit_shift),
+                None => (String::new(), 0),
+            };
+            if shift > 0 {
+                // 慢路径 bit_shift 补齐：落盘文件注册为单文件 VFS 借道
+                // zvf:// 装载，流层 ShiftReader 修正位移（与 zip 快路径同
+                // 源实现）；缓存文件保持忠实拷贝，位移不落盘、不进缓存键。
+                // id = hash(落盘路径)：逐文件唯一、跨重启稳定；不同 shift
+                // 得到不同 URI（?s=N），mpv 播放缓存天然隔离。LRU 驱逐
+                // 语义与 file:// 直读逐点一致（播放中句柄存活、切回重解
+                // 后同路径覆盖注册项）。注册失败兜底走 file:// 直读旧行为
+                //（取舍详见 doc/架构设计/13_渲染架构迁移.md §13.6）
+                match crate::vfs::file_vfs::SingleFileVFS::open(dest.to_path_buf()) {
+                    Ok(vfs) => {
+                        let (id, _) = crate::player::stream_cb::register_with_progress(
+                            std::sync::Arc::new(vfs),
+                            dest,
+                            &|_, _| {},
+                        );
+                        p.load(id, 0, &opts, shift);
+                    }
+                    Err(e) => {
+                        tracing::warn!("单文件 VFS 注册失败，回退 file:// 直读: {e}");
+                        p.load_path(dest, &opts);
+                    }
+                }
+            } else {
+                p.load_path(dest, &opts);
+            }
         }
     }
 }

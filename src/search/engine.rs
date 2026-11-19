@@ -57,7 +57,7 @@ enum Token {
     Exact(String),
     Not,
     Or,
-    And, // implicit (whitespace between terms)
+    And,    // implicit (whitespace between terms)
     LParen, // <
     RParen, // >
     End,
@@ -228,7 +228,9 @@ struct Parser {
 
 impl Parser {
     fn new(query: &str) -> Self {
-        Self { lex: Lexer::new(query) }
+        Self {
+            lex: Lexer::new(query),
+        }
     }
 
     /// entry: parse the full expression
@@ -348,7 +350,9 @@ pub fn parse_query(query: &str) -> SearchQuery {
         return SearchQuery { root: None };
     }
     let mut parser = Parser::new(trimmed);
-    SearchQuery { root: parser.parse() }
+    SearchQuery {
+        root: parser.parse(),
+    }
 }
 
 /// Evaluate a search node against a haystack.

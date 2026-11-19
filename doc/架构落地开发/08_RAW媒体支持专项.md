@@ -221,6 +221,12 @@ zvf 单文件装载（须给 stream_cb 增设注册通道）/ 落盘后原地变
 16bit 容器 bayer dump），收益不抵代码与架构复杂度代价，定案仅快路径
 支持（记录于 [ARCHITECTURE §13.6](../架构设计/13_渲染架构迁移.md)）。
 
+> **追记（2026-11-18，[§8.15](#815-需求变更慢路径-bit_shift-补齐--新增-yuv420rgb-通用预设-2026-11-18)）**：
+> 上述定案已废止——重审发现否决 FileVFS 候选的关键前提（"须给 stream_cb
+> 增设注册通道"）不成立：`register_with_progress` 本就接受任意 ArchiveVFS，
+> 只缺一个单文件 VFS 实现（~50 行）。慢路径经 SingleFileVFS 借道 zvf://
+> 已补齐，缓存忠实拷贝语义零破坏（当年否决后两候选的理由依然成立）。
+
 **坑 10 三犯**：4 处 SearchReplace 并行提交同一文件，互相覆盖仅存活
 1 处（[§2](02_渲染迁移与图片浏览器踩坑.md) 坑 10 / §8.4 已两次记录）——同文件多处编辑必须逐条串行提交，
 改后 grep 复核存活数。
@@ -423,3 +429,47 @@ RGGB 继续播；而兜底与真探测打的是**同一条 INFO 日志**
 支撑两级判别，旧版却一半用差分一半用均值，纯属设计割裂；② "需要更
 多先验（位深）"和"让统计量与先验无关（无量纲化）"都能回应同一缺陷，
 后者少一个猜测环节、少一类失败模式。
+
+### 8.15 需求变更：慢路径 bit_shift 补齐 + 新增 yuv420/rgb 通用预设（2026-11-18）
+
+**需求**：① 7z/RAR 落盘播放 `.raw` 支持 bit_shift（废止 8.8 的"仅快路径"
+定案）；② 新增两条通用默认预设：`*.yuv420`→yuv420p（planar I420）、
+`*.rgb`→rgb24，软解（对比视图/直方图/探针）同步支持这两种格式。
+
+**慢路径补齐（SingleFileVFS）**：重审 8.8 否决的三候选，发现 FileVFS
+候选的否决前提（"须给 stream_cb 增设注册通道"）不成立——
+`register_with_progress` 本就接受任意 ArchiveVFS。实现：
+
+- 新增 `vfs/file_vfs.rs`：`SingleFileVFS` 把单个落盘文件包装成单条目
+  FastSeek VFS（条目名 = 文件名，复用 `dir_vfs::FsFile` 适配器，size 构造
+  时取一次 metadata）；
+- `extract.rs` `load_extracted`：`shift > 0` 时注册 SingleFileVFS 进
+  stream_cb 注册表 → `p.load(id, 0, &opts, shift)` 走 `zvf://` 流层
+  ShiftReader（与快路径同源实现）；`shift = 0` 保持 `load_path` 零改动。
+  注册失败（文件被删/占用）兜底走旧 `load_path` 行为；
+- id = hash(落盘路径)：逐文件唯一、跨重启稳定；不同 shift → 不同 URI
+  → mpv 缓存天然隔离（同 8.8 语义）。LRU 驱逐语义与 file:// 直读逐点
+  一致（播放中句柄存活、切回重解后同路径覆盖注册项、open 失败走既有
+  END_FILE(ERROR) 回显）；
+- 缓存忠实拷贝语义零破坏：位移只在流层发生、不落盘、不进缓存键（当年
+  否决后两候选的理由依然成立）。
+
+**yuv420p / rgb24 软解**（`rawdec.rs`，探针集 = 软解集约束同 8.10）：
+
+- `yuv420p_to_rgb`：与 nv12 的差别只在 UV 平面组织（两个独立 (W/2)×(H/2)
+  平面 vs nv12 行内交错），BT.601 转换同款；
+- rgb24 直通：逐像素 R,G,B 字节序与 egui `Color32::from_rgb` 同序，零转换；
+- `RawProbe` 新增 `Rgb` 变体；yuv420p 探针复用 `Nv12` 变体（4:2:0 取样
+  语义相同，V 平面偏移 = U 平面尾后）；panels.rs 探针显示同步。
+
+**默认预设三条 → 五条**：`RawConfig::default()` / DEFAULT_TOML / README
+同步；防漂移测试改 `raw_default_presets_builtin`（len 5 + 两新后缀可见性）。
+老配置不受影响（serde 整体替换语义不变）。
+
+**测试**：file_vfs 单测（list/open/seek/未知条目拒绝/文件缺失报错）；
+`yuv420p_to_rgb_独立uv平面`（平面偏移/中性灰/数据不足）；探针测试扩
+yuv420p 与 rgb24 用例；`raw_frame_info_帧数与软解判定` 改判 yuv420p 应
+成功（8.8 时它是不在名单的负面用例）——用 yuv444p 接替负面角色。
+
+**设计记录**：[ARCHITECTURE §13.6](../架构设计/13_渲染架构迁移.md) bit_shift
+节已改为"快慢路径均生效"，8.8 定案段加追记指向本节。

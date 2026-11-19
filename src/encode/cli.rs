@@ -109,12 +109,14 @@ impl Out {
                 let mut f = f;
                 let _ = write!(f, "\r编码中 {pct:5.1}%");
                 let _ = f.flush();
-                self.wrote_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.wrote_progress
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             None if self.had_console => {
                 print!("\r编码中 {pct:5.1}%");
                 let _ = std::io::stdout().flush();
-                self.wrote_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.wrote_progress
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             None => {}
         }
@@ -122,7 +124,10 @@ impl Out {
 
     /// 结束 `\r` 进度行（打过才补换行；后续 line 输出不被进度行吞掉）
     fn end_progress(&self) {
-        if self.wrote_progress.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .wrote_progress
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             match &self.con {
                 Some(f) => {
                     use std::io::Write;
@@ -223,7 +228,10 @@ enum Input {
 
 fn is_archive_ext(p: &Path) -> bool {
     matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("zip") | Some("7z") | Some("rar")
     )
 }
@@ -239,9 +247,7 @@ fn classify(inputs: &[PathBuf]) -> Result<Input, String> {
         return Err("一次只能编码一个目录（一个目录 = 一个序列）".into());
     }
     if !dirs.is_empty() && !files.is_empty() {
-        return Err(
-            "文件与目录/压缩包混合输入不支持：请单独发送帧文件、目录或压缩包".into(),
-        );
+        return Err("文件与目录/压缩包混合输入不支持：请单独发送帧文件、目录或压缩包".into());
     }
     if let Some(d) = dirs.into_iter().next() {
         return Ok(Input::Dir(d));
@@ -296,7 +302,10 @@ impl std::fmt::Debug for Sequence {
 
 /// 文件按命中预设分族（滤目录条目，组内自然序）。
 /// 返回 (预设索引 → 条目列表)，键序 = 声明序（报错清单稳定）
-pub(crate) fn families(cfg: &Config, files: Vec<VirtualEntry>) -> BTreeMap<usize, Vec<VirtualEntry>> {
+pub(crate) fn families(
+    cfg: &Config,
+    files: Vec<VirtualEntry>,
+) -> BTreeMap<usize, Vec<VirtualEntry>> {
     let mut groups: BTreeMap<usize, Vec<VirtualEntry>> = BTreeMap::new();
     for e in files {
         if e.is_dir {
@@ -381,10 +390,11 @@ pub(crate) fn resolve_encode_format(
             p.r#match, p.pixfmt
         ));
     }
-    let Some(&(w, h)) = candidates
-        .iter()
-        .find(|&&(cw, ch)| entries.iter().all(|e| crate::rawdec::frame_divisible(Some(e.size), cw, ch, bits)))
-    else {
+    let Some(&(w, h)) = candidates.iter().find(|&&(cw, ch)| {
+        entries
+            .iter()
+            .all(|e| crate::rawdec::frame_divisible(Some(e.size), cw, ch, bits))
+    }) else {
         return Err(format!(
             "预设与文件名分辨率候选（{} 个）均未通过帧整除校验（pixfmt={}）——\
              序列与格式参数不匹配，或混入了非 dump 文件",
@@ -464,7 +474,10 @@ fn collect_files(cfg: &Config, paths: &[PathBuf]) -> Result<Sequence, String> {
     // 预设族一致性：逐文件给出精确文案（未命中 / 混族）
     let mut fam: Option<usize> = None;
     for p in paths {
-        let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         match preset_index(cfg, &name) {
             None => {
                 return Err(format!(
@@ -498,8 +511,12 @@ fn collect_files(cfg: &Config, paths: &[PathBuf]) -> Result<Sequence, String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let dv = DirVFS::open(&root, |n| names_lc.iter().any(|x| x == &n.to_ascii_lowercase()), 1)
-        .map_err(|e| e.to_string())?;
+    let dv = DirVFS::open(
+        &root,
+        |n| names_lc.iter().any(|x| x == &n.to_ascii_lowercase()),
+        1,
+    )
+    .map_err(|e| e.to_string())?;
     let vfs: Arc<dyn ArchiveVFS> = Arc::new(dv);
     let entries = vfs.list();
     if entries.len() != paths.len() {
@@ -547,22 +564,13 @@ fn collect_dir(cfg: &Config, dir: &Path) -> Result<Sequence, String> {
 }
 
 /// 压缩包通道：免解压直编（预设探测打开，加密条目提前拦截）
-fn collect_archive(
-    cfg: &Config,
-    path: &Path,
-    candidates: &[String],
-) -> Result<Sequence, String> {
-    let (v, _pw) =
-        open_with_password_probe(path, candidates).map_err(|e| {
-            format!("打开压缩包失败 {}: {e}", path.display())
-        })?;
+fn collect_archive(cfg: &Config, path: &Path, candidates: &[String]) -> Result<Sequence, String> {
+    let (v, _pw) = open_with_password_probe(path, candidates)
+        .map_err(|e| format!("打开压缩包失败 {}: {e}", path.display()))?;
     let vfs: Arc<dyn ArchiveVFS> = v.into();
     let entries = vfs.list();
     if let Some(e) = entries.iter().find(|e| e.encrypted) {
-        return Err(format!(
-            "包内条目加密（暂不支持，请先解压）：[{}]",
-            e.name
-        ));
+        return Err(format!("包内条目加密（暂不支持，请先解压）：[{}]", e.name));
     }
     let groups = families(cfg, entries);
     let (preset, entries) = single_family(cfg, groups, "压缩包内")?;
@@ -599,7 +607,11 @@ fn trailing_number(name: &str) -> Option<u64> {
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
     let digits = &stem[pos..];
-    if digits.is_empty() { None } else { digits.parse().ok() }
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 /// 自然序序列的编号断点：全体成员可解析出尾部编号才校验（无编号轴 = 稀疏
@@ -681,7 +693,10 @@ pub fn cli_main(args: &[String]) -> i32 {
     if parsed.inputs.is_empty() {
         out.line(&format!("缺少输入（帧文件 / 目录 / 压缩包）\n\n{USAGE}"));
         if !quiet {
-            msgbox("缺少输入：请在命令后指定帧文件、目录或压缩包，或用「发送到」发送。", true);
+            msgbox(
+                "缺少输入：请在命令后指定帧文件、目录或压缩包，或用「发送到」发送。",
+                true,
+            );
         }
         return 2;
     }
@@ -808,9 +823,9 @@ mod tests {
 
     fn nv12_cfg() -> Config {
         let mut cfg = Config::default();
-        // 清掉内置三条默认预设（nv12/yuv400/raw）：serde 语义下用户 TOML
-        // 写了 [[raw.demux]] 即整体替换默认数组；程序内 push 才会叠加，
-        // 同名 *.nv12 会被默认宽高 0 的条目按声明序抢先命中
+        // 清掉内置五条默认预设（nv12/yuv400/yuv420/rgb/raw）：serde 语义下
+        // 用户 TOML 写了 [[raw.demux]] 即整体替换默认数组；程序内 push 才会
+        // 叠加，同名 *.nv12 会被默认宽高 0 的条目按声明序抢先命中
         cfg.raw.demux.clear();
         cfg.raw.demux.push(RawDemux {
             r#match: "*.nv12".into(),
@@ -875,7 +890,10 @@ mod tests {
 
     #[test]
     fn merge_passwords_dedup_keeps_order() {
-        let m = merge_passwords(&["a".into(), "".into(), "b".into()], &["b".into(), "c".into()]);
+        let m = merge_passwords(
+            &["a".into(), "".into(), "b".into()],
+            &["b".into(), "c".into()],
+        );
         assert_eq!(m, ["a", "b", "c"]);
     }
 
@@ -994,11 +1012,19 @@ mod tests {
         assert!(g[0].contains("11~19"), "{}", g[0]);
 
         // 连续：无警告
-        let es = vec![entry("f_1.nv12", 1), entry("f_2.nv12", 1), entry("f_3.nv12", 1)];
+        let es = vec![
+            entry("f_1.nv12", 1),
+            entry("f_2.nv12", 1),
+            entry("f_3.nv12", 1),
+        ];
         assert!(numbering_gaps(&es).is_empty());
 
         // 无编号轴（一个成员无尾部数字即跳过整组）
-        let es = vec![entry("f_1.nv12", 1), entry("x.nv12", 1), entry("f_5.nv12", 1)];
+        let es = vec![
+            entry("f_1.nv12", 1),
+            entry("x.nv12", 1),
+            entry("f_5.nv12", 1),
+        ];
         assert!(numbering_gaps(&es).is_empty());
 
         // 倒序编号不算断点（合法倒序 dump）
@@ -1066,7 +1092,10 @@ mod tests {
         let paths = vec![d.join("f_10.nv12"), d.join("f_1.nv12"), d.join("f_2.nv12")];
         let s = collect_files(&cfg, &paths).unwrap();
         assert_eq!(
-            s.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            s.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
             ["f_1.nv12", "f_2.nv12", "f_10.nv12"]
         );
         // 默认输出 = 目录 + 首帧基名 + .mp4
@@ -1139,7 +1168,10 @@ mod tests {
 
         let s = collect_archive(&cfg, &zp, &[]).unwrap();
         assert_eq!(
-            s.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            s.entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
             ["z_1.nv12", "z_2.nv12"]
         );
         // 默认输出在压缩包所在目录
@@ -1152,7 +1184,9 @@ mod tests {
         w2.start_file("x.txt", zo).unwrap();
         w2.write_all(b"hi").unwrap();
         w2.finish().unwrap();
-        assert!(collect_archive(&cfg, &zp2, &[]).unwrap_err().contains("没有命中"));
+        assert!(collect_archive(&cfg, &zp2, &[])
+            .unwrap_err()
+            .contains("没有命中"));
     }
 
     #[test]

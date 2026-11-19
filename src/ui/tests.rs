@@ -152,9 +152,8 @@ fn dir_mode_open_pipeline() {
     // 3) 空目录：DirVFS 打开成功但零条目 → 统一提示
     let empty = root.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
-        super::DirVFS::open(&empty, media_pred(), 0).unwrap(),
-    );
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&empty, media_pred(), 0).unwrap());
     let entries2 = vfs2.list();
     app.apply_open_done(empty, None, vfs2, 7, entries2, None);
     assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
@@ -235,8 +234,7 @@ fn row_click_multi_select_semantics() {
 fn archive_switch_clears_selection() {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let root =
-        std::env::temp_dir().join(format!("ui_sel_clear_{}_{}", std::process::id(), uniq));
+    let root = std::env::temp_dir().join(format!("ui_sel_clear_{}_{}", std::process::id(), uniq));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("b.mp4"), b"v").unwrap();
@@ -270,8 +268,7 @@ fn archive_switch_clears_selection() {
 fn media_file_entry_focus_jump() {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let root =
-        std::env::temp_dir().join(format!("ui_media_focus_{}_{}", std::process::id(), uniq));
+    let root = std::env::temp_dir().join(format!("ui_media_focus_{}_{}", std::process::id(), uniq));
     let _ = std::fs::remove_dir_all(&root);
     let media = root.join("media");
     let deep = media.join("sub");
@@ -325,9 +322,8 @@ fn media_file_entry_focus_jump() {
     assert_eq!(app.list_tab, super::ListTab::Video, "视频目标应留在视频页");
 
     // 4) 图片目标 + 大小写变体：预切图片页、行缓存只含图片行
-    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
-        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
-    );
+    let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, media_pred(), 1).unwrap());
     let entries2 = vfs2.list();
     let idx_i = entries2
         .iter()
@@ -344,9 +340,8 @@ fn media_file_entry_focus_jump() {
     assert!(app.list_rows[0].label.contains("a.jpg"));
 
     // 5) 找不到同名条目：静默不播（视图照常），无报错无空集合提示
-    let vfs3: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
-        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
-    );
+    let vfs3: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, media_pred(), 1).unwrap());
     let entries3 = vfs3.list();
     app.pending_focus = Some("nope.mp4".into());
     assert_eq!(
@@ -359,9 +354,8 @@ fn media_file_entry_focus_jump() {
 
     // 6) 压缩包路径不吃焦点：pending_focus 保留待后续目录打开消费/重置
     //    （竞态防线：焦点未消费时用户又开了个压缩包，不得误播同名条目）
-    let vfs4: std::sync::Arc<dyn super::ArchiveVFS> = std::sync::Arc::new(
-        super::DirVFS::open(&media, media_pred(), 1).unwrap(),
-    );
+    let vfs4: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(super::DirVFS::open(&media, media_pred(), 1).unwrap());
     let entries4 = vfs4.list();
     app.pending_focus = Some("a.jpg".into());
     assert_eq!(
@@ -1106,18 +1100,25 @@ fn raw_demux_opts_validation() {
     let err = App::new_for_test(bad)
         .raw_demux_opts("sensor_a_0.bin", None)
         .unwrap_err();
-    assert!(err.contains("宽高无法确定") && err.contains("WxH"), "宽高 0 报错: {err}");
+    assert!(
+        err.contains("宽高无法确定") && err.contains("WxH"),
+        "宽高 0 报错: {err}"
+    );
 
     // 5) 大小不整除：报文件大小与尝试过的候选分辨率（文件名无 WxH →
     //    仅预设宽高 64x48 一个候选）
-    let err = app.raw_demux_opts("sensor_a_0.bin", Some(46081)).unwrap_err();
+    let err = app
+        .raw_demux_opts("sensor_a_0.bin", Some(46081))
+        .unwrap_err();
     assert!(
         err.contains("46081") && err.contains("64x48") && err.contains("不整除"),
         "整除报错应带核对数字: {err}"
     );
     // size 未知（None）时跳过整除校验，不拦装载
     assert!(
-        app.raw_demux_opts("sensor_a_0.bin", None).unwrap().is_some(),
+        app.raw_demux_opts("sensor_a_0.bin", None)
+            .unwrap()
+            .is_some(),
         "size 未知不应误拦"
     );
 
@@ -1163,7 +1164,10 @@ fn raw_demux_opts_validation() {
     ok.raw.demux[0] = mk("nv12", 0, 0, 0);
     ok.raw.demux[0].r#match = "*.bin".into();
     let r = App::new_for_test(ok)
-        .raw_demux_opts("fpga_in_s0_1920x1080_00_1.bin", Some(10 * 1920 * 1080 * 12 / 8))
+        .raw_demux_opts(
+            "fpga_in_s0_1920x1080_00_1.bin",
+            Some(10 * 1920 * 1080 * 12 / 8),
+        )
         .unwrap()
         .expect("文件名兜底应通过");
     assert_eq!((r.w, r.h), (1920, 1080));
@@ -1176,7 +1180,10 @@ fn raw_demux_opts_validation() {
     ok.raw.demux[0] = mk("nv12", 3840, 2160, 0);
     ok.raw.demux[0].r#match = "*.bin".into();
     let r = App::new_for_test(ok)
-        .raw_demux_opts("fpga_in_s0_1280x720_00_1.bin", Some(5 * 1280 * 720 * 12 / 8))
+        .raw_demux_opts(
+            "fpga_in_s0_1280x720_00_1.bin",
+            Some(5 * 1280 * 720 * 12 / 8),
+        )
         .unwrap()
         .expect("文件名候选应通过");
     assert_eq!((r.w, r.h), (1280, 720));
@@ -1419,8 +1426,7 @@ fn click_clears_notice_but_not_error() {
 fn open_done_clears_messages_and_keeps_empty_hint() {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let empty =
-        std::env::temp_dir().join(format!("ui_open_clear_{}_{}", std::process::id(), uniq));
+    let empty = std::env::temp_dir().join(format!("ui_open_clear_{}_{}", std::process::id(), uniq));
     let _ = std::fs::remove_dir_all(&empty);
     std::fs::create_dir_all(&empty).unwrap();
 
@@ -1481,19 +1487,17 @@ fn click_modifiers_prefers_inline_snapshot() {
         .drop_without_applying_deltas();
     ctx.run_ui(egui::RawInput::default().take(), |ui| {
         let m = ui.input(App::click_modifiers);
-        assert!(
-            m.shift && !m.ctrl,
-            "事件缺失时应回退跨帧状态 i.modifiers"
-        );
+        assert!(m.shift && !m.ctrl, "事件缺失时应回退跨帧状态 i.modifiers");
     })
     .drop_without_applying_deltas();
 
     // 场景 3：press 带 Ctrl、release 无修饰（按下后松开前放掉 Ctrl）
     // → 取帧末 release 的快照（egui click 判定时刻）
     let mut raw = egui::RawInput::default();
-    for (pressed, modifiers) in
-        [(true, egui::Modifiers::CTRL), (false, egui::Modifiers::default())]
-    {
+    for (pressed, modifiers) in [
+        (true, egui::Modifiers::CTRL),
+        (false, egui::Modifiers::default()),
+    ] {
         raw.events.push(egui::Event::PointerButton {
             pos: egui::pos2(10.0, 10.0),
             button: egui::PointerButton::Primary,
@@ -1503,7 +1507,10 @@ fn click_modifiers_prefers_inline_snapshot() {
     }
     ctx.run_ui(raw.take(), |ui| {
         let m = ui.input(App::click_modifiers);
-        assert!(!m.ctrl, "press 与 release 修饰不同时应取帧末（release）快照");
+        assert!(
+            !m.ctrl,
+            "press 与 release 修饰不同时应取帧末（release）快照"
+        );
     })
     .drop_without_applying_deltas();
 }

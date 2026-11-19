@@ -100,9 +100,7 @@ pub(crate) fn raw_demux_opts(
     let auto_bayer = d.pixfmt.eq_ignore_ascii_case("bayer_auto16le");
     // 2) bit_shift 合法域：0~8；>0 须 le 结尾（按 LE u16 采样
     //    移位，be/1 字节格式位移会破坏数据）
-    if d.bit_shift > 8
-        || d.bit_shift > 0 && !d.pixfmt.to_ascii_lowercase().ends_with("le")
-    {
+    if d.bit_shift > 8 || d.bit_shift > 0 && !d.pixfmt.to_ascii_lowercase().ends_with("le") {
         return Err(format!(
             "raw 预设 match='{}' 的 bit_shift={} 不合法（pixfmt={}）：\
              取值 0~8；>0 时 pixfmt 须为 le 结尾的 16bit 容器格式\
@@ -144,7 +142,9 @@ pub(crate) fn raw_demux_opts(
     Err(format!(
         "文件大小 {} B 与任一候选分辨率（{tried}）的 {} 单帧大小都不整除，无法切帧。\n\
          请核对预设 match='{}' 的 width/height/pixfmt 是否与该文件匹配。",
-        size.unwrap_or(0), d.pixfmt, d.r#match
+        size.unwrap_or(0),
+        d.pixfmt,
+        d.r#match
     ))
 }
 
@@ -166,7 +166,11 @@ pub(crate) fn raw_demux_opts(
 /// ② 组内 R/B 均值判别：大者判为 R（自然图像/彩条下 R>B 统计成立；
 ///    相对差 <1% 视为不可分辨）。
 /// 置信不足返回 None，调用方按 RGGB 兜底。None 另见：帧过小（<8x4）/ 读取失败
-pub(crate) fn detect_bayer_layout(read: &mut impl std::io::Read, w: u32, h: u32) -> Option<&'static str> {
+pub(crate) fn detect_bayer_layout(
+    read: &mut impl std::io::Read,
+    w: u32,
+    h: u32,
+) -> Option<&'static str> {
     use std::io::Read as _;
     const MAX_ROWS: usize = 128; // 采样行数上限（1920 宽 ≈ 512KB，zip 头部解压开销可忽略）
     if w < 8 || h < 4 {
@@ -221,12 +225,20 @@ pub(crate) fn detect_bayer_layout(read: &mut impl std::io::Read, w: u32, h: u32)
     if dm > da {
         // G 在反对角 (0,1)/(1,0)，R/B 在 (0,0)/(1,1)；亮者判 R
         rb(m00, m11).map(|bright00| {
-            if bright00 { "bayer_rggb16le" } else { "bayer_bggr16le" }
+            if bright00 {
+                "bayer_rggb16le"
+            } else {
+                "bayer_bggr16le"
+            }
         })
     } else {
         // G 在主对角 (0,0)/(1,1)，R/B 在 (0,1)/(1,0)；亮者判 R
         rb(m01, m10).map(|bright01| {
-            if bright01 { "bayer_grbg16le" } else { "bayer_gbrg16le" }
+            if bright01 {
+                "bayer_grbg16le"
+            } else {
+                "bayer_gbrg16le"
+            }
         })
     }
 }
@@ -279,7 +291,11 @@ pub(crate) fn shift_u16_le(data: &mut [u8], shift: u32) {
 pub(crate) fn nv12_to_rgb(w: usize, h: usize, data: &[u8]) -> Result<Vec<u8>, String> {
     let yp = w * h;
     if data.len() < yp + yp / 2 {
-        return Err(format!("nv12 数据不足：需 {a} 字节，实得 {b}", a = yp * 3 / 2, b = data.len()));
+        return Err(format!(
+            "nv12 数据不足：需 {a} 字节，实得 {b}",
+            a = yp * 3 / 2,
+            b = data.len()
+        ));
     }
     let (y, uv) = data.split_at(yp);
     let mut out = Vec::with_capacity(w * h * 3);
@@ -290,6 +306,40 @@ pub(crate) fn nv12_to_rgb(w: usize, h: usize, data: &[u8]) -> Result<Vec<u8>, St
             let yy = yrow[col] as f32;
             let u = uvrow[col & !1] as f32 - 128.0;
             let v = uvrow[(col & !1) + 1] as f32 - 128.0;
+            let r = (yy + 1.402 * v).clamp(0.0, 255.0) as u8;
+            let g = (yy - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u8;
+            let b = (yy + 1.772 * u).clamp(0.0, 255.0) as u8;
+            out.extend_from_slice(&[r, g, b]);
+        }
+    }
+    Ok(out)
+}
+
+/// yuv420p（I420）→ RGB8（BT.601）。布局：Y/U/V 三个独立平面，U/V 各
+/// (W/2)×(H/2)（4:2:0 色度半采样；与 nv12 的差别只在 UV 平面组织——
+/// nv12 交错在同一行，yuv420p 两个独立平面）
+pub(crate) fn yuv420p_to_rgb(w: usize, h: usize, data: &[u8]) -> Result<Vec<u8>, String> {
+    let yp = w * h;
+    let cp = (w / 2).max(1) * (h / 2).max(1);
+    if data.len() < yp + cp * 2 {
+        return Err(format!(
+            "yuv420p 数据不足：需 {a} 字节，实得 {b}",
+            a = yp + cp * 2,
+            b = data.len()
+        ));
+    }
+    let (y, rest) = data.split_at(yp);
+    let (u, v) = rest.split_at(cp);
+    let cw = (w / 2).max(1);
+    let mut out = Vec::with_capacity(w * h * 3);
+    for row in 0..h {
+        let yrow = &y[row * w..row * w + w];
+        let urow = &u[(row / 2) * cw..(row / 2) * cw + cw];
+        let vrow = &v[(row / 2) * cw..(row / 2) * cw + cw];
+        for col in 0..w {
+            let yy = yrow[col] as f32;
+            let u = urow[col / 2] as f32 - 128.0;
+            let v = vrow[col / 2] as f32 - 128.0;
             let r = (yy + 1.402 * v).clamp(0.0, 255.0) as u8;
             let g = (yy - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u8;
             let b = (yy + 1.772 * u).clamp(0.0, 255.0) as u8;
@@ -441,6 +491,8 @@ fn soft_decodable(pixfmt: &str, auto_bayer: bool) -> bool {
         || p == "gray"
         || p == "gray16le"
         || p == "nv12"
+        || p == "yuv420p"
+        || p == "rgb24"
         || (p.starts_with("bayer_") && p.ends_with("16le"))
 }
 
@@ -475,8 +527,8 @@ impl RawFrameInfo {
 pub(crate) fn raw_frame_info(rl: &RawLoad, size: u64) -> Result<RawFrameInfo, String> {
     if !soft_decodable(&rl.pixfmt, rl.auto_bayer) {
         return Err(format!(
-            "暂不支持软解该格式：{}（支持 nv12 / gray / gray16le / bayer*_16le；\
-             播放不受影响）",
+            "暂不支持软解该格式：{}（支持 nv12 / yuv420p / rgb24 / gray / \
+             gray16le / bayer*_16le；播放不受影响）",
             rl.pixfmt
         ));
     }
@@ -512,17 +564,19 @@ struct RawFrameDone {
     res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
 }
 
-/// raw 探针读数（三种内建格式各自的"真实值"，全部为**文件存储原值**——
-/// 未做 bit_shift 位移、未插值成 RGB；显示 RGB 是转换产物，探针要的是
+/// raw 探针读数（各内建格式各自的"真实值"，全部为**文件存储原值**——
+/// 未做 bit_shift 位移、未转换色彩空间；显示 RGB 是转换产物，探针要的是
 /// 传感器/编码前的原始采样值）
 #[derive(Clone, Debug)]
 pub(crate) enum RawProbe {
     /// gray/gray16le：单点亮度存储值 + 有效位深（gray=8；gray16le 位移后
     /// = 16-bit_shift，如 12bit 数据）
     Gray { v: u16, bits: u32 },
-    /// nv12：该点 Y + 覆盖它的 2×2 块共享的 U/V（4:2:0 色度半采样，UV 按
-    /// (x/2, y/2) 取）
+    /// nv12/yuv420p：该点 Y + 覆盖它的 2×2 块共享的 U/V（4:2:0 色度半采样，
+    /// UV 按 (x/2, y/2) 取——两种 4:2:0 的差别只在平面组织，取样语义相同）
     Nv12 { y: u8, u: u8, v: u8 },
+    /// rgb24：该点 RGB 三分量存储原值（逐像素 3 字节，R,G,B 字节序）
+    Rgb { r: u8, g: u8, b: u8 },
     /// bayer*_16le：采样点对齐 2×2 块的 4 个存储原值（CFA 排列位序）+ 排列
     /// 名 + 有效位深
     Bayer {
@@ -637,7 +691,14 @@ impl RawFrameService {
         {
             return;
         }
-        self.probes.insert(key, ProbeEntry { idx: fi, uv, res: None });
+        self.probes.insert(
+            key,
+            ProbeEntry {
+                idx: fi,
+                uv,
+                res: None,
+            },
+        );
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (source, info) = (source.clone(), info.clone());
         std::thread::Builder::new()
@@ -648,7 +709,12 @@ impl RawFrameService {
                 }))
                 .map_err(|_| "raw 探针线程 panic".to_string())
                 .and_then(|r| r);
-                let _ = tx.send(RawMsg::Probe(RawProbeDone { key, idx: fi, uv, res }));
+                let _ = tx.send(RawMsg::Probe(RawProbeDone {
+                    key,
+                    idx: fi,
+                    uv,
+                    res,
+                }));
                 ctx.request_repaint();
             })
             .ok();
@@ -673,8 +739,14 @@ impl RawFrameService {
                                 img,
                                 egui::TextureOptions::LINEAR,
                             );
-                            self.frames
-                                .insert(m.key, RawFrameTex { idx: m.idx, tex, hist });
+                            self.frames.insert(
+                                m.key,
+                                RawFrameTex {
+                                    idx: m.idx,
+                                    tex,
+                                    hist,
+                                },
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);
@@ -756,14 +828,22 @@ impl HistService {
 
     /// 确保当前 key 的直方图在途（幂等）。预设未命中（标准容器/视频）与
     /// 配置错误（Err）直接落 done——UI 覆盖层显示状态文案，不发线程
-    pub(crate) fn request(&mut self, key: ImgKey, source: &ImageSource, name: &str, size: u64, cfg: &Config) {
+    pub(crate) fn request(
+        &mut self,
+        key: ImgKey,
+        source: &ImageSource,
+        name: &str,
+        size: u64,
+        cfg: &Config,
+    ) {
         if self.pending.contains_key(&key) || self.done.contains_key(&key) {
             return;
         }
         let rl = match raw_demux_opts(cfg, name, Some(size)) {
             Ok(Some(rl)) => rl,
             Ok(None) => {
-                self.done.insert(key, Err("非 raw 裸数据（标准视频不支持直方图）".into()));
+                self.done
+                    .insert(key, Err("非 raw 裸数据（标准视频不支持直方图）".into()));
                 return;
             }
             Err(e) => {
@@ -854,7 +934,8 @@ impl std::io::Seek for FrameReader {
 fn open_frame_reader(source: &ImageSource) -> Result<FrameReader, String> {
     match source {
         ImageSource::Stream(vfs, e) => Ok(FrameReader::V(
-            vfs.open_entry(e).map_err(|er| format!("打开条目失败: {er}"))?,
+            vfs.open_entry(e)
+                .map_err(|er| format!("打开条目失败: {er}"))?,
         )),
         ImageSource::File(p) => Ok(FrameReader::F(
             std::fs::File::open(p).map_err(|er| format!("打开缓存文件失败: {er}"))?,
@@ -893,6 +974,9 @@ fn decode_raw_frame(
         "gray" => Ok(gray8_to_rgb(&data)),
         "gray16le" => Ok(gray16le_to_rgb(&data, 0)),
         "nv12" => nv12_to_rgb(w, h, &data),
+        "yuv420p" => yuv420p_to_rgb(w, h, &data),
+        // rgb24 = 逐像素 R,G,B 字节序，与 egui::Color32::from_rgb 同序——直通
+        "rgb24" => Ok(data),
         p if p.starts_with("bayer_") && p.ends_with("16le") => {
             let name = &p["bayer_".len()..p.len() - "16le".len()];
             bayer_layout_of(name)
@@ -900,7 +984,8 @@ fn decode_raw_frame(
                 .and_then(|layout| bayer16le_to_rgb(w, h, &data, &layout, 0))
         }
         _ => Err(format!(
-            "暂不支持软解该格式：{}（支持 nv12 / gray / gray16le / bayer*_16le）",
+            "暂不支持软解该格式：{}（支持 nv12 / yuv420p / rgb24 / gray / \
+             gray16le / bayer*_16le）",
             rl.pixfmt
         )),
     }?;
@@ -915,11 +1000,13 @@ fn decode_raw_frame(
 }
 
 /// 像素探针读数（Alt+点击 raw 栏）：按格式解析采样点的**存储原值**——
-/// 不做 bit_shift 位移、不插值 RGB（显示 RGB 是转换产物，探针要原始采样
-/// 值）。按字节偏移直读所需几个字节（auto_bayer 需先读首帧探测排列），
+/// 不做 bit_shift 位移、不转换色彩空间（显示 RGB 是转换产物，探针要原始
+/// 采样值）。按字节偏移直读所需几个字节（auto_bayer 需先读首帧探测排列），
 /// 无整帧读取/转换成本：
 /// - gray/gray16le：单点亮度值；
-/// - nv12：该点 Y + 覆盖 2×2 块共享的 U/V（4:2:0 半采样，按 (x/2, y/2) 取）；
+/// - nv12/yuv420p：该点 Y + 覆盖 2×2 块共享的 U/V（4:2:0 半采样，按
+///   (x/2, y/2) 取；差别只在平面组织，取样语义相同）；
+/// - rgb24：该点 RGB 三分量；
 /// - bayer*_16le：采样点对齐 2×2 块的 4 个 u16 原值（CFA 排列位序）。
 ///
 /// **新增格式约束**：与 `soft_decodable`/`decode_raw_frame` 的格式分派
@@ -956,7 +1043,10 @@ fn probe_raw_pixel(
     match pixfmt.as_str() {
         "gray" => {
             let b = read_at((y * w + x) as u64, 1)?;
-            Ok(RawProbe::Gray { v: u16::from(b[0]), bits: 8 })
+            Ok(RawProbe::Gray {
+                v: u16::from(b[0]),
+                bits: 8,
+            })
         }
         "gray16le" => {
             let b = read_at(((y * w + x) * 2) as u64, 2)?;
@@ -973,12 +1063,40 @@ fn probe_raw_pixel(
             let yb = read_at((y * w + x) as u64, 1)?;
             let ub = read_at((yp + cy * cw + cx) as u64, 1)?;
             let vb = read_at((yp + yp / 4 + cy * cw + cx) as u64, 1)?;
-            Ok(RawProbe::Nv12 { y: yb[0], u: ub[0], v: vb[0] })
+            Ok(RawProbe::Nv12 {
+                y: yb[0],
+                u: ub[0],
+                v: vb[0],
+            })
+        }
+        // yuv420p = nv12 的取样语义 + 独立 UV 平面（V 平面在 U 平面之后）
+        "yuv420p" => {
+            let yp = w * h;
+            let cw = (w / 2).max(1);
+            let ch = (h / 2).max(1);
+            let cp = cw * ch;
+            let (cx, cy) = ((x / 2).min(cw - 1), (y / 2).min(ch - 1));
+            let yb = read_at((y * w + x) as u64, 1)?;
+            let ub = read_at((yp + cy * cw + cx) as u64, 1)?;
+            let vb = read_at((yp + cp + cy * cw + cx) as u64, 1)?;
+            Ok(RawProbe::Nv12 {
+                y: yb[0],
+                u: ub[0],
+                v: vb[0],
+            })
+        }
+        // rgb24 = 逐像素 R,G,B 字节序，单点直读 3 字节
+        "rgb24" => {
+            let b = read_at(((y * w + x) * 3) as u64, 3)?;
+            Ok(RawProbe::Rgb {
+                r: b[0],
+                g: b[1],
+                b: b[2],
+            })
         }
         p if p.starts_with("bayer_") && p.ends_with("16le") => {
             let name = &p["bayer_".len()..p.len() - "16le".len()];
-            bayer_layout_of(name)
-                .ok_or_else(|| format!("未知 bayer 排列: {name}"))?;
+            bayer_layout_of(name).ok_or_else(|| format!("未知 bayer 排列: {name}"))?;
             let (bx, by) = (x & !1, y & !1);
             let row0 = read_at(((by * w + bx) * 2) as u64, 4)?;
             let row1 = read_at((((by + 1) * w + bx) * 2) as u64, 4)?;
@@ -1221,7 +1339,11 @@ mod tests {
         // 采样 (3,1) → 对齐 2×2 块起点 (2,0)：行 0 [101,201]、行 1 [301,401]
         let uv = egui::vec2(3.0 / 4.0, 1.0 / 2.0);
         match probe_raw_pixel(&src, &info, 0, uv).unwrap() {
-            RawProbe::Bayer { layout, block, bits } => {
+            RawProbe::Bayer {
+                layout,
+                block,
+                bits,
+            } => {
                 assert_eq!(layout, "RGGB");
                 assert_eq!(bits, 12, "bit_shift=4 → 有效位深 12");
                 assert_eq!(block, [[101, 201], [301, 401]], "对齐块 4 个存储原值");
@@ -1260,7 +1382,79 @@ mod tests {
             o => panic!("应 Gray，实际 {o:?}"),
         }
 
+        // ---- yuv420p：独立 UV 平面（V 平面紧跟 U 平面之后，区别于 nv12 交错）----
+        // 4×2（frame_bytes=12B：Y 8B + U 2B + V 2B），Y(3,0)=77、U[1]=66、V[1]=88
+        let mut d = vec![0u8; 12];
+        d[3] = 77; // Y(3,0)
+        d[8 + 1] = 66; // U 平面 (1,0)
+        d[8 + 2 + 1] = 88; // V 平面 (1,0)
+        let p = dir.join("t.yuv420");
+        std::fs::write(&p, &d).unwrap();
+        let info = RawFrameInfo {
+            w: 4,
+            h: 2,
+            pixfmt: "yuv420p".into(),
+            fps: 10.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: 12,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(p);
+        // 采样 (3,0) → 色度 (1,0)：Y=77、U=66、V=88
+        match probe_raw_pixel(&src, &info, 0, egui::vec2(3.0 / 4.0, 0.0)).unwrap() {
+            RawProbe::Nv12 { y, u, v } => assert_eq!((y, u, v), (77, 66, 88)),
+            o => panic!("应 Nv12（yuv420p 共用取样语义），实际 {o:?}"),
+        }
+
+        // ---- rgb24：单点 RGB 三分量（逐像素 3 字节，R,G,B 字节序）----
+        // 2×1（frame_bytes=6B），像素 (1,0) = (10, 20, 30)
+        let d = vec![0u8, 0, 0, 10, 20, 30];
+        let p = dir.join("t.rgb");
+        std::fs::write(&p, &d).unwrap();
+        let info = RawFrameInfo {
+            w: 2,
+            h: 1,
+            pixfmt: "rgb24".into(),
+            fps: 10.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: 6,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(p);
+        match probe_raw_pixel(&src, &info, 0, egui::vec2(0.75, 0.0)).unwrap() {
+            RawProbe::Rgb { r, g, b } => assert_eq!((r, g, b), (10, 20, 30), "R,G,B 字节序"),
+            o => panic!("应 Rgb，实际 {o:?}"),
+        }
+
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// yuv420p 软解：独立 UV 平面取样正确（4×2，Y/U/V 平面偏移与色度
+    /// 半采样索引）；中性色无色偏（Y=128, U=V=128 → 灰）
+    #[test]
+    fn yuv420p_to_rgb_独立uv平面() {
+        // Y 平面 8B：仅 (2,0)=255，其余 0；U=[128, 200]，V=[128, 128]
+        let (w, h) = (4usize, 2usize);
+        let mut d = vec![0u8; 12];
+        d[2] = 255;
+        d[8] = 128;
+        d[9] = 200;
+        d[10] = 128;
+        d[11] = 128;
+        let rgb = yuv420p_to_rgb(w, h, &d).unwrap();
+        // 3 字节/像素：行 0 = [黑(0,0), 黑, 白偏蓝, 白偏蓝]、行 1 全黑
+        // (2,0)：Y=255, u=200-128=72, v=0 → r=255, g=255-0.344136*72≈230, b=255
+        assert_eq!(&rgb[0..3], &[0, 0, 0]);
+        assert_eq!(&rgb[6..9], &[255, 230, 255], "U 平面独立取样");
+        assert_eq!(&rgb[12..15], &[0, 0, 0], "行 1 复用同一色度行");
+        // 中性灰：全 Y=128, U=V=128 → (128,128,128)
+        let d = vec![128u8; 12];
+        let rgb = yuv420p_to_rgb(w, h, &d).unwrap();
+        assert!(rgb.chunks_exact(3).all(|c| c == [128, 128, 128]));
+        // 数据不足报错
+        assert!(yuv420p_to_rgb(w, h, &d[..11]).is_err());
     }
 
     #[test]
@@ -1354,8 +1548,18 @@ mod tests {
         assert_eq!(info.frame_bytes, (1920 * 1080 * 3 / 2) as u64);
         assert_eq!(info.frame_count, 100);
         assert!(!info.to_raw_load().auto_bayer);
-        // yuv420p 不在软解支持名单 → RawErr
-        let rl2 = RawLoad { pixfmt: "yuv420p".into(), ..rl };
-        assert!(raw_frame_info(&rl2, size).is_err());
+        // yuv420p 在软解支持名单内（独立 UV 平面，见 yuv420p_to_rgb）
+        let rl2 = RawLoad {
+            pixfmt: "yuv420p".into(),
+            ..rl
+        };
+        let info2 = raw_frame_info(&rl2, size).unwrap();
+        assert_eq!(info2.frame_bytes, (1920 * 1080 * 12 / 8) as u64);
+        // 真正不在名单的格式 → RawErr
+        let rl3 = RawLoad {
+            pixfmt: "yuv444p".into(),
+            ..rl
+        };
+        assert!(raw_frame_info(&rl3, size).is_err());
     }
 }

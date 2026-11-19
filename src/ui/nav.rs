@@ -621,10 +621,7 @@ impl App {
     /// eof_handled 防重入：推进无效果时（列表末尾停住/目标需先解压等
     /// 装载）不每帧重复触发；eof 复位（新文件开播/手动回拖）自动清空
     pub(super) fn video_eof_tick(&mut self) {
-        if self.play_mode != PlayMode::List
-            || self.playing.is_none()
-            || self.playing_is_image()
-        {
+        if self.play_mode != PlayMode::List || self.playing.is_none() || self.playing_is_image() {
             return;
         }
         let eof = self.player.as_ref().is_some_and(|p| p.eof_reached());

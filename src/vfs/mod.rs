@@ -2,6 +2,7 @@
 //! Phase 1 只实现 ZipVFS；7z/RAR 是后续 Phase，接口不变。
 
 pub mod dir_vfs;
+pub mod file_vfs;
 pub mod rar_vfs;
 pub mod sevenz_vfs;
 pub mod zip_vfs;

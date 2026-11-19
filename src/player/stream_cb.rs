@@ -207,7 +207,11 @@ impl ShiftReader {
     pub(crate) fn new(inner: Box<dyn crate::vfs::VirtualFile>, shift: u32) -> Self {
         debug_assert!((1..=8).contains(&shift));
         // open_entry 契约：新开句柄位于 0（DirVFS/ZipVFS 同此）
-        Self { inner, shift, pos: 0 }
+        Self {
+            inner,
+            shift,
+            pos: 0,
+        }
     }
 }
 
@@ -218,9 +222,9 @@ impl Read for ShiftReader {
         }
         let pos = self.pos;
         let back = (pos & 1) as usize; // 奇地址：回看 1 字节补齐配对
-        // 窗口 = [pos & !1, pos&!1 + back + buf.len() + 1)：+1 是 buf 末
-        // 字节若落奇地址时的前看伙伴（文件尾读不到则少 1，尾部奇字节
-        // 保持原样交付——帧数据恒偶，仅 EOF 兜底路径会走到）
+                                       // 窗口 = [pos & !1, pos&!1 + back + buf.len() + 1)：+1 是 buf 末
+                                       // 字节若落奇地址时的前看伙伴（文件尾读不到则少 1，尾部奇字节
+                                       // 保持原样交付——帧数据恒偶，仅 EOF 兜底路径会走到）
         let window_len = back + buf.len() + 1;
         self.inner.seek(SeekFrom::Start(pos & !1))?;
         let mut window = vec![0u8; window_len];

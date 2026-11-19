@@ -209,36 +209,33 @@ impl App {
         let assembled: Result<EncodeDialog, String> = (|| {
             let a = self.archive.as_ref().ok_or("未打开压缩包")?;
             // ---- 模式与条目集：多选 ≥2 = 精确（自然序）；否则以目标行定位整族 ----
-            let (entries_idx, alt): (Vec<usize>, Option<Vec<usize>>) =
-                if self.selected.len() >= 2 {
-                    let mut v: Vec<usize> = self.selected.iter().copied().collect();
-                    v.sort_by(|&x, &y| {
-                        alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
-                    });
-                    (v, None)
-                } else {
-                    let row = ctx_row.or_else(|| self.selected.iter().next().copied());
-                    let row = row.ok_or("没有可编码的目标行")?;
-                    let name = &a.entries[row].name;
-                    let pi = cli::preset_index(&self.cfg, name).ok_or_else(|| {
-                        format!("文件 [{name}] 未命中任何 [[raw.demux]] 预设（config.toml）")
-                    })?;
-                    // UI 版带下标族收集：全包条目按同一预设分组（组内 name 自然序）。
-                    // 不走 cli::families——它返回条目本体，name→下标回查是 O(n²)
-                    let mut fam: Vec<usize> = a
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| {
-                            !e.is_dir && cli::preset_index(&self.cfg, &e.name) == Some(pi)
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    fam.sort_by(|&x, &y| {
-                        alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
-                    });
-                    (fam, Some(vec![row]))
-                };
+            let (entries_idx, alt): (Vec<usize>, Option<Vec<usize>>) = if self.selected.len() >= 2 {
+                let mut v: Vec<usize> = self.selected.iter().copied().collect();
+                v.sort_by(|&x, &y| {
+                    alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
+                });
+                (v, None)
+            } else {
+                let row = ctx_row.or_else(|| self.selected.iter().next().copied());
+                let row = row.ok_or("没有可编码的目标行")?;
+                let name = &a.entries[row].name;
+                let pi = cli::preset_index(&self.cfg, name).ok_or_else(|| {
+                    format!("文件 [{name}] 未命中任何 [[raw.demux]] 预设（config.toml）")
+                })?;
+                // UI 版带下标族收集：全包条目按同一预设分组（组内 name 自然序）。
+                // 不走 cli::families——它返回条目本体，name→下标回查是 O(n²)
+                let mut fam: Vec<usize> = a
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| !e.is_dir && cli::preset_index(&self.cfg, &e.name) == Some(pi))
+                    .map(|(i, _)| i)
+                    .collect();
+                fam.sort_by(|&x, &y| {
+                    alphanumeric_sort::compare_str(&a.entries[x].name, &a.entries[y].name)
+                });
+                (fam, Some(vec![row]))
+            };
             if entries_idx.is_empty() {
                 return Err("没有可编码的文件".into());
             }
@@ -271,13 +268,9 @@ impl App {
             let base = if a.path.is_dir() {
                 a.path.clone()
             } else {
-                a.path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default()
+                a.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
             };
-            let ve: Vec<VirtualEntry> =
-                entries_idx.iter().map(|&i| a.entries[i].clone()).collect();
+            let ve: Vec<VirtualEntry> = entries_idx.iter().map(|&i| a.entries[i].clone()).collect();
             let (fmt, bw) = cli::resolve_encode_format(preset, &ve, &a.vfs)?;
             Ok(EncodeDialog {
                 entries: entries_idx,
@@ -487,8 +480,9 @@ impl App {
                 };
                 let ve: Vec<VirtualEntry> =
                     d.entries.iter().map(|&i| a.entries[i].clone()).collect();
-                d.out =
-                    cli::default_output(&base, &ve[0].name).display().to_string();
+                d.out = cli::default_output(&base, &ve[0].name)
+                    .display()
+                    .to_string();
                 d.warnings = cli::numbering_gaps(&ve);
             }
         }
@@ -539,8 +533,7 @@ impl App {
             let last = std::cell::Cell::new(None::<std::time::Instant>);
             let progress = |p: f64| {
                 let now = std::time::Instant::now();
-                let due =
-                    !matches!(last.get(), Some(t) if now.duration_since(t).as_millis() < 100);
+                let due = !matches!(last.get(), Some(t) if now.duration_since(t).as_millis() < 100);
                 if due {
                     last.set(Some(now));
                     let _ = tx.send(EncodeMsg::Progress(p as f32));

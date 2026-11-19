@@ -286,23 +286,20 @@ impl App {
                 // 换空格；超宽时截断到右缘，全文由 elided 自动悬停气泡展示
                 // （Label 自带，勿再手动 on_hover_text——会出现第二个气泡）
                 let n = n.replace('\r', "").replace('\n', " ");
-                let lbl = egui::Label::new(
-                    egui::RichText::new(&n).color(egui::Color32::LIGHT_GREEN),
-                )
-                .truncate()
-                .sense(if clickable {
-                    egui::Sense::click()
-                } else {
-                    egui::Sense::hover()
-                });
+                let lbl =
+                    egui::Label::new(egui::RichText::new(&n).color(egui::Color32::LIGHT_GREEN))
+                        .truncate()
+                        .sense(if clickable {
+                            egui::Sense::click()
+                        } else {
+                            egui::Sense::hover()
+                        });
                 let resp = ui.add(lbl);
                 if clickable {
-                    resp.clone()
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
                         if let Some(dir) = self.encode_done_dir.take() {
-                            let _ =
-                                std::process::Command::new("explorer").arg(&dir).spawn();
+                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                         }
                         self.notice = None;
                     }
@@ -367,7 +364,11 @@ impl App {
             .unwrap_or_else(|| path.clone());
         if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
             let sel = format!("/select,{}", path.display());
-            if std::process::Command::new("explorer").arg(sel).spawn().is_err() {
+            if std::process::Command::new("explorer")
+                .arg(sel)
+                .spawn()
+                .is_err()
+            {
                 self.set_notice(format!("打开配置目录失败: {e}"));
             }
         }
@@ -490,10 +491,7 @@ impl App {
             if !self.search.is_empty() {
                 let side = resp.rect.height() - 4.0;
                 let btn_rect = egui::Rect::from_center_size(
-                    egui::pos2(
-                        resp.rect.right() - side * 0.5 - 2.0,
-                        resp.rect.center().y,
-                    ),
+                    egui::pos2(resp.rect.right() - side * 0.5 - 2.0, resp.rect.center().y),
                     egui::vec2(side, side),
                 );
                 let clear_btn = ui.put(
@@ -583,8 +581,7 @@ impl App {
             // 等价不防抖）。脏了但未到期时 request_repaint_after 预订到期帧
             // ——egui 按需重绘，不预订的话停手后没人唤醒这一帧
             if self.search_dirty {
-                let debounce =
-                    std::time::Duration::from_millis(self.cfg.ui.search_debounce_ms);
+                let debounce = std::time::Duration::from_millis(self.cfg.ui.search_debounce_ms);
                 let since = self
                     .search_last_edit
                     .map(|t| t.elapsed())
@@ -767,17 +764,13 @@ impl App {
                                 playing == Some(r.idx),
                                 (
                                     egui::RichText::new("S ").color(sel_c),
-                                    egui::RichText::new(r.label.as_str())
-                                        .atom_shrink(true),
+                                    egui::RichText::new(r.label.as_str()).atom_shrink(true),
                                 ),
                             )
                             .truncate()
                         } else {
-                            egui::Button::selectable(
-                                playing == Some(r.idx),
-                                r.label.as_str(),
-                            )
-                            .truncate()
+                            egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
+                                .truncate()
                         };
                         let mut resp = btn.ui(ui);
                         // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
@@ -975,7 +968,10 @@ impl App {
                 .zip(self.list_rows.iter().position(|r| r.idx == idx))
                 .map(|(a, b)| {
                     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    self.list_rows[lo..=hi].iter().map(|r| r.idx).collect::<Vec<_>>()
+                    self.list_rows[lo..=hi]
+                        .iter()
+                        .map(|r| r.idx)
+                        .collect::<Vec<_>>()
                 });
             self.selected.clear();
             match range {
@@ -1025,11 +1021,9 @@ impl App {
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::symmetric(6, 1))
                         .show(ui, |ui| {
-                            egui::Label::new(
-                                egui::RichText::new(text).small().color(amber),
-                            )
-                            .truncate()
-                            .ui(ui);
+                            egui::Label::new(egui::RichText::new(text).small().color(amber))
+                                .truncate()
+                                .ui(ui);
                         });
                 }
             }
@@ -1360,14 +1354,8 @@ impl App {
         }
         // 当前条目快照（借用分离：先取数据，后做 &mut 服务调用）
         let cur = self.archive.as_ref().and_then(|a| {
-            self.playing.map(|i| {
-                (
-                    a.id,
-                    a.stream,
-                    a.entries[i].name.clone(),
-                    a.entries[i].size,
-                )
-            })
+            self.playing
+                .map(|i| (a.id, a.stream, a.entries[i].name.clone(), a.entries[i].size))
         });
         if let Some(key) = self.tex_image_key() {
             // 标准图片：直方图随解码就绪（动图 = 首帧）
@@ -1433,7 +1421,10 @@ impl App {
                 let mut dy = 0.0_f32;
                 let mut ctrl = i.modifiers.ctrl;
                 for e in &i.events {
-                    if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
+                    if let egui::Event::MouseWheel {
+                        delta, modifiers, ..
+                    } = e
+                    {
                         dy += delta.y;
                         ctrl |= modifiers.ctrl;
                     }
@@ -1748,7 +1739,10 @@ impl App {
                 let mut dy = 0.0_f32;
                 let mut ctrl = i.modifiers.ctrl;
                 for e in &i.events {
-                    if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
+                    if let egui::Event::MouseWheel {
+                        delta, modifiers, ..
+                    } = e
+                    {
                         dy += delta.y;
                         ctrl |= modifiers.ctrl;
                     }
@@ -1812,11 +1806,7 @@ impl App {
                     // frame_ex：主栏 true（拥有 full 槽、可弃旧槽），非主栏
                     // false（每帧轮流 frame 若人人弃槽会把主栏 full 抖掉）
                     let Some((tex, rest)) = self.img.frame_ex(key, i == master0) else {
-                        self.draw_pane_text(
-                            ui,
-                            cell,
-                            "正在解码图片…（非流式包等待解压落地）",
-                        );
+                        self.draw_pane_text(ui, cell, "正在解码图片…（非流式包等待解压落地）");
                         if set_master {
                             self.compare.as_mut().unwrap().master = i;
                         }
@@ -1858,7 +1848,11 @@ impl App {
                     let screen_px = (native * zoom * ppp).max_elem();
                     let want_full = self.cfg.image.image_compare_full_resample_enable
                         && screen_px > native_max as f32 * self.cfg.image.image_full_threshold;
-                    let full = if want_full { self.img.full_tex(key) } else { None };
+                    let full = if want_full {
+                        self.img.full_tex(key)
+                    } else {
+                        None
+                    };
                     let tex = full.unwrap_or(tex);
                     let tid = tex.id();
                     self.draw_pane_and_interact(
@@ -1942,7 +1936,9 @@ impl App {
                     );
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.label(
-                            egui::RichText::new(msg).small().color(ui.visuals().warn_fg_color),
+                            egui::RichText::new(msg)
+                                .small()
+                                .color(ui.visuals().warn_fg_color),
                         );
                     });
                     if set_master {
@@ -1962,7 +1958,11 @@ impl App {
                 egui::Align2::LEFT_TOP,
                 format!("{prefix}{name}"),
                 egui::TextStyle::Small.resolve(ui.style()),
-                if i == master { amber } else { ui.visuals().weak_text_color() },
+                if i == master {
+                    amber
+                } else {
+                    ui.visuals().weak_text_color()
+                },
             );
         }
     }
@@ -2037,10 +2037,8 @@ impl App {
         let center = clamp_center(center_v, disp, cell.size());
         let mut raw = pane_image_rect(*cell, disp, center);
         // 物理像素 snap（同 image_view：100% 态防双线性发糊/拖拽亚像素爬动）
-        let snapped = egui::Rect::from_min_max(
-            (raw.min * ppp).round() / ppp,
-            (raw.max * ppp).round() / ppp,
-        );
+        let snapped =
+            egui::Rect::from_min_max((raw.min * ppp).round() / ppp, (raw.max * ppp).round() / ppp);
         if snapped.width() > 0.0 && snapped.height() > 0.0 {
             raw = snapped;
         }
@@ -2095,7 +2093,11 @@ impl App {
                 return true;
             }
             let s = self.compare.as_ref().unwrap();
-            let Some(ka) = s.panes.iter().find(|q| q.key == p.key).map(|q| q.kind.clone())
+            let Some(ka) = s
+                .panes
+                .iter()
+                .find(|q| q.key == p.key)
+                .map(|q| q.kind.clone())
             else {
                 return false;
             };
@@ -2179,20 +2181,32 @@ impl App {
         // 十字标记：圆圈 + 四段短线（不遮取样点中心）
         let stroke = egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.9));
         painter.circle_stroke(pos, 6.0, stroke);
-        painter.line_segment([pos - egui::vec2(11.0, 0.0), pos - egui::vec2(6.0, 0.0)], stroke);
-        painter.line_segment([pos + egui::vec2(6.0, 0.0), pos + egui::vec2(11.0, 0.0)], stroke);
-        painter.line_segment([pos - egui::vec2(0.0, 11.0), pos - egui::vec2(0.0, 6.0)], stroke);
-        painter.line_segment([pos + egui::vec2(0.0, 6.0), pos + egui::vec2(0.0, 11.0)], stroke);
+        painter.line_segment(
+            [pos - egui::vec2(11.0, 0.0), pos - egui::vec2(6.0, 0.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos + egui::vec2(6.0, 0.0), pos + egui::vec2(11.0, 0.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos - egui::vec2(0.0, 11.0), pos - egui::vec2(0.0, 6.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos + egui::vec2(0.0, 6.0), pos + egui::vec2(0.0, 11.0)],
+            stroke,
+        );
         // 信息文字按栏类型分流：图像栏 = 原图坐标 + RGB + YUV（BT.601）；
-        // raw 栏 = 存储原值按格式分流（NV12→YUV / GRAY→亮度 / BAYER→2×2）
+        // raw 栏 = 存储原值按格式分流（NV12/YUV420→YUV / GRAY→亮度 /
+        // RGB24→RGB / BAYER→2×2）
         let (text, dark_bg) = match target {
             PaneKind::Raw(info) => {
                 let (w, h) = (info.w.max(1) as f32, info.h.max(1) as f32);
                 let x = ((probe.uv.x * w) as u32).min(info.w.saturating_sub(1));
                 let y = ((probe.uv.y * h) as u32).min(info.h.saturating_sub(1));
-                let lum_ok = |v: u32, bits: u32| {
-                    (if bits <= 8 { v } else { v >> (bits - 8) }) >= 128
-                };
+                let lum_ok =
+                    |v: u32, bits: u32| (if bits <= 8 { v } else { v >> (bits - 8) }) >= 128;
                 match self
                     .rawdec
                     .probe(pane_key)
@@ -2200,14 +2214,21 @@ impl App {
                 {
                     Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => (
                         format!("[{x}, {y}]  4:2:0\nY({yv}) U({u}) V({v})"),
-                        u32::from(yv) * 299 + u32::from(u) * 587 + u32::from(v) * 114
-                            >= 128_000,
+                        u32::from(yv) * 299 + u32::from(u) * 587 + u32::from(v) * 114 >= 128_000,
+                    ),
+                    Some(Ok(rawdec::RawProbe::Rgb { r, g, b })) => (
+                        format!("[{x}, {y}]  RGB888\nR({r}) G({g}) B({b})"),
+                        u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 >= 128_000,
                     ),
                     Some(Ok(rawdec::RawProbe::Gray { v, bits })) => (
                         format!("[{x}, {y}]  {bits}bit\nGRAY({v})"),
                         lum_ok(u32::from(v), bits),
                     ),
-                    Some(Ok(rawdec::RawProbe::Bayer { layout, block, bits })) => {
+                    Some(Ok(rawdec::RawProbe::Bayer {
+                        layout,
+                        block,
+                        bits,
+                    })) => {
                         // 取样点亮度按其在 2×2 块内的位置取
                         let v = block[(y & 1) as usize][(x & 1) as usize];
                         (
@@ -2706,7 +2727,11 @@ fn draw_histogram(
     let galley = ui
         .painter()
         .layout_no_wrap(title.to_string(), font, egui::Color32::WHITE);
-    painter.galley(rect.left_top() + egui::vec2(8.0, 4.0), galley, egui::Color32::WHITE);
+    painter.galley(
+        rect.left_top() + egui::vec2(8.0, 4.0),
+        galley,
+        egui::Color32::WHITE,
+    );
     // 绘图区（标题下方留白）
     let plot = egui::Rect::from_min_max(
         rect.left_top() + egui::vec2(6.0, 20.0),
@@ -2731,7 +2756,10 @@ fn draw_histogram(
         let x = plot.left() + b as f32 * step;
         let y = plot.bottom() - (h.ch[3][b] as f32 / max) * plot.height();
         fill.colored_vertex(egui::pos2(x, y), egui::Color32::from_white_alpha(38));
-        fill.colored_vertex(egui::pos2(x, plot.bottom()), egui::Color32::from_white_alpha(38));
+        fill.colored_vertex(
+            egui::pos2(x, plot.bottom()),
+            egui::Color32::from_white_alpha(38),
+        );
     }
     for b in 0..255u32 {
         let (a, b1, c, d) = (2 * b, 2 * b + 1, 2 * b + 2, 2 * b + 3);

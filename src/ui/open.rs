@@ -143,58 +143,60 @@ impl App {
                 // 排帧（全事件驱动），进度显示与终态套用全靠此唤醒
                 let egui_ctx = self.egui_ctx.clone();
                 move || {
-                // 阶段 1（目录递归扫描 / crate 内部解析头/CD，无法细分）：不定进度
-                let stage = if path_t.is_dir() {
-                    "正在扫描目录"
-                } else {
-                    "正在读取压缩包目录"
-                };
-                let _ = tx.send(OpenMsg::Progress {
-                    fraction: None,
-                    stage: stage.into(),
-                });
-                egui_ctx.request_repaint();
-                // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
-                // doc/架构设计/04_VFS层.md §4.2）——无加密概念，不走密码探测链；文件模式照旧
-                let opened = if path_t.is_dir() {
-                    DirVFS::open(&path_t, is_media, dir_depth)
-                        .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
-                } else {
-                    // 打开阶段即探测并锁定密码（doc/架构设计/12_VarTidy整理器.md §12.5）：
-                    // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
-                    // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
-                    open_with_password_probe(&path_t, &candidates)
-                };
-                let msg = match opened {
-                    Ok((vfs, locked)) => {
-                        let arc: Arc<dyn ArchiveVFS> = vfs.into();
-                        // 阶段 2（list，zip 的 CD 顺序遍历有真实百分比）
-                        let (id, entries) =
-                            stream_cb::register_with_progress(arc.clone(), &path_t, &|f, s| {
-                                let _ = tx.send(OpenMsg::Progress {
-                                    fraction: f,
-                                    stage: s.to_string(),
+                    // 阶段 1（目录递归扫描 / crate 内部解析头/CD，无法细分）：不定进度
+                    let stage = if path_t.is_dir() {
+                        "正在扫描目录"
+                    } else {
+                        "正在读取压缩包目录"
+                    };
+                    let _ = tx.send(OpenMsg::Progress {
+                        fraction: None,
+                        stage: stage.into(),
+                    });
+                    egui_ctx.request_repaint();
+                    // 目录模式：目录即媒体集合（DirVFS 递归收集图片/视频，跳过压缩包，
+                    // doc/架构设计/04_VFS层.md §4.2）——无加密概念，不走密码探测链；文件模式照旧
+                    let opened = if path_t.is_dir() {
+                        DirVFS::open(&path_t, is_media, dir_depth)
+                            .map(|v| (Box::new(v) as Box<dyn ArchiveVFS>, None))
+                    } else {
+                        // 打开阶段即探测并锁定密码（doc/架构设计/12_VarTidy整理器.md §12.5）：
+                        // 加密头 open 即验；内容加密对最小加密条目逐候选校验。
+                        // 探测在后台线程完成，错密码不会替换已打开状态，直接重弹
+                        open_with_password_probe(&path_t, &candidates)
+                    };
+                    let msg = match opened {
+                        Ok((vfs, locked)) => {
+                            let arc: Arc<dyn ArchiveVFS> = vfs.into();
+                            // 阶段 2（list，zip 的 CD 顺序遍历有真实百分比）
+                            let (id, entries) =
+                                stream_cb::register_with_progress(arc.clone(), &path_t, &|f, s| {
+                                    let _ = tx.send(OpenMsg::Progress {
+                                        fraction: f,
+                                        stage: s.to_string(),
+                                    });
+                                    // 进度回调由 VFS 层节流（zip 每 256 条目
+                                    // 1 次，zip_vfs.rs list_from_central_directory），
+                                    // 频率极低；request_repaint 仅置内部标志，
+                                    // 开销可忽略
+                                    egui_ctx.request_repaint();
                                 });
-                                // 进度回调由 VFS 层节流（zip 每 256 条目
-                                // 1 次，zip_vfs.rs list_from_central_directory），
-                                // 频率极低；request_repaint 仅置内部标志，
-                                // 开销可忽略
-                                egui_ctx.request_repaint();
-                            });
-                        OpenMsg::Done {
-                            vfs: arc,
-                            id,
-                            entries,
-                            pw: locked,
+                            OpenMsg::Done {
+                                vfs: arc,
+                                id,
+                                entries,
+                                pw: locked,
+                            }
                         }
-                    }
-                    Err(VfsError::Password) => OpenMsg::NeedPw {
-                        wrong: pw.is_some(),
-                    },
-                    Err(e) => OpenMsg::Failed(format!("Failed to open {}: {e}", path_t.display())),
-                };
-                let _ = tx.send(msg);
-                egui_ctx.request_repaint();
+                        Err(VfsError::Password) => OpenMsg::NeedPw {
+                            wrong: pw.is_some(),
+                        },
+                        Err(e) => {
+                            OpenMsg::Failed(format!("Failed to open {}: {e}", path_t.display()))
+                        }
+                    };
+                    let _ = tx.send(msg);
+                    egui_ctx.request_repaint();
                 }
             })
             .is_ok();
@@ -333,7 +335,11 @@ impl App {
         // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。
         // 按目标扩展名预切标签页：混合内容目录下不预切的话目标在另一
         // 标签页里，跳转落空；已在该页则不再多算一次行缓存
-        let focus = if path.is_dir() { self.pending_focus.take() } else { None };
+        let focus = if path.is_dir() {
+            self.pending_focus.take()
+        } else {
+            None
+        };
         if let Some(name) = &focus {
             let want = if self.cfg.is_image_ext(name) {
                 Some(ListTab::Image)
@@ -379,8 +385,8 @@ impl App {
         self.extract = None;
         self.playing = None;
         self.last_focus = None; // 旧包的锚点下标对新包无意义
-        // 对比会话随旧包失效（栏键 = (archive_id, idx)）：清会话 + 多键
-        // 驻留保护 + raw 帧缓存，防止新包渲染引用旧包键
+                                // 对比会话随旧包失效（栏键 = (archive_id, idx)）：清会话 + 多键
+                                // 驻留保护 + raw 帧缓存，防止新包渲染引用旧包键
         if self.compare.take().is_some() {
             self.img.clear_shown_multi();
             self.rawdec.retain(&[]);
@@ -461,11 +467,13 @@ impl App {
         //   需要搜索框为空才切，避免打断用户在另一标签页里搜东西；
         //   注意不能用 query.is_empty()：输入 "!" 等无法成词的内容也会解析为空树）
         if self.search.trim().is_empty() {
-            let (n_video, n_image) = kinds
-                .iter()
-                .fold((0usize, 0usize), |(v, m), &is_video| {
-                    if is_video { (v + 1, m) } else { (v, m + 1) }
-                });
+            let (n_video, n_image) = kinds.iter().fold((0usize, 0usize), |(v, m), &is_video| {
+                if is_video {
+                    (v + 1, m)
+                } else {
+                    (v, m + 1)
+                }
+            });
             let (cur, other) = match self.list_tab {
                 ListTab::Video => (n_video, n_image),
                 ListTab::Image => (n_image, n_video),

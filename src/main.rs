@@ -3,8 +3,8 @@
 
 mod cache;
 // Windows 控制台管理：VT 颜色开启、启动来源判定、显隐切换（F12 可调回）
-mod console;
 mod config;
+mod console;
 // encode 引擎（dump 序列→视频）+ CLI 壳：UI 壳尚未接入（多选/右键/确认窗）
 mod encode;
 mod imgview;

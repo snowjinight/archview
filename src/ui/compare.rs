@@ -130,10 +130,7 @@ pub fn clamp_center(center: egui::Vec2, disp: egui::Vec2, viewport: egui::Vec2) 
 /// 单栏图像屏幕矩形：视口中心指向 `center`（归一化图像坐标）。
 /// 推导：p + center*disp = vp.center → 中心 = vp.center + (0.5 − center)*disp
 pub fn pane_image_rect(vp: egui::Rect, disp: egui::Vec2, center: egui::Vec2) -> egui::Rect {
-    egui::Rect::from_center_size(
-        vp.center() + (egui::vec2(0.5, 0.5) - center) * disp,
-        disp,
-    )
+    egui::Rect::from_center_size(vp.center() + (egui::vec2(0.5, 0.5) - center) * disp, disp)
 }
 
 /// 共享锚点缩放（方案 A 的 zoom_pan 同构）：锚点（delta = 锚点相对视口
@@ -187,15 +184,18 @@ pub fn grid_cells(area: egui::Rect, n: usize) -> Vec<egui::Rect> {
         _ => &[3, 3],
     };
     let gap = 2.0;
-    let rh = ((area.height() - gap * (row_counts.len() - 1) as f32) / row_counts.len() as f32)
-        .max(1.0);
+    let rh =
+        ((area.height() - gap * (row_counts.len() - 1) as f32) / row_counts.len() as f32).max(1.0);
     let mut out = Vec::with_capacity(n);
     let mut y = area.top();
     for rc in row_counts {
         let cw = ((area.width() - gap * (*rc as f32 - 1.0)) / *rc as f32).max(1.0);
         let mut x = area.left();
         for _ in 0..*rc {
-            out.push(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cw, rh)));
+            out.push(egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(cw, rh),
+            ));
             x += cw + gap;
         }
         y += rh + gap;
@@ -268,9 +268,7 @@ pub(super) fn webp_animated(source: &ImageSource) -> bool {
     }
     match source {
         ImageSource::Stream(vfs, e) => vfs.open_entry(e).ok().and_then(sniff).unwrap_or(false),
-        ImageSource::File(p) => {
-            std::fs::File::open(p).ok().and_then(sniff).unwrap_or(false)
-        }
+        ImageSource::File(p) => std::fs::File::open(p).ok().and_then(sniff).unwrap_or(false),
     }
 }
 
@@ -532,7 +530,11 @@ impl App {
         self.compare_request_raw_frames();
         // image 栏自愈（被挤出/在途丢失一帧内补发，同 heal_current_image）；
         // 源未落地（landed=false）不请求——防 img_fallback 确定性污染
-        let (heals, master_idx, master_landed): (Vec<(ImgKey, ImageSource, String)>, Option<usize>, Option<bool>) = {
+        let (heals, master_idx, master_landed): (
+            Vec<(ImgKey, ImageSource, String)>,
+            Option<usize>,
+            Option<bool>,
+        ) = {
             let Some(s) = &self.compare else { return };
             let heals = s
                 .panes
@@ -544,10 +546,7 @@ impl App {
                 .collect();
             // 主栏是否已落地（landed 缓存）：false = 未落地 → 可触发解压会话
             let mi = s.panes.get(s.master).map(|p| p.idx);
-            let landed = s
-                .panes
-                .get(s.master)
-                .map(|p| p.landed);
+            let landed = s.panes.get(s.master).map(|p| p.landed);
             (heals, mi, landed)
         };
         let max_dim = self.cfg.image.image_max_dim;
@@ -577,10 +576,7 @@ impl App {
         // 其它栏）。防重试风暴：密码框在场（Failed(is_pwd) 已触发）或错误
         // 横幅在场（Failed 其它错误已报）时不再触发，等用户处理
         if let Some(mi) = master_idx {
-            if master_landed == Some(false)
-                && self.pw_prompt.is_none()
-                && self.error.is_none()
-            {
+            if master_landed == Some(false) && self.pw_prompt.is_none() && self.error.is_none() {
                 let covered = self
                     .extract
                     .as_ref()
@@ -609,9 +605,7 @@ impl App {
                     if let Some(s) = &mut self.compare {
                         s.pending_slide = None;
                     }
-                } else if !noticed
-                    && since.elapsed() >= std::time::Duration::from_millis(300)
-                {
+                } else if !noticed && since.elapsed() >= std::time::Duration::from_millis(300) {
                     // 真等到了才提示：快滑（百毫秒级）全程静默
                     if let Some(s) = &mut self.compare {
                         if let Some(p) = &mut s.pending_slide {
@@ -630,13 +624,14 @@ impl App {
         let (new_idx, n) = {
             let Some(s) = &self.compare else { return };
             let idxs: Vec<usize> = s.panes.iter().map(|p| p.idx).collect();
-            (
-                slide_window(&s.domain, &idxs, dir),
-                s.panes.len(),
-            )
+            (slide_window(&s.domain, &idxs, dir), s.panes.len())
         };
         let Some(idxs) = new_idx else {
-            self.set_notice(if dir > 0 { "已到列表末尾" } else { "已到列表开头" });
+            self.set_notice(if dir > 0 {
+                "已到列表末尾"
+            } else {
+                "已到列表开头"
+            });
             return;
         };
         // 就绪闸门：Incoming（新入栏条目）纹理未就绪且"就绪在路上"时挂起
@@ -650,7 +645,9 @@ impl App {
         };
         if let Some(i) = incoming {
             let pane = {
-                let Some(a) = self.archive.as_ref() else { return };
+                let Some(a) = self.archive.as_ref() else {
+                    return;
+                };
                 self.build_compare_pane(a, i)
             };
             // 闸门只管静态图（raw 软解毫秒级 / 占位文案即时呈现，不值得等）
@@ -686,7 +683,9 @@ impl App {
                 }
             }
         }
-        let Some(a) = self.archive.as_ref() else { return };
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
         let panes: Vec<ComparePane> = idxs
             .into_iter()
             .take(n)
@@ -733,7 +732,9 @@ impl App {
             Some(s) => s.panes.clone(),
             None => return,
         };
-        let Some(a) = self.archive.as_ref() else { return };
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
         let panes: Vec<ComparePane> = idxs
             .iter()
             .map(|&i| match old.iter().position(|p| p.idx == i) {
@@ -772,7 +773,9 @@ impl App {
             self.set_notice("锚点不在对比滑动域内");
             return;
         };
-        let Some(a) = self.archive.as_ref() else { return };
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
         let panes: Vec<ComparePane> = idxs
             .iter()
             .map(|&i| self.build_compare_pane(a, i))
@@ -1118,7 +1121,13 @@ mod tests {
     #[test]
     fn grid_cells_形状与数量() {
         let area = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, 600.0));
-        for (n, rows, cols_row0) in [(2usize, 1usize, 2usize), (3, 1, 3), (4, 2, 2), (5, 2, 3), (6, 2, 3)] {
+        for (n, rows, cols_row0) in [
+            (2usize, 1usize, 2usize),
+            (3, 1, 3),
+            (4, 2, 2),
+            (5, 2, 3),
+            (6, 2, 3),
+        ] {
             let cells = grid_cells(area, n);
             assert_eq!(cells.len(), n, "n={n}");
             // 第一行 y 一致、第二行 y 更大

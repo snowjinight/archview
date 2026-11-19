@@ -199,8 +199,8 @@ impl Default for MediaConfig {
             // 末 6 个为相机 RAW（raw-files 库提取内嵌 JPEG 预览直读，走图片
             // 纹理路径）：Sony ARW 家族（arw/srf/sr2/arq）+ Nikon NEF 家族（nef/nrw）
             image_extensions: [
-                "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "arw", "nef",
-                "nrw", "srf", "sr2", "arq",
+                "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "arw", "nef", "nrw",
+                "srf", "sr2", "arq",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -219,9 +219,9 @@ pub struct RawConfig {
     /// demux 预设（按声明顺序取首个 glob 命中：先写具体、后写宽泛）。
     /// 预设是裸数据唯一入口：glob 命中才可见、可播——不再有独立扩展名
     /// 清单（.yuv/.bin 等非标扩展名都只靠这里声明，防「可见但不可播」
-    /// 的中间态）。默认内置三类 FPGA dump 常见后缀（nv12/yuv400/raw），
-    /// 宽高交由文件名内嵌 WxH 兜底（[[raw.demux]] 数组不逐项 backfill：
-    /// 用户已有任一预设则整用用户的，需要默认三条时手动复制）
+    /// 的中间态）。默认内置五类 FPGA dump 常见后缀（nv12/yuv400/yuv420/
+    /// rgb/raw），宽高交由文件名内嵌 WxH 兜底（[[raw.demux]] 数组不逐项
+    /// backfill：用户已有任一预设则整用用户的，需要默认五条时手动复制）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub demux: Vec<RawDemux>,
 }
@@ -241,6 +241,20 @@ impl Default for RawConfig {
                 RawDemux {
                     r#match: "*.yuv400".into(),
                     pixfmt: "gray".into(),
+                    fps: default_raw_fps(),
+                    ..Default::default()
+                },
+                // YUV420 planar（I420）dump：Y/U/V 三个独立平面
+                RawDemux {
+                    r#match: "*.yuv420".into(),
+                    pixfmt: "yuv420p".into(),
+                    fps: default_raw_fps(),
+                    ..Default::default()
+                },
+                // RGB888 逐像素 3 字节（R,G,B 字节序 = FFmpeg rgb24）
+                RawDemux {
+                    r#match: "*.rgb".into(),
+                    pixfmt: "rgb24".into(),
                     fps: default_raw_fps(),
                     ..Default::default()
                 },
@@ -279,9 +293,9 @@ pub struct RawDemux {
     /// 适用场景：12bit 等有效位深数据 LSB 对齐（低对齐补零）存进 16bit
     /// 容器时，FFmpeg bayer16* 转 RGB 写死取高 8 位（>>8），低对齐数据
     /// 只剩 16 级灰阶——播放发黑根因。12bit→16bit 容器填 4，10bit 填 6。
-    /// 约束：>0 时 pixfmt 须以 "le" 结尾（按 LE u16 采样移位）；仅快路径
-    /// （zip 流式 / 目录模式 zvf:// 流层）生效，7z/RAR 落盘路径不支持
-    /// （设计定案：适用面窄，不为慢路径增加复杂度，见 doc/架构设计/13_渲染架构迁移.md §13.6）
+    /// 约束：>0 时 pixfmt 须以 "le" 结尾（按 LE u16 采样移位）；快路径
+    /// （zip 流式 / 目录模式）与慢路径（7z/RAR 落盘经单文件 VFS 借道
+    /// zvf://，位移只在流层发生、缓存文件保持忠实拷贝）均生效
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub bit_shift: u32,
 }
@@ -314,7 +328,11 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     while ni < n.len() {
         if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
             pi += 1;
-            ni += if p[pi - 1] == b'?' { char_len(n, ni) } else { 1 };
+            ni += if p[pi - 1] == b'?' {
+                char_len(n, ni)
+            } else {
+                1
+            };
         } else if pi < p.len() && p[pi] == b'*' {
             star = pi;
             mark = ni;
@@ -358,77 +376,210 @@ fn suffix_pattern(pattern: &str) -> Option<&str> {
 /// 收窄：前置拦截报错优先于让 mpv 试载。
 pub const RAWVIDEO_PIXFMTS: &[(&str, u32)] = &[
     // Bayer（12，全部仅输入；packed MIPI 10/12bit 不在 ffmpeg 名单）
-    ("bayer_bggr8", 8), ("bayer_rggb8", 8), ("bayer_gbrg8", 8), ("bayer_grbg8", 8),
-    ("bayer_bggr16le", 16), ("bayer_bggr16be", 16),
-    ("bayer_rggb16le", 16), ("bayer_rggb16be", 16),
-    ("bayer_gbrg16le", 16), ("bayer_gbrg16be", 16),
-    ("bayer_grbg16le", 16), ("bayer_grbg16be", 16),
+    ("bayer_bggr8", 8),
+    ("bayer_rggb8", 8),
+    ("bayer_gbrg8", 8),
+    ("bayer_grbg8", 8),
+    ("bayer_bggr16le", 16),
+    ("bayer_bggr16be", 16),
+    ("bayer_rggb16le", 16),
+    ("bayer_rggb16be", 16),
+    ("bayer_gbrg16le", 16),
+    ("bayer_gbrg16be", 16),
+    ("bayer_grbg16le", 16),
+    ("bayer_grbg16be", 16),
     // Gray / Gray+Alpha（16）
     ("gray", 8),
-    ("gray9le", 16), ("gray9be", 16), ("gray10le", 16), ("gray10be", 16),
-    ("gray12le", 16), ("gray12be", 16), ("gray14le", 16), ("gray14be", 16),
-    ("gray16le", 16), ("gray16be", 16),
-    ("grayf32le", 32), ("grayf32be", 32),
-    ("ya8", 16), ("ya16le", 32), ("ya16be", 32),
+    ("gray9le", 16),
+    ("gray9be", 16),
+    ("gray10le", 16),
+    ("gray10be", 16),
+    ("gray12le", 16),
+    ("gray12be", 16),
+    ("gray14le", 16),
+    ("gray14be", 16),
+    ("gray16le", 16),
+    ("gray16be", 16),
+    ("grayf32le", 32),
+    ("grayf32be", 32),
+    ("ya8", 16),
+    ("ya16le", 32),
+    ("ya16be", 32),
     // YUV planar 8-bit（14）
-    ("yuv420p", 12), ("yuv422p", 16), ("yuv444p", 24), ("yuv410p", 9), ("yuv411p", 12),
-    ("yuv440p", 16), ("yuvj420p", 12), ("yuvj422p", 16), ("yuvj444p", 24),
-    ("yuvj440p", 16), ("yuvj411p", 12),
-    ("yuva420p", 20), ("yuva422p", 24), ("yuva444p", 32),
+    ("yuv420p", 12),
+    ("yuv422p", 16),
+    ("yuv444p", 24),
+    ("yuv410p", 9),
+    ("yuv411p", 12),
+    ("yuv440p", 16),
+    ("yuvj420p", 12),
+    ("yuvj422p", 16),
+    ("yuvj444p", 24),
+    ("yuvj440p", 16),
+    ("yuvj411p", 12),
+    ("yuva420p", 20),
+    ("yuva422p", 24),
+    ("yuva444p", 32),
     // YUV planar 9~16-bit（56；每采样 2 字节容器）
-    ("yuv420p9le", 24), ("yuv420p9be", 24), ("yuv420p10le", 24), ("yuv420p10be", 24),
-    ("yuv420p12le", 24), ("yuv420p12be", 24), ("yuv420p14le", 24), ("yuv420p14be", 24),
-    ("yuv420p16le", 24), ("yuv420p16be", 24),
-    ("yuv422p9le", 32), ("yuv422p9be", 32), ("yuv422p10le", 32), ("yuv422p10be", 32),
-    ("yuv422p12le", 32), ("yuv422p12be", 32), ("yuv422p14le", 32), ("yuv422p14be", 32),
-    ("yuv422p16le", 32), ("yuv422p16be", 32),
-    ("yuv444p9le", 48), ("yuv444p9be", 48), ("yuv444p10le", 48), ("yuv444p10be", 48),
-    ("yuv444p12le", 48), ("yuv444p12be", 48), ("yuv444p14le", 48), ("yuv444p14be", 48),
-    ("yuv444p16le", 48), ("yuv444p16be", 48),
-    ("yuv440p10le", 24), ("yuv440p10be", 24), ("yuv440p12le", 24), ("yuv440p12be", 24),
-    ("yuva420p9le", 40), ("yuva420p9be", 40), ("yuva420p10le", 40), ("yuva420p10be", 40),
-    ("yuva420p16le", 40), ("yuva420p16be", 40),
-    ("yuva422p9le", 48), ("yuva422p9be", 48), ("yuva422p10le", 48), ("yuva422p10be", 48),
-    ("yuva422p12le", 48), ("yuva422p12be", 48), ("yuva422p16le", 48), ("yuva422p16be", 48),
-    ("yuva444p9le", 64), ("yuva444p9be", 64), ("yuva444p10le", 64), ("yuva444p10be", 64),
-    ("yuva444p12le", 64), ("yuva444p12be", 64), ("yuva444p16le", 64), ("yuva444p16be", 64),
+    ("yuv420p9le", 24),
+    ("yuv420p9be", 24),
+    ("yuv420p10le", 24),
+    ("yuv420p10be", 24),
+    ("yuv420p12le", 24),
+    ("yuv420p12be", 24),
+    ("yuv420p14le", 24),
+    ("yuv420p14be", 24),
+    ("yuv420p16le", 24),
+    ("yuv420p16be", 24),
+    ("yuv422p9le", 32),
+    ("yuv422p9be", 32),
+    ("yuv422p10le", 32),
+    ("yuv422p10be", 32),
+    ("yuv422p12le", 32),
+    ("yuv422p12be", 32),
+    ("yuv422p14le", 32),
+    ("yuv422p14be", 32),
+    ("yuv422p16le", 32),
+    ("yuv422p16be", 32),
+    ("yuv444p9le", 48),
+    ("yuv444p9be", 48),
+    ("yuv444p10le", 48),
+    ("yuv444p10be", 48),
+    ("yuv444p12le", 48),
+    ("yuv444p12be", 48),
+    ("yuv444p14le", 48),
+    ("yuv444p14be", 48),
+    ("yuv444p16le", 48),
+    ("yuv444p16be", 48),
+    ("yuv440p10le", 24),
+    ("yuv440p10be", 24),
+    ("yuv440p12le", 24),
+    ("yuv440p12be", 24),
+    ("yuva420p9le", 40),
+    ("yuva420p9be", 40),
+    ("yuva420p10le", 40),
+    ("yuva420p10be", 40),
+    ("yuva420p16le", 40),
+    ("yuva420p16be", 40),
+    ("yuva422p9le", 48),
+    ("yuva422p9be", 48),
+    ("yuva422p10le", 48),
+    ("yuva422p10be", 48),
+    ("yuva422p12le", 48),
+    ("yuva422p12be", 48),
+    ("yuva422p16le", 48),
+    ("yuva422p16be", 48),
+    ("yuva444p9le", 64),
+    ("yuva444p9be", 64),
+    ("yuva444p10le", 64),
+    ("yuva444p10be", 64),
+    ("yuva444p12le", 64),
+    ("yuva444p12be", 64),
+    ("yuva444p16le", 64),
+    ("yuva444p16be", 64),
     // YUV semi-planar / NV（23）
-    ("nv12", 12), ("nv21", 12), ("nv16", 16), ("nv24", 24), ("nv42", 24),
-    ("p010le", 24), ("p010be", 24), ("p012le", 24), ("p012be", 24),
-    ("p016le", 24), ("p016be", 24),
-    ("p210le", 32), ("p210be", 32), ("p212le", 32), ("p212be", 32),
-    ("p216le", 32), ("p216be", 32),
-    ("p410le", 48), ("p410be", 48), ("p412le", 48), ("p412be", 48),
-    ("p416le", 48), ("p416be", 48),
+    ("nv12", 12),
+    ("nv21", 12),
+    ("nv16", 16),
+    ("nv24", 24),
+    ("nv42", 24),
+    ("p010le", 24),
+    ("p010be", 24),
+    ("p012le", 24),
+    ("p012be", 24),
+    ("p016le", 24),
+    ("p016be", 24),
+    ("p210le", 32),
+    ("p210be", 32),
+    ("p212le", 32),
+    ("p212be", 32),
+    ("p216le", 32),
+    ("p216be", 32),
+    ("p410le", 48),
+    ("p410be", 48),
+    ("p412le", 48),
+    ("p412be", 48),
+    ("p416le", 48),
+    ("p416be", 48),
     // YUV packed（10）
-    ("yuyv422", 16), ("uyvy422", 16), ("yvyu422", 16),
-    ("ayuv64le", 64), ("vuya", 32), ("vuyx", 24),
-    ("y210le", 32), ("y212le", 32), ("xv30le", 32), ("xv36le", 64),
+    ("yuyv422", 16),
+    ("uyvy422", 16),
+    ("yvyu422", 16),
+    ("ayuv64le", 64),
+    ("vuya", 32),
+    ("vuyx", 24),
+    ("y210le", 32),
+    ("y212le", 32),
+    ("xv30le", 32),
+    ("xv36le", 64),
     // RGB packed 8-bit（26）
-    ("rgb24", 24), ("bgr24", 24),
-    ("argb", 32), ("rgba", 32), ("abgr", 32), ("bgra", 32),
-    ("0rgb", 24), ("rgb0", 24), ("0bgr", 24), ("bgr0", 24),
-    ("rgb8", 8), ("bgr8", 8), ("rgb4_byte", 8), ("bgr4_byte", 8),
-    ("rgb565le", 16), ("rgb565be", 16), ("bgr565le", 16), ("bgr565be", 16),
-    ("rgb555le", 16), ("rgb555be", 16), ("bgr555le", 16), ("bgr555be", 16),
-    ("rgb444le", 16), ("rgb444be", 16), ("bgr444le", 16), ("bgr444be", 16),
+    ("rgb24", 24),
+    ("bgr24", 24),
+    ("argb", 32),
+    ("rgba", 32),
+    ("abgr", 32),
+    ("bgra", 32),
+    ("0rgb", 24),
+    ("rgb0", 24),
+    ("0bgr", 24),
+    ("bgr0", 24),
+    ("rgb8", 8),
+    ("bgr8", 8),
+    ("rgb4_byte", 8),
+    ("bgr4_byte", 8),
+    ("rgb565le", 16),
+    ("rgb565be", 16),
+    ("bgr565le", 16),
+    ("bgr565be", 16),
+    ("rgb555le", 16),
+    ("rgb555be", 16),
+    ("bgr555le", 16),
+    ("bgr555be", 16),
+    ("rgb444le", 16),
+    ("rgb444be", 16),
+    ("bgr444le", 16),
+    ("bgr444be", 16),
     // RGB 高位深（12）
-    ("rgb48le", 48), ("rgb48be", 48), ("bgr48le", 48), ("bgr48be", 48),
-    ("rgba64le", 64), ("rgba64be", 64), ("bgra64le", 64), ("bgra64be", 64),
-    ("x2rgb10le", 32), ("x2bgr10le", 32),
-    ("rgbaf16le", 64), ("rgbaf16be", 64),
+    ("rgb48le", 48),
+    ("rgb48be", 48),
+    ("bgr48le", 48),
+    ("bgr48be", 48),
+    ("rgba64le", 64),
+    ("rgba64be", 64),
+    ("bgra64le", 64),
+    ("bgra64be", 64),
+    ("x2rgb10le", 32),
+    ("x2bgr10le", 32),
+    ("rgbaf16le", 64),
+    ("rgbaf16be", 64),
     // Planar RGB / GBR（24；高位深每采样 2 字节容器）
     ("gbrp", 24),
-    ("gbrp9le", 48), ("gbrp9be", 48), ("gbrp10le", 48), ("gbrp10be", 48),
-    ("gbrp12le", 48), ("gbrp12be", 48), ("gbrp14le", 48), ("gbrp14be", 48),
-    ("gbrp16le", 48), ("gbrp16be", 48),
-    ("gbrpf32le", 96), ("gbrpf32be", 96),
+    ("gbrp9le", 48),
+    ("gbrp9be", 48),
+    ("gbrp10le", 48),
+    ("gbrp10be", 48),
+    ("gbrp12le", 48),
+    ("gbrp12be", 48),
+    ("gbrp14le", 48),
+    ("gbrp14be", 48),
+    ("gbrp16le", 48),
+    ("gbrp16be", 48),
+    ("gbrpf32le", 96),
+    ("gbrpf32be", 96),
     ("gbrap", 32),
-    ("gbrap10le", 64), ("gbrap10be", 64), ("gbrap12le", 64), ("gbrap12be", 64),
-    ("gbrap14le", 64), ("gbrap14be", 64), ("gbrap16le", 64), ("gbrap16be", 64),
-    ("gbrapf32le", 128), ("gbrapf32be", 128),
+    ("gbrap10le", 64),
+    ("gbrap10be", 64),
+    ("gbrap12le", 64),
+    ("gbrap12be", 64),
+    ("gbrap14le", 64),
+    ("gbrap14be", 64),
+    ("gbrap16le", 64),
+    ("gbrap16be", 64),
+    ("gbrapf32le", 128),
+    ("gbrapf32be", 128),
     // XYZ（2）
-    ("xyz12le", 48), ("xyz12be", 48),
+    ("xyz12le", 48),
+    ("xyz12be", 48),
 ];
 
 /// 查 pixfmt 名单：Some = 每像素位数（帧位数 = W×H×bits，帧字节数 = /8，
@@ -485,8 +636,14 @@ pub fn parse_filename_dims(name: &str) -> Vec<(u32, u32)> {
         }
         if let (Some(s), Some((rs, re))) = (digits_before(i), digits_after(i)) {
             // ≤5 位数字串解析必成功不溢出
-            let w: u32 = std::str::from_utf8(&b[s..i]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
-            let h: u32 = std::str::from_utf8(&b[rs..re]).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+            let w: u32 = std::str::from_utf8(&b[s..i])
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
+            let h: u32 = std::str::from_utf8(&b[rs..re])
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
             if w > 0 && h > 0 {
                 out.push((w, h));
             }
@@ -846,16 +1003,22 @@ impl Config {
     /// （先写具体如 sensor_a_*.bin、后写宽泛如 *.bin）；无命中返回 None。
     /// 热路径分流：纯后缀形模式（`*.raw` 等，见 suffix_pattern）走大小写
     /// 不敏感 ends_with（免回溯零分配），其余才走 glob_match 通用回溯——
-    /// 内置三条默认预设全落快路，万级文件目录扫描匹配成本降 ~2 个数量级
+    /// 内置五条默认预设全落快路，万级文件目录扫描匹配成本降 ~2 个数量级
     pub fn raw_demux(&self, name: &str) -> Option<&RawDemux> {
-        let file = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
-        self.raw.demux.iter().find(|d| match suffix_pattern(&d.r#match) {
-            Some(suf) => {
-                let (f, s) = (file.as_bytes(), suf.as_bytes());
-                f.len() >= s.len() && f[f.len() - s.len()..].eq_ignore_ascii_case(s)
-            }
-            None => glob_match(&d.r#match, file),
-        })
+        let file = name
+            .rsplit(|c| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(name);
+        self.raw
+            .demux
+            .iter()
+            .find(|d| match suffix_pattern(&d.r#match) {
+                Some(suf) => {
+                    let (f, s) = (file.as_bytes(), suf.as_bytes());
+                    f.len() >= s.len() && f[f.len() - s.len()..].eq_ignore_ascii_case(s)
+                }
+                None => glob_match(&d.r#match, file),
+            })
     }
 
     fn has_ext(list: &[String], name: &str) -> bool {
@@ -1013,7 +1176,7 @@ file_open_depth = 1
 # 可写任意多条预设，按声明顺序取首个 match 命中（先写具体、后写宽泛）。
 # fps 可省略，默认 3；width/height 可省略或填 0 = 从文件名内嵌 WxH
 # 兜底（如 fpga_in_s0_1920x1080_00_1.raw → 1920x1080；文件名无分辨率
-# 且预设宽高为 0 时报错）。内置三条默认预设如下（可改可删；已有自定义
+# 且预设宽高为 0 时报错）。内置五条默认预设如下（可改可删；已有自定义
 # 预设的老配置不会被自动合并，需要时手动复制）：
 
 # NV12 8bit 半平面 dump
@@ -1025,6 +1188,16 @@ pixfmt = "nv12"
 [[raw.demux]]
 match = "*.yuv400"
 pixfmt = "gray"
+
+# YUV420 planar（I420）dump：Y/U/V 三个独立平面
+[[raw.demux]]
+match = "*.yuv420"
+pixfmt = "yuv420p"
+
+# RGB888 逐像素 3 字节（R,G,B 字节序 = FFmpeg rgb24）
+[[raw.demux]]
+match = "*.rgb"
+pixfmt = "rgb24"
 
 # unpacked Bayer dump（12bit 低对齐存 16bit 容器）：
 # bayer_auto16le = 伪格式，装载时读首帧自动探测排列
@@ -1350,7 +1523,17 @@ mod tests {
     /// 会假通过（实际发生过），节头缺失必须在这里先炸
     #[test]
     fn default_template_matches_config_default() {
-        for head in ["[cache]", "[media]", "[raw]", "[player]", "[image]", "[ui]", "[extract]", "[vartidy]", "[encode]"] {
+        for head in [
+            "[cache]",
+            "[media]",
+            "[raw]",
+            "[player]",
+            "[image]",
+            "[ui]",
+            "[extract]",
+            "[vartidy]",
+            "[encode]",
+        ] {
             assert!(
                 DEFAULT_TOML.contains(&format!("\n{head}\n")),
                 "DEFAULT_TOML 缺少节头 {head}（键会静默落到顶层被忽略）"
@@ -1442,7 +1625,7 @@ slideshow_secs = 2.0
         // 缺失键按默认值补上
         assert!(out.contains("log_level = \"info\""));
         assert!(out.contains("image_max_dim = 4096"));
-        // 整节补全：[raw] 连注释带内置三条预设一并补上（老用户升级场景）
+        // 整节补全：[raw] 连注释带内置五条预设一并补上（老用户升级场景）
         assert!(out.contains("# [[raw.demux]]"));
         assert!(out.contains("bayer_auto16le"));
         assert!(out.contains("image_extensions"));
@@ -1501,22 +1684,29 @@ height = 480
         // glob 大小写不敏感 & 路径剥离（预设写文件名，传全路径也能命中）
         assert!(cfg.raw_demux("dir/SENSOR_A_9.BIN").is_some());
         assert!(cfg.raw_demux(r"C:\cap\cap_003.bin").is_some());
-        // 无命中 → None；默认三条预设不覆盖 .bin → 普通数据文件不可见
+        // 无命中 → None；默认五条预设不覆盖 .bin → 普通数据文件不可见
         assert!(cfg.raw_demux("note.txt").is_none());
         assert!(Config::default().raw_demux("a.bin").is_none());
     }
 
-    /// 默认模板内置三条 FPGA dump 预设（nv12/yuv400/raw）：宽高 0 交由
-    /// 文件名内嵌 WxH 兜底；raw 用伪格式 bayer_auto16le + bit_shift 4
+    /// 默认模板内置五条 FPGA dump 预设（nv12/yuv400/yuv420/rgb/raw）：
+    /// 宽高 0 交由文件名内嵌 WxH 兜底；raw 用伪格式 bayer_auto16le + bit_shift 4
     #[test]
     fn raw_default_presets_builtin() {
         let cfg = Config::default();
-        assert_eq!(cfg.raw.demux.len(), 3);
+        assert_eq!(cfg.raw.demux.len(), 5);
         let nv12 = cfg.raw_demux("cap_01.NV12").unwrap();
-        assert_eq!((nv12.pixfmt.as_str(), nv12.width, nv12.height), ("nv12", 0, 0));
+        assert_eq!(
+            (nv12.pixfmt.as_str(), nv12.width, nv12.height),
+            ("nv12", 0, 0)
+        );
         assert_eq!(nv12.fps, 3.0);
         let y400 = cfg.raw_demux("x.yuv400").unwrap();
         assert_eq!(y400.pixfmt, "gray");
+        let y420 = cfg.raw_demux("x.yuv420").unwrap();
+        assert_eq!(y420.pixfmt, "yuv420p");
+        let rgb = cfg.raw_demux("frame_640x480.rgb").unwrap();
+        assert_eq!(rgb.pixfmt, "rgb24");
         let raw = cfg.raw_demux("fpga_in_s0_1920x1080_00_1.raw").unwrap();
         assert_eq!(raw.pixfmt, "bayer_auto16le");
         assert_eq!(raw.bit_shift, 4);
@@ -1524,10 +1714,12 @@ height = 480
         assert_eq!(raw_pixfmt_bits("bayer_auto16le"), Some(16));
         assert_eq!(raw_pixfmt_bits("BAYER_AUTO16LE"), Some(16));
         assert_eq!(raw_pixfmt_bits("bayer_auto16be"), None);
-        // 可见性：默认三条后缀进视频桶；其它非标后缀仍不可见
+        // 可见性：默认五条后缀进视频桶；其它非标后缀仍不可见
         assert!(cfg.is_video_ext("fpga_in_s0_1920x1080_00_1.raw"));
         assert!(cfg.is_video_ext("x.nv12"));
         assert!(cfg.is_video_ext("x.yuv400"));
+        assert!(cfg.is_video_ext("x.yuv420"));
+        assert!(cfg.is_video_ext("x.rgb"));
         assert!(!cfg.is_video_ext("a.yuv"));
         assert!(!cfg.is_video_ext("cap.bin"));
     }
@@ -1540,7 +1732,10 @@ height = 480
             parse_filename_dims("fpga_in_s0_1920x1080_00_12345.raw"),
             vec![(1920, 1080)]
         );
-        assert_eq!(parse_filename_dims("cap_1280X720_01.nv12"), vec![(1280, 720)]);
+        assert_eq!(
+            parse_filename_dims("cap_1280X720_01.nv12"),
+            vec![(1280, 720)]
+        );
         assert_eq!(
             parse_filename_dims("a_640x480_b_320x240.yuv"),
             vec![(640, 480), (320, 240)]
@@ -1548,9 +1743,15 @@ height = 480
         assert!(parse_filename_dims("v2x4raw.bin").is_empty(), "左侧邻字母");
         assert!(parse_filename_dims("mp3x4.bin").is_empty(), "左侧邻字母");
         assert!(parse_filename_dims("raw4x8x.bin").is_empty(), "右侧邻字母");
-        assert!(parse_filename_dims("addr_0x10.bin").is_empty(), "W=0 十六进制");
+        assert!(
+            parse_filename_dims("addr_0x10.bin").is_empty(),
+            "W=0 十六进制"
+        );
         assert!(parse_filename_dims("no_dims.bin").is_empty());
-        assert!(parse_filename_dims("f_123456x789.bin").is_empty(), "段长 >5 位");
+        assert!(
+            parse_filename_dims("f_123456x789.bin").is_empty(),
+            "段长 >5 位"
+        );
     }
 
     /// raw 可见性路由：预设即真相——[[raw.demux]] glob 命中才归视频桶，

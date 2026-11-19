@@ -104,8 +104,7 @@ fn toggle_comment_lines(text: &str, first: usize, last: usize) -> (String, usize
     let commented = |l: &str| l.trim_start().starts_with('#');
     let blank = |l: &str| l.trim().is_empty();
     let sel = &lines[first..=last];
-    let uncomment = sel.iter().any(|l| !blank(l))
-        && sel.iter().all(|l| blank(l) || commented(l));
+    let uncomment = sel.iter().any(|l| !blank(l)) && sel.iter().all(|l| blank(l) || commented(l));
 
     let mut out = String::with_capacity(text.len() + sel.len() * 2);
     let mut block_start = 0usize;
@@ -142,11 +141,7 @@ fn toggle_comment_lines(text: &str, first: usize, last: usize) -> (String, usize
 
 /// 注释灰色高亮的排版：按注释起点把每行切成两段，注释段用弱色。
 /// wrap_width 由 TextEdit 传入（换行行为与默认一致）
-fn highlight_galley(
-    text: &str,
-    ui: &egui::Ui,
-    wrap_width: f32,
-) -> std::sync::Arc<egui::Galley> {
+fn highlight_galley(text: &str, ui: &egui::Ui, wrap_width: f32) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let plain = egui::TextFormat::simple(font_id.clone(), ui.visuals().text_color());
@@ -171,7 +166,9 @@ impl App {
     /// 保存 = 校验 → 写盘 → 关窗 → reload_config 热生效；
     /// 校验/写盘失败窗口保留并显示错误（编辑内容不丢）
     pub(super) fn config_editor_window(&mut self, ctx: &egui::Context) {
-        let Some(ed) = self.config_editor.as_mut() else { return };
+        let Some(ed) = self.config_editor.as_mut() else {
+            return;
+        };
         let mut open = true;
         let mut save = false;
         let mut reset = false;
@@ -207,8 +204,11 @@ impl App {
                                 .entry(name.as_str())
                                 .and_modify(|n| *n += 1)
                                 .or_insert(0usize);
-                            let label =
-                                if *n == 0 { name.clone() } else { format!("{name} ×{}", *n + 1) };
+                            let label = if *n == 0 {
+                                name.clone()
+                            } else {
+                                format!("{name} ×{}", *n + 1)
+                            };
                             if ui.small_button(label).clicked() {
                                 jump = Some(line_char_offset(&ed.text, *line));
                             }
@@ -222,9 +222,11 @@ impl App {
                     // 在下方 TextEdit::show 之后自做
                     let mut state =
                         egui::text_edit::TextEditState::load(ctx, edit_id).unwrap_or_default();
-                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                        egui::text::CCursor::new(off),
-                    )));
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(off),
+                        )));
                     state.store(ctx, edit_id);
                     ctx.memory_mut(|mem| mem.request_focus(edit_id));
                 }
@@ -251,11 +253,10 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let mut layouter = |ui: &egui::Ui,
-                                            buf: &dyn egui::TextBuffer,
-                                            wrap_width: f32| {
-                            highlight_galley(buf.as_str(), ui, wrap_width)
-                        };
+                        let mut layouter =
+                            |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                highlight_galley(buf.as_str(), ui, wrap_width)
+                            };
                         let rows = ed.text.lines().count().max(20) + 1;
                         let out = egui::TextEdit::multiline(&mut ed.text)
                             .id(edit_id)
@@ -307,9 +308,7 @@ impl App {
                                 };
                                 // 选区末端恰停在行首且非空选区 → 该行不参与
                                 // （选区覆盖到上一行行尾，VSCode 惯例）
-                                let last = if hi > lo
-                                    && ed.text.chars().nth(hi - 1) == Some('\n')
-                                {
+                                let last = if hi > lo && ed.text.chars().nth(hi - 1) == Some('\n') {
                                     line_of(hi) - 1
                                 } else {
                                     line_of(hi)
@@ -319,10 +318,7 @@ impl App {
                                 ed.text = new_text;
                                 // 选区恢复为覆盖整个行块（连按切换不丢范围）
                                 if let Some(mut state) =
-                                    egui::text_edit::TextEditState::load(
-                                        ui.ctx(),
-                                        out.response.id,
-                                    )
+                                    egui::text_edit::TextEditState::load(ui.ctx(), out.response.id)
                                 {
                                     state.cursor.set_char_range(Some(
                                         egui::text::CCursorRange::two(
@@ -351,7 +347,9 @@ impl App {
     /// （热生效 + notice 反馈）。写盘后 reload 重读的是同一文本，解析必成；
     /// 用户删掉的键由 backfill 自动补全（下次打开编辑器即见）
     fn save_config_editor(&mut self) {
-        let Some(ed) = self.config_editor.as_ref() else { return };
+        let Some(ed) = self.config_editor.as_ref() else {
+            return;
+        };
         let text = ed.text.clone();
         if let Err(e) = toml::from_str::<Config>(&text) {
             let msg = format!(
@@ -408,7 +406,10 @@ mod tests {
             Vec::<(String, usize)>::new()
         );
         // CRLF 行尾
-        assert_eq!(section_headers("[cache]\r\nx"), vec![("cache".to_string(), 0)]);
+        assert_eq!(
+            section_headers("[cache]\r\nx"),
+            vec![("cache".to_string(), 0)]
+        );
     }
 
     #[test]
@@ -486,6 +487,9 @@ mod tests {
         assert_eq!(out, "x\n# a = 1\n# b = 2\ny");
         let out_chars: Vec<char> = out.chars().collect();
         assert_eq!(out_chars[bs], '#'); // bs 指向第二行行首
-        assert_eq!(&out_chars[bs..be].iter().collect::<String>(), "# a = 1\n# b = 2");
+        assert_eq!(
+            &out_chars[bs..be].iter().collect::<String>(),
+            "# a = 1\n# b = 2"
+        );
     }
 }

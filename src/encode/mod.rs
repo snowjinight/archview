@@ -102,11 +102,9 @@ pub fn encode_raw_sequence(
         return Err("编码输入含加密条目（暂不支持，请先解压）".into());
     }
     if fmt.pixfmt.eq_ignore_ascii_case("bayer_auto16le") {
-        return Err(
-            "编码引擎不支持 bayer_auto16le（自动排列探测仅播放链路），\
+        return Err("编码引擎不支持 bayer_auto16le（自动排列探测仅播放链路），\
              请在预设中写明具体排列（如 bayer_rggb16le）"
-                .into(),
-        );
+            .into());
     }
     let Some(bits) = raw_pixfmt_bits(&fmt.pixfmt) else {
         return Err(format!(
@@ -161,7 +159,15 @@ pub fn encode_raw_sequence(
     let ctx = ffi::create_uninit()?;
     let mut last_err = String::new();
     let result = drive_encode(
-        ctx, vfs, entries, fmt, &out_abs, opts, cancel, progress, &mut last_err,
+        ctx,
+        vfs,
+        entries,
+        fmt,
+        &out_abs,
+        opts,
+        cancel,
+        progress,
+        &mut last_err,
     );
     ffi::destroy(ctx);
     result.map(|_| EncodeStats {
@@ -200,8 +206,12 @@ fn drive_encode(
     // 编码模式选项
     ffi::set_option_string(ctx, "o", &out_abs.to_string_lossy())
         .map_err(|e| format!("设置编码输出失败: {e}"))?;
-    ffi::set_option_string(ctx, "ovc", &opts.vcodec)
-        .map_err(|e| format!("设置编码器 [{}] 失败: {e}（该编码器可能不在本 libmpv 构建内）", opts.vcodec))?;
+    ffi::set_option_string(ctx, "ovc", &opts.vcodec).map_err(|e| {
+        format!(
+            "设置编码器 [{}] 失败: {e}（该编码器可能不在本 libmpv 构建内）",
+            opts.vcodec
+        )
+    })?;
     // x264 默认 bframes=3 → 首帧 DTS 为负 → mp4 muxer 写 edit list 补偿 →
     // ffmpeg 系解码器按 edit list 裁掉末帧（e2e 实证：10 帧只解出 9，
     // 丢的是亮度 225 的最后一帧）。dump 序列不需要 B 帧，默认强制 bf=0；
@@ -237,8 +247,7 @@ fn drive_encode(
     // 选项全部就位后才初始化（o/ovc 在 initialize 后设置不生效，
     // 见 create_uninit 的注释）；失败时上层 encode_raw_sequence 统一 destroy
     ffi::initialize(ctx).map_err(|e| format!("mpv 初始化失败: {e}"))?;
-    ffi::request_log_messages(ctx, "error")
-        .map_err(|e| format!("订阅 mpv 日志失败: {e}"))?;
+    ffi::request_log_messages(ctx, "error").map_err(|e| format!("订阅 mpv 日志失败: {e}"))?;
 
     // zcat 协议：read/seek/size/close 复用 zvf 的协议无关回调
     ffi::stream_cb_add_ro(ctx, "zcat", std::ptr::null_mut(), zcat_open_cb)
@@ -398,7 +407,10 @@ unsafe extern "C" fn zcat_open_cb(
     info: *mut ffi::StreamCbInfo,
 ) -> i32 {
     let uri = CStr::from_ptr(uri).to_string_lossy();
-    let Some(id) = uri.strip_prefix("zcat://").and_then(|s| s.parse::<u64>().ok()) else {
+    let Some(id) = uri
+        .strip_prefix("zcat://")
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
         return ffi::MPV_ERROR_LOADING_FAILED;
     };
     let (vfs, entries, bit_shift) = {
@@ -542,8 +554,7 @@ mod tests {
     fn fixture(files: &[(&str, Vec<u8>)]) -> (PathBuf, Arc<dyn ArchiveVFS>) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("zcat_cat_{}_{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("zcat_cat_{}_{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, data) in files {
@@ -558,10 +569,7 @@ mod tests {
     fn open_all(vfs: &Arc<dyn ArchiveVFS>) -> Vec<Box<dyn VirtualFile>> {
         let entries = vfs.list();
         assert!(!entries.is_empty());
-        entries
-            .iter()
-            .map(|e| vfs.open_entry(e).unwrap())
-            .collect()
+        entries.iter().map(|e| vfs.open_entry(e).unwrap()).collect()
     }
 
     #[test]
@@ -657,7 +665,11 @@ mod tests {
         if let Ok(p) = std::env::var("ARCHVIEW_TEST_FFMPEG") {
             let pb = PathBuf::from(p);
             // 环境变量给目录或 ffprobe.exe 完整路径均可
-            let cand = if pb.extension().is_some() { pb } else { pb.join("ffprobe.exe") };
+            let cand = if pb.extension().is_some() {
+                pb
+            } else {
+                pb.join("ffprobe.exe")
+            };
             if cand.exists() {
                 return Some(cand);
             }

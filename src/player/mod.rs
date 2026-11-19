@@ -365,11 +365,9 @@ impl PlayerService {
                         // 正常结束不发。通道对所有 mpv 装载失败生效（不只 raw）
                         mpv_ffi::MPV_EVENT_END_FILE => {
                             if !ev.data.is_null() {
-                                let ef =
-                                    unsafe { &*(ev.data as *mut mpv_ffi::MpvEventEndFile) };
+                                let ef = unsafe { &*(ev.data as *mut mpv_ffi::MpvEventEndFile) };
                                 if ef.reason == mpv_ffi::MPV_END_FILE_REASON_ERROR {
-                                    let log =
-                                        std::mem::take(&mut *last_err_log.lock().unwrap());
+                                    let log = std::mem::take(&mut *last_err_log.lock().unwrap());
                                     let _ = load_err_tx.send((ef.error, log));
                                     // 装载失败唤醒：mpv 出错后停止渲染（update 回调
                                     // 不再触发），错误横幅回显靠此帧
@@ -400,7 +398,8 @@ impl PlayerService {
             if log_on {
                 tracing::debug!(
                     "mpv 日志泵已启动 (level={}, 订阅={})",
-                    cfg.player.mpv_log_level, sub_level
+                    cfg.player.mpv_log_level,
+                    sub_level
                 );
             }
         }
@@ -741,8 +740,14 @@ impl PlayerService {
     /// opening 短路同 toggle_pause。成功下发后落 step_idle=false（完成信号
     /// PLAYBACK_RESTART 由泵线程解锁）；下发失败保持 true，重试不被卡死
     pub fn frame_step(&self, dir: i32) {
-        if self.opening() { return; }
-        let cmd = if dir >= 0 { "no-osd frame-step 1 seek" } else { "no-osd frame-back-step" };
+        if self.opening() {
+            return;
+        }
+        let cmd = if dir >= 0 {
+            "no-osd frame-step 1 seek"
+        } else {
+            "no-osd frame-back-step"
+        };
         match mpv_ffi::command_string(self.ctx, cmd) {
             Ok(()) => self.step_idle.store(false, Ordering::Relaxed),
             Err(e) => tracing::error!("逐帧步进失败: {e}"),
@@ -1173,7 +1178,10 @@ mod tests {
             .ok()
             .flatten()
             .expect("读不到 duration");
-        assert!((dur - 1.0).abs() < 0.1, "duration 应为 10 帧@10fps=1s: {dur}");
+        assert!(
+            (dur - 1.0).abs() < 0.1,
+            "duration 应为 10 帧@10fps=1s: {dur}"
+        );
         assert_eq!(
             mpv_ffi::get_property_f64(ctx, "width").ok().flatten(),
             Some(64.0)
@@ -1194,8 +1202,7 @@ mod tests {
         //    不发 END_FILE（本 libmpv 实测）；且 UI 层 raw_demux_opts 已在
         //    下发前校验，选项坏值路径到不了 mpv——真失败源是文件级错误
         let bad_url = to_file_url(&dir.join("no_such_file.nv12"));
-        mpv_ffi::command_string(ctx, &format!("loadfile {bad_url} replace -1"))
-            .unwrap();
+        mpv_ffi::command_string(ctx, &format!("loadfile {bad_url} replace -1")).unwrap();
         // 修复验证：与 PlayerService::load 同款，loadfile 后显式取消暂停
         // （pause 是全局属性，会跨 loadfile replace 粘滞到新文件）
         mpv_ffi::set_property_string(ctx, "pause", "no").unwrap();
@@ -1213,7 +1220,9 @@ mod tests {
                 let m = unsafe { &*((*ev).data as *mut mpv_ffi::MpvEventLogMessage) };
                 if m.log_level <= mpv_ffi::MPV_LOG_LEVEL_ERROR {
                     err_log = unsafe {
-                        std::ffi::CStr::from_ptr(m.text).to_string_lossy().into_owned()
+                        std::ffi::CStr::from_ptr(m.text)
+                            .to_string_lossy()
+                            .into_owned()
                     };
                 }
             } else if id == mpv_ffi::MPV_EVENT_START_FILE {
@@ -1662,7 +1671,10 @@ mod tests {
         drain(300);
         let t_b = run("B file直读1000", to_file_url(&media_dir.join("1000.webp")));
         drain(300);
-        let t_c = run("C zvf切换1000", stream_cb::entry_uri(archive_id, idx1000, 0));
+        let t_c = run(
+            "C zvf切换1000",
+            stream_cb::entry_uri(archive_id, idx1000, 0),
+        );
         drain(300);
 
         mpv_ffi::destroy(ctx);

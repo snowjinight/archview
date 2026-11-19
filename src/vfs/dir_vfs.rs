@@ -128,10 +128,11 @@ impl ArchiveVFS for DirVFS {
     }
 }
 
-/// `std::fs::File` 的 `VirtualFile` 适配（只读 + seek，size 打开时缓存）
-struct FsFile {
-    f: std::fs::File,
-    len: u64,
+/// `std::fs::File` 的 `VirtualFile` 适配（只读 + seek，size 打开时缓存）。
+/// pub(crate)：file_vfs（单文件 VFS）复用同一适配器
+pub(crate) struct FsFile {
+    pub(crate) f: std::fs::File,
+    pub(crate) len: u64,
 }
 
 impl Read for FsFile {
@@ -185,7 +186,9 @@ mod tests {
     fn is_media() -> impl Fn(&str) -> bool {
         |n: &str| {
             let ext = n.rsplit('.').next().unwrap_or("");
-            ["mp4", "jpg", "mkv"].iter().any(|x| x.eq_ignore_ascii_case(ext))
+            ["mp4", "jpg", "mkv"]
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(ext))
         }
     }
 
@@ -298,8 +301,7 @@ mod tests {
         // 命中的非标名（*.yuv420 / sensor_a_*.bin）也能进集合——白名单时代
         // 这类文件在扫描阶段即被丢弃，列表里根本不出现（glob 匹配语义本身
         // 在 config.rs 另测，此处谓词为仿写）
-        let root =
-            std::env::temp_dir().join(format!("dirvfs_raw_pred_{}_0", std::process::id()));
+        let root = std::env::temp_dir().join(format!("dirvfs_raw_pred_{}_0", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("frame.yuv420"), vec![0u8; 100]).unwrap();
