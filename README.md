@@ -60,7 +60,7 @@
 
 ### 配置文件 config.toml
 
-启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则生成一份**带中文注释**的默认配置；已有配置缺失新版本新增的键时，启动时自动按默认值补全并写回（已有键值与注释原样保留）。所有路径均可为绝对路径，`"auto"` 表示自动探测。
+启动时按「exe 同目录 → 当前工作目录」顺序查找；不存在则生成一份**带中文注释**的默认配置；已有配置缺失新版本新增的键时，启动时自动按默认值补全并写回（已有键值与注释原样保留）。所有路径均可为绝对路径，`"auto"` 表示自动探测。顶栏「配置 → 重载配置」（或内嵌配置编辑器保存）热生效，不重启：若当前正在播放/显示，当前项自动按新配置重载（图片重解码、视频销毁播放器重建后重新装载；per-file 亮度记忆保留）。
 
 配置项按功能拆分、随对应章节介绍，本节只列全局项：播放器相关（`[cache]` / `[media]` / `[raw]` / `[player]` / `[ui]` / `[image]` / `[extract]`）见「播放器」节；`[encode]` 见「Encode」节；`[vartidy]` 见「VarTidy」节。
 
@@ -116,6 +116,7 @@ dir = "auto"              # 特殊值：自动探测
 | Esc | 退出全屏 |
 | Ctrl + A | 全选文件列表当前标签页的全部条目（多选；搜索框聚焦或密码框 / 配置编辑器 / 编码确认窗在场时不触发，避免误吞输入框的文本全选） |
 | C | 对比显示：将选中集（Ctrl/Shift 多选，合格 2~6 个）进入分栏对比视图；也可用列表右键菜单「对比显示（C）」。详见下文「对比模式」 |
+| [ / ] | per-file 显示亮度 −5 / +5（mpv gamma 标尺 −100~100，0 = 复位；视频 / 图片 / raw dump 通用，会话内按文件记忆，切回自动恢复；对比模式下对全部栏同调） |
 
 **视频模式**
 
@@ -393,6 +394,9 @@ redraw_other_fps = 60
 image_texture = true
 # 图片纹理 LRU 缓存张数（含当前张）：预解码相邻页，翻页零等待
 image_cache_count = 3
+# 原图缓存（orig-lru）总预算（MB，钳 64~4096）：像素探针 / full 升级复用 /
+# [ ] 亮度毫秒级重建三个消费者共用；单张准入 = 预算/2，张数上限 = 当前栏数+2
+image_orig_cache_mb = 512
 # 基础纹理档尺寸上限；full 高清档升级资格判据同此值
 image_max_dim = 4096
 # 高清档触发阈值：zoom×ppp 超过此值才解码/换画 full 级纹理
@@ -400,15 +404,15 @@ image_full_threshold = 2.0
 # 高清档放大前原图级观感增强（保边降噪 → unsharp 锐化），总开关
 image_full_sharpen = true
 # 锐化强度 amount 与半径 σ（决定强化频带）
-image_full_sharpen_amount = 0.5
+image_full_sharpen_amount = 1.0
 image_full_sharpen_sigma = 1.5
 # 白边抑制折点曲线 [shoot_v, ratio]（空数组 = 关闭，零开销）
-image_full_sharpen_white_edge_curve = [[150.0, 1.0], [200.0, 0.7], [240.0, 0.25], [255.0, 0.0]]
+image_full_sharpen_white_edge_curve = [[100.0, 1.0], [150.0, 0.9], [200.0, 0.6], [240.0, 0.3], [255.0, 0.05]]
 # 锐化前保边降噪 + 算法切换（guided / bilateral，参数独立、强度同量纲可对比）
 image_full_denoise = true
 image_full_denoise_algo = "guided"
 image_full_bilateral_strength = 10.0
-image_full_guided_strength = 5.0
+image_full_guided_strength = 10.0
 image_full_guided_radius = 1
 
 [extract]
@@ -443,15 +447,16 @@ prefetch_upstream_mb = 512
 | `ui.redraw_hover_fps` / `redraw_drag_fps` / `redraw_other_fps` | UI 重绘频率三档上限（fps，钳 5~240）：悬停/滚轮、拖拽中、其余情况（解码完成显示 / 解压进度刷新等）。静置/悬停时 CPU/GPU 占用可控，弱机可下调；视频播放不受影响（vsync 主钟） |
 | `image.image_texture` | 图片走 egui 纹理直显（后台解码直接上纹理，翻页秒开；静图与动图 gif 均走此链路）。解码失败的图片自动回退 mpv |
 | `image.image_cache_count` | 图片纹理 LRU 缓存张数（含当前张），预解码 ±1 相邻页，翻页零等待 |
+| `image.image_orig_cache_mb` | 原图缓存（orig-lru）总预算（MB，钳 64~4096，默认 512）：解码后的原图 CPU 副本，供像素探针（Alt+左键）/ full 高清档升级复用 / `W/S` 亮度毫秒级重建三个消费者共用。单张准入 = 预算/2（超准入巨图不驻留，探针显示"原图未保留"、亮度重走解码）；张数上限 = 当前栏数+2，逐出最旧但跳过当前显示与对比保护集 |
 | `image.image_max_dim` | 基础纹理档尺寸上限（预放大 ×ppp 后超过则原尺寸直进）；full 高清档升级资格判据同此值（详见 [架构设计 13.4 两档策略](doc/架构设计/13_渲染架构迁移.md)） |
 | `image.image_full_threshold` | 高清档触发/换画阈值：屏幕物理像素超过基础纹理该倍数（zoom×ppp > 此值）才解码/换画 full 级纹理。full 为 ×3 屏幕密度纹理，默认 2.0 = badge 200% 起接管、300% 处逐纹素 1:1 直出（200%~300% 为轻微缩采样，静止图无感）；调大（如 3.0）甜点后移且基本关闭 |
 | `image.image_full_sharpen` | 高清档**放大前**在原图分辨率执行观感增强（保边降噪 → unsharp 锐化，先把边缘坡度变陡再 Lanczos 放大），总开关；噪点同步放大由前置降噪对冲 |
-| `image.image_full_sharpen_amount` / `image_full_sharpen_sigma` | unsharp 强度（默认 0.5：越大边缘越脆，>0.8 光晕/振铃明显；控噪优先调 σ/降噪而非减强度）与半径 σ（默认 1.5：决定强化频带，越大越"体积感"、光晕越宽；暗部分层时优先切导向降噪或降 σ） |
-| `image.image_full_sharpen_white_edge_curve` | 白边抑制折点曲线 `[shoot_v, ratio]`（默认 `[150,1]→[200,0.7]→[240,0.25]→[255,0]`）：shoot 多尺度方差标出孤立强边（unsharp 白边亮晕来源），分段线性插值成 256 项 LUT 只压正向增强、细纹理全额保留；空数组 = 关闭（连方差计算都跳过）；折点非法回退默认并 WARN |
+| `image.image_full_sharpen_amount` / `image_full_sharpen_sigma` | unsharp 强度（默认 1.0：越大边缘越脆，>0.8 光晕/振铃明显；控噪优先调 σ/降噪而非减强度）与半径 σ（默认 1.5：决定强化频带，越大越"体积感"、光晕越宽；暗部分层时优先切导向降噪或降 σ） |
+| `image.image_full_sharpen_white_edge_curve` | 白边抑制折点曲线 `[shoot_v, ratio]`（默认 `[100,1]→[150,0.9]→[200,0.6]→[240,0.3]→[255,0.05]`，2026-11-18 release 实测定版）：shoot 多尺度方差标出孤立强边（unsharp 白边亮晕来源），分段线性插值成 256 项 LUT 只压正向增强、细纹理全额保留；空数组 = 关闭（连方差计算都跳过）；折点非法回退默认并 WARN |
 | `image.image_full_denoise` | 锐化前保边降噪（压平坦区噪点不糊边缘；默认开） |
 | `image.image_full_denoise_algo` | 降噪算法 `"guided"`（导向滤波，默认：锯齿最弱、弱纹理保留最好）/ `"bilateral"`（双边 3×3：眼部更锐）；两算法参数独立、strength 同量纲（亮度差容忍级）可同值对比；非法值 WARN 回退导向 |
 | `image.image_full_bilateral_strength` | 双边降噪颜色容忍度 σc（默认 10）：5~10 温和保纹理 / 10~20 通用 / 20~50 激进 / >50 ≈ 普通模糊；涂抹感重调小、噪点残留调大 |
-| `image.image_full_guided_strength` / `image_full_guided_radius` | 导向降噪结构容忍度 D（默认 5，内部换算 ε=D² 方差阈值：3~8 温和 / 15~30 重噪 / 30~60 激进）与窗口半径（默认 1 = 3×3，人像实测定版；重噪图可 2~4）；涂抹感重调小、噪点残留调大 |
+| `image.image_full_guided_strength` / `image_full_guided_radius` | 导向降噪结构容忍度 D（默认 10，内部换算 ε=D² 方差阈值：3~8 温和 / 15~30 重噪 / 30~60 激进）与窗口半径（默认 1 = 3×3，人像实测定版；重噪图可 2~4）；涂抹感重调小、噪点残留调大 |
 | `extract.prefetch_downstream_mb` | 下游预取上限（MB），0 = 关闭：solid 包（7z / solid RAR）解压时顺带预取下标更大的后续文件，一次顺序解压流解出一批，翻页直接命中 |
 | `extract.prefetch_upstream_mb` | 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目顺带写盘，随机跳看后回看直接命中缓存（旧键名 `prefetch_mb` / `prefetch_prev_mb` 仍可读取） |
 

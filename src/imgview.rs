@@ -186,15 +186,18 @@ enum ImgMsg {
         key: ImgKey,
         error: String,
     },
-    /// full 槽纹理就绪（原图 ×ppp×3，见 request_full）
+    /// full 槽纹理就绪（原图 ×ppp×3，见 request_full）。epoch = 发起时的
+    /// full 请求代次：被 invalidate 丢弃的旧 worker 迟到产物按代次丢弃
     FullReady {
         key: ImgKey,
         img: egui::ColorImage,
         name: String,
+        epoch: u64,
     },
     /// 原图解码失败/放弃：UI 保持降采样纹理
     FullFailed {
         key: ImgKey,
+        epoch: u64,
     },
 }
 
@@ -219,6 +222,11 @@ pub struct ImageService {
     /// 解码中集合：发起时刻 → 看门狗超时判定。防重复 spawn 同一条目
     /// （请求 → 线程 → Ready/Failed 才移除）
     pending: HashMap<ImgKey, Instant>,
+    /// **per-file 显示亮度**（W/S 快捷键，值 = ×1.25 步数 n）：App 共享
+    /// 同一 Rc<RefCell>（单源真值，视频属性/图片 LUT/对比 raw 重放都读
+    /// 这里）。poll 上传期应用 LUT——解码发起在先、调亮度在后也恒拿到
+    /// 最新值，无 worker 竞态
+    gamma_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
     /// **tex-lru**：GPU 纹理缓存 LRU（front = 最近使用；back = 最久未用，
     /// 逐出候选）。全图的翻页缓存——条目内容 = base 档显示纹理（GPU 显存
     /// TextureHandle）：小图 = native×ppp 预放大、大图 = native 直出、
@@ -241,28 +249,41 @@ pub struct ImageService {
     full: Option<(ImgKey, egui::TextureHandle)>,
     /// 原图解码中（key + 发起时刻，后者供看门狗超时判定）
     full_pending: Option<(ImgKey, Instant)>,
+    /// full 请求代次：invalidate 丢弃在途 full worker 时递增——迟到消息按
+    /// 代次判旧（旧 worker 产物是旧解码/增强配置，不能顶掉新参数请求）
+    full_epoch: u64,
     /// 原图解码放弃标记（失败/超时/动图）：防止每帧重触发无限重解
     full_failed: Option<ImgKey>,
-    /// **orig-lru**：CPU 原图缓存 LRU（base worker 顺手留存，仅静态且具备
-    /// full 资格的图）：两个消费者——① full 升级复用免二次解码（2K 图省
-    /// ~300ms PNG 解码）；② alt+点击像素探针取**原图**像素值（显示纹理是
-    /// 插值重采样结果，取样会拿到缩放插值而非真实像素，见
-    /// [`ImageService::original_pixel`]）。容量随当前栏数自适应（tex-lru
-    /// 保护集同语义：当前栏数 + 2，单图 3、对比 n 栏 n+2），单张 ≤30MB
-    /// （native ≤ image_max_dim/ppp，正方形极端），封顶逐出最旧，随翻页
-    /// 自然更替。注：**不与 tex-lru 重复**——native 只在 native×ppp ≤
-    /// max_dim（即会被 ×ppp 预放大的小图）时保留，大图/超大图 base 纹理
-    /// 直出原图但 native = None
+    /// **orig-lru**：CPU 原图缓存 LRU（base worker 顺手留存，静态图按
+    /// orig-lru 准入判据）：三个消费者——① full 升级复用免二次熵解码；
+    /// ② alt+点击像素探针取**原图**像素值（显示纹理是插值重采样结果，
+    /// 取样会拿到缩放插值而非真实像素，见 [`ImageService::original_pixel`]；
+    /// 预算制后任意准入尺寸都有读数）；③ per-file 亮度 [ ] native 重建
+    /// （免重解码，毫秒级）。张数 cap 随当前栏数自适应（当前栏数 + 2，
+    /// 单图 3、对比 n 栏 n+2）+ 字节预算（config image.image_orig_cache_mb）
+    /// 双护栏逐出最旧（当前显示受保护），随翻页自然更替。**不与 tex-lru
+    /// 重复**——持有的是原始分辨率 CPU 像素
     natives: VecDeque<(ImgKey, image::DynamicImage)>,
+    /// orig-lru 字节预算（config image.image_orig_cache_mb）：natives 当前
+    /// 驻留字节总数随推入/逐出维护，超预算逐出最旧（当前显示受保护）
+    orig_budget: usize,
+    /// natives 当前驻留字节总数（as_bytes().len() 增量维护）
+    natives_bytes: usize,
 }
 
 impl ImageService {
-    pub fn new(ctx: egui::Context, cap: usize) -> Self {
+    pub fn new(
+        ctx: egui::Context,
+        cap: usize,
+        gamma_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
+        orig_budget: usize,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             tx,
             rx,
             ctx,
+            gamma_map,
             pending: HashMap::new(),
             cache: VecDeque::new(),
             cap: cap.max(1),
@@ -270,8 +291,11 @@ impl ImageService {
             shown_multi: Vec::new(),
             full: None,
             full_pending: None,
+            full_epoch: 0,
             full_failed: None,
             natives: VecDeque::new(),
+            orig_budget: orig_budget.max(1),
+            natives_bytes: 0,
         }
     }
 
@@ -279,6 +303,35 @@ impl ImageService {
     /// 收缩在下次推入时生效（逐出按本字段比较，已缓存内容不主动丢弃）
     pub fn set_cap(&mut self, cap: usize) {
         self.cap = cap.max(1);
+    }
+
+    /// 更新 orig-lru 字节预算（config 热重载同步 image.image_orig_cache_mb）。
+    /// 收缩在下次推入时生效
+    pub fn set_orig_budget(&mut self, mb: u32) {
+        self.orig_budget = (mb.clamp(64, 4096) as usize) * 1024 * 1024;
+    }
+
+    /// 丢弃指定条目的显示缓存（config 热重载后当前播放项重放用）：tex 条目
+    /// 与 full 三态清掉，下次 request 走全新解码（新配置生效）。natives 保留
+    /// ——原图像素与解码配置无关，探针 / gamma 重建继续可用
+    pub fn invalidate(&mut self, key: ImgKey) {
+        if let Some(i) = self.pos(key) {
+            self.cache.remove(i);
+        }
+        self.pending.remove(&key);
+        // 在途 full worker 同 key：清 pending 并递增代次——迟到的 FullReady/
+        // FullFailed 按代次丢弃（其产物是旧配置参数，不能顶掉 invalidate 后
+        // 的新参数请求）
+        if self.full.as_ref().is_some_and(|(k, _)| *k == key) {
+            self.full = None;
+        }
+        if self.full_pending.as_ref().is_some_and(|(k, _)| *k == key) {
+            self.full_pending = None;
+            self.full_epoch += 1;
+        }
+        if self.full_failed.as_ref() == Some(&key) {
+            self.full_failed = None;
+        }
     }
 
     /// 对比模式显示集合（逐出保护；退出对比时清空）
@@ -302,6 +355,9 @@ impl ImageService {
         // （ppp<1）钳 1.0 免无谓缩小重采样。取发起时刻值；跨屏迁移后
         // 已缓存纹理不回炉（LRU 深度浅，翻几页即换血）
         let factor = (self.ctx.pixels_per_point() as f64).max(1.0);
+        // orig-lru 单张准入 = 预算/2：防单张巨图独占预算（当前显示受保护
+        // 的那张最坏驻留预算一半，其余合计不超另一半）
+        let native_limit = (self.orig_budget / 2) as u64;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let name = name.to_owned();
@@ -313,7 +369,7 @@ impl ImageService {
                 // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
                 // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image(&source, max_dim, false, factor, &name, &SharpenCfg::OFF)
+                    decode_image(&source, max_dim, false, factor, &name, &SharpenCfg::OFF, native_limit)
                 }));
                 match r {
                     Ok(Ok((decoded, native))) => {
@@ -387,6 +443,7 @@ impl ImageService {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let name = name.to_owned();
+        let epoch = self.full_epoch;
         self.full_pending = Some((key, Instant::now()));
         // 原图缓存命中即复用（clone 一份：natives 同时服务像素探针不能
         // take；缓冲拷贝 ~10ms 后台线程无感）；未命中走二次解码
@@ -405,7 +462,8 @@ impl ImageService {
                         Ok(build_full(img, factor, &sharpen))
                     }
                     None => {
-                        match decode_image(&source, FULL_MAX_DIM, true, factor, &name, &sharpen) {
+                        // full 档：原图即输入不保留 native（native_limit 传 0）
+                        match decode_image(&source, FULL_MAX_DIM, true, factor, &name, &sharpen, 0) {
                             Ok((Decoded::Static(img), _)) => Ok(img),
                             // 单帧动图取唯一帧当静态原图
                             Ok((Decoded::Anim(mut a), _)) if a.len() == 1 => {
@@ -416,8 +474,8 @@ impl ImageService {
                     }
                 }));
                 let msg = match r {
-                    Ok(Ok(img)) => ImgMsg::FullReady { key, img, name },
-                    Ok(Err(())) | Err(_) => ImgMsg::FullFailed { key },
+                    Ok(Ok(img)) => ImgMsg::FullReady { key, img, name, epoch },
+                    Ok(Err(())) | Err(_) => ImgMsg::FullFailed { key, epoch },
                 };
                 let _ = tx.send(msg);
                 ctx.request_repaint();
@@ -467,31 +525,78 @@ impl ImageService {
                     // full 就绪/失败不再清空——像素探针在 full 档显示下仍需
                     // 原图取样）
                     if let Some(n) = native {
-                        self.natives.push_front((key, n));
-                        let cap =
-                            self.shown_multi
+                        // orig-lru 预算准入：超单张准入（预算/2）不驻留（探针/
+                        // full 复用/亮度重建对该图退回旧行为）。张数 cap +
+                        // 字节预算双护栏逐出最旧；当前显示与对比保护集跳过
+                        //（全保护时暂时超支，随显示切换自然可逐出）
+                        let bytes = n.as_bytes().len();
+                        if bytes <= self.orig_budget / 2 {
+                            self.natives.push_front((key, n));
+                            self.natives_bytes += bytes;
+                            let cap = self
+                                .shown_multi
                                 .len()
                                 .max(if self.shown.is_some() { 1 } else { 0 })
                                 + 2;
-                        while self.natives.len() > cap {
-                            self.natives.pop_back();
+                            while self.natives.len() > cap
+                                || self.natives_bytes > self.orig_budget
+                            {
+                                let Some(pos) = self
+                                    .natives
+                                    .iter()
+                                    .rposition(|(k, _)| !self.is_protected(k))
+                                else {
+                                    break;
+                                };
+                                if let Some((_, old)) = self.natives.remove(pos) {
+                                    self.natives_bytes -= old.as_bytes().len();
+                                }
+                            }
                         }
                     }
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
-                    let (frames, delays) = match decoded {
-                        Decoded::Static(image) => {
+                    // per-file 亮度：poll 上传期应用 LUT——解码发起在先、调亮度
+                    // 在后也恒拿到最新值（worker 不读 gamma，无竞态）；gamma≠0
+                    // 时直方图改在 LUT 后像素上重算（"显示帧与直方图一致"语义），
+                    // worker 按原值算的直方图丢弃；g==0 原样直传零开销
+                    let lut = {
+                        let m = self.gamma_map.borrow();
+                        m.get(&key).and_then(|&g| gamma_lut(g))
+                    };
+                    let (frames, delays, hist) = match decoded {
+                        Decoded::Static(mut image) => {
+                            if let Some(l) = &lut {
+                                apply_gamma(&mut image, l);
+                            }
+                            let hist = match &lut {
+                                Some(_) => Some(Histogram::compute(&image)),
+                                None => hist,
+                            };
                             let tex = self.tex(&key, 0, image);
-                            (vec![tex], vec![Duration::ZERO])
+                            (vec![tex], vec![Duration::ZERO], hist)
                         }
                         Decoded::Anim(anim) => {
                             let delays = anim.iter().map(|(_, d)| *d).collect::<Vec<_>>();
+                            let mut first: Option<egui::ColorImage> = None;
                             let frames = anim
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, (img, _))| self.tex(&key, i, img))
+                                .map(|(i, (mut img, _))| {
+                                    if let Some(l) = &lut {
+                                        apply_gamma(&mut img, l);
+                                    }
+                                    if i == 0 {
+                                        first = Some(img.clone());
+                                    }
+                                    self.tex(&key, i, img)
+                                })
                                 .collect::<Vec<_>>();
-                            (frames, delays)
+                            let hist = match &lut {
+                                Some(_) => first.as_ref().map(Histogram::compute),
+                                None => hist,
+                            };
+                            (frames, delays, hist)
                         }
                     };
                     let n = frames.len();
@@ -516,10 +621,23 @@ impl ImageService {
                     self.pending.remove(&key);
                     out.push(ImgEvent::Failed(key, error));
                 }
-                ImgMsg::FullReady { key, img, name } => {
-                    // 只认当前 pending 的 key：槽已换条目/超时判死的迟到消息丢弃
-                    if self.full_pending.take().is_some_and(|(k, _)| k == key) {
+                ImgMsg::FullReady { key, mut img, name, epoch } => {
+                    // 只认当前 pending 的 key + 当前代次：槽已换条目/被
+                    // invalidate 的旧 worker 迟到消息丢弃（其产物是旧配置
+                    // 参数，不能顶掉 invalidate 后按新配置发起的请求）。
+                    // 代次先验再 take——误 take 会吃掉新请求的 pending，
+                    // 新 worker 的结果反而无处落地
+                    if self.full_pending.as_ref().is_some_and(|(k, _)| *k == key)
+                        && epoch == self.full_epoch
+                    {
+                        self.full_pending = None;
                         let t = std::time::Instant::now();
+                        // full 纹理同步 per-file 亮度（与 base 纹理同标尺，深
+                        // 放大与 base 档观感连续）
+                        let g = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+                        if let Some(l) = gamma_lut(g) {
+                            apply_gamma(&mut img, &l);
+                        }
                         let tex = self.ctx.load_texture(
                             format!("img-full-{}-{}", key.0, key.1),
                             img,
@@ -531,8 +649,11 @@ impl ImageService {
                         // 仍需原图取样，不再随 full 就绪释放）
                     }
                 }
-                ImgMsg::FullFailed { key } => {
-                    if self.full_pending.take().is_some_and(|(k, _)| k == key) {
+                ImgMsg::FullFailed { key, epoch } => {
+                    if self.full_pending.as_ref().is_some_and(|(k, _)| *k == key)
+                        && epoch == self.full_epoch
+                    {
+                        self.full_pending = None;
                         tracing::warn!("原图解码失败，保持降采样纹理: {key:?}");
                         self.full_failed = Some(key);
                     }
@@ -579,6 +700,72 @@ impl ImageService {
         self.pos(key)
             .and_then(|p| self.cache.get(p))
             .and_then(|(_, c)| c.hist.as_ref())
+    }
+
+    /// orig-lru 逐出保护：单图当前显示或对比显示集合内的条目不可逐出
+    fn is_protected(&self, k: &ImgKey) -> bool {
+        self.shown.as_ref() == Some(k) || self.shown_multi.contains(k)
+    }
+
+    /// per-file 亮度 [ ] 重放（App 写 gamma_map 后调用）。natives 命中 →
+    /// finish_static 精确复现 base 管线（sharpen OFF，与首次解码同代码路径）
+    /// → LUT → 上传 + 直方图重算，毫秒级；未命中（动图 / 超预算巨图 /
+    /// native 已逐出）→ 清该条纹理缓存返回 false，调用方重发 request——
+    /// 解码结果在 poll 上传期按最新 gamma 落 LUT，连按自洽无需防抖。
+    /// g==0 同样走重建（从带旧 gamma 的显示纹理回到原值）。full 槽同步
+    /// 失效——缩放中的 full 由现有 per-frame ensure 按需重触发
+    ///（natives 命中免二次熵解码）
+    pub fn refresh_gamma(&mut self, key: ImgKey, max_dim: u32) -> bool {
+        if self.full.as_ref().is_some_and(|(k, _)| *k == key) {
+            self.full = None;
+        }
+        if self.full_failed.as_ref() == Some(&key) {
+            self.full_failed = None;
+        }
+        let g = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+        let Some(native) = self
+            .natives
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, n)| n.clone())
+        else {
+            if let Some(pos) = self.pos(key) {
+                self.cache.remove(pos);
+            }
+            return false;
+        };
+        let factor = (self.ctx.pixels_per_point() as f64).max(1.0);
+        let rebuilt = finish_static(native, max_dim, false, factor, &SharpenCfg::OFF, 0)
+            .ok()
+            .and_then(|(d, _)| match d {
+                Decoded::Static(out) => Some(out),
+                _ => None,
+            });
+        let Some(mut img) = rebuilt else {
+            if let Some(pos) = self.pos(key) {
+                self.cache.remove(pos);
+            }
+            return false;
+        };
+        if let Some(l) = gamma_lut(g) {
+            apply_gamma(&mut img, &l);
+        }
+        let hist = Histogram::compute(&img);
+        let tex = self.tex(&key, 0, img);
+        let cached = Cached {
+            frames: vec![tex],
+            delays: vec![Duration::ZERO],
+            cur: 0,
+            next_at: None,
+            hist: Some(hist),
+        };
+        // 原条目在位则原位替换（保留 LRU 位置）；不在位（refresh 先于
+        // 首次上传到达等边缘时序）按新条目推入
+        if self.pos(key).is_some() {
+            self.cache.remove(self.pos(key).expect("pos 有效"));
+        }
+        self.cache_push(key, cached);
+        true
     }
 
     /// 对比模式变体：非主栏调用传 `drop_stale_full=false`——多栏每帧轮流
@@ -699,13 +886,69 @@ impl ImageService {
     }
 }
 
+/// per-file 显示亮度步进标尺：n = 按键次数（正 = 提亮），每步中间调
+/// ×1.25（下调 ×0.8 = 精确逆操作）。图片/raw 软解 LUT 路径的步数上限
+pub(crate) const GAMMA_STEP_MAX: i32 = 10;
+/// mpv 路径步数上限：gamma 属性域 ±100，一步 ×1.25 ≈ gamma ±64，
+/// ±2 步即触属性边界——钳住防"OSD 倍率在涨画面却不再变化"
+pub(crate) const GAMMA_STEP_MAX_MPV: i32 = 2;
+
+/// 步数 → 中间调倍率（f = 1.25^n；OSD 与 LUT/mpv 换算共用）
+pub(crate) fn gamma_factor(n: i32) -> f64 {
+    1.25f64.powf(n as f64)
+}
+
+/// OSD 文案：步数 → 倍率显示（0 = 复位）
+pub(crate) fn gamma_label(n: i32) -> String {
+    if n == 0 {
+        "亮度 ×1.00（复位）".into()
+    } else {
+        format!("亮度 ×{:.2}", gamma_factor(n))
+    }
+}
+
+/// per-file 显示亮度 LUT（W/S 快捷键）：n = 步数（0 = 不调）。幂律映射
+/// out = (v/255)^k × 255，k = f^-2（f = 1.25^n 中间调倍率）——与 mpv
+/// gamma 属性同一条曲线的等价形式（g = 200·log2(f)，k = 2^(g/-100)）：
+/// +1 步 k=0.64 中间调 ×1.28、倍率越大 k 越小渐进全白，无符号反转奇点。
+/// None = n==0（恒等——调用方跳过整帧遍历，亮度未调零成本）。探针读
+/// natives 原图，不经 LUT（忠实存储原值语义，与显示增益分离）
+pub(crate) fn gamma_lut(n: i32) -> Option<[u8; 256]> {
+    if n == 0 {
+        return None;
+    }
+    let k = 1.25f64.powf(-2.0 * n as f64);
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = ((i as f64 / 255.0).powf(k) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    Some(lut)
+}
+
+/// LUT 逐像素应用到 ColorImage（RGB 查表，alpha 不动）。O(像素) 单次遍历，
+/// 4K 图 ~10ms——[ ] 按键重放在 UI 线程可接受
+pub(crate) fn apply_gamma(img: &mut egui::ColorImage, lut: &[u8; 256]) {
+    for px in &mut img.pixels {
+        // ColorImage 像素为非预乘 RGBA（from_rgba_unmultiplied 构造），
+        // 重建时保持 alpha 通道语义一致
+        *px = egui::Color32::from_rgba_unmultiplied(
+            lut[px.r() as usize],
+            lut[px.g() as usize],
+            lut[px.b() as usize],
+            px.a(),
+        );
+    }
+}
+
 /// 后台线程主体：读源 → 解码（gif/webp 逐帧）→ 尺寸适配 → RGBA。
 /// full=false 基础档（factor=ppp）/ true 高清档（factor=ppp×3），
 /// 两档策略见 resample；factor 由 ImageService 按屏幕 DPI 内部取值；
 /// sharpen = 高清档放大前观感增强配置（config image.image_full_sharpen*，
 /// 基础档传 [`SharpenCfg::OFF`]）
-/// 返回 (结果, 原图保留)：原图仅基础档静态且具备 full 资格（native×factor
-/// ≤ max_dim，同预放大判据）时带回，供 full 升级复用免二次解码
+/// 返回 (结果, 原图保留)：原图仅基础档静态且满足 orig-lru 准入时带回
+///（小图 native×factor ≤ max_dim 同预放大判据，或字节数 ≤ 单张准入
+/// native_limit_bytes = orig 预算/2），供 full 升级复用/像素探针/per-file
+/// 亮度重建三个消费者使用
 fn decode_image(
     source: &ImageSource,
     max_dim: u32,
@@ -713,6 +956,7 @@ fn decode_image(
     factor: f64,
     name: &str,
     sharpen: &SharpenCfg,
+    native_limit_bytes: u64,
 ) -> Result<(Decoded, Option<image::DynamicImage>), String> {
     match source {
         ImageSource::File(path) => {
@@ -722,14 +966,14 @@ fn decode_image(
             if is_raw_photo_ext(name) {
                 if let Ok(img) = decode_raw_preview_path(path) {
                     tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen);
+                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes);
                 }
             }
             let reader = image::ImageReader::open(path)
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen)
+            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes)
         }
         ImageSource::Stream(vfs, entry) => {
             let mut vf = vfs
@@ -743,13 +987,13 @@ fn decode_image(
             if is_raw_photo_ext(name) {
                 if let Ok(img) = decode_raw_preview(&buf) {
                     tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen);
+                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes);
                 }
             }
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen)
+            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes)
         }
     }
 }
@@ -764,6 +1008,7 @@ fn decode_any<R: BufRead + Seek>(
     factor: f64,
     name: &str,
     sharpen: &SharpenCfg,
+    native_limit_bytes: u64,
 ) -> Result<(Decoded, Option<image::DynamicImage>), String> {
     let fmt = reader.format();
     // 日志用短名（压缩包条目路径不含目录）
@@ -821,7 +1066,7 @@ fn decode_any<R: BufRead + Seek>(
     // clamp 12288 + 像素预算）。factor 由 ImageService 按屏幕 DPI 定。
     // 共享尾部抽为 finish_static，与 RAW 预览拦截分支共用（方案 §4.3）
     let (w, h) = (img.width(), img.height());
-    let (decoded, native) = finish_static(img, max_dim, full, factor, sharpen)?;
+    let (decoded, native) = finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)?;
     // 尺寸命名日志：native_size 原图 / lru_size 基础纹理 / full_size
     // full 槽纹理（箭头一致 = 未触发重采样，尺寸原样直进）
     let Decoded::Static(out) = &decoded else {
@@ -841,15 +1086,16 @@ fn decode_any<R: BufRead + Seek>(
 /// 静态图共享尾部：可选降噪+锐化（config image.image_full_sharpen*，仅高清
 /// 档，**放大前**在原图分辨率执行——把边缘坡度先变陡，Lanczos 插值保持
 /// 陡峭过渡，成本从放大后千万像素级降到原图级，见 [`sharpen_full`]）→
-/// 两档尺寸适配（见 [`resample`]）→ RGBA，并按 full 资格判据
-///（native×factor ≤ max_dim，同基础档预放大阈值）决定是否保留原图供 full
-/// 升级复用。[`decode_any`] 与 RAW 预览拦截分支共用
+/// 两档尺寸适配（见 [`resample`]）→ RGBA，并按 orig-lru 准入判据决定
+/// 是否保留原图（三个消费者：full 升级复用 / 像素探针 / per-file 亮度
+/// native 重建）。[`decode_any`] 与 RAW 预览拦截分支共用
 fn finish_static(
     img: image::DynamicImage,
     max_dim: u32,
     full: bool,
     factor: f64,
     sharpen: &SharpenCfg,
+    native_limit_bytes: u64,
 ) -> Result<(Decoded, Option<image::DynamicImage>), String> {
     // shoot_v 边缘掩码暂存（sharpen_full 产出 → resample 后的 antiring_step
     // 消费——两步夹着 resample，用局部 Option 中转）
@@ -863,12 +1109,17 @@ fn finish_static(
     } else {
         img
     };
-    // 原图保留（仅基础档）：full=true 时原图即输入，无需缓存
+    // 原图保留（仅基础档）：full=true 时原图即输入，无需缓存。
+    // 准入判据（任一满足）：① 小图（native×factor ≤ max_dim，同预放大
+    // 判据——×ppp 后仍小，驻留便宜）；② 字节数 ≤ 单张准入（orig 预算/2，
+    // budget 制：大图也驻留，服务探针/full 复用/亮度重建）
     let native = if full {
         None
     } else {
         let longest = img.width().max(img.height());
-        ((longest as f64 * factor).round() <= max_dim as f64).then(|| img.clone())
+        let fits_tex = (longest as f64 * factor).round() <= max_dim as f64;
+        let fits_budget = native_limit_bytes > 0 && img.as_bytes().len() as u64 <= native_limit_bytes;
+        (fits_tex || fits_budget).then(|| img.clone())
     };
     // 防振铃源 rgba 提取（掩码存在的充要前提：antiring 开 + 锐化开 + 白边
     // 抑制开——三者缺一掩码为 None，antiring_step 直通，src 提取也跳过）
@@ -2764,6 +3015,7 @@ mod tests {
                 1.0,
                 "s.png",
                 &cfg,
+                0,
             )
             .unwrap();
             let (out, _) = out;
@@ -2867,6 +3119,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -2919,6 +3172,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -2953,6 +3207,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -2981,6 +3236,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -3024,6 +3280,7 @@ mod tests {
             2.0,
             "anim2.webp",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -3064,6 +3321,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -3091,6 +3349,7 @@ mod tests {
             1.5,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -3116,6 +3375,7 @@ mod tests {
             2.0,
             "t.png",
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         std::fs::remove_file(&p).ok();
@@ -3144,7 +3404,7 @@ mod tests {
 
     #[test]
     fn lru_容量逐出_跳过当前() {
-        let mut svc = ImageService::new(egui::Context::default(), 2);
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
         let cur = (1, 5);
         let ready = |svc: &mut ImageService, key: ImgKey| {
             feed(
@@ -3174,7 +3434,7 @@ mod tests {
 
     #[test]
     fn lru_预取洪水不逐出正在显示的条目() {
-        let mut svc = ImageService::new(egui::Context::default(), 2);
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
         let cur = (1, 5);
         let ready = |svc: &mut ImageService, key: ImgKey| {
             feed(
@@ -3200,7 +3460,7 @@ mod tests {
 
     #[test]
     fn frame_动图推进状态机() {
-        let mut svc = ImageService::new(egui::Context::default(), 2);
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
         let key = (2, 0);
         let frame = |c: u8| egui::ColorImage::new([4, 4], vec![egui::Color32::from_gray(c); 16]);
         feed(
@@ -3238,7 +3498,7 @@ mod tests {
 
     #[test]
     fn frame_静态图无时钟() {
-        let mut svc = ImageService::new(egui::Context::default(), 2);
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
         let key = (3, 0);
         feed(
             &mut svc,
@@ -3256,7 +3516,7 @@ mod tests {
 
     #[test]
     fn request_去重与失败事件() {
-        let mut svc = ImageService::new(egui::Context::default(), 3);
+        let mut svc = ImageService::new(egui::Context::default(), 3, Default::default(), 0);
         let missing = || ImageSource::File(std::path::PathBuf::from("definitely_missing.png"));
         // 同 key 重复请求只解码一次
         svc.request((9, 9), missing(), 4096, "t.png");
@@ -3369,6 +3629,7 @@ mod tests {
             false,
             2.0,
             &SharpenCfg::OFF,
+            0,
         )
         .unwrap();
         let Decoded::Static(out) = out else {
@@ -3376,5 +3637,173 @@ mod tests {
         };
         assert_eq!(out.size, [200, 100]);
         assert!(native.is_some(), "100×50×2≤4096 应命中原图保留资格");
+    }
+
+    // ---- per-file 显示亮度（[ ] 快捷键）----
+
+    #[test]
+    fn gamma_lut_方向边界与单调() {
+        assert!(gamma_lut(0).is_none(), "n=0 恒等应返 None（调用方零开销直通）");
+        let up = gamma_lut(1).unwrap();
+        let down = gamma_lut(-1).unwrap();
+        // 中间调方向：+1 步（×1.25）提亮、-1 步（×0.8）压暗
+        //（幂律 k = 1.25^(-2n)，f^(-2) 等价 mpv gamma 曲线）
+        assert!(up[128] > 128, "+1 步应提亮，实际 {}", up[128]);
+        assert!(down[128] < 128, "-1 步应压暗，实际 {}", down[128]);
+        // 端点钳制 + 全程单调不减（亮度序保持，直方图形状不折叠）
+        assert_eq!(up[0], 0);
+        assert_eq!(up[255], 255);
+        for w in up.windows(2) {
+            assert!(w[0] <= w[1], "LUT 应单调不减: {} > {}", w[0], w[1]);
+        }
+        // 步进复合：+2 步比 +1 步更亮（×1.25 逐次叠加）；深压暗端不发散
+        let up2 = gamma_lut(2).unwrap();
+        assert!(up2[128] > up[128], "+2 步应比 +1 步更亮");
+        let deep = gamma_lut(-10).unwrap();
+        assert!(deep[255] <= 255 && deep[0] == 0);
+        for w in deep.windows(2) {
+            assert!(w[0] <= w[1]);
+        }
+    }
+
+    #[test]
+    fn apply_gamma_像素与alpha保持() {
+        let mut img = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[100, 100, 100, 128]);
+        let lut = gamma_lut(2).unwrap();
+        // ColorImage 存储为预乘 alpha（from_rgba_unmultiplied 内部转换），
+        // 半透明像素 RGB 已缩放——提亮方向性只做相对断言，alpha 恒不变
+        let before = img.pixels[0].r();
+        apply_gamma(&mut img, &lut);
+        let px = img.pixels[0];
+        assert!(px.r() > before, "灰值经提亮 LUT 应提亮");
+        assert_eq!(px.a(), 128, "alpha 不动");
+    }
+
+    /// 塞一帧就绪消息（native 可带）进服务缓存（跳过后台线程，同步可控）
+    fn feed_native(
+        svc: &mut ImageService,
+        key: ImgKey,
+        decoded: Decoded,
+        native: Option<image::DynamicImage>,
+        name: &str,
+    ) {
+        let hist = match &decoded {
+            Decoded::Static(img) => Some(Histogram::compute(img)),
+            Decoded::Anim(a) => a.first().map(|(f, _)| Histogram::compute(f)),
+        };
+        let _ = svc.tx.send(ImgMsg::Ready {
+            key,
+            decoded,
+            hist,
+            native,
+            name: name.to_owned(),
+        });
+        svc.poll();
+    }
+
+    #[test]
+    fn natives_预算准入与逐出() {
+        // 预算 8MB（单张准入 4MB）：850×850 RGBA ≈ 2.89MB 准入；shown 保护
+        // 使张数 cap = 1+2 = 3，3 张 ≈ 8.67MB 超预算 → 预算护栏逐出最旧
+        let mut svc = ImageService::new(
+            egui::Context::default(),
+            2,
+            Default::default(),
+            8 * 1024 * 1024,
+        );
+        svc.shown = Some((1, 5));
+        let nat = |v: u8| {
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                850,
+                850,
+                image::Rgba([v, 0, 0, 255]),
+            ))
+        };
+        for i in 0..6u8 {
+            feed_native(
+                &mut svc,
+                (1, i as usize),
+                Decoded::Static(egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16])),
+                Some(nat(10 + i)),
+                "t.png",
+            );
+        }
+        assert!(
+            svc.natives_bytes <= 8 * 1024 * 1024,
+            "超预算必须逐出，实际 {} 字节",
+            svc.natives_bytes
+        );
+        assert!(svc.natives.len() <= 3, "张数 cap = 栏数+2");
+        assert!(
+            svc.natives.iter().any(|(k, _)| *k == (1, 5)),
+            "最新一张（且为当前显示）应保留"
+        );
+        assert!(
+            svc.natives.iter().all(|(k, _)| k.1 >= 4),
+            "最旧的应被逐出，剩余下标: {:?}",
+            svc.natives.iter().map(|(k, _)| k.1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refresh_gamma_natives重建与直方图重算() {
+        let map: std::rc::Rc<
+            std::cell::RefCell<std::collections::HashMap<ImgKey, i32>>,
+        > = Default::default();
+        let mut svc = ImageService::new(egui::Context::default(), 2, map.clone(), 4 * 1024 * 1024);
+        let key = (7, 0);
+        // 灰 100 平坦图：native 带回（预算内）→ refresh 毫秒级重建
+        feed_native(
+            &mut svc,
+            key,
+            Decoded::Static(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::from_gray(100); 64],
+            )),
+            Some(image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([100, 100, 100, 255]),
+            ))),
+            "t.png",
+        );
+        assert!(svc.frame(key).is_some(), "首帧应就绪");
+        // 原值直方图全部落 bin 100（小图会被 finish_static ×2 上采样，
+        // 像素总数取首帧实际值，不写死 64）
+        let px_count = svc.histogram(key).expect("hist 应随上传就绪").ch[3][100];
+        assert!(px_count > 0);
+        // 调亮度 +2 步（×1.56，k=1.25^-4≈0.4096）→ refresh_gamma 原位重建：
+        // 灰 100 → (100/255)^0.4096×255 ≈ 174
+        map.borrow_mut().insert(key, 2);
+        assert!(svc.refresh_gamma(key, 4096), "natives 命中应返 true");
+        let h1 = svc.histogram(key).expect("重建后 hist 应重算");
+        assert_eq!(h1.ch[3][174], px_count, "全部像素应移到 LUT 后的 bin");
+        assert_eq!(h1.ch[3][100], 0, "原 bin 应清空（直方图与显示帧一致）");
+        assert!(svc.frame(key).is_some(), "重建后纹理应在位");
+        // 复位 0 → 再次重建回原值
+        map.borrow_mut().insert(key, 0);
+        assert!(svc.refresh_gamma(key, 4096));
+        let h2 = svc.histogram(key).expect("复位后 hist 应回原值");
+        assert_eq!(h2.ch[3][100], px_count);
+    }
+
+    #[test]
+    fn refresh_gamma_无native清缓存返false() {
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
+        let key = (7, 1);
+        // 无 native（预算 0 → 准入关闭模拟巨图）：refresh 无原图可重建
+        feed_native(
+            &mut svc,
+            key,
+            Decoded::Static(egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16])),
+            None,
+            "t.png",
+        );
+        assert!(svc.frame(key).is_some());
+        assert!(
+            !svc.refresh_gamma(key, 4096),
+            "natives 未命中应返 false（调用方重解码）"
+        );
+        assert!(svc.frame(key).is_none(), "旧纹理条目应被清掉防陈旧显示");
     }
 }

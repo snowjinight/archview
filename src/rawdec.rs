@@ -552,6 +552,9 @@ pub(crate) fn raw_frame_info(rl: &RawLoad, size: u64) -> Result<RawFrameInfo, St
 
 pub(crate) struct RawFrameTex {
     pub(crate) idx: usize,
+    /// 本帧显示 gamma（mpv 标尺 -100~100，0=原值）：缓存随 gamma 陈旧判定——
+    /// [ ] 调亮度后同帧按新 gamma 重发重解（raw 无熵编码重解几十 ms）
+    pub(crate) gamma: i32,
     pub(crate) tex: egui::TextureHandle,
     /// 本帧直方图（软解线程顺手算，与纹理同源同帧）：对比模式 Ctrl+H
     /// 直方图覆盖层用，显示帧与直方图永远一致（保留旧帧时直方图同旧）
@@ -561,6 +564,7 @@ pub(crate) struct RawFrameTex {
 struct RawFrameDone {
     key: ImgKey,
     idx: usize,
+    gamma: i32,
     res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
 }
 
@@ -602,8 +606,9 @@ enum RawMsg {
 pub(crate) struct RawFrameService {
     tx: Sender<RawMsg>,
     rx: Receiver<RawMsg>,
-    /// (key, 帧号) → 发起时刻（防重复 spawn）
-    pending: HashMap<(ImgKey, usize), Instant>,
+    /// (key, 帧号, gamma) → 发起时刻（防重复 spawn；gamma 入键——调亮度后
+    /// 同帧按新 gamma 重发，旧请求在途不阻塞新请求）
+    pending: HashMap<(ImgKey, usize, i32), Instant>,
     /// 每栏已就绪帧（保留上一帧直到新帧就绪，切换无闪烁）
     frames: HashMap<ImgKey, RawFrameTex>,
     /// 确定性失败（格式不支持/数据坏）：不再重试
@@ -636,22 +641,28 @@ impl RawFrameService {
         }
     }
 
-    /// 请求解码第 idx 帧（幂等；idx 按栏帧数钳制）
+    /// 请求解码第 idx 帧（幂等；idx 按栏帧数钳制）。gamma = per-file 显示
+    /// 亮度（mpv 标尺）：worker 解码后 LUT，直方图在 LUT 后像素上统计
+    /// （显示帧与直方图一致，与 imgview poll 期语义同源）
     pub(crate) fn request(
         &mut self,
         key: ImgKey,
         source: &ImageSource,
         info: &RawFrameInfo,
         frame_idx: usize,
+        gamma: i32,
     ) {
         let fi = frame_idx.min(info.frame_count.saturating_sub(1));
-        if self.frames.get(&key).is_some_and(|t| t.idx == fi)
-            || self.pending.contains_key(&(key, fi))
+        if self
+            .frames
+            .get(&key)
+            .is_some_and(|t| t.idx == fi && t.gamma == gamma)
+            || self.pending.contains_key(&(key, fi, gamma))
             || self.errs.contains_key(&key)
         {
             return;
         }
-        self.pending.insert((key, fi), Instant::now());
+        self.pending.insert((key, fi, gamma), Instant::now());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (source, info) = (source.clone(), info.clone());
         std::thread::Builder::new()
@@ -659,15 +670,24 @@ impl RawFrameService {
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // 直方图顺手算（O(像素)，被解码耗时掩盖；与 imgview 解码
-                    // worker 同款先例）：对比模式 Ctrl+H 直方图与显示帧同源
-                    decode_raw_frame(&source, &info, fi).map(|(img, native)| {
+                    // worker 同款先例）：gamma LUT 先落显示像素、直方图统计
+                    // LUT 后像素，与纹理同源
+                    decode_raw_frame(&source, &info, fi).map(|(mut img, native)| {
+                        if let Some(l) = crate::imgview::gamma_lut(gamma) {
+                            crate::imgview::apply_gamma(&mut img, &l);
+                        }
                         let hist = Histogram::compute(&img);
                         (img, native, hist)
                     })
                 }))
                 .map_err(|_| "raw 帧解码线程 panic".to_string())
                 .and_then(|r| r);
-                let _ = tx.send(RawMsg::Frame(RawFrameDone { key, idx: fi, res }));
+                let _ = tx.send(RawMsg::Frame(RawFrameDone {
+                    key,
+                    idx: fi,
+                    gamma,
+                    res,
+                }));
                 ctx.request_repaint();
             })
             .ok();
@@ -731,7 +751,7 @@ impl RawFrameService {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 RawMsg::Frame(m) => {
-                    self.pending.remove(&(m.key, m.idx));
+                    self.pending.remove(&(m.key, m.idx, m.gamma));
                     match m.res {
                         Ok((img, _native, hist)) => {
                             let tex = self.ctx.load_texture(
@@ -743,6 +763,7 @@ impl RawFrameService {
                                 m.key,
                                 RawFrameTex {
                                     idx: m.idx,
+                                    gamma: m.gamma,
                                     tex,
                                     hist,
                                 },
@@ -782,20 +803,27 @@ impl RawFrameService {
     /// 请求在途判定（预留：等待文案区分用）
     #[allow(dead_code)]
     pub(crate) fn is_pending(&self, key: ImgKey) -> bool {
-        self.pending.keys().any(|(k, _)| *k == key)
+        self.pending.keys().any(|(k, _, _)| *k == key)
     }
 
     /// 退出对比/滑动后清理不在当前窗口的栏
     pub(crate) fn retain(&mut self, keys: &[ImgKey]) {
         self.frames.retain(|k, _| keys.contains(k));
         self.errs.retain(|k, _| keys.contains(k));
-        self.pending.retain(|(k, _), _| keys.contains(k));
+        self.pending.retain(|(k, _, _), _| keys.contains(k));
         self.probes.retain(|k, _| keys.contains(k));
     }
 }
 
 struct HistDone {
     key: ImgKey,
+    gamma: i32,
+    res: Result<Histogram, String>,
+}
+
+/// 直方图结果条目（gamma 记录在案：W/S 调亮度后同 key 按 gamma 陈旧判定重算）
+struct HistEntry {
+    gamma: i32,
     res: Result<Histogram, String>,
 }
 
@@ -810,7 +838,7 @@ pub(crate) struct HistService {
     /// key → 发起时刻（防重复 spawn）
     pending: HashMap<ImgKey, Instant>,
     /// 已就绪结果（Ok=直方图 / Err=确定性失败文案，不重试）
-    done: HashMap<ImgKey, Result<Histogram, String>>,
+    done: HashMap<ImgKey, HistEntry>,
     ctx: egui::Context,
 }
 
@@ -826,8 +854,9 @@ impl HistService {
         }
     }
 
-    /// 确保当前 key 的直方图在途（幂等）。预设未命中（标准容器/视频）与
-    /// 配置错误（Err）直接落 done——UI 覆盖层显示状态文案，不发线程
+    /// 确保当前 key 的直方图在途（幂等；gamma 变化视为陈旧自动重算）。
+    /// 预设未命中（标准容器/视频）与配置错误（Err）直接落 done——UI 覆盖层
+    /// 显示状态文案，不发线程
     pub(crate) fn request(
         &mut self,
         key: ImgKey,
@@ -835,26 +864,49 @@ impl HistService {
         name: &str,
         size: u64,
         cfg: &Config,
+        gamma: i32,
     ) {
-        if self.pending.contains_key(&key) || self.done.contains_key(&key) {
+        if self.pending.contains_key(&key)
+            || self
+                .done
+                .get(&key)
+                .is_some_and(|e| e.gamma == gamma && e.res.is_ok())
+        {
             return;
         }
         let rl = match raw_demux_opts(cfg, name, Some(size)) {
             Ok(Some(rl)) => rl,
             Ok(None) => {
-                self.done
-                    .insert(key, Err("非 raw 裸数据（标准视频不支持直方图）".into()));
+                self.done.insert(
+                    key,
+                    HistEntry {
+                        gamma,
+                        res: Err("非 raw 裸数据（标准视频不支持直方图）".into()),
+                    },
+                );
                 return;
             }
             Err(e) => {
-                self.done.insert(key, Err(format!("raw 预设错误: {e}")));
+                self.done.insert(
+                    key,
+                    HistEntry {
+                        gamma,
+                        res: Err(format!("raw 预设错误: {e}")),
+                    },
+                );
                 return;
             }
         };
         let info = match raw_frame_info(&rl, size) {
             Ok(i) => i,
             Err(e) => {
-                self.done.insert(key, Err(format!("raw 帧参数错误: {e}")));
+                self.done.insert(
+                    key,
+                    HistEntry {
+                        gamma,
+                        res: Err(format!("raw 帧参数错误: {e}")),
+                    },
+                );
                 return;
             }
         };
@@ -866,18 +918,30 @@ impl HistService {
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // 第 0 帧：直方图语义是"这张 dump 长什么样"；多帧序列
-                    // 逐帧统计成本线性涨，首帧足够代表（覆盖层标注帧号）
-                    decode_raw_frame(&source, &info, 0).map(|(img, _)| Histogram::compute(&img))
+                    // 逐帧统计成本线性涨，首帧足够代表（覆盖层标注帧号）。
+                    // gamma LUT 先落显示像素再统计（显示帧与直方图一致）
+                    decode_raw_frame(&source, &info, 0).map(|(mut img, _)| {
+                        if let Some(l) = crate::imgview::gamma_lut(gamma) {
+                            crate::imgview::apply_gamma(&mut img, &l);
+                        }
+                        Histogram::compute(&img)
+                    })
                 }))
                 .map_err(|_| "raw 直方图线程 panic".to_string())
                 .and_then(|r| r);
                 tracing::debug!("raw 直方图[{name}]: {}", res.is_ok());
-                let _ = tx.send(HistDone { key, res });
+                let _ = tx.send(HistDone { key, gamma, res });
                 ctx.request_repaint();
             });
         if r.is_err() {
             self.pending.remove(&key);
-            self.done.insert(key, Err("直方图线程创建失败".into()));
+            self.done.insert(
+                key,
+                HistEntry {
+                    gamma,
+                    res: Err("直方图线程创建失败".into()),
+                },
+            );
         }
     }
 
@@ -886,7 +950,13 @@ impl HistService {
         let mut repaint = false;
         while let Ok(m) = self.rx.try_recv() {
             self.pending.remove(&m.key);
-            self.done.insert(m.key, m.res);
+            self.done.insert(
+                m.key,
+                HistEntry {
+                    gamma: m.gamma,
+                    res: m.res,
+                },
+            );
             repaint = true;
         }
         if repaint {
@@ -896,7 +966,7 @@ impl HistService {
 
     /// Ok(Some(hist)) = 就绪；Ok(None) = 在途（软解中）；Err = 失败文案
     pub(crate) fn histogram(&self, key: ImgKey) -> Option<&Result<Histogram, String>> {
-        self.done.get(&key)
+        self.done.get(&key).map(|e| &e.res)
     }
 
     /// 切条目后清理非当前 key（直方图按 key 即用即弃，不驻留）
@@ -1215,7 +1285,7 @@ mod tests {
         let cfg = crate::config::Config::default();
 
         // 标准视频名：无 raw 预设命中 → Ok(None)
-        svc.request(key, &src, "movie.mp4", 12345, &cfg);
+        svc.request(key, &src, "movie.mp4", 12345, &cfg, 0);
         let msg = match svc.histogram(key) {
             Some(Err(m)) => m.clone(),
             other => panic!("应直落 Err，实际 {other:?}"),
@@ -1233,7 +1303,7 @@ mod tests {
             bit_shift: 0,
         }];
         let key2: ImgKey = (0, 1);
-        svc.request(key2, &src, "sensor.bin", 12345, &bad);
+        svc.request(key2, &src, "sensor.bin", 12345, &bad, 0);
         let msg = match svc.histogram(key2) {
             Some(Err(m)) => m.clone(),
             other => panic!("应直落 Err，实际 {other:?}"),

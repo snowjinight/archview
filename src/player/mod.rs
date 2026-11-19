@@ -158,6 +158,11 @@ pub struct PlayerService {
     step_idle: Arc<AtomicBool>,
     /// 配置原文 hwdec："auto" 时启用探测记忆（hwdec_fixed），其余取值原样生效
     hwdec_cfg: String,
+    /// per-file 显示亮度（值 = ×1.25 步数 n，mpv 侧换算 gamma 属性值）：
+    /// 本地记忆，loadfile 后重发——mpv 全局属性跨装载持续，切换文件必须按
+    /// 新文件的记录值显式复位，否则上一文件的亮度泄漏到下一文件。运行期走
+    /// async 写（与 volume 同款：同步 set 拿 core 锁，装载窗口内会冻结 UI）
+    display_gamma: Cell<i32>,
     /// hwdec 探测记忆：首次成功解码后 hwdec-current 的取值（如 "d3d11va-copy"）。
     /// 配置为 auto 时，后续装载以 loadfile 的 per-file 选项固定该方法，跳过
     /// auto 试探链（每次试探都要创建解码设备、占 core 锁）。方法取决于
@@ -225,6 +230,7 @@ impl PlayerService {
             buffering_cache: Arc::new(AtomicBool::new(false)),
             step_idle: Arc::new(AtomicBool::new(true)),
             hwdec_cfg: cfg.player.hwdec.clone(),
+            display_gamma: Cell::new(0),
             hwdec_fixed: std::cell::RefCell::new(None),
             load_err_rx: std::sync::Mutex::new(load_err_rx),
         };
@@ -570,6 +576,34 @@ impl PlayerService {
         }
     }
 
+    /// per-file 显示亮度（W/S 快捷键，App.gamma_map 为真值来源）：n = ×1.25
+    /// 步数，换算 mpv gamma 属性值 g = 200·log2(1.25)·n ≈ 64.4n 后 async 写
+    /// （属性域 ±100，超界由 gamma_prop_str 钳制）。异步入队即返回
+    /// 不拿 core 锁（连按不冻结 UI）；0 同样下发（显式复位，不依赖 mpv 默认值）
+    pub fn set_display_gamma(&self, n: i32) {
+        self.display_gamma.set(n);
+        let s = Self::gamma_prop_str(n);
+        self.set_prop_str_async("gamma", &s);
+        tracing::debug!("显示亮度: {s}");
+    }
+
+    /// 步数 → mpv gamma 属性值字符串：g = 200·log2(1.25)·n（每步中间调
+    /// ×1.25 的精确等价换算），钳属性域 [-100, 100]。mpv gamma 为浮点属性，
+    /// 带两位小数下发
+    fn gamma_prop_str(n: i32) -> String {
+        let g = (n as f64 * 64.385_618_977_472_47).clamp(-100.0, 100.0);
+        format!("{g:.2}")
+    }
+
+    /// loadfile 提交后按本地记忆重发 gamma：mpv 全局属性跨装载持续，
+    /// 上一文件的亮度不随换文件清除——每次装载显式复位（App 侧已在装载
+    /// 点按新文件记录值调过 set_display_gamma，此处再发一次幂等对齐，
+    /// 防两类窗口：装载点遗漏 / set 先于 loadfile 提交被旧值覆盖的时序）
+    fn reapply_display_gamma(&self) {
+        let s = Self::gamma_prop_str(self.display_gamma.get());
+        self.set_prop_str_async("gamma", &s);
+    }
+
     /// `bit_shift`：raw dump 每 u16 采样左移位数（0 = 不位移）。经
     /// zvf:// URI 查询串下发，open_cb 在流层包装 ShiftReader（12bit 低
     /// 对齐存 16bit 容器的发黑修复，见 [[raw.demux]] bit_shift）
@@ -592,6 +626,7 @@ impl PlayerService {
         // keep-open=always 在 EOF 时会把 pause 置为 yes，且 loadfile 不清除它——
         // 不显式取消暂停的话，播完一个视频后切换新视频会停在第一帧
         self.set_prop_str("pause", "no");
+        self.reapply_display_gamma();
         // 装载窗口起点：供 has_painted_since_load 打首帧耗时 + UI 轮询判定
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
@@ -613,6 +648,7 @@ impl PlayerService {
             tracing::error!("loadfile {url} 失败: {e}");
         }
         self.set_prop_str("pause", "no"); // 同 load()：清除 EOF 粘滞的暂停态
+        self.reapply_display_gamma();
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
         self.first_frame.store(false, Ordering::Relaxed);
@@ -836,6 +872,17 @@ impl PlayerService {
 
 impl Drop for PlayerService {
     fn drop(&mut self) {
+        // 先停事件泵再销毁核心：泵线程持裸 ctx 指针（usize 过线程边界），
+        // terminate_destroy 释放 handle 后泵若仍循环（stop 未置位、SHUTDOWN
+        // 未被投递到自身队列的时序），下一次 wait_event 即 use-after-free
+        // → 0xc0000005（配置重载销毁播放器实测踩中）。stop 置位 + join：
+        // 泵最多阻塞在一个 0.2s 的 wait_event 上，join 上限同量级
+        if let Some(stop) = &self.log_stop {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(t) = self.log_thread.take() {
+            let _ = t.join();
+        }
         mpv_ffi::destroy(self.ctx);
     }
 }
@@ -1347,6 +1394,82 @@ mod tests {
         mpv_ffi::destroy(ctx);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("7z 解压播放端到端测试通过 ✓");
+    }
+
+    /// gamma 等化器属性可用性（UI 层全局提亮方案的视频端前提）：
+    /// ① 属性被 mpv 接受且可回读；② 非法/越界值被拒（证明 mpv 真解析等化器
+    /// 属性而非裸存字符串）；③ 播放中运行时写入无错且跨 loadfile 持续
+    /// （切文件无需重设）。
+    /// 注：vo=null 无画面输出，"视觉生效"以属性接受 + mpv 等化器管线文档
+    /// 语义为准；真机 d3d11va + libmpv render 路径建议人工确认一次画面变化。
+    #[test]
+    fn e2e_gamma_property_available() {
+        let Some(dll_dir) = find_mpv_dll_dir() else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
+        let ctx = mpv_ffi::create().unwrap();
+        mpv_ffi::set_option_string(ctx, "terminal", "yes").unwrap();
+        mpv_ffi::set_option_string(ctx, "msg-level", "all=error").unwrap();
+        mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
+        mpv_ffi::set_option_string(ctx, "ao", "null").unwrap();
+
+        // gamma 属性在 mpv 内部是浮点存储（回读 "50.000000"），统一按 f64 回读比较
+        let gamma_f64 = |ctx: *mut mpv_ffi::MpvHandle| -> f64 {
+            mpv_ffi::get_property_string(ctx, "gamma")
+                .unwrap()
+                .unwrap()
+                .trim()
+                .parse()
+                .expect("gamma 回读应为数值")
+        };
+
+        // ① 写入 + 回读（正值 = 提亮方向）；属性被接受即证明等化器管线在场
+        mpv_ffi::set_property_string(ctx, "gamma", "50").expect("gamma 属性应被接受");
+        assert!((gamma_f64(ctx) - 50.0).abs() < 1e-6, "回读应等于写入值");
+
+        // ② 非法值拒绝：证明 mpv 在真解析（等化器属性存在且带域校验）
+        assert!(
+            mpv_ffi::set_property_string(ctx, "gamma", "abc").is_err(),
+            "非数字应被拒"
+        );
+        assert!(
+            mpv_ffi::set_property_string(ctx, "gamma", "101").is_err(),
+            "越界 (>100) 应被拒"
+        );
+
+        // ③ 负值（变暗方向）合法；0 = 等化器关闭（复位语义）
+        mpv_ffi::set_property_string(ctx, "gamma", "-30").unwrap();
+        assert!((gamma_f64(ctx) + 30.0).abs() < 1e-6);
+        mpv_ffi::set_property_string(ctx, "gamma", "0").unwrap();
+
+        // ④ 播放中运行时写入（ffmpeg 可用时走真实解码流）
+        if have_ffmpeg() {
+            if let Some(zip_path) = make_test_zip() {
+                let vfs = ZipVFS::open(&zip_path, None).unwrap();
+                let arc: std::sync::Arc<dyn crate::vfs::ArchiveVFS> =
+                    std::sync::Arc::new(vfs);
+                let (archive_id, _) =
+                    stream_cb::register_with_progress(arc, &zip_path, &|_, _| {});
+                mpv_ffi::stream_cb_add_ro(ctx, "zvf", std::ptr::null_mut(), stream_cb::open_cb)
+                    .expect("注册 zvf:// 失败");
+                let uri = stream_cb::entry_uri(archive_id, 0, 0);
+                mpv_ffi::command_string(ctx, &format!("loadfile {uri}")).expect("loadfile 失败");
+                wait_prop(ctx, "time-pos", |t| t > 0.2, 30).expect("未起播");
+                // core 忙碌中异步属性写入（UI 快捷键的实际调用路径）不报错；
+                // 异步写要等 core 空出手才应用，立即同步读会竞态——轮询等待
+                mpv_ffi::set_property_string_async(ctx, "gamma", "40")
+                    .expect("播放中 gamma 写入应成功");
+                assert!(
+                    wait_prop(ctx, "gamma", |g| (g - 40.0).abs() < 1e-6, 10).is_some(),
+                    "播放中异步写入应生效"
+                );
+                mpv_ffi::command_string(ctx, "stop").ok();
+            }
+        }
+
+        mpv_ffi::destroy(ctx);
     }
 
     /// FFI 层 observe_property 实证：订阅即推送初始值（idle 静默玩家收到的

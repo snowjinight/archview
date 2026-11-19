@@ -115,6 +115,9 @@ impl App {
                     Some(r) => (r.opts(), r.bit_shift),
                     None => (String::new(), 0),
                 };
+                // per-file gamma 复位（先于 load：load 内部 loadfile 后还会
+                // 按 Cell 幂等重发一次；mpv gamma 跨装载持续，防泄漏）
+                self.sync_player_gamma((archive_id, entry_idx));
                 p.load(archive_id, entry_idx, &opts, shift);
             }
             // 切视频清防闪快照与图片源：否则快照停留在视频前的旧图，下次
@@ -274,6 +277,9 @@ impl App {
         // 回退 mpv 同切视频：清快照防隔图闪现
         self.hold_img = None;
         self.img_source = None;
+        // 回退图走 mpv 显示：同样按 per-file gamma 复位（mpv gamma 属性对
+        // 图片渲染同样生效）
+        self.sync_player_gamma((archive_id, entry_idx));
         if let Some(p) = &self.player {
             // 回退条目必为图片（raw dump 不走纹理路径），无 per-file 选项
             if stream {
@@ -1037,6 +1043,10 @@ impl App {
                 Some(r) => (r.opts(), r.bit_shift),
                 None => (String::new(), 0),
             };
+            // per-file gamma 复位（先于 load/load_path；语义与流式装载一致）
+            if let Some(arch) = self.archive.as_ref() {
+                self.sync_player_gamma((arch.id, entry_idx));
+            }
             if shift > 0 {
                 // 慢路径 bit_shift 补齐：落盘文件注册为单文件 VFS 借道
                 // zvf:// 装载，流层 ShiftReader 修正位移（与 zip 快路径同

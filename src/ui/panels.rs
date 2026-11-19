@@ -167,6 +167,7 @@ impl App {
                             ("B", "跳到最后播放的位置"),
                             ("回车", "全屏 / 退出全屏"),
                             ("Esc", "退出全屏"),
+                            ("W / S", "显示亮度 ×1.25 / ×0.8（当前文件记忆）"),
                         ],
                     ),
                     (
@@ -380,8 +381,10 @@ impl App {
     ///   密码解码）、ui.font_path（重装字体链）、ui.image_cache_count（LRU 容量），
     ///   以及一切使用点读 self.cfg 的项（预取预算/图片阈值与锐化/幻灯片间隔等）；
     ///   passwords/codepage 对**下次打开**的压缩包生效（已开包的密码已锁定）
-    /// - 下次播放：player.*——未播放时此处销毁播放器，下次播放按新配置重建；
-    ///   播放中不打断（断流重建体验更差），仅把音量/静音即时下发
+    /// - 播放中：**自动重载当前播放项**——mpv 选项（vo/hwdec 等）启动期固定，
+    ///   必须销毁播放器重建才全量生效；图片态丢缓存条目后 play 重发 request
+    ///   按新配置重解码。per-file 亮度随 gamma_map 记忆保留（装载点自动对齐）
+    /// - 下次播放：未播放时销毁播放器，下次播放按新配置重建
     /// - 重启：log_level（tracing 订阅器启动后固定）、cache.dll_dir（dll 启动时
     ///   动态加载一次）
     /// 解析失败保留旧配置继续运行（编辑出错不必杀进程），错误显示在顶栏
@@ -399,30 +402,29 @@ impl App {
         Self::install_cjk_font(&new_cfg, &self.egui_ctx);
         // 图片 LRU 容量：收缩在下次推入时生效
         self.img.set_cap(new_cfg.image.image_cache_count.max(1));
-        // 播放器：未播放时销毁 → 下次播放按新 player.* 重建；播放中只下发音量/
-        // 静音（set_* 走 async 入队即返回，不拿 mpv core 锁，不断流）
-        let had_player = self.player.is_some();
+        // 播放器统一销毁：播放中 → play() 重建并重载当前项（新配置全量生效）；
+        // 未播放 → 下次播放按新配置重建
         let playing = self.playing.is_some();
-        if playing {
-            if let Some(p) = self.player.as_ref() {
-                p.set_volume(new_cfg.player.volume);
-                p.set_muted(new_cfg.player.muted);
-            }
-        } else if had_player {
-            if let Some(gl) = self.gl.as_deref() {
-                if let Some(p) = self.player.as_mut() {
-                    p.shutdown_render(gl);
-                }
-                self.player = None;
+        if let Some(gl) = self.gl.as_deref() {
+            if let Some(p) = self.player.as_mut() {
+                p.shutdown_render(gl);
             }
         }
+        self.player = None;
         self.cfg = new_cfg;
         // 扩展名分类 / 排序变化 → 重建列表视图（含行缓存、两类计数）
         self.rebuild_view();
+        if playing {
+            // 图片态：丢当前条目显示缓存（request 幂等会跳过已缓存条目，
+            // 不丢则新解码配置不生效），随后 play 重发全新解码
+            if let Some(k) = self.tex_image_key() {
+                self.img.invalidate(k);
+            }
+            let idx = self.playing.expect("playing 已判定");
+            self.play(idx);
+        }
         let note = if playing {
-            "；播放中不断流，播放器参数未播放时重载或重启后生效"
-        } else if had_player {
-            "；播放器参数已更新（下次播放生效）"
+            "；当前播放项已按新配置重载"
         } else {
             ""
         };
@@ -1381,7 +1383,9 @@ impl App {
                 ImageSource::File(crate::cache::dest_path(&dir, id, key.1, &name))
             };
             self.hist_raw.retain(&[key]);
-            self.hist_raw.request(key, &source, &name, size, &self.cfg);
+            let gamma = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+            self.hist_raw
+                .request(key, &source, &name, size, &self.cfg, gamma);
             match self.hist_raw.histogram(key) {
                 None => paint_hist_status(ui, area, "直方图：软解中…"),
                 Some(Ok(h)) => {

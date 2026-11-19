@@ -692,6 +692,14 @@ pub struct ImageConfig {
     /// 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
     /// 升级资格判据同此值（见 imgview.rs resample 两档策略）
     pub image_max_dim: u32,
+    /// orig-lru（CPU 原图缓存）总预算 MB：原图 DynamicImage 驻留上限，
+    /// 超出逐出最旧（当前显示条目受保护）。原图缓存服务两个消费者——
+    /// ① 像素探针（alt+点击读原图原值，任何尺寸都有读数）；
+    /// ② full 高清升级免二次熵解码 + per-file 亮度 [ ] 快捷键免重解码
+    /// （native 重建 base 纹理，毫秒级）。单张准入 = 预算/2（防单张巨图
+    /// 独占预算），超准入的图不驻留（探针/full 复用/亮度重放退回旧行为）。
+    /// 默认 512（≈容纳 85MP RGB8 ×2 或 8K 图 ×3）；钳 64~4096
+    pub image_orig_cache_mb: u32,
     /// 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
     /// （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = badge 200%
     /// 起接管——full 是 ×3 密度纹理，badge 300%（采样比 zoom×ppp/3 = 1）
@@ -821,6 +829,7 @@ impl Default for ImageConfig {
             image_texture: true,
             image_cache_count: 3,
             image_max_dim: 4096,
+            image_orig_cache_mb: 512,
             image_full_threshold: 2.0,
             image_full_sharpen: true,
             image_full_sharpen_amount: 1.0,
@@ -1313,6 +1322,12 @@ image_cache_count = 3
 # 基础纹理档尺寸上限：预放大（×ppp）后超过则原尺寸直进；full 高清
 # 升级资格判据同此值（详见 doc/架构设计/13_渲染架构迁移.md §13.4 两档策略）
 image_max_dim = 4096
+
+# orig-lru（CPU 原图缓存）总预算 MB：超出逐出最旧（当前显示受保护）。
+# 服务像素探针（alt+点击任何尺寸都有原图读数）、full 升级免二次解码、
+# per-file 亮度 [ ] 快捷键免重解码（native 重建，毫秒级）。单张准入 =
+# 预算/2，超准入不驻留。默认 512；钳 64~4096
+image_orig_cache_mb = 512
 
 # 高清档（full）触发/换画阈值：屏幕物理像素超过基础纹理该倍数
 # （zoom×ppp > 此值）才解码/换画 full 级纹理。默认 2.0 = badge 200% 起
