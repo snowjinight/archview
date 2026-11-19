@@ -84,7 +84,9 @@ fn main() -> eframe::Result<()> {
         // glow 渲染器：mpv render API 需要 GL 上下文（wgpu 默认下无 glow painter）
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
+            // 高度 900：快捷键帮助面板约需 860pt（41 行 × 20pt + 顶栏锚点），
+            // 800 会把面板底缘裁掉两三行；多留余量容纳后续新增键位
+            .with_inner_size([1280.0, 900.0])
             .with_title("Archive Media Player")
             .with_icon(icon),
         ..Default::default()
