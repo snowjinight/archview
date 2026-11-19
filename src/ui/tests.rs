@@ -1514,3 +1514,177 @@ fn click_modifiers_prefers_inline_snapshot() {
     })
     .drop_without_applying_deltas();
 }
+
+/// 生成真实 PNG 的媒体目录（重播冒烟共用）：解码必须可成功，否则图片
+/// 走 mpv 兜底偏离纹理路径。返回 (目录, 文件名列表)
+fn make_png_dir(tag: &str, names: &[&str]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ui_replay_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, name) in names.iter().enumerate() {
+        // 尺寸取 1200×900：full 档 ×3 放大 ≈ 10MP，build_full 耗时百 ms 级
+        // ——request_full 后立即重播时 worker 大概率仍在途，稳定命中
+        // invalidate 的"full 在途"分支（代次守卫）
+        let img = image::RgbaImage::from_fn(1200, 900, |x, y| {
+            image::Rgba([((x + i as u32 * 64) % 256) as u8, (y % 256) as u8, 128, 255])
+        });
+        img.save_with_format(dir.join(name), image::ImageFormat::Png).unwrap();
+    }
+    dir
+}
+
+/// 手造流式目录集合（DirVFS，png 谓词）注入 app.archive
+fn png_archive(
+    app: &mut App,
+    id: u64,
+    dir: &std::path::Path,
+    n: usize,
+) -> std::sync::Arc<dyn crate::vfs::ArchiveVFS> {
+    use crate::vfs::dir_vfs::DirVFS;
+    use crate::vfs::{ArchiveVFS, SessionState};
+    let vfs: std::sync::Arc<dyn ArchiveVFS> =
+        std::sync::Arc::new(DirVFS::open(dir, |nm: &str| nm.to_ascii_lowercase().ends_with(".png"), 0).unwrap());
+    let entries = vfs.list();
+    assert_eq!(entries.len(), n, "目录应收集全部 png");
+    let session: crate::vfs::SharedSession = std::sync::Arc::new(std::sync::Mutex::new(SessionState {
+        targets: Default::default(),
+        focus: None,
+        alive: false,
+        gen: 0,
+    }));
+    app.archive = Some(super::ArchiveState {
+        id,
+        name: format!("replay_{id}.dir"),
+        path: dir.to_path_buf(),
+        password: None,
+        entries,
+        view: (0..n).collect(),
+        vfs: vfs.clone(),
+        stream: true,
+        session,
+    });
+    vfs
+}
+
+/// 等待纹理就绪（轮询 poll_img，出错即 panic）
+fn wait_texture(app: &mut App, key: super::ImgKey, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !app.img.has(key) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 {what} 纹理就绪超时"
+        );
+        assert!(
+            app.error.is_none(),
+            "{what} 时出错: {}",
+            app.error.as_deref().unwrap_or("")
+        );
+        app.poll_img();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// 重播链路冒烟（纹理图路径，控制栏「重播」按钮与配置重载共用
+/// replay_current）：解码就绪 → 记 per-file 亮度 → 深放大发起高清升级
+/// （full worker 在途）→ 立即重播。钉死三点（对应"高清放大中改锐化
+/// 参数保存重放"的实测崩溃场景）：
+/// - 重播丢显示缓存后 play 重发全新解码，新纹理就绪（has 重新命中）
+/// - full 在途被 invalidate 打断：迟到 FullReady 按代次/无 pending 丢弃，
+///   绝不进槽顶掉新请求（陈旧配置产物上屏 = 当年 full_epoch 修复的回归）
+/// - per-file 对比度（contrast_map）跨重播保留（重放装载自动对齐）
+#[test]
+fn replay_current_full_upgrade_inflight_and_contrast_kept() {
+    use crate::imgview::{ImageSource, SharpenCfg};
+
+    let dir = make_png_dir("tex", &["photo.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+
+    let vfs = png_archive(&mut app, 9, &dir, 1);
+    let key: super::ImgKey = (9, 0);
+
+    // 首播：等纹理就绪
+    app.play(0);
+    wait_texture(&mut app, key, "首播");
+
+    // per-file 对比度（图片 LUT 路径，与 ImageService 共享 contrast_map）
+    app.contrast_map.borrow_mut().insert(key, 3);
+
+    // 深放大：发起高清升级（worker 在途，产物尚未 poll）
+    let e = app.archive.as_ref().unwrap().entries[0].clone();
+    app.img.request_full(
+        key,
+        ImageSource::Stream(vfs.clone(), e),
+        "photo.png",
+        SharpenCfg::OFF,
+    );
+    assert!(app.img.is_full_pending(key), "full 请求应在途");
+
+    // 立即重播（配置重载/控制栏按钮同一链路）
+    app.replay_current();
+    assert_eq!(app.playing, Some(0), "重播后仍停在当前条目");
+
+    // 重放重发解码：等新纹理就绪
+    wait_texture(&mut app, key, "重播");
+
+    // 排空迟到消息：旧 full worker 的 FullReady 必须被丢弃（invalidate 已
+    // 清 pending/槽位，消息按代次或无 pending 判定落空）
+    app.poll_img();
+    assert!(!app.img.has_full(key), "迟到 full 产物不得进槽（代次守卫）");
+    assert!(!app.img.is_full_pending(key), "full 槽应保持空闲");
+    assert_eq!(
+        app.contrast_map.borrow().get(&key).copied(),
+        Some(3),
+        "per-file 对比度跨重播保留"
+    );
+    assert!(app.error.is_none(), "重播全程无错误");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 重播链路冒烟（对比模式 + 空态防御）：对比会话在场时重播 = 退出对比
+/// 回落单图重放（play() 统一清场：会话丢弃、LRU 保护集清空、rawdec 清空）；
+/// 未播放/无包时重播为安全 no-op（按钮未播放态根本不出现，此处钉死
+/// 防御语义：不 panic、不动状态）
+#[test]
+fn replay_current_exits_compare_and_noop_safe() {
+    // 空态 1：全新 app（无包无播放）——replay 仅尝试销毁播放器（本为
+    // None），无重放动作，不 panic
+    let mut cfg = crate::config::Config::default();
+    let dir = make_png_dir("cmp", &["p0.png", "p1.png"]);
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut empty = App::new_for_test(cfg.clone());
+    empty.replay_current();
+    assert_eq!(empty.playing, None, "无播放时重播不得触发重放");
+    assert!(empty.player.is_none());
+
+    // 空态 2：有包无播放——play 无目标可放，同样 no-op 不 panic
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 11, &dir, 2);
+    app.replay_current();
+    assert_eq!(app.playing, None);
+
+    // 对比模式重播：退出对比 + 保持当前条目
+    app.playing = Some(0);
+    let pane = |i: usize| super::compare::ComparePane {
+        idx: i,
+        key: (11, i),
+        name: format!("p{i}.png"),
+        source: crate::imgview::ImageSource::File(dir.join(format!("p{i}.png"))),
+        kind: super::compare::PaneKind::Image,
+        landed: true,
+    };
+    app.compare = Some(super::compare::CompareSession {
+        domain: vec![0, 1],
+        panes: vec![pane(0), pane(1)],
+        ..Default::default()
+    });
+    app.img.set_shown_multi(vec![(11, 0), (11, 1)]);
+    app.replay_current();
+    assert!(app.compare.is_none(), "重播应退出对比模式");
+    assert_eq!(app.playing, Some(0), "退出对比后回落单图重放当前条目");
+    assert!(app.error.is_none(), "重播全程无错误");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

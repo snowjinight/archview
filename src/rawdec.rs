@@ -552,9 +552,9 @@ pub(crate) fn raw_frame_info(rl: &RawLoad, size: u64) -> Result<RawFrameInfo, St
 
 pub(crate) struct RawFrameTex {
     pub(crate) idx: usize,
-    /// 本帧显示 gamma（mpv 标尺 -100~100，0=原值）：缓存随 gamma 陈旧判定——
-    /// [ ] 调亮度后同帧按新 gamma 重发重解（raw 无熵编码重解几十 ms）
-    pub(crate) gamma: i32,
+    /// 本帧显示对比度（per-file 步数 n，0=原值）：缓存随 contrast 陈旧判定——
+    /// W/S 调对比度后同帧按新 contrast 重发重解（raw 无熵编码重解几十 ms）
+    pub(crate) contrast: i32,
     pub(crate) tex: egui::TextureHandle,
     /// 本帧直方图（软解线程顺手算，与纹理同源同帧）：对比模式 Ctrl+H
     /// 直方图覆盖层用，显示帧与直方图永远一致（保留旧帧时直方图同旧）
@@ -564,7 +564,7 @@ pub(crate) struct RawFrameTex {
 struct RawFrameDone {
     key: ImgKey,
     idx: usize,
-    gamma: i32,
+    contrast: i32,
     res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
 }
 
@@ -606,8 +606,8 @@ enum RawMsg {
 pub(crate) struct RawFrameService {
     tx: Sender<RawMsg>,
     rx: Receiver<RawMsg>,
-    /// (key, 帧号, gamma) → 发起时刻（防重复 spawn；gamma 入键——调亮度后
-    /// 同帧按新 gamma 重发，旧请求在途不阻塞新请求）
+    /// (key, 帧号, contrast) → 发起时刻（防重复 spawn；contrast 入键——调
+    /// 对比度后同帧按新 contrast 重发，旧请求在途不阻塞新请求）
     pending: HashMap<(ImgKey, usize, i32), Instant>,
     /// 每栏已就绪帧（保留上一帧直到新帧就绪，切换无闪烁）
     frames: HashMap<ImgKey, RawFrameTex>,
@@ -641,8 +641,8 @@ impl RawFrameService {
         }
     }
 
-    /// 请求解码第 idx 帧（幂等；idx 按栏帧数钳制）。gamma = per-file 显示
-    /// 亮度（mpv 标尺）：worker 解码后 LUT，直方图在 LUT 后像素上统计
+    /// 请求解码第 idx 帧（幂等；idx 按栏帧数钳制）。contrast = per-file 显示
+    /// 对比度（步数 n）：worker 解码后 LUT，直方图在 LUT 后像素上统计
     /// （显示帧与直方图一致，与 imgview poll 期语义同源）
     pub(crate) fn request(
         &mut self,
@@ -650,19 +650,19 @@ impl RawFrameService {
         source: &ImageSource,
         info: &RawFrameInfo,
         frame_idx: usize,
-        gamma: i32,
+        contrast: i32,
     ) {
         let fi = frame_idx.min(info.frame_count.saturating_sub(1));
         if self
             .frames
             .get(&key)
-            .is_some_and(|t| t.idx == fi && t.gamma == gamma)
-            || self.pending.contains_key(&(key, fi, gamma))
+            .is_some_and(|t| t.idx == fi && t.contrast == contrast)
+            || self.pending.contains_key(&(key, fi, contrast))
             || self.errs.contains_key(&key)
         {
             return;
         }
-        self.pending.insert((key, fi, gamma), Instant::now());
+        self.pending.insert((key, fi, contrast), Instant::now());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (source, info) = (source.clone(), info.clone());
         std::thread::Builder::new()
@@ -670,11 +670,11 @@ impl RawFrameService {
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // 直方图顺手算（O(像素)，被解码耗时掩盖；与 imgview 解码
-                    // worker 同款先例）：gamma LUT 先落显示像素、直方图统计
+                    // worker 同款先例）：contrast LUT 先落显示像素、直方图统计
                     // LUT 后像素，与纹理同源
                     decode_raw_frame(&source, &info, fi).map(|(mut img, native)| {
-                        if let Some(l) = crate::imgview::gamma_lut(gamma) {
-                            crate::imgview::apply_gamma(&mut img, &l);
+                        if let Some(l) = crate::imgview::contrast_lut(contrast) {
+                            crate::imgview::apply_contrast(&mut img, &l);
                         }
                         let hist = Histogram::compute(&img);
                         (img, native, hist)
@@ -685,7 +685,7 @@ impl RawFrameService {
                 let _ = tx.send(RawMsg::Frame(RawFrameDone {
                     key,
                     idx: fi,
-                    gamma,
+                    contrast,
                     res,
                 }));
                 ctx.request_repaint();
@@ -751,7 +751,7 @@ impl RawFrameService {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 RawMsg::Frame(m) => {
-                    self.pending.remove(&(m.key, m.idx, m.gamma));
+                    self.pending.remove(&(m.key, m.idx, m.contrast));
                     match m.res {
                         Ok((img, _native, hist)) => {
                             let tex = self.ctx.load_texture(
@@ -763,7 +763,7 @@ impl RawFrameService {
                                 m.key,
                                 RawFrameTex {
                                     idx: m.idx,
-                                    gamma: m.gamma,
+                                    contrast: m.contrast,
                                     tex,
                                     hist,
                                 },
@@ -817,13 +817,13 @@ impl RawFrameService {
 
 struct HistDone {
     key: ImgKey,
-    gamma: i32,
+    contrast: i32,
     res: Result<Histogram, String>,
 }
 
-/// 直方图结果条目（gamma 记录在案：W/S 调亮度后同 key 按 gamma 陈旧判定重算）
+/// 直方图结果条目（contrast 记录在案：W/S 调对比度后同 key 按 contrast 陈旧判定重算）
 struct HistEntry {
-    gamma: i32,
+    contrast: i32,
     res: Result<Histogram, String>,
 }
 
@@ -854,7 +854,7 @@ impl HistService {
         }
     }
 
-    /// 确保当前 key 的直方图在途（幂等；gamma 变化视为陈旧自动重算）。
+    /// 确保当前 key 的直方图在途（幂等；contrast 变化视为陈旧自动重算）。
     /// 预设未命中（标准容器/视频）与配置错误（Err）直接落 done——UI 覆盖层
     /// 显示状态文案，不发线程
     pub(crate) fn request(
@@ -864,13 +864,13 @@ impl HistService {
         name: &str,
         size: u64,
         cfg: &Config,
-        gamma: i32,
+        contrast: i32,
     ) {
         if self.pending.contains_key(&key)
             || self
                 .done
                 .get(&key)
-                .is_some_and(|e| e.gamma == gamma && e.res.is_ok())
+                .is_some_and(|e| e.contrast == contrast && e.res.is_ok())
         {
             return;
         }
@@ -880,7 +880,7 @@ impl HistService {
                 self.done.insert(
                     key,
                     HistEntry {
-                        gamma,
+                        contrast,
                         res: Err("非 raw 裸数据（标准视频不支持直方图）".into()),
                     },
                 );
@@ -890,7 +890,7 @@ impl HistService {
                 self.done.insert(
                     key,
                     HistEntry {
-                        gamma,
+                        contrast,
                         res: Err(format!("raw 预设错误: {e}")),
                     },
                 );
@@ -903,7 +903,7 @@ impl HistService {
                 self.done.insert(
                     key,
                     HistEntry {
-                        gamma,
+                        contrast,
                         res: Err(format!("raw 帧参数错误: {e}")),
                     },
                 );
@@ -919,10 +919,10 @@ impl HistService {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // 第 0 帧：直方图语义是"这张 dump 长什么样"；多帧序列
                     // 逐帧统计成本线性涨，首帧足够代表（覆盖层标注帧号）。
-                    // gamma LUT 先落显示像素再统计（显示帧与直方图一致）
+                    // contrast LUT 先落显示像素再统计（显示帧与直方图一致）
                     decode_raw_frame(&source, &info, 0).map(|(mut img, _)| {
-                        if let Some(l) = crate::imgview::gamma_lut(gamma) {
-                            crate::imgview::apply_gamma(&mut img, &l);
+                        if let Some(l) = crate::imgview::contrast_lut(contrast) {
+                            crate::imgview::apply_contrast(&mut img, &l);
                         }
                         Histogram::compute(&img)
                     })
@@ -930,7 +930,7 @@ impl HistService {
                 .map_err(|_| "raw 直方图线程 panic".to_string())
                 .and_then(|r| r);
                 tracing::debug!("raw 直方图[{name}]: {}", res.is_ok());
-                let _ = tx.send(HistDone { key, gamma, res });
+                let _ = tx.send(HistDone { key, contrast, res });
                 ctx.request_repaint();
             });
         if r.is_err() {
@@ -938,7 +938,7 @@ impl HistService {
             self.done.insert(
                 key,
                 HistEntry {
-                    gamma,
+                    contrast,
                     res: Err("直方图线程创建失败".into()),
                 },
             );
@@ -953,7 +953,7 @@ impl HistService {
             self.done.insert(
                 m.key,
                 HistEntry {
-                    gamma: m.gamma,
+                    contrast: m.contrast,
                     res: m.res,
                 },
             );

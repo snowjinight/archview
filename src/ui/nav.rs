@@ -175,9 +175,9 @@ impl App {
         // Ctrl+H=直方图开关（当前条目为图片或 raw dump 时覆盖层有内容；
         // 开关本身无门控——未播放时按下只翻状态，覆盖层不绘制无副作用）
         let mut hist_toggle = false;
-        // W/S=per-file 显示亮度步进（×1.25/×0.8，图片/raw dump/视频通吃，
-        // 见 adjust_gamma）
-        let (mut gamma_up, mut gamma_down) = (false, false);
+        // W/S=per-file 显示对比度步进（×1.25/×0.8，图片/raw dump/视频通吃，
+        // 见 adjust_contrast）
+        let (mut contrast_up, mut contrast_down) = (false, false);
         // C=进入多图对比（选中合格条目 ≥2；校验与提示在 try_enter_compare）
         let mut enter_compare = false;
         // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
@@ -211,14 +211,14 @@ impl App {
                         enter_compare = true;
                         return false;
                     }
-                    // W/S 同理：亮度步进（与 Key::W/Key::S 臂一致；
-                    // adjust_gamma 无作用对象时自 early-return）
+                    // W/S 同理：对比度步进（与 Key::W/Key::S 臂一致；
+                    // adjust_contrast 无作用对象时自 early-return）
                     if t == "w" || t == "W" {
-                        gamma_up = true;
+                        contrast_up = true;
                         return false;
                     }
                     if t == "s" || t == "S" {
-                        gamma_down = true;
+                        contrast_down = true;
                         return false;
                     }
                     return true;
@@ -316,13 +316,13 @@ impl App {
                         do_mute = true;
                         false
                     }
-                    // W/S=per-file 显示亮度步进（W=×1.25 提亮、S=×0.8 变暗）
+                    // W/S=per-file 显示对比度步进（W=×1.25 增强、S=×0.8 降低）
                     egui::Key::W if m.is_none() => {
-                        gamma_up = true;
+                        contrast_up = true;
                         false
                     }
                     egui::Key::S if m.is_none() => {
-                        gamma_down = true;
+                        contrast_down = true;
                         false
                     }
                     // L=视频播放模式切换（图片模式不响应）
@@ -447,12 +447,12 @@ impl App {
                 self.hist_raw.retain(&[]);
             }
         }
-        // W/S：per-file 显示亮度步进（见 adjust_gamma）
-        if gamma_up {
-            self.adjust_gamma(true);
+        // W/S：per-file 显示对比度步进（见 adjust_contrast）
+        if contrast_up {
+            self.adjust_contrast(true);
         }
-        if gamma_down {
-            self.adjust_gamma(false);
+        if contrast_down {
+            self.adjust_contrast(false);
         }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
@@ -472,19 +472,19 @@ impl App {
         self.arrow_hold_fire(ctx);
     }
 
-    // ---- per-file 显示亮度（W/S 快捷键） ----
+    // ---- per-file 显示对比度（W/S 快捷键） ----
 
-    /// 单图模式亮度步进：W=+1 步（×1.25）、S=-1 步（×0.8）。写
-    /// App.gamma_map（会话内 per-file 记忆，值 = 步数）后按媒体类型分治
+    /// 单图模式对比度步进：W=+1 步（×1.25）、S=-1 步（×0.8）。写
+    /// App.contrast_map（会话内 per-file 记忆，值 = 步数）后按媒体类型分治
     /// 下发——
-    /// - 纹理图：refresh_gamma（natives 命中毫秒级重建纹理 + 直方图重算；
-    ///   未命中清缓存返 false，重发 request 让 poll 上传期按新 gamma 落 LUT）；
-    ///   步数上限 [`crate::imgview::GAMMA_STEP_MAX`]（±10）
-    /// - 视频/raw dump/mpv 回退图：mpv gamma 属性 async 写（不拿 core 锁）；
-    ///   属性域 ±100 只容 ±2 步（一步 ≈ gamma ±64），步数钳 ±2 防"倍率
+    /// - 纹理图：refresh_contrast（natives 命中毫秒级重建纹理 + 直方图重算；
+    ///   未命中清缓存返 false，重发 request 让 poll 上传期按新对比度落 LUT）；
+    ///   步数上限 [`crate::imgview::CONTRAST_STEP_MAX`]（±6）
+    /// - 视频/raw dump/mpv 回退图：mpv contrast 属性 async 写（不拿 core 锁）；
+    ///   属性域 ±100 容 ±4 步（一步 = contrast ±25），步数钳 ±4 防"倍率
     ///   显示在涨画面却不再变化"
-    /// - raw 对比栏不走此路径（compare_shortcuts → compare_adjust_gamma）
-    pub(super) fn adjust_gamma(&mut self, up: bool) {
+    /// - raw 对比栏不走此路径（compare_shortcuts → compare_adjust_contrast）
+    pub(super) fn adjust_contrast(&mut self, up: bool) {
         let Some(key) = self
             .archive
             .as_ref()
@@ -494,19 +494,19 @@ impl App {
         };
         let step = if up { 1 } else { -1 };
         let limit = if self.tex_image_key().is_some() {
-            crate::imgview::GAMMA_STEP_MAX
+            crate::imgview::CONTRAST_STEP_MAX
         } else {
-            crate::imgview::GAMMA_STEP_MAX_MPV
+            crate::imgview::CONTRAST_STEP_MAX_MPV
         };
-        let cur = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+        let cur = self.contrast_map.borrow().get(&key).copied().unwrap_or(0);
         let new = (cur + step).clamp(-limit, limit);
-        self.gamma_map.borrow_mut().insert(key, new);
-        self.set_notice(crate::imgview::gamma_label(new));
+        self.contrast_map.borrow_mut().insert(key, new);
+        self.set_notice(crate::imgview::contrast_label(new));
         if let Some(k) = self.tex_image_key() {
             let max_dim = self.cfg.image.image_max_dim;
-            if !self.img.refresh_gamma(k, max_dim) {
+            if !self.img.refresh_contrast(k, max_dim) {
                 // natives 未命中（巨图超预算/已逐出）：refresh 已清缓存条目，
-                // 按记录源立即重发——poll 上传期读 gamma_map 落 LUT
+                // 按记录源立即重发——poll 上传期读 contrast_map 落 LUT
                 if let Some((src_key, source, name)) = self.img_source.clone() {
                     if src_key == k {
                         self.img.request(k, source, max_dim, &name);
@@ -514,17 +514,17 @@ impl App {
                 }
             }
         } else if let Some(p) = &self.player {
-            p.set_display_gamma(new);
+            p.set_display_contrast(new);
         }
     }
 
-    /// 装载点 per-file gamma 复位：播放器按 gamma_map 中新条目的记录值对齐
+    /// 装载点 per-file 对比度复位：播放器按 contrast_map 中新条目的记录值对齐
     /// （player.load 内部 loadfile 后还会按 Cell 重发一次幂等对齐——mpv
-    /// gamma 全局属性跨装载持续，切文件必须显式复位防上一文件亮度泄漏）
-    pub(super) fn sync_player_gamma(&self, key: ImgKey) {
-        let g = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+    /// contrast 全局属性跨装载持续，切文件必须显式复位防上一文件对比度泄漏）
+    pub(super) fn sync_player_contrast(&self, key: ImgKey) {
+        let g = self.contrast_map.borrow().get(&key).copied().unwrap_or(0);
         if let Some(p) = &self.player {
-            p.set_display_gamma(g);
+            p.set_display_contrast(g);
         }
     }
 

@@ -158,11 +158,11 @@ pub struct PlayerService {
     step_idle: Arc<AtomicBool>,
     /// 配置原文 hwdec："auto" 时启用探测记忆（hwdec_fixed），其余取值原样生效
     hwdec_cfg: String,
-    /// per-file 显示亮度（值 = ×1.25 步数 n，mpv 侧换算 gamma 属性值）：
+    /// per-file 显示对比度（值 = ×1.25 步数 n，mpv 侧换算 contrast 属性值）：
     /// 本地记忆，loadfile 后重发——mpv 全局属性跨装载持续，切换文件必须按
-    /// 新文件的记录值显式复位，否则上一文件的亮度泄漏到下一文件。运行期走
+    /// 新文件的记录值显式复位，否则上一文件的对比度泄漏到下一文件。运行期走
     /// async 写（与 volume 同款：同步 set 拿 core 锁，装载窗口内会冻结 UI）
-    display_gamma: Cell<i32>,
+    display_contrast: Cell<i32>,
     /// hwdec 探测记忆：首次成功解码后 hwdec-current 的取值（如 "d3d11va-copy"）。
     /// 配置为 auto 时，后续装载以 loadfile 的 per-file 选项固定该方法，跳过
     /// auto 试探链（每次试探都要创建解码设备、占 core 锁）。方法取决于
@@ -230,7 +230,7 @@ impl PlayerService {
             buffering_cache: Arc::new(AtomicBool::new(false)),
             step_idle: Arc::new(AtomicBool::new(true)),
             hwdec_cfg: cfg.player.hwdec.clone(),
-            display_gamma: Cell::new(0),
+            display_contrast: Cell::new(0),
             hwdec_fixed: std::cell::RefCell::new(None),
             load_err_rx: std::sync::Mutex::new(load_err_rx),
         };
@@ -576,32 +576,33 @@ impl PlayerService {
         }
     }
 
-    /// per-file 显示亮度（W/S 快捷键，App.gamma_map 为真值来源）：n = ×1.25
-    /// 步数，换算 mpv gamma 属性值 g = 200·log2(1.25)·n ≈ 64.4n 后 async 写
-    /// （属性域 ±100，超界由 gamma_prop_str 钳制）。异步入队即返回
-    /// 不拿 core 锁（连按不冻结 UI）；0 同样下发（显式复位，不依赖 mpv 默认值）
-    pub fn set_display_gamma(&self, n: i32) {
-        self.display_gamma.set(n);
-        let s = Self::gamma_prop_str(n);
-        self.set_prop_str_async("gamma", &s);
-        tracing::debug!("显示亮度: {s}");
+    /// per-file 显示对比度（W/S 快捷键，App.contrast_map 为真值来源）：n = ×1.25
+    /// 步数，换算 mpv contrast 属性值 c = 25n（斜率 = 1 + c/100，与图片 LUT
+    /// 同一条锚点线性曲线）后 async 写（属性域 ±100，超界由 contrast_prop_str
+    /// 钳制）。异步入队即返回不拿 core 锁（连按不冻结 UI）；0 同样下发
+    ///（显式复位，不依赖 mpv 默认值）
+    pub fn set_display_contrast(&self, n: i32) {
+        self.display_contrast.set(n);
+        let s = Self::contrast_prop_str(n);
+        self.set_prop_str_async("contrast", &s);
+        tracing::debug!("显示对比度: {s}");
     }
 
-    /// 步数 → mpv gamma 属性值字符串：g = 200·log2(1.25)·n（每步中间调
-    /// ×1.25 的精确等价换算），钳属性域 [-100, 100]。mpv gamma 为浮点属性，
-    /// 带两位小数下发
-    fn gamma_prop_str(n: i32) -> String {
-        let g = (n as f64 * 64.385_618_977_472_47).clamp(-100.0, 100.0);
-        format!("{g:.2}")
+    /// 步数 → mpv contrast 属性值字符串：c = 25n（每步斜率 ×1.25 的精确
+    /// 换算——contrast 斜率 = 1 + c/100），钳属性域 [-100, 100]。
+    /// contrast 为整型属性，整数值下发
+    fn contrast_prop_str(n: i32) -> String {
+        let c = (n * 25).clamp(-100, 100);
+        format!("{c}")
     }
 
-    /// loadfile 提交后按本地记忆重发 gamma：mpv 全局属性跨装载持续，
-    /// 上一文件的亮度不随换文件清除——每次装载显式复位（App 侧已在装载
-    /// 点按新文件记录值调过 set_display_gamma，此处再发一次幂等对齐，
+    /// loadfile 提交后按本地记忆重发 contrast：mpv 全局属性跨装载持续，
+    /// 上一文件的对比度不随换文件清除——每次装载显式复位（App 侧已在装载
+    /// 点按新文件记录值调过 set_display_contrast，此处再发一次幂等对齐，
     /// 防两类窗口：装载点遗漏 / set 先于 loadfile 提交被旧值覆盖的时序）
-    fn reapply_display_gamma(&self) {
-        let s = Self::gamma_prop_str(self.display_gamma.get());
-        self.set_prop_str_async("gamma", &s);
+    fn reapply_display_contrast(&self) {
+        let s = Self::contrast_prop_str(self.display_contrast.get());
+        self.set_prop_str_async("contrast", &s);
     }
 
     /// `bit_shift`：raw dump 每 u16 采样左移位数（0 = 不位移）。经
@@ -626,7 +627,7 @@ impl PlayerService {
         // keep-open=always 在 EOF 时会把 pause 置为 yes，且 loadfile 不清除它——
         // 不显式取消暂停的话，播完一个视频后切换新视频会停在第一帧
         self.set_prop_str("pause", "no");
-        self.reapply_display_gamma();
+        self.reapply_display_contrast();
         // 装载窗口起点：供 has_painted_since_load 打首帧耗时 + UI 轮询判定
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
@@ -648,7 +649,7 @@ impl PlayerService {
             tracing::error!("loadfile {url} 失败: {e}");
         }
         self.set_prop_str("pause", "no"); // 同 load()：清除 EOF 粘滞的暂停态
-        self.reapply_display_gamma();
+        self.reapply_display_contrast();
         self.load_mark.set(Some(Instant::now()));
         self.painted_since_load.set(false);
         self.first_frame.store(false, Ordering::Relaxed);

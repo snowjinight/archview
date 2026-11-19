@@ -407,15 +407,16 @@ pub struct App {
     // 播放=连续 ±5s seek，松开/失焦/模态清除（见 nav::arrow_hold_fire 与
     // handle_shortcuts 头部清除逻辑）
     arrow_hold: Option<(i32, std::time::Instant)>,
-    // per-file 显示亮度（[ ] 快捷键）：key = (archive_id, entry_idx)，值 =
-    // mpv gamma 标尺 -100~100（缺省 0 = 未调）。会话内记忆（切回自动恢复），
-    // 不进 config（亮度是 per-file 显示偏好，全局默认无意义）。与 ImageService
-    // 共享 Rc<RefCell> 单源真值：视频走 mpv 属性、图片/raw 走 LUT
-    gamma_map: GammaMap,
+    // per-file 显示对比度（W/S 快捷键）：key = (archive_id, entry_idx)，值 =
+    // 步数 n（每步斜率 ×1.25，缺省 0 = 未调）。会话内记忆（切回自动恢复），
+    // 不进 config（对比度是 per-file 显示偏好，全局默认无意义）。与
+    // ImageService 共享 Rc<RefCell> 单源真值：视频走 mpv contrast 属性、
+    // 图片/raw 走 LUT
+    contrast_map: ContrastMap,
 }
 
-/// per-file 显示亮度共享映射（见 App.gamma_map 字段注释）
-pub(crate) type GammaMap =
+/// per-file 显示对比度共享映射（见 App.contrast_map 字段注释）
+pub(crate) type ContrastMap =
     std::rc::Rc<std::cell::RefCell<std::collections::HashMap<crate::imgview::ImgKey, i32>>>;
 
 impl App {
@@ -455,9 +456,10 @@ impl App {
             }
         );
         let img_cap = cfg.image.image_cache_count.max(1);
-        // per-file 显示亮度（[ ] 快捷键）：App 与 ImageService 共享同一
-        // Rc<RefCell>（单源真值；视频走 mpv 属性、图片/raw 走 LUT 都读它）
-        let gamma_map: GammaMap =
+        // per-file 显示对比度（W/S 快捷键）：App 与 ImageService 共享同一
+        // Rc<RefCell>（单源真值；视频走 mpv contrast 属性、图片/raw 走 LUT
+        // 都读它）
+        let contrast_map: ContrastMap =
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let orig_budget = (cfg.image.image_orig_cache_mb.clamp(64, 4096) as usize) * 1024 * 1024;
         Self {
@@ -471,7 +473,7 @@ impl App {
             gl: cc.gl.clone(),
             egui_ctx: cc.egui_ctx.clone(),
             player: None,
-            img: ImageService::new(cc.egui_ctx.clone(), img_cap, gamma_map.clone(), orig_budget),
+            img: ImageService::new(cc.egui_ctx.clone(), img_cap, contrast_map.clone(), orig_budget),
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
@@ -521,7 +523,7 @@ impl App {
             histogram_on: false,
             hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone()),
             arrow_hold: None,
-            gamma_map,
+            contrast_map,
         }
     }
 
@@ -532,7 +534,7 @@ impl App {
         cache::cleanup_partial(&cache::cache_dir(&cfg));
         let ctx = egui::Context::default();
         let img_cap = cfg.image.image_cache_count.max(1);
-        let gamma_map: GammaMap =
+        let contrast_map: ContrastMap =
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let orig_budget = (cfg.image.image_orig_cache_mb.clamp(64, 4096) as usize) * 1024 * 1024;
         Self {
@@ -546,7 +548,7 @@ impl App {
             gl: None,
             egui_ctx: ctx.clone(),
             player: None,
-            img: ImageService::new(ctx.clone(), img_cap, gamma_map.clone(), orig_budget),
+            img: ImageService::new(ctx.clone(), img_cap, contrast_map.clone(), orig_budget),
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
@@ -596,7 +598,7 @@ impl App {
             histogram_on: false,
             hist_raw: crate::rawdec::HistService::new(ctx.clone()),
             arrow_hold: None,
-            gamma_map,
+            contrast_map,
         }
     }
 

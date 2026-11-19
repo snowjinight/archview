@@ -167,7 +167,7 @@ impl App {
                             ("B", "跳到最后播放的位置"),
                             ("回车", "全屏 / 退出全屏"),
                             ("Esc", "退出全屏"),
-                            ("W / S", "显示亮度 ×1.25 / ×0.8（当前文件记忆）"),
+                            ("W / S", "显示对比度 ×1.25 / ×0.8（当前文件记忆）"),
                         ],
                     ),
                     (
@@ -383,7 +383,7 @@ impl App {
     ///   passwords/codepage 对**下次打开**的压缩包生效（已开包的密码已锁定）
     /// - 播放中：**自动重载当前播放项**——mpv 选项（vo/hwdec 等）启动期固定，
     ///   必须销毁播放器重建才全量生效；图片态丢缓存条目后 play 重发 request
-    ///   按新配置重解码。per-file 亮度随 gamma_map 记忆保留（装载点自动对齐）
+    ///   按新配置重解码。per-file 对比度随 contrast_map 记忆保留（装载点自动对齐）
     /// - 下次播放：未播放时销毁播放器，下次播放按新配置重建
     /// - 重启：log_level（tracing 订阅器启动后固定）、cache.dll_dir（dll 启动时
     ///   动态加载一次）
@@ -402,34 +402,41 @@ impl App {
         Self::install_cjk_font(&new_cfg, &self.egui_ctx);
         // 图片 LRU 容量：收缩在下次推入时生效
         self.img.set_cap(new_cfg.image.image_cache_count.max(1));
-        // 播放器统一销毁：播放中 → play() 重建并重载当前项（新配置全量生效）；
-        // 未播放 → 下次播放按新配置重建
-        let playing = self.playing.is_some();
-        if let Some(gl) = self.gl.as_deref() {
-            if let Some(p) = self.player.as_mut() {
-                p.shutdown_render(gl);
-            }
-        }
-        self.player = None;
+        self.img.set_orig_budget(new_cfg.image.image_orig_cache_mb);
+        // 播放器统一销毁 + 播放中重播当前项（新配置全量生效，replay_current
+        // 与控制栏「重播」按钮共用同一链路）；未播放时销毁后无重放动作
         self.cfg = new_cfg;
         // 扩展名分类 / 排序变化 → 重建列表视图（含行缓存、两类计数）
         self.rebuild_view();
-        if playing {
-            // 图片态：丢当前条目显示缓存（request 幂等会跳过已缓存条目，
-            // 不丢则新解码配置不生效），随后 play 重发全新解码
-            if let Some(k) = self.tex_image_key() {
-                self.img.invalidate(k);
-            }
-            let idx = self.playing.expect("playing 已判定");
-            self.play(idx);
-        }
-        let note = if playing {
+        let replayed = self.playing.is_some();
+        self.replay_current();
+        let note = if replayed {
             "；当前播放项已按新配置重载"
         } else {
             ""
         };
         self.set_notice(format!("配置已重载{note}"));
         tracing::info!("配置已重载（菜单触发）{note}");
+    }
+
+    /// 重播当前播放项（控制栏「重播」按钮与配置重载共用链路）：销毁播放器
+    /// （下次装载按当前配置重建，mpv vo/hwdec 等启动期选项全量生效）+ 图片
+    /// 态丢当前条目显示缓存（request 幂等会跳过已缓存条目，不丢则新解码
+    /// 配置不生效）+ play 重放；对比模式由 play() 统一清场退出。per-file
+    /// 对比度随 contrast_map 记忆保留（装载点/上传期自动对齐）。未播放时仅销毁
+    /// 播放器（下次播放按当前配置重建），无重放动作
+    pub(super) fn replay_current(&mut self) {
+        if let Some(gl) = self.gl.as_deref() {
+            if let Some(p) = self.player.as_mut() {
+                p.shutdown_render(gl);
+            }
+        }
+        self.player = None;
+        let Some(idx) = self.playing else { return };
+        if let Some(k) = self.tex_image_key() {
+            self.img.invalidate(k);
+        }
+        self.play(idx);
     }
 
     /// 点击时刻的修饰键（列表多选语义）。取当帧 PointerButton 事件的
@@ -1383,9 +1390,9 @@ impl App {
                 ImageSource::File(crate::cache::dest_path(&dir, id, key.1, &name))
             };
             self.hist_raw.retain(&[key]);
-            let gamma = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+            let contrast = self.contrast_map.borrow().get(&key).copied().unwrap_or(0);
             self.hist_raw
-                .request(key, &source, &name, size, &self.cfg, gamma);
+                .request(key, &source, &name, size, &self.cfg, contrast);
             match self.hist_raw.histogram(key) {
                 None => paint_hist_status(ui, area, "直方图：软解中…"),
                 Some(Ok(h)) => {
@@ -2364,6 +2371,8 @@ impl App {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui) {
         #[derive(Default)]
         struct Act {
+            /// 重播当前项（销毁播放器/丢图片缓存后重新装载，replay_current）
+            replay: bool,
             /// < > 按钮的方向步进（±1；对比模式 = 整组滑动）
             step: i32,
             /// 未播放态中键 ▶「从第一项开始播放」——与 step 分立的动作
@@ -2411,7 +2420,7 @@ impl App {
             egui::vec2(ui.available_width(), 34.0),
             egui::Layout::left_to_right(egui::Align::Min),
             |row| {
-                // selected=true 时图标着色加粗（激活态高亮，如循环播放中）
+                // selected=true 时图标着色加粗（激活态高亮，如图片翻页开关开启中）
                 let icon_btn =
                     |ui: &mut egui::Ui, txt: &str, tip: &str, selected: bool| -> egui::Response {
                         let mut rt = egui::RichText::new(txt).size(20.0);
@@ -2498,14 +2507,31 @@ impl App {
 
                 // 按钮组：整行居中（默认 AllocateType::Content 只占实测组宽，不撑
                 // 行宽；首帧测量帧被 request_discard 丢弃，不可见）。
-                // 槽序 [隐形][<][播放][>][模式/隐形] 五槽等宽 48：播放键两侧各两
+                // 槽序 [重播/隐形][<][播放][>][模式/隐形] 五槽等宽 48：播放键两侧各两
                 // 槽，恰为组的几何中心——Aligner 居组＝播放键中心落在窗口中线。
-                // 左端隐形槽与右端模式键配重（无笔画、无交互），两种模式下都在，
-                // 组宽恒定，切图↔视频零位移。
+                // 播放中首槽是重播键，未播放时隐形配重（无笔画、无交互），右端
+                // 模式键同尺寸配重，组宽恒定，切图↔视频零位移。
                 egui_alignments::Aligner::center()
                     .bounds(egui_alignments::Bounds::max_rect())
                     .show_horizontal(row, |ui| {
-                        ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
+                        // 首槽（原隐形配重）：重播当前项——销毁播放器/丢图片
+                        // 缓存后按当前配置重新装载（与配置重载的重播链路同一
+                        // 代码 replay_current，见 reload_config）。未播放时保持
+                        // 隐形槽：两种形态都是 48×34，组宽恒定，切图↔视频零位移
+                        if self.playing.is_some() {
+                            if icon_btn(
+                                ui,
+                                "↺",
+                                "重播当前项：销毁播放器并按当前配置重新装载（图片重新解码，视频重建播放器）",
+                                false,
+                            )
+                            .clicked()
+                            {
+                                act.replay = true;
+                            }
+                        } else {
+                            ui.allocate_exact_size(egui::vec2(48.0, 34.0), egui::Sense::hover());
+                        }
                         if icon_btn(ui, "<", "上一个", false).clicked() {
                             act.step = -1;
                         }
@@ -2542,7 +2568,8 @@ impl App {
                         }
                         // 播放模式（仅视频，图片不显示——图片用各自的自动翻页开关）：
                         // 定格（默认，播完停末帧）→ 列表（自动下一个）→ 循环；
-                        // 循环中高亮（延续原语义），icon 区分三态。未播放时也
+                        // 三态同色不高亮（↻ 与重播键 ↺ 形近，图标带上标 1 =
+                        // "单文件"循环区分，颜色与其它按钮统一）。未播放时也
                         // 显示，允许预设模式
                         if !self.playing_is_image() {
                             let (icon, tip) = match self.play_mode {
@@ -2557,11 +2584,13 @@ impl App {
                                     ("≡", "列表播放中：播完自动下一个｜点击切为循环（L）")
                                 }
                                 PlayMode::Loop => {
-                                    ("↻", "循环播放中：单视频无限重播｜点击切为单文件播放（L）")
+                                    // ↻¹：单文件循环（上标 1 表"单文件"，与重播
+                                    // 键 ↺ 区分；¹ U+00B9 雅黑有字形）。原蓝色
+                                    // 高亮弃用：按钮组统一无 ACCENT 色
+                                    ("↻¹", "循环播放中：单视频无限重播｜点击切为单文件播放（L）")
                                 }
                             };
-                            let selected = self.play_mode == PlayMode::Loop;
-                            if icon_btn(ui, icon, tip, selected).clicked() {
+                            if icon_btn(ui, icon, tip, false).clicked() {
                                 act.loop_toggle = true;
                             }
                         } else {
@@ -2579,6 +2608,11 @@ impl App {
         // 空格在对比模态被独立键表全权接管（主键表 return，无落点），
         // 按钮与空格严格同义 = 完全不响应（toggle_pause 会翻转缓存
         // 暂停态，导致 ▶/|| 图标假切换）
+        if act.replay {
+            // 重播 = 销毁播放器/丢图片缓存后重放当前项；对比模式下 play()
+            // 统一清场退出对比回落单图（与配置重载的重播语义一致）
+            self.replay_current();
+        }
         if act.step != 0 {
             if self.compare.is_some() {
                 self.compare_slide(act.step);

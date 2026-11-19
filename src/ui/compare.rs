@@ -516,24 +516,24 @@ impl App {
                 .collect()
         };
         for (key, source, info, want) in wants {
-            let gamma = self
-                .gamma_map
+            let contrast = self
+                .contrast_map
                 .borrow()
                 .get(&key)
                 .copied()
                 .unwrap_or(0);
-            self.rawdec.request(key, &source, &info, want, gamma);
+            self.rawdec.request(key, &source, &info, want, contrast);
         }
     }
 
-    /// 对比视图亮度步进（W/S 快捷键）：W=+1 步（×1.25）、S=-1 步（×0.8），
-    /// 当前全部栏各自的 key 各调一步（步数上限 ±10）。图片栏 refresh_gamma
+    /// 对比视图对比度步进（W/S 快捷键）：W=+1 步（×1.25）、S=-1 步（×0.8），
+    /// 当前全部栏各自的 key 各调一步（步数上限 ±6）。图片栏 refresh_contrast
     /// （natives 毫秒级重建，未命中清缓存由 compare_tick 自愈补发）；raw 栏
-    /// 不动手——compare_request_raw_frames 幂等守卫含 gamma，下一帧自动按
+    /// 不动手——compare_request_raw_frames 幂等守卫含 contrast，下一帧自动按
     /// 新值重解。OSD 显示主栏（或首栏）的新倍率
-    fn compare_adjust_gamma(&mut self, up: bool) {
+    fn compare_adjust_contrast(&mut self, up: bool) {
         let Some(s) = &self.compare else { return };
-        // 先收 owned 列表结束借用（后续 refresh_gamma 要 &mut self）
+        // 先收 owned 列表结束借用（后续 refresh_contrast 要 &mut self）
         let items: Vec<(ImgKey, bool)> = s
             .panes
             .iter()
@@ -542,21 +542,21 @@ impl App {
         let step = if up { 1 } else { -1 };
         let mut head = 0i32;
         {
-            let mut m = self.gamma_map.borrow_mut();
+            let mut m = self.contrast_map.borrow_mut();
             for (k, _) in &items {
                 let v = (m.get(k).copied().unwrap_or(0) + step)
-                    .clamp(-crate::imgview::GAMMA_STEP_MAX, crate::imgview::GAMMA_STEP_MAX);
+                    .clamp(-crate::imgview::CONTRAST_STEP_MAX, crate::imgview::CONTRAST_STEP_MAX);
                 m.insert(*k, v);
                 head = v;
             }
         }
-        self.set_notice(crate::imgview::gamma_label(head));
+        self.set_notice(crate::imgview::contrast_label(head));
         let max_dim = self.cfg.image.image_max_dim;
         for (k, is_image) in items {
             if is_image {
                 // 返 false（natives 未命中）时 refresh 已清缓存条目，
                 // compare_tick 的 image 栏自愈下一帧自动补发重解码
-                let _ = self.img.refresh_gamma(k, max_dim);
+                let _ = self.img.refresh_contrast(k, max_dim);
             }
         }
     }
@@ -874,20 +874,20 @@ impl App {
         // Ctrl+H = 直方图开关（通用键补位）：与单图模式共用同一开关状态，
         // 每栏各画缩小版覆盖层（图片栏读 LRU、raw 栏读软解帧顺手算的直方图）
         let mut hist_toggle = false;
-        // W/S = 亮度步进（通用键补位）：当前全部栏各调一步（对比场景调亮度
-        // 通常为公平比较，逐栏同调；见 compare_adjust_gamma）
-        let (mut gamma_up, mut gamma_down) = (false, false);
+        // W/S = 对比度步进（通用键补位）：当前全部栏各调一步（对比场景调
+        // 对比度通常为公平比较，逐栏同调；见 compare_adjust_contrast）
+        let (mut contrast_up, mut contrast_down) = (false, false);
         ctx.input_mut(|i| {
             i.events.retain(|e| {
                 // IME 下字母键常只产 Text 事件（无 Key 事件），W/S 两路都收
                 //（与主键表同款；搜索框聚焦已在上方整体让位）
                 if let egui::Event::Text(t) = e {
                     if t == "w" || t == "W" {
-                        gamma_up = true;
+                        contrast_up = true;
                         return false;
                     }
                     if t == "s" || t == "S" {
-                        gamma_down = true;
+                        contrast_down = true;
                         return false;
                     }
                     return true;
@@ -963,13 +963,13 @@ impl App {
                         zout = true;
                         false
                     }
-                    // W/S=亮度步进（全部栏同调，见 compare_adjust_gamma）
+                    // W/S=对比度步进（全部栏同调，见 compare_adjust_contrast）
                     egui::Key::W => {
-                        gamma_up = true;
+                        contrast_up = true;
                         false
                     }
                     egui::Key::S => {
-                        gamma_down = true;
+                        contrast_down = true;
                         false
                     }
                     // ↑/↓ = 缩放步进（与 +/− 同义，同单图模式心智：图片态
@@ -1071,12 +1071,12 @@ impl App {
         if hist_toggle {
             self.histogram_on = !self.histogram_on;
         }
-        // W/S：亮度步进（全部栏同调，见 compare_adjust_gamma）
-        if gamma_up {
-            self.compare_adjust_gamma(true);
+        // W/S：对比度步进（全部栏同调，见 compare_adjust_contrast）
+        if contrast_up {
+            self.compare_adjust_contrast(true);
         }
-        if gamma_down {
-            self.compare_adjust_gamma(false);
+        if contrast_down {
+            self.compare_adjust_contrast(false);
         }
         if exit {
             if self.fullscreen {

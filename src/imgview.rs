@@ -222,11 +222,11 @@ pub struct ImageService {
     /// 解码中集合：发起时刻 → 看门狗超时判定。防重复 spawn 同一条目
     /// （请求 → 线程 → Ready/Failed 才移除）
     pending: HashMap<ImgKey, Instant>,
-    /// **per-file 显示亮度**（W/S 快捷键，值 = ×1.25 步数 n）：App 共享
+    /// **per-file 显示对比度**（W/S 快捷键，值 = ×1.25 步数 n）：App 共享
     /// 同一 Rc<RefCell>（单源真值，视频属性/图片 LUT/对比 raw 重放都读
-    /// 这里）。poll 上传期应用 LUT——解码发起在先、调亮度在后也恒拿到
+    /// 这里）。poll 上传期应用 LUT——解码发起在先、调对比度在后也恒拿到
     /// 最新值，无 worker 竞态
-    gamma_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
+    contrast_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
     /// **tex-lru**：GPU 纹理缓存 LRU（front = 最近使用；back = 最久未用，
     /// 逐出候选）。全图的翻页缓存——条目内容 = base 档显示纹理（GPU 显存
     /// TextureHandle）：小图 = native×ppp 预放大、大图 = native 直出、
@@ -258,7 +258,7 @@ pub struct ImageService {
     /// orig-lru 准入判据）：三个消费者——① full 升级复用免二次熵解码；
     /// ② alt+点击像素探针取**原图**像素值（显示纹理是插值重采样结果，
     /// 取样会拿到缩放插值而非真实像素，见 [`ImageService::original_pixel`]；
-    /// 预算制后任意准入尺寸都有读数）；③ per-file 亮度 [ ] native 重建
+    /// 预算制后任意准入尺寸都有读数）；③ per-file 对比度 W/S native 重建
     /// （免重解码，毫秒级）。张数 cap 随当前栏数自适应（当前栏数 + 2，
     /// 单图 3、对比 n 栏 n+2）+ 字节预算（config image.image_orig_cache_mb）
     /// 双护栏逐出最旧（当前显示受保护），随翻页自然更替。**不与 tex-lru
@@ -275,7 +275,7 @@ impl ImageService {
     pub fn new(
         ctx: egui::Context,
         cap: usize,
-        gamma_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
+        contrast_map: std::rc::Rc<std::cell::RefCell<HashMap<ImgKey, i32>>>,
         orig_budget: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -283,7 +283,7 @@ impl ImageService {
             tx,
             rx,
             ctx,
-            gamma_map,
+            contrast_map,
             pending: HashMap::new(),
             cache: VecDeque::new(),
             cap: cap.max(1),
@@ -313,7 +313,7 @@ impl ImageService {
 
     /// 丢弃指定条目的显示缓存（config 热重载后当前播放项重放用）：tex 条目
     /// 与 full 三态清掉，下次 request 走全新解码（新配置生效）。natives 保留
-    /// ——原图像素与解码配置无关，探针 / gamma 重建继续可用
+    /// ——原图像素与解码配置无关，探针 / 对比度重建继续可用
     pub fn invalidate(&mut self, key: ImgKey) {
         if let Some(i) = self.pos(key) {
             self.cache.remove(i);
@@ -526,7 +526,7 @@ impl ImageService {
                     // 原图取样）
                     if let Some(n) = native {
                         // orig-lru 预算准入：超单张准入（预算/2）不驻留（探针/
-                        // full 复用/亮度重建对该图退回旧行为）。张数 cap +
+                        // full 复用/对比度重建对该图退回旧行为）。张数 cap +
                         // 字节预算双护栏逐出最旧；当前显示与对比保护集跳过
                         //（全保护时暂时超支，随显示切换自然可逐出）
                         let bytes = n.as_bytes().len();
@@ -556,18 +556,19 @@ impl ImageService {
                     }
                     // 计时：与解码日志对照，量化"解码 vs 纹理上传"占比
                     let t = std::time::Instant::now();
-                    // per-file 亮度：poll 上传期应用 LUT——解码发起在先、调亮度
-                    // 在后也恒拿到最新值（worker 不读 gamma，无竞态）；gamma≠0
-                    // 时直方图改在 LUT 后像素上重算（"显示帧与直方图一致"语义），
-                    // worker 按原值算的直方图丢弃；g==0 原样直传零开销
+                    // per-file 对比度：poll 上传期应用 LUT——解码发起在先、调
+                    // 对比度在后也恒拿到最新值（worker 不读 contrast_map，
+                    // 无竞态）；n≠0 时直方图改在 LUT 后像素上重算（"显示帧
+                    // 与直方图一致"语义），worker 按原值算的直方图丢弃；
+                    // n==0 原样直传零开销
                     let lut = {
-                        let m = self.gamma_map.borrow();
-                        m.get(&key).and_then(|&g| gamma_lut(g))
+                        let m = self.contrast_map.borrow();
+                        m.get(&key).and_then(|&n| contrast_lut(n))
                     };
                     let (frames, delays, hist) = match decoded {
                         Decoded::Static(mut image) => {
                             if let Some(l) = &lut {
-                                apply_gamma(&mut image, l);
+                                apply_contrast(&mut image, l);
                             }
                             let hist = match &lut {
                                 Some(_) => Some(Histogram::compute(&image)),
@@ -584,7 +585,7 @@ impl ImageService {
                                 .enumerate()
                                 .map(|(i, (mut img, _))| {
                                     if let Some(l) = &lut {
-                                        apply_gamma(&mut img, l);
+                                        apply_contrast(&mut img, l);
                                     }
                                     if i == 0 {
                                         first = Some(img.clone());
@@ -632,11 +633,11 @@ impl ImageService {
                     {
                         self.full_pending = None;
                         let t = std::time::Instant::now();
-                        // full 纹理同步 per-file 亮度（与 base 纹理同标尺，深
+                        // full 纹理同步 per-file 对比度（与 base 纹理同标尺，深
                         // 放大与 base 档观感连续）
-                        let g = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
-                        if let Some(l) = gamma_lut(g) {
-                            apply_gamma(&mut img, &l);
+                        let g = self.contrast_map.borrow().get(&key).copied().unwrap_or(0);
+                        if let Some(l) = contrast_lut(g) {
+                            apply_contrast(&mut img, &l);
                         }
                         let tex = self.ctx.load_texture(
                             format!("img-full-{}-{}", key.0, key.1),
@@ -707,22 +708,22 @@ impl ImageService {
         self.shown.as_ref() == Some(k) || self.shown_multi.contains(k)
     }
 
-    /// per-file 亮度 [ ] 重放（App 写 gamma_map 后调用）。natives 命中 →
+    /// per-file 对比度 W/S 重放（App 写 contrast_map 后调用）。natives 命中 →
     /// finish_static 精确复现 base 管线（sharpen OFF，与首次解码同代码路径）
     /// → LUT → 上传 + 直方图重算，毫秒级；未命中（动图 / 超预算巨图 /
     /// native 已逐出）→ 清该条纹理缓存返回 false，调用方重发 request——
-    /// 解码结果在 poll 上传期按最新 gamma 落 LUT，连按自洽无需防抖。
-    /// g==0 同样走重建（从带旧 gamma 的显示纹理回到原值）。full 槽同步
+    /// 解码结果在 poll 上传期按最新对比度落 LUT，连按自洽无需防抖。
+    /// n==0 同样走重建（从带旧对比度的显示纹理回到原值）。full 槽同步
     /// 失效——缩放中的 full 由现有 per-frame ensure 按需重触发
     ///（natives 命中免二次熵解码）
-    pub fn refresh_gamma(&mut self, key: ImgKey, max_dim: u32) -> bool {
+    pub fn refresh_contrast(&mut self, key: ImgKey, max_dim: u32) -> bool {
         if self.full.as_ref().is_some_and(|(k, _)| *k == key) {
             self.full = None;
         }
         if self.full_failed.as_ref() == Some(&key) {
             self.full_failed = None;
         }
-        let g = self.gamma_map.borrow().get(&key).copied().unwrap_or(0);
+        let g = self.contrast_map.borrow().get(&key).copied().unwrap_or(0);
         let Some(native) = self
             .natives
             .iter()
@@ -747,8 +748,8 @@ impl ImageService {
             }
             return false;
         };
-        if let Some(l) = gamma_lut(g) {
-            apply_gamma(&mut img, &l);
+        if let Some(l) = contrast_lut(g) {
+            apply_contrast(&mut img, &l);
         }
         let hist = Histogram::compute(&img);
         let tex = self.tex(&key, 0, img);
@@ -886,48 +887,50 @@ impl ImageService {
     }
 }
 
-/// per-file 显示亮度步进标尺：n = 按键次数（正 = 提亮），每步中间调
-/// ×1.25（下调 ×0.8 = 精确逆操作）。图片/raw 软解 LUT 路径的步数上限
-pub(crate) const GAMMA_STEP_MAX: i32 = 10;
-/// mpv 路径步数上限：gamma 属性域 ±100，一步 ×1.25 ≈ gamma ±64，
-/// ±2 步即触属性边界——钳住防"OSD 倍率在涨画面却不再变化"
-pub(crate) const GAMMA_STEP_MAX_MPV: i32 = 2;
+/// per-file 显示对比度步进标尺：n = 按键次数（正 = 增强），每步对比度斜率
+/// ×1.25（降低 ×0.8 = 精确逆操作）。图片/raw 软解 LUT 路径的步数上限：
+/// 斜率 1.25^6 ≈ 3.8 时画面已接近黑白两色，再大无意义
+pub(crate) const CONTRAST_STEP_MAX: i32 = 6;
+/// mpv 路径步数上限：contrast 属性域 ±100，一步斜率 ×1.25 ≈ contrast ±25，
+/// ±4 步即触属性边界——钳住防"OSD 倍率在涨画面却不再变化"
+pub(crate) const CONTRAST_STEP_MAX_MPV: i32 = 4;
 
-/// 步数 → 中间调倍率（f = 1.25^n；OSD 与 LUT/mpv 换算共用）
-pub(crate) fn gamma_factor(n: i32) -> f64 {
+/// 步数 → 对比度斜率倍率（s = 1.25^n；OSD 与 LUT/mpv 换算共用）
+pub(crate) fn contrast_factor(n: i32) -> f64 {
     1.25f64.powf(n as f64)
 }
 
 /// OSD 文案：步数 → 倍率显示（0 = 复位）
-pub(crate) fn gamma_label(n: i32) -> String {
+pub(crate) fn contrast_label(n: i32) -> String {
     if n == 0 {
-        "亮度 ×1.00（复位）".into()
+        "对比度 ×1.00（复位）".into()
     } else {
-        format!("亮度 ×{:.2}", gamma_factor(n))
+        format!("对比度 ×{:.2}", contrast_factor(n))
     }
 }
 
-/// per-file 显示亮度 LUT（W/S 快捷键）：n = 步数（0 = 不调）。幂律映射
-/// out = (v/255)^k × 255，k = f^-2（f = 1.25^n 中间调倍率）——与 mpv
-/// gamma 属性同一条曲线的等价形式（g = 200·log2(f)，k = 2^(g/-100)）：
-/// +1 步 k=0.64 中间调 ×1.28、倍率越大 k 越小渐进全白，无符号反转奇点。
-/// None = n==0（恒等——调用方跳过整帧遍历，亮度未调零成本）。探针读
-/// natives 原图，不经 LUT（忠实存储原值语义，与显示增益分离）
-pub(crate) fn gamma_lut(n: i32) -> Option<[u8; 256]> {
+/// per-file 显示对比度 LUT（W/S 快捷键）：n = 步数（0 = 不调）。绕固定锚点
+/// 127.5 的线性映射 out = (v−127.5)×s + 127.5（s = 1.25^n），与 mpv contrast
+/// 属性同一条曲线（斜率 = 1 + c/100，c = 25n）：锚点不动——黑还是黑、白还是
+/// 白，无 gamma 提亮"黑位发灰"问题；s>1 增强（极部饱和裁剪是对比度预期
+/// 行为）、s<1 降低（向中灰收敛）。None = n==0（恒等——调用方跳过整帧
+/// 遍历，未调零成本）。探针读 natives 原图，不经 LUT（忠实存储原值语义，
+/// 与显示增益分离）
+pub(crate) fn contrast_lut(n: i32) -> Option<[u8; 256]> {
     if n == 0 {
         return None;
     }
-    let k = 1.25f64.powf(-2.0 * n as f64);
+    let s = 1.25f64.powf(n as f64);
     let mut lut = [0u8; 256];
     for (i, v) in lut.iter_mut().enumerate() {
-        *v = ((i as f64 / 255.0).powf(k) * 255.0).round().clamp(0.0, 255.0) as u8;
+        *v = ((i as f64 - 127.5) * s + 127.5).round().clamp(0.0, 255.0) as u8;
     }
     Some(lut)
 }
 
 /// LUT 逐像素应用到 ColorImage（RGB 查表，alpha 不动）。O(像素) 单次遍历，
-/// 4K 图 ~10ms——[ ] 按键重放在 UI 线程可接受
-pub(crate) fn apply_gamma(img: &mut egui::ColorImage, lut: &[u8; 256]) {
+/// 4K 图 ~10ms——W/S 按键重放在 UI 线程可接受
+pub(crate) fn apply_contrast(img: &mut egui::ColorImage, lut: &[u8; 256]) {
     for px in &mut img.pixels {
         // ColorImage 像素为非预乘 RGBA（from_rgba_unmultiplied 构造），
         // 重建时保持 alpha 通道语义一致
@@ -948,7 +951,7 @@ pub(crate) fn apply_gamma(img: &mut egui::ColorImage, lut: &[u8; 256]) {
 /// 返回 (结果, 原图保留)：原图仅基础档静态且满足 orig-lru 准入时带回
 ///（小图 native×factor ≤ max_dim 同预放大判据，或字节数 ≤ 单张准入
 /// native_limit_bytes = orig 预算/2），供 full 升级复用/像素探针/per-file
-/// 亮度重建三个消费者使用
+/// 对比度重建三个消费者使用
 fn decode_image(
     source: &ImageSource,
     max_dim: u32,
@@ -1087,7 +1090,7 @@ fn decode_any<R: BufRead + Seek>(
 /// 档，**放大前**在原图分辨率执行——把边缘坡度先变陡，Lanczos 插值保持
 /// 陡峭过渡，成本从放大后千万像素级降到原图级，见 [`sharpen_full`]）→
 /// 两档尺寸适配（见 [`resample`]）→ RGBA，并按 orig-lru 准入判据决定
-/// 是否保留原图（三个消费者：full 升级复用 / 像素探针 / per-file 亮度
+/// 是否保留原图（三个消费者：full 升级复用 / 像素探针 / per-file 对比度
 /// native 重建）。[`decode_any`] 与 RAW 预览拦截分支共用
 fn finish_static(
     img: image::DynamicImage,
@@ -1112,7 +1115,7 @@ fn finish_static(
     // 原图保留（仅基础档）：full=true 时原图即输入，无需缓存。
     // 准入判据（任一满足）：① 小图（native×factor ≤ max_dim，同预放大
     // 判据——×ppp 后仍小，驻留便宜）；② 字节数 ≤ 单张准入（orig 预算/2，
-    // budget 制：大图也驻留，服务探针/full 复用/亮度重建）
+    // budget 制：大图也驻留，服务探针/full 复用/对比度重建）
     let native = if full {
         None
     } else {
@@ -3639,44 +3642,51 @@ mod tests {
         assert!(native.is_some(), "100×50×2≤4096 应命中原图保留资格");
     }
 
-    // ---- per-file 显示亮度（[ ] 快捷键）----
+    // ---- per-file 显示对比度（W/S 快捷键）----
 
     #[test]
-    fn gamma_lut_方向边界与单调() {
-        assert!(gamma_lut(0).is_none(), "n=0 恒等应返 None（调用方零开销直通）");
-        let up = gamma_lut(1).unwrap();
-        let down = gamma_lut(-1).unwrap();
-        // 中间调方向：+1 步（×1.25）提亮、-1 步（×0.8）压暗
-        //（幂律 k = 1.25^(-2n)，f^(-2) 等价 mpv gamma 曲线）
-        assert!(up[128] > 128, "+1 步应提亮，实际 {}", up[128]);
-        assert!(down[128] < 128, "-1 步应压暗，实际 {}", down[128]);
+    fn contrast_lut_方向边界与单调() {
+        assert!(contrast_lut(0).is_none(), "n=0 恒等应返 None（调用方零开销直通）");
+        let up = contrast_lut(1).unwrap();
+        let down = contrast_lut(-1).unwrap();
+        // 对比度方向：+1 步（×1.25）亮处更亮暗处更暗（锚点 127.5 不动）；
+        // -1 步（×0.8）向中灰收敛
+        assert!(up[192] > 192, "+1 步亮半区应更亮，实际 {}", up[192]);
+        assert!(up[64] < 64, "+1 步暗半区应更暗，实际 {}", up[64]);
+        assert!(down[192] < 192 && down[64] > 64, "-1 步应向中灰收敛");
         // 端点钳制 + 全程单调不减（亮度序保持，直方图形状不折叠）
         assert_eq!(up[0], 0);
         assert_eq!(up[255], 255);
         for w in up.windows(2) {
             assert!(w[0] <= w[1], "LUT 应单调不减: {} > {}", w[0], w[1]);
         }
-        // 步进复合：+2 步比 +1 步更亮（×1.25 逐次叠加）；深压暗端不发散
-        let up2 = gamma_lut(2).unwrap();
-        assert!(up2[128] > up[128], "+2 步应比 +1 步更亮");
-        let deep = gamma_lut(-10).unwrap();
-        assert!(deep[255] <= 255 && deep[0] == 0);
+        // 锚点不动（128 落 127.5+0.5s，任何步数四舍五入回 128——黑位不抬升
+        // 是"不发灰"的关键不变量）
+        assert_eq!(up[128], 128);
+        assert_eq!(down[128], 128);
+        // 步进复合：+2 步比 +1 步对比更强；深降档不发散仍单调
+        let up2 = contrast_lut(2).unwrap();
+        assert!(up2[192] > up[192] && up2[64] < up[64], "+2 步应比 +1 步对比更强");
+        let deep = contrast_lut(-6).unwrap();
+        // 深降档向锚点收敛：两端都拉回中灰附近（不再顶到黑/白边界）
+        assert!(deep[255] < 255 && deep[0] > 0);
         for w in deep.windows(2) {
             assert!(w[0] <= w[1]);
         }
     }
 
     #[test]
-    fn apply_gamma_像素与alpha保持() {
-        let mut img = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[100, 100, 100, 128]);
-        let lut = gamma_lut(2).unwrap();
+    fn apply_contrast_像素与alpha保持() {
+        let mut img = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[200, 200, 200, 255]);
+        let lut = contrast_lut(2).unwrap();
         // ColorImage 存储为预乘 alpha（from_rgba_unmultiplied 内部转换），
-        // 半透明像素 RGB 已缩放——提亮方向性只做相对断言，alpha 恒不变
+        // 半透明像素 RGB 已缩放——用不透明像素（alpha=255，预乘=原值，
+        // 与真实解码产物一致）做方向性断言，alpha 恒不变
         let before = img.pixels[0].r();
-        apply_gamma(&mut img, &lut);
+        apply_contrast(&mut img, &lut);
         let px = img.pixels[0];
-        assert!(px.r() > before, "灰值经提亮 LUT 应提亮");
-        assert_eq!(px.a(), 128, "alpha 不动");
+        assert!(px.r() > before, "亮值（>锚点）经增强 LUT 应更亮");
+        assert_eq!(px.a(), 255, "alpha 不动");
     }
 
     /// 塞一帧就绪消息（native 可带）进服务缓存（跳过后台线程，同步可控）
@@ -3746,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_gamma_natives重建与直方图重算() {
+    fn refresh_contrast_natives重建与直方图重算() {
         let map: std::rc::Rc<
             std::cell::RefCell<std::collections::HashMap<ImgKey, i32>>,
         > = Default::default();
@@ -3772,23 +3782,23 @@ mod tests {
         // 像素总数取首帧实际值，不写死 64）
         let px_count = svc.histogram(key).expect("hist 应随上传就绪").ch[3][100];
         assert!(px_count > 0);
-        // 调亮度 +2 步（×1.56，k=1.25^-4≈0.4096）→ refresh_gamma 原位重建：
-        // 灰 100 → (100/255)^0.4096×255 ≈ 174
+        // 调对比度 +2 步（×1.56，斜率 1.25^2）→ refresh_contrast 原位重建：
+        // 灰 100 → (100−127.5)×1.5625+127.5 ≈ 85（低于锚点的值更暗）
         map.borrow_mut().insert(key, 2);
-        assert!(svc.refresh_gamma(key, 4096), "natives 命中应返 true");
+        assert!(svc.refresh_contrast(key, 4096), "natives 命中应返 true");
         let h1 = svc.histogram(key).expect("重建后 hist 应重算");
-        assert_eq!(h1.ch[3][174], px_count, "全部像素应移到 LUT 后的 bin");
+        assert_eq!(h1.ch[3][85], px_count, "全部像素应移到 LUT 后的 bin");
         assert_eq!(h1.ch[3][100], 0, "原 bin 应清空（直方图与显示帧一致）");
         assert!(svc.frame(key).is_some(), "重建后纹理应在位");
         // 复位 0 → 再次重建回原值
         map.borrow_mut().insert(key, 0);
-        assert!(svc.refresh_gamma(key, 4096));
+        assert!(svc.refresh_contrast(key, 4096));
         let h2 = svc.histogram(key).expect("复位后 hist 应回原值");
         assert_eq!(h2.ch[3][100], px_count);
     }
 
     #[test]
-    fn refresh_gamma_无native清缓存返false() {
+    fn refresh_contrast_无native清缓存返false() {
         let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0);
         let key = (7, 1);
         // 无 native（预算 0 → 准入关闭模拟巨图）：refresh 无原图可重建
@@ -3801,7 +3811,7 @@ mod tests {
         );
         assert!(svc.frame(key).is_some());
         assert!(
-            !svc.refresh_gamma(key, 4096),
+            !svc.refresh_contrast(key, 4096),
             "natives 未命中应返 false（调用方重解码）"
         );
         assert!(svc.frame(key).is_none(), "旧纹理条目应被清掉防陈旧显示");
