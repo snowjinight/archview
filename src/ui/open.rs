@@ -326,11 +326,57 @@ impl App {
                 alive: false,
                 gen: 0,
             })),
+            ratings: std::collections::HashMap::new(),
+            deleted: std::collections::HashSet::new(),
         });
         // 新包旧选择无意义：清多选与范围锚点（entry 下标对新包是错位引用）
         self.selected.clear();
         self.select_anchor = None;
+        // 星级筛选/删除确认窗是 per-archive 会话状态，换包即清
+        self.rating_filter = None;
+        self.delete_confirm = None;
         self.rebuild_view();
+        // 目录模式：后台扫描图片评级（星级筛选/列表亮星的数据源）。压缩包
+        // 模式无磁盘路径跳过。评级读取三级优先：sidecar .xmp > 嵌入式 XMP
+        // > EXIF 18246/18249 存量（见 meta.rs 头注）。结果一次性回传，
+        // poll_rating_scan 合并进 a.ratings——线程持目录路径与名字快照，
+        // 不持 ArchiveState 引用（UI 线程独占）；换包后旧结果按 id 丢弃
+        self.rating_scan = None;
+        if path.is_dir() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = path.clone();
+            let names: Vec<(usize, String)> = self
+                .archive
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .enumerate()
+                // sidecar 评级全格式可用（含 RAW/GIF/BMP）→ 不再限
+                // meta_writable，按图片扩展名全集扫描
+                .filter(|(_, e)| !e.is_dir && self.cfg.is_image_ext(&e.name))
+                .map(|(i, e)| (i, e.name.clone()))
+                .collect();
+            std::thread::Builder::new()
+                .name("ratingscan".into())
+                .spawn(move || {
+                    let mut out = Vec::new();
+                    for (i, name) in names {
+                        let p = dir.join(&name);
+                        // 三级优先：sidecar（本应用写）> 嵌入式 XMP
+                        //（Lightroom 等主流软件写）> EXIF 18246/18249 存量
+                        let r = crate::meta::read_sidecar_rating(&crate::meta::sidecar_path(&p))
+                            .or_else(|| crate::meta::read_embedded_xmp_rating(&p))
+                            .or_else(|| crate::meta::read_meta_path(&p).and_then(|m| m.rating));
+                        if let Some(r) = r {
+                            out.push((i, r));
+                        }
+                    }
+                    let _ = tx.send(out);
+                })
+                .ok();
+            self.rating_scan = Some((id, rx));
+        }
         // 单媒体文件入口：目标文件所在目录打开完成（仅目录模式消费——
         // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。
         // 按目标扩展名预切标签页：混合内容目录下不预切的话目标在另一
@@ -407,6 +453,40 @@ impl App {
         retry_play.map(|(entry_idx, _)| entry_idx).or(focus_idx)
     }
 
+    /// 目录模式后台评级扫描轮询：扫描线程完成时一次性收到
+    /// Vec<(entry_idx, 星级)>，合并进 a.ratings（**会话值优先**——用户
+    /// 扫描期间手动评的星不被覆盖）。合并后清扫描任务；若星级筛选
+    /// 条已启用则重建视图（扫描前筛选条件暂不生效，防列表闪烁）。
+    /// 换包后 archive.id 变化，旧结果按 id 丢弃
+    pub(super) fn poll_rating_scan(&mut self) {
+        // 先试收（借用随语句结束），有结果再清任务、后合并
+        let results = self
+            .rating_scan
+            .as_ref()
+            .and_then(|(_, rx)| rx.try_recv().ok());
+        let Some(results) = results else {
+            return;
+        };
+        let (aid, _) = self.rating_scan.take().unwrap();
+        let Some(a) = self.archive.as_mut() else {
+            return;
+        };
+        if a.id != aid {
+            return; // 旧包迟到结果
+        }
+        let merged = {
+            let a = self.archive.as_mut().unwrap();
+            for (idx, r) in results {
+                a.ratings.entry(idx).or_insert(r);
+            }
+            a.ratings.len()
+        };
+        if self.rating_filter.is_some() {
+            self.rebuild_view();
+        }
+        tracing::info!("评级扫描完成：合并 {} 条 EXIF Rating", merged);
+    }
+
     /// 重新计算过滤视图：搜索框高级语法匹配（search_engine：空格 AND、| OR、
     /// ! 排除、"精确短语"、* ? 通配、<分组>，语法说明见根目录 serach.md）
     /// + 只显示媒体文件（视频/图片按 config 分类），
@@ -429,15 +509,28 @@ impl App {
         // kinds 与 view 同序携带，后续计数/行缓存直接查表——旧实现同一名单
         // 要过 3 遍 is_video_ext，万级条目 × raw 预设回溯时开销放大 3 倍
         let query = crate::search::parse_query(&self.search);
+        // 星级筛选谓词（仅图片条目；与文本搜索 AND）：Some(0)=未评、
+        // Some(n)=≥n 星。扫描未完成时暂不生效（poll_rating_scan 合并后
+        // 重建视图）——防扫描中途列表反复闪变。已删除条目（trash 删除
+        // 后的会话标记）无条件剔除
+        let filter_active = self.rating_scan.is_none() && self.rating_filter.is_some();
+        let rating_filter = self.rating_filter;
         let mut classified: Vec<(usize, bool)> = a
             .entries
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
-                if e.is_dir || !query.matches(&e.name) {
+                if e.is_dir || !query.matches(&e.name) || a.deleted.contains(&i) {
                     return None;
                 }
                 let is_video = self.cfg.is_video_ext(&e.name);
+                if !is_video && filter_active {
+                    let r = a.ratings.get(&i).copied().unwrap_or(0);
+                    let want = rating_filter.unwrap();
+                    if (want == 0 && r != 0) || (want > 0 && r < want) {
+                        return None;
+                    }
+                }
                 (is_video || self.cfg.is_image_ext(&e.name)).then_some((i, is_video))
             })
             .collect();

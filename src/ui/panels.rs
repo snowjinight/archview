@@ -641,11 +641,59 @@ impl App {
             // 多选计数（§15.5）：有选择时右侧弱提示（编码对象个数一目了然）
             if !self.selected.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("已选 {}", self.selected.len()));
+                    // right_to_left 布局先加的控件靠右：数字（红色醒目，
+                    // 用户指定）在"已选"标签右侧
+                    ui.label(
+                        egui::RichText::new(format!("{}", self.selected.len()))
+                            .color(egui::Color32::RED),
+                    );
+                    ui.weak("已选");
                 });
             }
         });
         ui.separator();
+
+        // 星级筛选（图片标签页；PLAN_image_meta.md §5E）：评级 = 后台 EXIF/
+        // XMP 扫描合并 + 会话评星快捷键即时写入。下拉菜单收窄 UI 宽度
+        //（None=全部、Some(0)=未评、Some(n)=≥n）。**切换筛选即清空当前
+        // 选中**——选中集是跨筛选状态，旧选中在新筛选下可能不可见，
+        // 留着易误删；删除入口在右键菜单（按选中集，目录模式）
+        if self.list_tab == ListTab::Image {
+            ui.horizontal(|ui| {
+                ui.weak("星级:");
+                let opts: [(Option<u8>, &str); 7] = [
+                    (None, "全部"),
+                    (Some(0), "未评"),
+                    (Some(1), "≥1"),
+                    (Some(2), "≥2"),
+                    (Some(3), "≥3"),
+                    (Some(4), "≥4"),
+                    (Some(5), "≥5"),
+                ];
+                let before = self.rating_filter;
+                let cur_label = opts
+                    .iter()
+                    .find(|(v, _)| *v == self.rating_filter)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("全部");
+                egui::ComboBox::from_id_salt("rating_filter")
+                    // 显式收窄：egui 默认宽 = interact_size.x×3 ≈ 120px，
+                    // 内容最长仅两字（"全部"/"≥5"），40px 即可
+                    .width(40.0)
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        for (v, label) in opts {
+                            ui.selectable_value(&mut self.rating_filter, v, label);
+                        }
+                    });
+                if self.rating_filter != before {
+                    self.selected.clear();
+                    self.select_anchor = None;
+                    self.rebuild_view();
+                }
+            });
+            ui.separator();
+        }
 
         // ---- 虚拟化列表：只布局可见行（万级条目从每帧 O(n) 降到 O(可见行数)）----
         let mut action: Option<usize> = None;
@@ -654,6 +702,9 @@ impl App {
         let mut menu_all = false;
         let mut menu_clear = false;
         let mut menu_compare: Option<usize> = None;
+        // 删除选中（进回收站）：仅目录模式可达（压缩包内无磁盘路径）
+        let menu_delete_ok = self.archive.as_ref().is_some_and(|a| a.path.is_dir());
+        let mut menu_delete = false;
         let mut scrolled = false;
         // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
         // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
@@ -763,23 +814,46 @@ impl App {
                         // 度=完整文件名宽 → 溢出内容撑宽左面板的 PanelState
                         //（resizable 面板宽=上一帧内容矩形），表现为"一选中
                         // 列表就被文件名撑开"。完整文件名在悬停气泡查看。
-                        let btn = if sel.contains(&r.idx) {
-                            let sel_c = if ui.visuals().dark_mode {
-                                AMBER_DARK
-                            } else {
-                                AMBER_LIGHT
-                            };
-                            egui::Button::selectable(
+                        // 星级前缀（★n）：评级来自 EXIF 后台扫描/会话评星（r.idx
+                        // 即 entries 下标）。原子拼接同 S 前缀结构——atom_shrink
+                        // 仍钉在文件名段（有显式 shrink 原子时 egui 不再自动选
+                        // 第一个文本原子，见下方 ⚠ 注释）
+                        let star = self
+                            .archive
+                            .as_ref()
+                            .and_then(|a| a.ratings.get(&r.idx).copied())
+                            .filter(|&s| s > 0);
+                        let star_txt = star.map(|s| format!("★{s} "));
+                        let label = egui::RichText::new(r.label.as_str()).atom_shrink(true);
+                        let sel_c = if ui.visuals().dark_mode {
+                            AMBER_DARK
+                        } else {
+                            AMBER_LIGHT
+                        };
+                        let btn = match (sel.contains(&r.idx), star_txt) {
+                            (true, Some(st)) => egui::Button::selectable(
                                 playing == Some(r.idx),
                                 (
                                     egui::RichText::new("S ").color(sel_c),
-                                    egui::RichText::new(r.label.as_str()).atom_shrink(true),
+                                    egui::RichText::new(st),
+                                    label,
                                 ),
                             )
-                            .truncate()
-                        } else {
-                            egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
-                                .truncate()
+                            .truncate(),
+                            (true, None) => egui::Button::selectable(
+                                playing == Some(r.idx),
+                                (egui::RichText::new("S ").color(sel_c), label),
+                            )
+                            .truncate(),
+                            (false, Some(st)) => egui::Button::selectable(
+                                playing == Some(r.idx),
+                                (egui::RichText::new(st), label),
+                            )
+                            .truncate(),
+                            (false, None) => {
+                                egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
+                                    .truncate()
+                            }
                         };
                         let mut resp = btn.ui(ui);
                         // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
@@ -858,6 +932,20 @@ impl App {
                                 menu_compare = Some(r.idx);
                             }
                             ui.separator();
+                            if ui
+                                .add_enabled(
+                                    menu_delete_ok && !sel.is_empty(),
+                                    egui::Button::new(if sel.is_empty() {
+                                        "删除选中：先 Ctrl+点选"
+                                    } else {
+                                        "删除选中（进回收站）"
+                                    }),
+                                )
+                                .on_hover_text("删除当前选中的全部文件（快捷键 Ctrl+Delete）")
+                                .clicked()
+                            {
+                                menu_delete = true;
+                            }
                             if ui.button("全选（Ctrl+A）").clicked() {
                                 menu_all = true;
                             }
@@ -942,6 +1030,10 @@ impl App {
         }
         if menu_all {
             self.selected = self.list_rows.iter().map(|r| r.idx).collect();
+        }
+        // 删除选中：确认窗（数量/体积）二次确认后 trash::delete
+        if menu_delete {
+            self.open_delete_confirm_for_selection();
         }
         if menu_clear {
             self.selected.clear();

@@ -81,6 +81,15 @@ struct ArchiveState {
     /// 不使用）。UI 组批时重写 targets/focus，解码线程动态消费——跳转只
     /// 更新目标集，不重启解码流（协议见 vfs::ArchiveVFS::extract_session）
     session: SharedSession,
+    /// 会话内评级缓存（entry 下标 → 星数 0-5）：评星快捷键即时记录 +
+    /// P2 后台扫描合并文件 EXIF 评级（会话值优先）。压缩包内评星只能存
+    /// 这里（不可写回文件）；目录模式写回成功同样进此表供列表/筛选消费
+    ratings: std::collections::HashMap<usize, u8>,
+    /// 会话内已删除条目（trash 回收站删除后标记）：条目本体保留在 entries
+    ///（**下标稳定是硬前提**——ImgKey/评级表/多选/锚点全按 entry_idx 寻址，
+    /// 物理移除会让后续下标整体位移、缓存纹理错位指向错误文件），只在
+    /// rebuild_view 谓词中剔除。压缩包模式删除入口不可达（仅目录模式）
+    deleted: std::collections::HashSet<usize>,
 }
 
 /// 密码输入弹窗：加密头（打开阶段）或内容加密（播放阶段）触发
@@ -146,6 +155,13 @@ enum EncodeMsg {
     Progress(f32),
     Done(crate::encode::EncodeStats),
     Failed(String),
+}
+
+/// 「删除选中」确认窗状态：选中的条目下标（entries 寻址，目录模式）。
+/// 配合星级筛选使用：筛出不要的 → 全选/多选 → 右键菜单 / Ctrl+Delete
+/// → 确认后逐条 trash::delete 进回收站（可从回收站还原）
+struct DeleteConfirm {
+    targets: Vec<usize>,
 }
 
 /// 后台解压任务（7z/RAR）：UI 侧的期望状态 + 消息通道。真正的解码循环
@@ -420,6 +436,15 @@ pub struct App {
     // ImageService 共享 Rc<RefCell> 单源真值：视频走 mpv contrast 属性、
     // 图片/raw 走 LUT
     contrast_map: ContrastMap,
+    /// 目录模式后台评级扫描：(archive_id, 结果接收端)。线程遍历图片条目读
+    /// EXIF Rating，完成后一次性回传 Vec<(entry_idx, 星级)>；poll 合并进
+    /// ArchiveState.ratings（会话值优先不覆盖）。换包后按 id 丢弃
+    rating_scan: Option<(u64, std::sync::mpsc::Receiver<Vec<(usize, u8)>>)>,
+    /// 星级筛选（图片标签页筛选条）：None=全部；Some(0)=未评；
+    /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）
+    rating_filter: Option<u8>,
+    /// 「删除筛选结果」确认窗（星级删除入口；仅目录模式可达）
+    delete_confirm: Option<DeleteConfirm>,
 }
 
 /// per-file 显示对比度共享映射（见 App.contrast_map 字段注释）
@@ -534,6 +559,9 @@ impl App {
             hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone()),
             arrow_hold: None,
             contrast_map,
+            rating_scan: None,
+            rating_filter: None,
+            delete_confirm: None,
         }
     }
 
@@ -612,6 +640,9 @@ impl App {
             hist_raw: crate::rawdec::HistService::new(ctx.clone()),
             arrow_hold: None,
             contrast_map,
+            rating_scan: None,
+            rating_filter: None,
+            delete_confirm: None,
         }
     }
 
@@ -803,6 +834,9 @@ impl eframe::App for App {
         // 后台打开任务轮询（大包/网络盘）
         self.poll_open();
         probe!("poll_open");
+        // 目录模式评级扫描轮询（EXIF Rating → 列表亮星/筛选条）
+        self.poll_rating_scan();
+        probe!("poll_rating_scan");
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
         probe!("poll_extract");
@@ -844,6 +878,9 @@ impl eframe::App for App {
         probe!("encode_dialog");
         self.poll_encode();
         probe!("poll_encode");
+        // 「删除筛选结果」确认窗（星级筛选一键删除，仅目录模式）
+        self.delete_confirm_window(&ctx);
+        probe!("delete_confirm");
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条

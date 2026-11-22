@@ -16,6 +16,7 @@ mod encode;
 mod imgview;
 // 日志管线：内存环形缓冲（F12 面板）+ 后台线程定时落盘 archview.log
 mod logsink;
+mod meta;
 mod player;
 // raw 裸数据媒体层：预设校验 / Bayer 探测 / 软解帧提取（mpv 播放与对比视图两路消费）
 mod rawdec;

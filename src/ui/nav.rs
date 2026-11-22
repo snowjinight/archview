@@ -25,7 +25,9 @@ impl App {
     /// PgUp/PgDn=上一个/下一个，
     /// L=视频播放模式三态循环（定格→列表→循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
-    /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
+    /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口，
+    /// R=顺时针旋转 90°，1-5=评星，Q=清除评级；Ctrl+Delete=删除选中
+    /// 文件（目录模式，确认窗二次确认；同右键菜单项）
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // F12 = 运行日志面板开关（诊断性质，任何模态/焦点下都可用）。
         // release 无控制台（windows 子系统），日志走 logsink 环形缓冲 +
@@ -191,6 +193,12 @@ impl App {
         let (mut contrast_up, mut contrast_down) = (false, false);
         // C=进入多图对比（选中合格条目 ≥2；校验与提示在 try_enter_compare）
         let mut enter_compare = false;
+        // R=图片顺时针旋转 90°；1-5=评星、Q=清除评级（0 键已被 100% 缩放
+        // 占用）。EXIF 元数据写回，见 rotate_image_cw / rate_image
+        let mut rotate_cw = false;
+        let mut rate_set: Option<u8> = None;
+        // Ctrl+Delete=删除选中文件（目录模式；确认窗二次确认）
+        let mut del_selected = false;
         // N=打开下一个压缩包（「目录内连续看包」，仅压缩包文件模式有效）
         let mut ask_next_key = false;
         // 图片模式缩放：+/−=步进，0=100%，Home=适应窗口
@@ -231,6 +239,24 @@ impl App {
                     if t == "s" || t == "S" {
                         contrast_down = true;
                         return false;
+                    }
+                    // R/Q/数字 同理：旋转/评级（仅图片模式；IME 兜底与
+                    // Key 臂同语义）
+                    if img_mode {
+                        if t == "r" || t == "R" {
+                            rotate_cw = true;
+                            return false;
+                        }
+                        if t == "q" || t == "Q" {
+                            rate_set = Some(0);
+                            return false;
+                        }
+                        if let Ok(n) = t.parse::<u8>() {
+                            if (1..=5).contains(&n) {
+                                rate_set = Some(n);
+                                return false;
+                            }
+                        }
                     }
                     return true;
                 }
@@ -353,6 +379,42 @@ impl App {
                         go_focus = true;
                         false
                     }
+                    // R=图片顺时针旋转 90°（EXIF Orientation 轮进，写回或会话内）
+                    egui::Key::R if m.is_none() && img_mode => {
+                        rotate_cw = true;
+                        false
+                    }
+                    // Q=清除评级（0 键已被 100% 缩放占用）
+                    egui::Key::Q if m.is_none() && img_mode => {
+                        rate_set = Some(0);
+                        false
+                    }
+                    // 1-5=评星（EXIF 18246/18249 写回或会话内）
+                    egui::Key::Num1 if m.is_none() && img_mode => {
+                        rate_set = Some(1);
+                        false
+                    }
+                    egui::Key::Num2 if m.is_none() && img_mode => {
+                        rate_set = Some(2);
+                        false
+                    }
+                    egui::Key::Num3 if m.is_none() && img_mode => {
+                        rate_set = Some(3);
+                        false
+                    }
+                    egui::Key::Num4 if m.is_none() && img_mode => {
+                        rate_set = Some(4);
+                        false
+                    }
+                    egui::Key::Num5 if m.is_none() && img_mode => {
+                        rate_set = Some(5);
+                        false
+                    }
+                    // Ctrl+Delete=删除选中文件（确认窗二次确认；同右键菜单项）
+                    egui::Key::Delete if m.ctrl => {
+                        del_selected = true;
+                        false
+                    }
                     // C=进入多图对比视图（选中 2~6 个合格条目分栏同步缩放）
                     egui::Key::C if m.is_none() => {
                         enter_compare = true;
@@ -465,6 +527,18 @@ impl App {
         if contrast_down {
             self.adjust_contrast(false);
         }
+        // R：图片顺时针旋转 90°（EXIF Orientation 写回/会话内覆盖）
+        if rotate_cw {
+            self.rotate_image_cw();
+        }
+        // 1-5/Q：评星 / 清除评级
+        if let Some(r) = rate_set {
+            self.rate_image(r);
+        }
+        // Ctrl+Delete：删除选中文件（确认窗；校验在内部）
+        if del_selected {
+            self.open_delete_confirm_for_selection();
+        }
         // B：回到锚点（与列表底部悬浮按钮一致）；正播在锚点时无事可做
         if go_focus {
             if let Some(f) = self.last_focus {
@@ -537,6 +611,122 @@ impl App {
         if let Some(p) = &self.player {
             p.set_display_contrast(g);
         }
+    }
+
+    // ---- 图片方向 / 评级（EXIF 元数据写回，PLAN_image_meta.md） ----
+
+    /// 当前显示图片条目的元数据操作上下文：(key, entry 下标, 文件路径)。
+    /// 门控 = tex_image_key（排除 mpv 回退图与解码中占位）；压缩包内
+    /// path = None（不可写回，评级/方向只能会话内记忆）
+    fn image_meta_ctx(&self) -> Option<(ImgKey, usize, Option<PathBuf>)> {
+        let key = self.tex_image_key()?;
+        let a = self.archive.as_ref()?;
+        let entry = a.entries.get(key.1)?;
+        let path = if a.path.is_dir() {
+            Some(a.path.join(&entry.name))
+        } else {
+            None
+        };
+        Some((key, key.1, path))
+    }
+
+    /// R 键：当前图片顺时针旋转 90°。方向真相 = 文件 EXIF Orientation
+    /// tag（写回后重解码显示，位图零重写）；不可写格式（压缩包内 /
+    /// GIF/BMP/写失败）降级会话内 override（rotoverride 表，request
+    /// 快照下发 worker 覆盖文件 tag）。已知接受风险：invalidate 后旧
+    /// 解码 worker 的迟到 Ready 可能短暂上传旧方向像素（与
+    /// refresh_contrast 同款，竞态窗口毫秒级）
+    fn rotate_image_cw(&mut self) {
+        let Some((key, idx, path)) = self.image_meta_ctx() else {
+            return;
+        };
+        let ename = self.archive.as_ref().unwrap().entries[idx].name.clone();
+        let cur = self.img.orientation(key);
+        let new = crate::meta::orientation_rotate(cur, true);
+        let mut written = false;
+        if let Some(p) = &path {
+            if crate::meta::meta_writable(&ename) {
+                match crate::meta::write_orientation(p, new) {
+                    Ok(()) => {
+                        // 文件 tag 已是新值：清 override 防残留抢读；
+                        // 立即记录方向事实防 full 档用旧方向二次解码
+                        self.img.clear_orient_override(key);
+                        self.img.record_orientation(key, new);
+                        written = true;
+                    }
+                    Err(e) => {
+                        self.set_err(format!("旋转写回失败（改用会话内方向）: {e}"));
+                    }
+                }
+            }
+        }
+        if !written {
+            self.img.set_orient_override(key, new);
+        }
+        // 旋转只改 tag 不改像素，但 base 纹理/natives 是旧方向矫正产物，
+        // 探针/full/对比度重建都会用过期像素 → 全清（含 natives）重解码
+        self.img.invalidate_full(key);
+        // 按记录源立即重发（幂等检查已被 invalidate 清缓存放行）
+        if let Some((src_key, source, name)) = self.img_source.clone() {
+            if src_key == key {
+                let max_dim = self.cfg.image.image_max_dim;
+                self.img.request(key, source, max_dim, &name);
+            }
+        }
+        self.set_notice(if written {
+            "已顺时针旋转 90°（已写回文件）"
+        } else {
+            "已顺时针旋转 90°（会话内，未写回文件）"
+        });
+        tracing::info!("旋转 {ename}: orient {cur}→{new} written={written}");
+    }
+
+    /// 1-5/Q 键：评级（r=0 清除）。写入只走 sidecar `.xmp`（原文件字节
+    /// 零改动，全格式统一可用，不再写 EXIF 18246/18249——见 meta.rs 头注）；
+    /// sidecar 写失败降级会话内（a.ratings 表，列表星级/筛选消费）。
+    /// 评级只影响 sidecar 不动像素，无需失效任何缓存
+    fn rate_image(&mut self, r: u8) {
+        let Some((_, idx, path)) = self.image_meta_ctx() else {
+            return;
+        };
+        let ename = self.archive.as_ref().unwrap().entries[idx].name.clone();
+        let mut written = false;
+        if let Some(p) = &path {
+            match crate::meta::write_sidecar_rating(p, r) {
+                Ok(()) => written = true,
+                Err(e) => {
+                    self.set_err(format!("评级 sidecar 写入失败（仅会话内记录）: {e}"));
+                }
+            }
+        }
+        let a = self.archive.as_mut().unwrap();
+        if r == 0 {
+            a.ratings.remove(&idx);
+        } else {
+            a.ratings.insert(idx, r);
+        }
+        // 星级筛选生效中：评级变化可能让条目进出筛选集，重建视图；
+        // 已不可见（退出筛选集）的选中项一并剔除，防旧选中被误删
+        if self.rating_filter.is_some() {
+            self.rebuild_view();
+            let visible: std::collections::HashSet<usize> = self
+                .archive
+                .as_ref()
+                .unwrap()
+                .view
+                .iter()
+                .copied()
+                .collect();
+            self.selected.retain(|i| visible.contains(i));
+            self.select_anchor = self.select_anchor.filter(|i| visible.contains(i));
+        }
+        let tail = if written { "（已写入 sidecar）" } else { "（会话内）" };
+        self.set_notice(if r == 0 {
+            format!("已清除评级{tail}")
+        } else {
+            format!("已评 {}{tail}", "★".repeat(r as usize))
+        });
+        tracing::info!("评级 {ename}: {r} sidecar={written}");
     }
 
     // ---- 方向键长按连发 ----

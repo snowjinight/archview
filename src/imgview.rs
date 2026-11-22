@@ -181,6 +181,9 @@ enum ImgMsg {
         /// 原图保留（仅静态且具备 full 资格的图：native×factor ≤ max_dim），
         /// 供 full 升级复用免二次解码；动图/超大图为 None
         native: Option<image::DynamicImage>,
+        /// 本次解码实际应用的 EXIF 方向值（静态图；动图恒 1）——
+        /// 进 ImageService.orientations 方向事实表
+        orient: u8,
     },
     Failed {
         key: ImgKey,
@@ -269,6 +272,13 @@ pub struct ImageService {
     orig_budget: usize,
     /// natives 当前驻留字节总数（as_bytes().len() 增量维护）
     natives_bytes: usize,
+    /// 方向事实表：各 key 最近一次解码应用的 EXIF 方向值（静态图；动图
+    /// 不记录）。R 键旋转在此值上轮转；写回路径写完文件后立即同步更新
+    orientations: HashMap<ImgKey, u8>,
+    /// 方向覆盖表：不可写格式（GIF/BMP/lossy webp/压缩包内/RAW）的 R 键
+    /// 旋转只存会话内存——request 时下发给 worker 覆盖文件 EXIF 方向。
+    /// 可写格式不走此表（直接写回文件）
+    rotoverride: HashMap<ImgKey, u8>,
 }
 
 impl ImageService {
@@ -296,6 +306,8 @@ impl ImageService {
             natives: VecDeque::new(),
             orig_budget: orig_budget.max(1),
             natives_bytes: 0,
+            orientations: HashMap::new(),
+            rotoverride: HashMap::new(),
         }
     }
 
@@ -334,6 +346,41 @@ impl ImageService {
         }
     }
 
+    /// 丢弃指定条目全部缓存**含 natives 原图**（旋转/评级写回后专用）：
+    /// 写回改变了文件内容语义（新 EXIF 方向），旧原图像素（已按旧方向
+    /// 矫正）不能再供探针/full 复用/对比度重建——三消费者都会用过期像素。
+    /// 全部清掉，下次 request 走全新解码
+    pub fn invalidate_full(&mut self, key: ImgKey) {
+        self.invalidate(key);
+        if let Some(pos) = self.natives.iter().position(|(k, _)| *k == key) {
+            if let Some((_, old)) = self.natives.remove(pos) {
+                self.natives_bytes -= old.as_bytes().len();
+            }
+        }
+    }
+
+    /// 方向事实读取（R 键轮转基准）：无记录 = 1（未矫正）
+    pub fn orientation(&self, key: ImgKey) -> u8 {
+        self.orientations.get(&key).copied().unwrap_or(1)
+    }
+
+    /// 方向事实写入（R 键写回成功后立即同步，防 full 档在 base 重解码
+    /// 完成前用旧方向二次解码出错误朝向）
+    pub fn record_orientation(&mut self, key: ImgKey, o: u8) {
+        self.orientations.insert(key, o);
+    }
+
+    /// 会话内方向覆盖（不可写格式）：request 时下发 worker 覆盖文件 tag
+    pub fn set_orient_override(&mut self, key: ImgKey, o: u8) {
+        self.rotoverride.insert(key, o);
+    }
+
+    /// 清除方向覆盖（可写格式写回文件后调用——文件 tag 已是新值，
+    /// 覆盖残留会让后续解码跳过文件读取走旧覆盖值）
+    pub fn clear_orient_override(&mut self, key: ImgKey) {
+        self.rotoverride.remove(&key);
+    }
+
     /// 对比模式显示集合（逐出保护；退出对比时清空）
     pub fn set_shown_multi(&mut self, keys: Vec<ImgKey>) {
         self.shown_multi = keys;
@@ -358,6 +405,9 @@ impl ImageService {
         // orig-lru 单张准入 = 预算/2：防单张巨图独占预算（当前显示受保护
         // 的那张最坏驻留预算一半，其余合计不超另一半）
         let native_limit = (self.orig_budget / 2) as u64;
+        // 会话内方向覆盖（R 键旋转不可写格式路径）：request 时快照下发，
+        // worker 覆盖文件 EXIF 方向
+        let orient_override = self.rotoverride.get(&key).copied();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let name = name.to_owned();
@@ -369,10 +419,19 @@ impl ImageService {
                 // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
                 // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image(&source, max_dim, false, factor, &name, &SharpenCfg::OFF, native_limit)
+                    decode_image_orient(
+                        &source,
+                        max_dim,
+                        false,
+                        factor,
+                        &name,
+                        &SharpenCfg::OFF,
+                        native_limit,
+                        orient_override,
+                    )
                 }));
                 match r {
-                    Ok(Ok((decoded, native))) => {
+                    Ok(Ok((decoded, native, orient))) => {
                         // 直方图在解码线程顺手算（O(像素)，被解码耗时掩盖）：
                         // 静态图全图；动图取首帧（逐帧统计显存外的 CPU 成本
                         // 随帧数线性涨，且直方图语义是"这张图长什么样"）
@@ -386,6 +445,7 @@ impl ImageService {
                             hist,
                             name,
                             native,
+                            orient,
                         });
                     }
                     Ok(Err(e)) => {
@@ -452,6 +512,9 @@ impl ImageService {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, n)| n.clone());
+        // 方向事实快照：full 档从源重解码时必须与 base 档同朝向（R 键
+        // 写回路径已同步此表，见 record_orientation）
+        let orient = self.orientation(key);
         let r = std::thread::Builder::new()
             .name("imgfull".into())
             .spawn(move || {
@@ -462,11 +525,15 @@ impl ImageService {
                         Ok(build_full(img, factor, &sharpen))
                     }
                     None => {
-                        // full 档：原图即输入不保留 native（native_limit 传 0）
-                        match decode_image(&source, FULL_MAX_DIM, true, factor, &name, &sharpen, 0) {
-                            Ok((Decoded::Static(img), _)) => Ok(img),
+                        // full 档：原图即输入不保留 native（native_limit 传 0）。
+                        // 方向走方向事实表快照（base 解码已记录/写回路径已同步）
+                        let orient = orient;
+                        match decode_image_orient(
+                            &source, FULL_MAX_DIM, true, factor, &name, &sharpen, 0, Some(orient),
+                        ) {
+                            Ok((Decoded::Static(img), _, _)) => Ok(img),
                             // 单帧动图取唯一帧当静态原图
-                            Ok((Decoded::Anim(mut a), _)) if a.len() == 1 => {
+                            Ok((Decoded::Anim(mut a), _, _)) if a.len() == 1 => {
                                 Ok(a.pop().expect("len==1").0)
                             }
                             Ok(_) | Err(_) => Err(()),
@@ -518,8 +585,11 @@ impl ImageService {
                     hist,
                     name,
                     native,
+                    orient,
                 } => {
                     self.pending.remove(&key);
+                    // 方向事实表：R 键旋转基准（无覆盖时 = 文件 tag 值）
+                    self.orientations.insert(key, orient);
                     // 原图入 LRU（容量随当前栏数自适应 = 纹理缓存保护集同
                     // 语义"栏数 + 2"，单图 3、对比 n 栏 n+2；封顶逐出最旧；
                     // full 就绪/失败不再清空——像素探针在 full 档显示下仍需
@@ -952,6 +1022,8 @@ pub(crate) fn apply_contrast(img: &mut egui::ColorImage, lut: &[u8; 256]) {
 ///（小图 native×factor ≤ max_dim 同预放大判据，或字节数 ≤ 单张准入
 /// native_limit_bytes = orig 预算/2），供 full 升级复用/像素探针/per-file
 /// 对比度重建三个消费者使用
+/// 旧签名包装（现仅测试调用；生产链路走 decode_image_orient）。
+#[cfg(test)]
 fn decode_image(
     source: &ImageSource,
     max_dim: u32,
@@ -961,22 +1033,47 @@ fn decode_image(
     sharpen: &SharpenCfg,
     native_limit_bytes: u64,
 ) -> Result<(Decoded, Option<image::DynamicImage>), String> {
+    // 无方向覆盖的默认入口（单测与 full 档旧调用形态）
+    decode_image_orient(source, max_dim, full, factor, name, sharpen, native_limit_bytes, None)
+        .map(|(d, n, _)| (d, n))
+}
+
+/// 方向参数化版本：orient_override = Some(u8 1-8) 时覆盖文件 EXIF 方向
+///（R 键旋转、不可写格式的会话内记忆路径），None = 读文件元数据。
+/// 返回值第三项 = 实际应用的 EXIF 方向值（静态图；动图恒 1），
+/// 供 ImageService 记录方向事实（R 键在此值上轮转）。
+fn decode_image_orient(
+    source: &ImageSource,
+    max_dim: u32,
+    full: bool,
+    factor: f64,
+    name: &str,
+    sharpen: &SharpenCfg,
+    native_limit_bytes: u64,
+    orient_override: Option<u8>,
+) -> Result<(Decoded, Option<image::DynamicImage>, u8), String> {
     match source {
         ImageSource::File(path) => {
             // 相机 RAW 拦截：with_guessed_format 对 ARW/NEF 探不出格式
             //（返回 None），须按扩展名先行拦截（方案 §4.3）。失败 fall
             // through 原路径——改名伪 raw 由 ImageReader 报错 → mpv 回退
             if is_raw_photo_ext(name) {
-                if let Ok(img) = decode_raw_preview_path(path) {
-                    tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes);
+                if let Ok((img, o)) = decode_raw_preview_path(path, orient_override) {
+                    tracing::debug!("RAW 预览 [{name}] {}x{} orient={o}", img.width(), img.height());
+                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)
+                        .map(|(d, n)| (d, n, o));
                 }
             }
+            // EXIF 方向（R 旋转覆盖优先；kamadak-exif 读文件头，畸形文件
+            // 静默回 1——方向缺失不影响解码主链路）
+            let orient = orient_override.unwrap_or_else(|| {
+                crate::meta::read_meta_path(path).map(|m| m.orientation).unwrap_or(1)
+            });
             let reader = image::ImageReader::open(path)
                 .map_err(|e| format!("打开图片失败: {e}"))?
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes)
+            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes, orient)
         }
         ImageSource::Stream(vfs, entry) => {
             let mut vf = vfs
@@ -988,15 +1085,20 @@ fn decode_image(
                 .map_err(|e| format!("读取压缩包条目失败: {e}"))?;
             // 同 File 分支：RAW 拦截（buf 已全量读入，from_bytes 直接解析）
             if is_raw_photo_ext(name) {
-                if let Ok(img) = decode_raw_preview(&buf) {
-                    tracing::debug!("RAW 预览 [{name}] {}x{}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes);
+                if let Ok((img, o)) = decode_raw_preview(&buf, orient_override) {
+                    tracing::debug!("RAW 预览 [{name}] {}x{} orient={o}", img.width(), img.height());
+                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)
+                        .map(|(d, n)| (d, n, o));
                 }
             }
+            // EXIF 方向：buf 已在内存，Cursor 头部解析零额外 IO
+            let orient = orient_override.unwrap_or_else(|| {
+                crate::meta::read_meta_bytes(&buf).map(|m| m.orientation).unwrap_or(1)
+            });
             let reader = image::ImageReader::new(std::io::Cursor::new(buf))
                 .with_guessed_format()
                 .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes)
+            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes, orient)
         }
     }
 }
@@ -1012,7 +1114,8 @@ fn decode_any<R: BufRead + Seek>(
     name: &str,
     sharpen: &SharpenCfg,
     native_limit_bytes: u64,
-) -> Result<(Decoded, Option<image::DynamicImage>), String> {
+    orient: u8,
+) -> Result<(Decoded, Option<image::DynamicImage>, u8), String> {
     let fmt = reader.format();
     // 日志用短名（压缩包条目路径不含目录）
     let base = std::path::Path::new(name)
@@ -1029,12 +1132,13 @@ fn decode_any<R: BufRead + Seek>(
             frames.len(),
             t.elapsed().as_millis()
         );
-        // 动图（含单帧）不保留原图：不做 full 升级，缓存白驻
+        // 动图（含单帧）不保留原图：不做 full 升级，缓存白驻。
+        // 动图无方向语义（帧序列已含变换），EXIF 方向不适用
         return Ok(if frames.len() == 1 {
             let (img, _) = frames.into_iter().next().expect("len==1");
-            (Decoded::Static(img), None)
+            (Decoded::Static(img), None, 1)
         } else {
-            (Decoded::Anim(frames), None)
+            (Decoded::Anim(frames), None, 1)
         });
     }
     let t = std::time::Instant::now();
@@ -1052,18 +1156,22 @@ fn decode_any<R: BufRead + Seek>(
                 frames.len(),
                 t.elapsed().as_millis()
             );
-            // 同 gif：动图（含单帧）不保留原图
+            // 同 gif：动图（含单帧）不保留原图；方向不适用
             return Ok(if frames.len() == 1 {
                 let (img, _) = frames.into_iter().next().expect("len==1");
-                (Decoded::Static(img), None)
+                (Decoded::Static(img), None, 1)
             } else {
-                (Decoded::Anim(frames), None)
+                (Decoded::Anim(frames), None, 1)
             });
         }
         image::DynamicImage::from_decoder(dec).map_err(|e| format!("解码图片失败: {e}"))?
     } else {
         reader.decode().map_err(|e| format!("解码图片失败: {e}"))?
     };
+    // EXIF 方向矫正（≤4096 像素级重排，被解码耗时掩盖）：手机横拍照片
+    // 依赖此步正立显示；R 键旋转覆盖与文件 tag 同走一个 T(o) 变换
+    //（PLAN_image_meta.md §5.A）
+    let img = crate::meta::apply_orientation(img, orient);
     // 两档尺寸适配（策略见 resample）：基础档 LRU 存 native×ppp（翻页
     // 即 100% 密度直出）；高清档 full 槽存 native×ppp×3（深放大用，
     // clamp 12288 + 像素预算）。factor 由 ImageService 按屏幕 DPI 定。
@@ -1076,14 +1184,14 @@ fn decode_any<R: BufRead + Seek>(
         unreachable!("finish_static 恒返回 Static")
     };
     tracing::debug!(
-        "解码 {fmt:?} [{base}] native_size={w}x{h} {}_size={}x{}{}: {}ms",
+        "解码 {fmt:?} [{base}] orient={orient} native_size={w}x{h} {}_size={}x{}{}: {}ms",
         if full { "full" } else { "lru" },
         out.size[0],
         out.size[1],
         if full { sharpen.tag() } else { "" },
         t.elapsed().as_millis()
     );
-    Ok((decoded, native))
+    Ok((decoded, native, orient))
 }
 
 /// 静态图共享尾部：可选降噪+锐化（config image.image_full_sharpen*，仅高清
@@ -1173,67 +1281,51 @@ fn is_raw_photo_ext(name: &str) -> bool {
 /// 相机 RAW 内嵌 JPEG 预览解码（内存源：zip/目录条目已全量读入）。
 /// raw-files 只解析文件结构（自带 64KiB 块缓存），读出相机内嵌的最大
 /// JPEG 预览再交 image 解码——成本与普通 jpg 同量级，LRU/高清档/
-/// 看门狗机制照常生效。识别/解码失败返回 Err，调用方 fall through
-fn decode_raw_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+/// 看门狗机制照常生效。识别/解码失败返回 Err，调用方 fall through。
+/// 返回 (矫正后位图, 实际应用的 EXIF 方向值)：R 键覆盖优先，否则用
+/// raw-files 读出的 Orientation（raw-files 变体与 EXIF 1-8 一一对应）
+fn decode_raw_preview(
+    bytes: &[u8],
+    orient_override: Option<u8>,
+) -> Result<(image::DynamicImage, u8), String> {
     let mut f = raw_files::RawFile::from_bytes(bytes).map_err(|e| format!("RAW 识别失败: {e}"))?;
     let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
     let jpeg = f
         .read_preview(&pv)
         .map_err(|e| format!("读预览失败: {e}"))?;
     let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
-    Ok(apply_orientation(img, pv.orientation()))
+    let o = orient_override.unwrap_or_else(|| raw_orient_u8(pv.orientation()));
+    Ok((crate::meta::apply_orientation(img, o), o))
 }
 
 /// 同 [`decode_raw_preview`]，文件源（7z/RAR 落盘缓存）：`RawFile::open`
 /// 的块缓存只读文件结构与预览所在块，优于全量读盘
-fn decode_raw_preview_path(path: &std::path::Path) -> Result<image::DynamicImage, String> {
+fn decode_raw_preview_path(
+    path: &std::path::Path,
+    orient_override: Option<u8>,
+) -> Result<(image::DynamicImage, u8), String> {
     let mut f = raw_files::RawFile::open(path).map_err(|e| format!("RAW 识别失败: {e}"))?;
     let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
     let jpeg = f
         .read_preview(&pv)
         .map_err(|e| format!("读预览失败: {e}"))?;
     let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
-    Ok(apply_orientation(img, pv.orientation()))
+    let o = orient_override.unwrap_or_else(|| raw_orient_u8(pv.orientation()));
+    Ok((crate::meta::apply_orientation(img, o), o))
 }
 
-/// EXIF 方向矫正：raw-files `Orientation`（EXIF 1-8，变体名与 image
-/// crate 一一对应）→ image crate 旋转/翻转。EXIF 恰定义 8 个值，
-/// 穷尽匹配无需兜底。镜像/180° 用 in_place 零分配；90/270 旋转需
-/// 重排行列返回新图；EXIF 5/7 = 旋转后左右镜像（主/反对角线转置）
-fn apply_orientation(img: image::DynamicImage, o: raw_files::Orientation) -> image::DynamicImage {
-    use image::imageops;
+/// raw-files `Orientation` → EXIF 1-8 数值（变体名与 image crate 一一对应）
+fn raw_orient_u8(o: raw_files::Orientation) -> u8 {
     use raw_files::Orientation as O;
     match o {
-        O::NoTransforms => img,
-        O::FlipHorizontal => {
-            let mut i = img;
-            imageops::flip_horizontal_in_place(&mut i);
-            i
-        }
-        O::Rotate180 => {
-            let mut i = img;
-            imageops::rotate180_in_place(&mut i);
-            i
-        }
-        O::FlipVertical => {
-            let mut i = img;
-            imageops::flip_vertical_in_place(&mut i);
-            i
-        }
-        // EXIF 5：顺时针 90° 后左右镜像（主对角线转置）。
-        // image 0.25 的 imageops 旋转/镜像自由函数返回 ImageBuffer
-        //（非 I），统一 to_rgba8 再包回 DynamicImage
-        O::Rotate90FlipH => image::DynamicImage::ImageRgba8(imageops::flip_horizontal(
-            &imageops::rotate90(&img.to_rgba8()),
-        )),
-        // EXIF 6：顺时针 90°
-        O::Rotate90 => image::DynamicImage::ImageRgba8(imageops::rotate90(&img.to_rgba8())),
-        // EXIF 7：顺时针 270° 后左右镜像（反对角线转置）
-        O::Rotate270FlipH => image::DynamicImage::ImageRgba8(imageops::flip_horizontal(
-            &imageops::rotate270(&img.to_rgba8()),
-        )),
-        // EXIF 8：顺时针 270°
-        O::Rotate270 => image::DynamicImage::ImageRgba8(imageops::rotate270(&img.to_rgba8())),
+        O::NoTransforms => 1,
+        O::FlipHorizontal => 2,
+        O::Rotate180 => 3,
+        O::FlipVertical => 4,
+        O::Rotate90FlipH => 5,
+        O::Rotate90 => 6,
+        O::Rotate270FlipH => 7,
+        O::Rotate270 => 8,
     }
 }
 
@@ -3401,6 +3493,7 @@ mod tests {
             hist,
             native: None,
             name: name.to_owned(),
+            orient: 1,
         });
         svc.poll();
     }
@@ -3569,58 +3662,12 @@ mod tests {
     fn decode_raw_preview_垃圾字节报错供fall_through() {
         // 改名伪 raw（内容非相机文件）→ 识别失败 Err → decode_image
         // 拦截分支 fall through 原路径（ImageReader 大概率也失败 → mpv 回退）
-        assert!(decode_raw_preview(b"definitely not a camera raw file").is_err());
-        assert!(decode_raw_preview(&[]).is_err());
+        assert!(decode_raw_preview(b"definitely not a camera raw file", None).is_err());
+        assert!(decode_raw_preview(&[], None).is_err());
     }
 
-    #[test]
-    fn apply_orientation_八个exif方向映射() {
-        use image::GenericImageView;
-        use raw_files::Orientation as O;
-        // 2×1 横条 [红|绿]：像素方位标识旋转/翻转方向
-        let mut strip = image::RgbaImage::new(2, 1);
-        strip.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
-        strip.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
-        let strip = image::DynamicImage::ImageRgba8(strip);
-        let red = image::Rgba([255, 0, 0, 255]);
-        let green = image::Rgba([0, 255, 0, 255]);
-
-        // EXIF 1：原样
-        assert_eq!(
-            apply_orientation(strip.clone(), O::NoTransforms).dimensions(),
-            (2, 1)
-        );
-        // EXIF 6：顺时针 90° → 1×2，红（左端）转到顶部
-        let r = apply_orientation(strip.clone(), O::Rotate90);
-        assert_eq!(r.dimensions(), (1, 2));
-        assert_eq!(r.get_pixel(0, 0), red);
-        assert_eq!(r.get_pixel(0, 1), green);
-        // EXIF 8：顺时针 270° → 1×2，红转到底部
-        let r = apply_orientation(strip.clone(), O::Rotate270);
-        assert_eq!(r.get_pixel(0, 0), green);
-        assert_eq!(r.get_pixel(0, 1), red);
-        // EXIF 2：左右镜像 → 红绿互换
-        let r = apply_orientation(strip.clone(), O::FlipHorizontal);
-        assert_eq!(r.get_pixel(0, 0), green);
-        assert_eq!(r.get_pixel(1, 0), red);
-        // EXIF 3：180°（高 1 的条上等同左右互换）→ 红绿互换
-        let r = apply_orientation(strip.clone(), O::Rotate180);
-        assert_eq!(r.get_pixel(0, 0), green);
-        // EXIF 4：上下镜像（高 1 无可见变化，验证尺寸与不炸）
-        assert_eq!(
-            apply_orientation(strip.clone(), O::FlipVertical).dimensions(),
-            (2, 1)
-        );
-        // EXIF 5/7：旋转 + 镜像 → 1×2 转置
-        assert_eq!(
-            apply_orientation(strip.clone(), O::Rotate90FlipH).dimensions(),
-            (1, 2)
-        );
-        assert_eq!(
-            apply_orientation(strip, O::Rotate270FlipH).dimensions(),
-            (1, 2)
-        );
-    }
+    // EXIF 方向 8 值映射测试已迁移 src/meta.rs（apply_orientation_八个exif方向映射
+    // + 与旋转映射自洽），此处不再重复
 
     #[test]
     fn finish_static_抽取后行为不变() {
@@ -3707,6 +3754,7 @@ mod tests {
             hist,
             native,
             name: name.to_owned(),
+            orient: 1,
         });
         svc.poll();
     }

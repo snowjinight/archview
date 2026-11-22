@@ -683,6 +683,150 @@ impl App {
             }
         }
     }
+
+    // ---- 选中集删除（仅目录模式，PLAN_image_meta.md §5F；右键菜单 /
+    // Ctrl+Delete 两入口。配合星级筛选：筛出不要的 → Ctrl+A 全选 → 删除） ----
+
+    /// 收集当前**选中集**为删除目标并弹确认窗。目录模式 + 选中非空才可达；
+    /// 下标排序保证确认窗与执行顺序确定。压缩包模式（无磁盘路径）不可达
+    pub(super) fn open_delete_confirm_for_selection(&mut self) {
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
+        if !a.path.is_dir() {
+            return;
+        }
+        let mut targets: Vec<usize> = self.selected.iter().copied().collect();
+        if targets.is_empty() {
+            self.set_notice("没有选中可删除的文件");
+            return;
+        }
+        targets.sort_unstable();
+        self.delete_confirm = Some(DeleteConfirm { targets });
+    }
+
+    /// 「删除选中」确认窗：列出数量/体积，按钮右对齐
+    ///（主操作「删除」最右、「取消」居左，见用户 UI 偏好）
+    pub(super) fn delete_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.delete_confirm.as_ref() else {
+            return;
+        };
+        let (n, total) = {
+            let a = self.archive.as_ref().unwrap();
+            let total: u64 = d.targets.iter().map(|&i| a.entries[i].size).sum();
+            (d.targets.len(), total)
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("删除选中")
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.label(format!(
+                    "将把 {} 个文件（共 {:.1} MB）移入系统回收站：",
+                    n,
+                    total as f64 / 1048576.0
+                ));
+                ui.weak("回收站中可还原");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // right_to_left：先声明的在右侧——「删除」主操作最右
+                        if ui.button("删除").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("取消").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            });
+        if confirmed {
+            self.delete_confirmed();
+        } else if cancelled {
+            self.delete_confirm = None;
+        }
+    }
+
+    /// 确认删除执行：逐条 trash::delete（回收站，失败逐条报错继续）→
+    /// 标记 a.deleted（下标稳定方案，见 ArchiveState.deleted 注释）→
+    /// 清评级/选择/锚点、失效图片缓存 → 若正显示被删条目则跳最近的
+    /// 存活条目 → 重建视图
+    fn delete_confirmed(&mut self) {
+        let Some(d) = self.delete_confirm.take() else {
+            return;
+        };
+        let mut errors = 0usize;
+        let mut deleted = 0usize;
+        // 先记当前播放项（删除后可能需要跳转）
+        let was_playing = self.playing;
+        let (dir, aid) = {
+            let a = self.archive.as_ref().unwrap();
+            (a.path.clone(), a.id)
+        };
+        for idx in &d.targets {
+            let name = self.archive.as_ref().unwrap().entries[*idx].name.clone();
+            // sidecar 随图删除（评级存储；不存在则静默跳过）
+            let sidecar = crate::meta::sidecar_path(&dir.join(&name));
+            if sidecar.exists() {
+                if let Err(e) = trash::delete(&sidecar) {
+                    tracing::warn!("sidecar 删除失败 {}: {e}", sidecar.display());
+                }
+            }
+            match trash::delete(dir.join(&name)) {
+                Ok(()) => {
+                    deleted += 1;
+                    let key = (aid, *idx);
+                    // 像素缓存失效（含 natives：文件已不存在，原图不再有效）
+                    self.img.invalidate_full(key);
+                    self.img_fallback.remove(&key);
+                    let a = self.archive.as_mut().unwrap();
+                    a.deleted.insert(*idx);
+                    a.ratings.remove(idx);
+                }
+                Err(e) => {
+                    errors += 1;
+                    tracing::warn!("删除失败 {}: {e}", name);
+                }
+            }
+        }
+        // 多选/锚点清掉被删项（残留下标会指向不可达条目）；块内结束 a 借用
+        let playing_gone = {
+            let a = self.archive.as_mut().unwrap();
+            self.selected.retain(|i| !a.deleted.contains(i));
+            self.select_anchor = self.select_anchor.filter(|i| !a.deleted.contains(i));
+            self.last_focus = self.last_focus.filter(|i| !a.deleted.contains(i));
+            was_playing.is_some_and(|p| a.deleted.contains(&p))
+        };
+        self.rebuild_view();
+        // 正在看的图被删：跳筛选后最近的一个存活条目（向后优先，无则向前）
+        if playing_gone {
+            let p = was_playing.unwrap();
+            let next = self.archive.as_ref().unwrap().view.iter().find(|&&i| i > p)
+                .or_else(|| {
+                    self.archive.as_ref().unwrap().view.iter().rev().find(|&&i| i < p)
+                })
+                .copied();
+            match next {
+                Some(i) => self.play(i),
+                None => {
+                    self.playing = None;
+                    if let Some(pl) = &self.player {
+                        pl.stop();
+                    }
+                }
+            }
+        }
+        let msg = format!("已删除 {deleted} 个文件（进回收站）");
+        if errors > 0 {
+            self.set_err(format!("{msg}，{errors} 个失败（详见日志）"));
+        } else {
+            self.set_notice(msg);
+        }
+        tracing::info!("星级删除：{deleted} 成功 / {errors} 失败");
+    }
 }
 
 /// 「关于」下拉面板文案（顶栏「关于」按钮，panels.rs Popup 渲染）。
