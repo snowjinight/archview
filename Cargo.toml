@@ -59,7 +59,4 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_Graphics_OpenGL",
     "Win32_System_LibraryLoader",
-    # console.rs 父进程来源判定：进程快照 + 镜像名查询
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
 ]

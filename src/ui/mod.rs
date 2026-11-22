@@ -377,6 +377,13 @@ pub struct App {
     seen_archives: std::collections::HashSet<PathBuf>,
     // 内嵌 config.toml 编辑器（「配置 → 编辑」打开；None = 关闭）
     config_editor: Option<config_editor::ConfigEditor>,
+    // 运行日志窗口（F12 开关）：logsink 内存环形缓冲的界面展示
+    //（release 无控制台，这是 GUI 侧的日志出口，见 logsink.rs）
+    log_open: bool,
+    // 日志窗口收起态：只留右缘小标签（点击/F12 展开），不挡左侧文件列表
+    log_collapsed: bool,
+    // 日志窗口跟随底部滚动（默认开；手动上翻即看历史）
+    log_follow: bool,
     // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
     initial_open: Option<PathBuf>,
     // 单媒体文件入口（拖入/SendTo/命令行/「打开媒体文件」）的跳转目标文件名：
@@ -512,6 +519,9 @@ impl App {
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
             config_editor: None,
+            log_open: false,
+            log_collapsed: false,
+            log_follow: true,
             initial_open: initial,
             pending_focus: None,
             selected: Default::default(),
@@ -587,6 +597,9 @@ impl App {
             next_archive_prompt: None,
             seen_archives: std::collections::HashSet::new(),
             config_editor: None,
+            log_open: false,
+            log_collapsed: false,
+            log_follow: true,
             initial_open: None,
             pending_focus: None,
             selected: Default::default(),
@@ -823,6 +836,9 @@ impl eframe::App for App {
         // 内嵌 config.toml 编辑器窗口（「配置 → 编辑」）
         self.config_editor_window(&ctx);
         probe!("config_editor");
+        // 运行日志窗口（F12 开关；环形缓冲展示 + 落盘文件直达）
+        self.log_window(&ctx);
+        probe!("log_window");
         // 「编码为视频…」确认窗 + 后台编码任务轮询（§15.5 UI 执行）
         self.encode_dialog_window(&ctx);
         probe!("encode_dialog");

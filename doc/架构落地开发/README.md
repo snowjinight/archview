@@ -29,7 +29,7 @@
 | [§12 多图对比视图专项](12_多图对比视图专项.md) | 多图对比视图（2~6 栏同步缩放）：方案 A 几何纯函数 / RawFrameService 线程模型 / source_ready 防污染闸门 / 三处防播放劫持守卫 / egui 0.36 差异 / 像素探针（orig-lru 单槽→LRU→字节预算制双护栏 `image_orig_cache_mb`；raw 栏按格式读存储原值走 rawprobe 直读磁盘）/ 对比 full 重采样使能默认关 | [ARCHITECTURE §16](../架构设计/16_多图对比视图.md) |
 | [§13 空闲CPU全事件驱动专项](13_空闲CPU全事件驱动专项.md) | 空闲/暂停/对比静置 CPU 趋近 0：全局心跳删除、open/extract/mpv 泵线程补 send 后唤醒、幻灯片精确排帧、对比落地 landed 缓存（消每帧 fs::metadata）、暂停逐帧图标闪烁根因（mpv frame-step pause 往返推送 → flags=1 seek 语义）与方向键长按连发排帧 | [ARCHITECTURE §13.2 / §5.5](../架构设计/13_渲染架构迁移.md) |
 | [§14 直方图专项](14_直方图专项.md) | Ctrl+H 图片直方图：软解旁路方案取舍（否决显示改道）/ 位深全量程压缩到 0-255 / 非凸轮廓三角带 Mesh / Color32 预乘还原 | [ARCHITECTURE §6.5](../架构设计/06_图片预览模块.md) |
-| [§15 控制台窗口显隐与ANSI颜色专项](15_控制台窗口显隐与ANSI颜色专项.md) | console 子系统黑框运行时隐藏（启动来源判定：父进程镜像 + CARGO 环境）+ F12 全局调出 + VT Processing 开启治 ANSI 乱码 | src/console.rs · [ARCHITECTURE §7](../架构设计/07_配置文件设计.md) |
+| [§15 日志与控制台子系统专项](15_控制台窗口显隐与ANSI颜色专项.md) | release 切 windows 子系统彻底无黑框（旧：console 子系统运行时隐藏，父进程判定有 PID 复用竞态）+ logsink 日志管线（600 行环形缓冲 F12 界面面板 + 5s/64KB 定时落盘 archview.log + 4MB 轮转）+ CLI Attach/AllocConsole 接入 + VT Processing 治 ANSI 乱码 | src/console.rs · src/logsink.rs · [ARCHITECTURE §7](../架构设计/07_配置文件设计.md) |
 | [§16 图片高清档密度重构专项](16_图片高清档密度重构专项.md) | full 档密度 ×ppp×2→×3 + 预算制（12288/100MP）/ orig-lru 免二次解码（单槽起步，后 LRU 化见 §12）/ fast_image_resize SIMD / 锐化默认关+前移 / 观感增强链 YUV 域重构 + Y·增强量 dump；预算 clamp 取整 floor 教训 | [ARCHITECTURE §13.4 / §6.3](../架构设计/13_渲染架构迁移.md) |
 
 ## 维护约定（强制）

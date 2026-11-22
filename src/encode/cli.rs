@@ -52,7 +52,9 @@ const USAGE: &str = r#"archview encode — 帧序列 dump → 视频（libmpv �
 // 控制台输出 / 弹窗（vartidy 同款自实现副本）
 // ============================================================
 
-/// CLI 输出：GUI 子系统 exe 从终端启动无控制台——附加父进程控制台经 CONOUT$ 直写
+/// CLI 输出：GUI 子系统 exe 从终端启动无控制台——附加父进程控制台经 CONOUT$ 直写；
+/// 附加失败（「发送到」/双击，父进程无控制台）→ AllocConsole 自分配一个
+/// （恢复 console 子系统时代的进度黑窗体验，进程退出自动关闭）
 struct Out {
     con: Option<std::fs::File>,
     had_console: bool,
@@ -73,7 +75,8 @@ impl Out {
             }
             let attached = windows_sys::Win32::System::Console::AttachConsole(
                 windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
-            ) != 0;
+            ) != 0
+                || windows_sys::Win32::System::Console::AllocConsole() != 0;
             let con = if attached {
                 std::fs::File::create("CONOUT$").ok()
             } else {

@@ -784,7 +784,8 @@ archview tidy — var 资源包增量整理（架构与规则见 doc/架构设�
 （仓库目录在 config.toml 的 vartidy.repo_dir 配置，无需命令行参数）";
 
 /// CLI 输出：GUI 子系统 exe 从终端启动无控制台——附加父进程控制台经 CONOUT$ 直写；
-/// 「发送到」/双击启动（附加失败）→ 输出全走报告文件，结束时弹窗汇总
+/// 附加失败（「发送到」/双击，父进程无控制台）→ AllocConsole 自分配一个
+/// （恢复 console 子系统时代的黑窗体验，进程退出自动关闭），报告仍落文件
 struct Out {
     con: Option<std::fs::File>,
     had_console: bool,
@@ -802,7 +803,8 @@ impl Out {
             }
             let attached = windows_sys::Win32::System::Console::AttachConsole(
                 windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
-            ) != 0;
+            ) != 0
+                || windows_sys::Win32::System::Console::AllocConsole() != 0;
             let con = if attached {
                 std::fs::File::create("CONOUT$").ok()
             } else {

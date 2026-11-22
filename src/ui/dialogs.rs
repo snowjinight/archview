@@ -1,10 +1,88 @@
-//! 弹窗：压缩包密码输入（加密头/内容加密两阶段）与「下一个压缩包」选择
+//! 弹窗：运行日志（F12，logsink 环形缓冲展示）、压缩包密码输入
+//!（加密头/内容加密两阶段）与「下一个压缩包」选择
 //!（本包末项后翻 / N 键主动触发共用）。
 
 use super::*;
 use crate::encode::cli;
 
 impl App {
+    /// 运行日志窗口（F12 开关，nav.rs 接线）：展示 logsink 内存环形缓冲
+    /// （最近 600 行，无 ANSI 色）。完整历史落盘 archview.log（exe 同目录），
+    /// 「用记事本打开」直达。跟随底部滚动默认开，手动上翻即冻结自动跟随
+    pub(super) fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_open {
+            return;
+        }
+        // 收起态：右缘中部小标签，点击展开——贴边不占内容区，不挡左侧文件列表
+        if self.log_collapsed {
+            let mut expand = false;
+            egui::Area::new(egui::Id::new("log_tab"))
+                .anchor(egui::Align2::RIGHT_CENTER, [-4.0, 0.0])
+                .show(ctx, |ui| {
+                    expand = ui.button("日志 ▶").clicked();
+                });
+            if expand {
+                self.log_collapsed = false;
+            }
+            return;
+        }
+        let lines = crate::logsink::snapshot();
+        let path = crate::logsink::file_path();
+        let mut open = self.log_open;
+        let follow = &mut self.log_follow;
+        let collapsed = &mut self.log_collapsed;
+        // 全宽贴底停靠：fixed_rect 把窗口钉死在视口（同宽、下缘对齐、
+        // 高约 38%），不可拖动/缩放，与底部控制栏同一坐标基准，视觉上
+        // 像内嵌面板而不是浮动窗
+        let scr = ctx
+            .input(|i| i.raw.screen_rect)
+            .unwrap_or(egui::Rect::NOTHING);
+        let h = (scr.height() * 0.38).clamp(220.0, 560.0);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(scr.left(), scr.bottom() - h),
+            egui::pos2(scr.right(), scr.bottom()),
+        );
+        egui::Window::new("运行日志 (F12)")
+            .open(&mut open)
+            .collapsible(false)
+            .fixed_rect(rect)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(follow, "跟随底部");
+                    if ui.button("复制全部").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                    if ui.button("用记事本打开日志文件").clicked() {
+                        if let Some(p) = &path {
+                            let _ = std::process::Command::new("notepad.exe").arg(p).spawn();
+                        }
+                    }
+                    if ui.button("清屏").clicked() {
+                        // 仅清界面视图：文件与 pending 增量不动（日志事实不丢）
+                        crate::logsink::clear_view();
+                    }
+                    // 收起为右缘小标签（egui 自带折叠按钮已禁用——它会把
+                    // 窗口缩成左缘标题条挡住文件列表）
+                    if ui.button("收起 ▶").clicked() {
+                        *collapsed = true;
+                    }
+                });
+                ui.separator();
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(*follow)
+                    .show_rows(ui, row_h, lines.len(), |ui, range| {
+                        for i in range {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(&lines[i]).monospace(),
+                            ));
+                        }
+                    });
+            });
+        self.log_open = open;
+    }
+
     /// 密码输入弹窗（加密头=打开阶段 / 加密条目=播放阶段）。窗口视口居中
     pub(super) fn password_dialog(&mut self, ctx: &egui::Context) {
         let Some(p) = self.pw_prompt.as_mut() else {

@@ -1,13 +1,21 @@
 //! 压缩包媒体预览播放器 — Phase 1 MVP
 //! ZIP 流式播放 + egui 列表/搜索 + 进度条 seek。
 
+// release 用 windows 子系统：不分配控制台，日志走 logsink（环形缓冲 +
+// archview.log 落盘 + F12 界面面板）；CLI 子命令的控制台接入见 console.rs
+// 模块文档。debug 保持 console 子系统，cargo run 终端直接可见日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod cache;
-// Windows 控制台管理：VT 颜色开启、启动来源判定、显隐切换（F12 可调回）
+// Windows 控制台工具：VT 颜色开启、致命错误弹窗（debug 无隐藏逻辑——
+// release 直接不分配控制台）
 mod config;
 mod console;
 // encode 引擎（dump 序列→视频）+ CLI 壳：UI 壳尚未接入（多选/右键/确认窗）
 mod encode;
 mod imgview;
+// 日志管线：内存环形缓冲（F12 面板）+ 后台线程定时落盘 archview.log
+mod logsink;
 mod player;
 // raw 裸数据媒体层：预设校验 / Bayer 探测 / 软解帧提取（mpv 播放与对比视图两路消费）
 mod rawdec;
@@ -16,6 +24,8 @@ mod search;
 mod ui;
 mod vartidy;
 mod vfs;
+
+use tracing_subscriber::prelude::*;
 
 fn main() -> eframe::Result<()> {
     // ANSI 颜色：tracing 默认无条件输出转义序列，legacy conhost 需先开
@@ -38,23 +48,18 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
 
-    // 控制台显隐策略：exe 是 console 子系统，Windows 必分配黑框。
-    // 从终端启动（cmd/powershell/…/cargo run）→ 保留，用户想看日志；
-    // 双击/资源管理器/sendto/拖拽 → 隐藏，GUI 用户不需要黑框。
-    // 隐藏后日志仍写入控制台缓冲区，F12 随时调出/收回（ui/nav.rs）。
-    // 放在 config 加载前：黑框在窗口创建前就消失，不闪屏
-    if !console::launched_from_terminal() {
-        console::set_visible(false);
-    }
-
     // config 需在 tracing 初始化前加载（日志级别来自配置）——此时日志管线
-    // 尚未建立，失败信息走 eprintln 兜底
+    // 尚未建立，失败信息走弹窗（windows 子系统下 eprintln/panic 不可见）
     let cfg = match config::Config::load_or_create() {
         Ok(c) => c,
-        // 解析失败即 panic（用户要求）：但先打明确原因——
+        // 解析失败即 panic（用户要求）：但先弹明确原因——
         // TOML 错误带行列号，常见于字符串没加双引号、反斜杠没双写等转义问题
         Err(e) => {
             eprintln!("config.toml 加载失败: {e}");
+            console::fatal_msgbox(
+                "配置加载失败",
+                &format!("config.toml 加载失败:\n{e}\n\n（TOML：字符串必须双引号；路径写正斜杠 D:/dir 或双反斜杠 D:\\\\dir）"),
+            );
             panic!("配置加载失败: {e}");
         }
     };
@@ -69,7 +74,29 @@ fn main() -> eframe::Result<()> {
         .or_else(|| Some(cfg.log_level.clone()))
         .and_then(|s| tracing_subscriber::EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    // 日志出口（windows 子系统无控制台）：logsink 层（环形缓冲供 F12 面板 +
+    // 定时落盘 archview.log）为主出口，纯文本无 ANSI；debug 构建追加 stderr
+    // 层（console 子系统，cargo run 终端彩色直显）
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("archview.log")))
+        .unwrap_or_else(|| "archview.log".into());
+    let sink = logsink::LogSink::start(log_path.clone());
+    let registry = tracing_subscriber::registry()
+        .with(log_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(logsink::SinkWriter(sink)),
+        );
+    #[cfg(debug_assertions)]
+    let registry = registry.with(tracing_subscriber::fmt::layer());
+    registry.init();
+    tracing::info!(
+        "archview v{} 启动，日志文件: {}",
+        env!("CARGO_PKG_VERSION"),
+        log_path.display()
+    );
     if let Err(e) = player::mpv_ffi::init(&cfg.dll_path()) {
         // mpv 不可用时仍可浏览列表，播放功能在 UI 内提示错误
         tracing::error!("{e}");
@@ -86,7 +113,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             // 高度 900：快捷键帮助面板约需 860pt（41 行 × 20pt + 顶栏锚点），
             // 800 会把面板底缘裁掉两三行；多留余量容纳后续新增键位
-            .with_inner_size([1280.0, 900.0])
+            .with_inner_size([1280.0, 850.0])
             .with_title("Archive Media Player")
             .with_icon(icon),
         ..Default::default()

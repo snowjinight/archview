@@ -27,12 +27,23 @@ impl App {
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // F12 = 控制台窗口显隐切换（诊断性质，任何模态/焦点下都可用）。
-        // 双击/资源管理器启动时控制台被隐藏（console.rs），日志仍在
-        // 写入缓冲区，需要排查时按 F12 调出。必须先于一切早退分支
+        // F12 = 运行日志面板开关（诊断性质，任何模态/焦点下都可用）。
+        // release 无控制台（windows 子系统），日志走 logsink 环形缓冲 +
+        // archview.log 落盘；面板展示环形缓冲最近若干行。必须先于一切早退分支。
+        // 三态循环：关闭 → 展开 → （收起态）→ 展开；展开时按 = 关闭。
+        // 级别用 debug：面板开关属于交互噪声，info 档会刷屏
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
-            let shown = crate::console::toggle();
-            tracing::info!("控制台窗口: {}", if shown { "显示" } else { "隐藏" });
+            if self.log_open && self.log_collapsed {
+                self.log_collapsed = false;
+            } else {
+                self.log_open = !self.log_open;
+                self.log_collapsed = false;
+            }
+            tracing::debug!(
+                "日志面板: open={} collapsed={}",
+                self.log_open,
+                self.log_collapsed
+            );
         }
 
         // 模态/失焦 = 长按连发状态不可信，直接清除（None 时空转无害）：
