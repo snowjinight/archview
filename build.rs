@@ -16,12 +16,19 @@ fn main() {
         return;
     };
     // exe 资源图标（资源管理器/快捷方式显示），仅 Windows 目标；窗口/任务栏图标在 main.rs 运行时设置
+    // id 1 = 应用图标；id 2/3/4 = 图片/视频/压缩包类图标（install.bat 的 DefaultIcon 按 ,2/,3/,4 引用）
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-changed=assets/icons/image.ico");
+    println!("cargo:rerun-if-changed=assets/icons/video.ico");
+    println!("cargo:rerun-if-changed=assets/icons/archive.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
             .set_icon("assets/icon.ico")
+            .set_icon_with_id("assets/icons/image.ico", "2")
+            .set_icon_with_id("assets/icons/video.ico", "3")
+            .set_icon_with_id("assets/icons/archive.ico", "4")
             .compile()
-            .expect("嵌入 assets/icon.ico 失败");
+            .expect("嵌入 exe 资源图标失败");
     }
     if src.exists() {
         let dst = target_dir.join("libmpv-2.dll");

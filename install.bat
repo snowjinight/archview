@@ -39,17 +39,22 @@ powershell -NoProfile -Command ^
 rem ==== 2. File associations ============================================
 rem ProgID: who we are + how to open. OpenWithProgids: add us to each
 rem extension's "Open with" list without touching the default app.
+rem DefaultIcon "exe",N: N is a ZERO-BASED index over the exe's icon
+rem resources in resource-ID order (build.rs ids 1..4):
+rem   index 0 = app, 1 = image, 2 = video, 3 = archive
+rem (verified by ExtractIconEx on the built exe; ",N" inside quotes is
+rem legacy notation, "exe",N outside quotes is the canonical form)
 
 reg add "HKCU\Software\Classes\Archview.Archive" /ve /d "Archview Archive" /f >nul
-reg add "HKCU\Software\Classes\Archview.Archive\DefaultIcon" /ve /d "\"%EXE_PATH%,0\"" /f >nul
+reg add "HKCU\Software\Classes\Archview.Archive\DefaultIcon" /ve /d "\"%EXE_PATH%\",3" /f >nul
 reg add "HKCU\Software\Classes\Archview.Archive\shell\open\command" /ve /d "\"%EXE_PATH%\" \"%%1\"" /f >nul
 
 reg add "HKCU\Software\Classes\Archview.Video" /ve /d "Archview Video" /f >nul
-reg add "HKCU\Software\Classes\Archview.Video\DefaultIcon" /ve /d "\"%EXE_PATH%,0\"" /f >nul
+reg add "HKCU\Software\Classes\Archview.Video\DefaultIcon" /ve /d "\"%EXE_PATH%\",2" /f >nul
 reg add "HKCU\Software\Classes\Archview.Video\shell\open\command" /ve /d "\"%EXE_PATH%\" \"%%1\"" /f >nul
 
 reg add "HKCU\Software\Classes\Archview.Image" /ve /d "Archview Image" /f >nul
-reg add "HKCU\Software\Classes\Archview.Image\DefaultIcon" /ve /d "\"%EXE_PATH%,0\"" /f >nul
+reg add "HKCU\Software\Classes\Archview.Image\DefaultIcon" /ve /d "\"%EXE_PATH%\",1" /f >nul
 reg add "HKCU\Software\Classes\Archview.Image\shell\open\command" /ve /d "\"%EXE_PATH%\" \"%%1\"" /f >nul
 
 rem Archives: zip / 7z / rar (VFS supported set)
@@ -62,6 +67,12 @@ for %%e in (jpg jpeg png gif webp bmp tif tiff arw nef nrw srf sr2 arq) do call 
 
 reg query "HKCU\Software\Classes\Archview.Archive\shell\open\command" >nul 2>&1
 if errorlevel 1 goto :fail
+
+rem Tell the shell that association icons changed so Explorer re-reads them
+rem without a manual icon-cache rebuild / reboot.
+powershell -NoProfile -Command ^
+  "Add-Type -Namespace Win32 -Name Shell -MemberDefinition '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int wEventId, int uFlags, IntPtr dwItem1, IntPtr dwItem2);';" ^
+  "[Win32.Shell]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)"
 
 echo [OK] Install finished for: "%EXE_PATH%"
 echo.
