@@ -190,7 +190,7 @@ type RatingProbeBatch = Vec<(usize, PathBuf, String)>;
 /// 句柄丢弃，迟到结果天然不串包）
 struct RatingProbeJob {
     tx: std::sync::mpsc::Sender<RatingProbeBatch>,
-    rx: std::sync::mpsc::Receiver<Vec<(usize, u8)>>,
+    rx: std::sync::mpsc::Receiver<Vec<(usize, Option<u8>)>>,
 }
 
 /// 探测窗口 = 可见行数 × 此倍数（可见 ± 1 个视口行，总窗 ≈ 3×视口）。
@@ -502,7 +502,7 @@ pub struct App {
     /// 剩余未探测项（insert-noop 天然只入新项）；压缩包模式为空
     rating_image_idx: Vec<usize>,
     /// 已入队未收回的探测条数：星级筛选门控（==0 才让筛选谓词生效）+
-    /// 下拉"扫描中…"后缀的依据
+    /// 顶栏"评级扫描中… N%"标记的依据（panels.rs top_bar）
     rating_inflight: usize,
     /// 星级筛选（图片标签页筛选条）：None=全部；Some(0)=未评；
     /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）

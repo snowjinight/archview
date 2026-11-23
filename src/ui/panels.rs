@@ -335,6 +335,23 @@ impl App {
                     format!("后台解压中…（剩余 {left} 项）"),
                 );
             }
+            // 评级按需探测扫描中（inflight>0）：顶栏短标记 + 百分比。
+            // 已完成 = 已入队（位图标记数）- 在途（inflight），基数 = 打开时
+            // 登记的图片条目总数；归零即消失。仅扫描期每帧 O(图片数) 计数
+            //（worker 回传驱动重绘，10k 条目布尔读开销可忽略），平时零开销
+            if self.rating_inflight > 0 && !self.rating_image_idx.is_empty() {
+                let marked = self
+                    .rating_image_idx
+                    .iter()
+                    .filter(|&i| self.rating_probed[*i])
+                    .count();
+                let done = marked.saturating_sub(self.rating_inflight);
+                let pct = done * 100 / self.rating_image_idx.len();
+                ui.colored_label(
+                    ui.visuals().weak_text_color(),
+                    format!("评级扫描中… {pct}%"),
+                );
+            }
             // 锚点落地即可点（无需等整批解完）：秒开锚点，预取批继续后台跑
             if self.extract_ready {
                 if let Some(f) = self.last_focus {
@@ -677,19 +694,11 @@ impl App {
                     .find(|(v, _)| *v == self.rating_filter)
                     .map(|(_, l)| *l)
                     .unwrap_or("全部");
-                // 探测未收齐时加宽并缀"扫描中…"（按需探测：筛选谓词等
-                // 全量事实就绪才生效，poll_rating_probe 归零后重建视图）
-                let scanning = self.rating_inflight > 0;
                 egui::ComboBox::from_id_salt("rating_filter")
                     // 显式收窄：egui 默认宽 = interact_size.x×3 ≈ 120px，
-                    // 内容最长仅两字（"全部"/"≥5"），40px 即可；扫描中
-                    // 后缀长，动态放宽避免截断
-                    .width(if scanning { 130.0 } else { 40.0 })
-                    .selected_text(if scanning {
-                        format!("{cur_label}（扫描中…）")
-                    } else {
-                        cur_label.to_string()
-                    })
+                    // 内容最长仅两字（"全部"/"≥5"），40px 即可
+                    .width(40.0)
+                    .selected_text(cur_label)
                     .show_ui(ui, |ui| {
                         for (v, label) in opts {
                             ui.selectable_value(&mut self.rating_filter, v, label);

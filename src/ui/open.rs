@@ -4,16 +4,15 @@ use super::*;
 
 /// 探测一批条目的评级（纯函数，单测覆盖）：分格式真相矩阵读取（嵌入式
 /// 头部 ≤512KB / sidecar .xmp，meta::read_rating 内部按 rating_kind 分流），
-/// 名单外格式（目录行/非图片，rating_kind None）直接跳过不读盘；只回传
-/// 有评级的项（ratings 表只存有星条目，未评级=None 不占行）
-fn probe_batch(batch: RatingProbeBatch) -> Vec<(usize, u8)> {
-    let mut out = Vec::new();
-    for (idx, p, name) in batch {
-        if let Some(r) = crate::meta::read_rating(&p, &name) {
-            out.push((idx, r));
-        }
-    }
-    out
+/// 名单外格式（目录行/非图片，rating_kind None）直接跳过不读盘。**全长回传**
+/// （每项 Option<u8>，含 None）：poll 按回传长度扣 inflight，入队时按整批
+/// 累加——若只回传有评级项，部分评级批会永久漏账（inflight 收不回零，
+/// "扫描中"永不消失，实测踩中）；ratings 表只存有星条目（None 不占行）
+fn probe_batch(batch: RatingProbeBatch) -> Vec<(usize, Option<u8>)> {
+    batch
+        .into_iter()
+        .map(|(idx, p, name)| (idx, crate::meta::read_rating(&p, &name)))
+        .collect()
 }
 
 impl App {
@@ -385,12 +384,12 @@ impl App {
                 .name("ratingprobe".into())
                 .spawn(move || {
                     // 常驻：cmd_rx 断连（UI 端换包 drop job）即退出；逐批
-                    // 处理，每批回传一条（可能为空——poll 按批长计账）。
-                    // 有结果即唤醒 UI（空闲全事件驱动：结果不靠下一次
-                    // 用户事件才显示）
+                    // 处理，每批回传一条（与命令批等长——poll 按批长计账，
+                    // 空批也发）。有结果即唤醒 UI（空闲全事件驱动：结果不靠
+                    // 下一次用户事件才显示）
                     for batch in cmd_rx {
                         let out = probe_batch(batch);
-                        if !out.is_empty() {
+                        if out.iter().any(|(_, r)| r.is_some()) {
                             egui_ctx.request_repaint();
                         }
                         let _ = tx.send(out);
@@ -496,6 +495,16 @@ impl App {
             return;
         }
         self.rating_inflight += batch.len();
+        // debug 探针（config log_level=debug 可见）：入队 idx 区间 + 批量 +
+        // 在途计数——排查计账闭环/窗口覆盖的观测点（idx 非连续属正常，
+        // 视图行映射的是图片条目下标，目录行/视频条目穿插其间）
+        tracing::debug!(
+            "评级探测入队 [{}..{}] {} 项（在途 {}）",
+            batch.first().map(|(i, _, _)| *i).unwrap_or_default(),
+            batch.last().map(|(i, _, _)| *i).unwrap_or_default(),
+            batch.len(),
+            self.rating_inflight,
+        );
         let _ = job.tx.send(batch);
     }
 
@@ -540,12 +549,20 @@ impl App {
                 break;
             };
             got = true;
+            // 回传与命令批等长（含 None），按长度扣减计账精确归零
             self.rating_inflight = self.rating_inflight.saturating_sub(results.len());
+            tracing::debug!(
+                "评级探测收回 {} 项（在途 {}）",
+                results.len(),
+                self.rating_inflight
+            );
             let Some(a) = self.archive.as_mut() else {
                 break;
             };
             for (idx, r) in results {
-                a.ratings.entry(idx).or_insert(r);
+                if let Some(r) = r {
+                    a.ratings.entry(idx).or_insert(r);
+                }
             }
         }
         if got && self.rating_inflight == 0 && self.rating_filter.is_some() {
@@ -691,8 +708,10 @@ mod tests {
     use super::probe_batch;
 
     /// probe_batch 矩阵分流：嵌入式（jpg 签名 + 属性式 Rating）命中 /
-    /// sidecar（bmp + .xmp）命中 / 名单外格式（txt）跳过 / 未评级 None 不占行。
-    /// 独立 pid 临时目录（并行测试竞态惯例：禁共享目录 whole-dir 清理互删）
+    /// sidecar（bmp + .xmp）命中 / 名单外格式（txt）跳过零读盘 / 未评级与
+    /// 缺失文件 None。**全长回传断言**（out.len()==batch.len()，计账按批长
+    /// 精确扣减的前提）。独立 pid 临时目录（并行测试竞态惯例：禁共享目录
+    /// whole-dir 清理互删）
     #[test]
     fn probe_batch_矩阵分流与名单外跳过() {
         let dir = std::env::temp_dir().join(format!("archview_probe_batch_{}", std::process::id()));
@@ -709,7 +728,7 @@ mod tests {
         std::fs::write(dir.join("p.xmp"), "<xmp:Rating>2</xmp:Rating>").unwrap();
         // 名单外：txt 即使含 Rating 文本也不读（rating_kind None 零读盘语义）
         std::fs::write(dir.join("n.txt"), b"<xmp:Rating>5</xmp:Rating>").unwrap();
-        // 未评级 jpg：签名合法但无标记 → None 不入结果
+        // 未评级 jpg：签名合法但无标记 → None（占位回传，计账用）
         std::fs::write(dir.join("u.jpg"), b"\xff\xd8\xff\xe0plain").unwrap();
 
         let batch: Vec<(usize, std::path::PathBuf, String)> = [
@@ -724,7 +743,11 @@ mod tests {
         .collect();
         let out = probe_batch(batch);
 
-        assert_eq!(out, vec![(0, 4), (1, 2)]);
+        // 全长：5 进 5 出（含 None）——计账闭环断言；有值项只有前两个
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], (0, Some(4)));
+        assert_eq!(out[1], (1, Some(2)));
+        assert!(out[2..].iter().all(|(_, r)| r.is_none()));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
