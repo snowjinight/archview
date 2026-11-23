@@ -2260,15 +2260,15 @@ impl App {
         );
     }
 
-    /// 像素探针绘制（单图媒体区 / 对比栏共用）：十字标记 + 悬浮信息文字。
+    /// 像素探针绘制（单图媒体区 / 对比栏共用）：小十字光标 + 悬浮信息文字。
     /// 像素值按栏类型取真实值：图像栏读 orig-lru（`ImageService::original_pixel`
     /// 非显示纹理插值）；raw 栏读 rawdec 按需读源的**存储原值**（未位移
     /// 未插值，帧游标/取样点变化即重取，在途显示"读取中…"）。
     /// pane_key = **当前绘制栏**的 key——跨栏同步时各栏用同一个 uv 各取
     /// 各的原图像素（发起栏的 probe.key 只提供 uv，不提供读数来源）。
-    /// 文字全透明背景，颜色按取样亮度自动黑白，叠反色 1px 阴影兜底（悬浮
-    /// 点附近背景可能与取样点亮度不同）。锚定点右下偏移 12px，超界折回
-    /// 左/上。clip = 裁剪区（媒体区或栏）
+    /// 文字固定白字 + 黑色 8 向包边（不探测背景亮度——任何背景都可读），
+    /// 锚定探针右下 10px 尽量贴近，超界折回左/上。clip = 裁剪区（媒体区
+    /// 或栏）
     fn paint_probe(
         &self,
         ui: &egui::Ui,
@@ -2280,113 +2280,96 @@ impl App {
     ) {
         let pos = rect.min + probe.uv * rect.size();
         let painter = ui.painter_at(clip);
-        // 十字标记：圆圈 + 四段短线（不遮取样点中心）
-        let stroke = egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.9));
-        painter.circle_stroke(pos, 6.0, stroke);
-        painter.line_segment(
-            [pos - egui::vec2(11.0, 0.0), pos - egui::vec2(6.0, 0.0)],
-            stroke,
-        );
-        painter.line_segment(
-            [pos + egui::vec2(6.0, 0.0), pos + egui::vec2(11.0, 0.0)],
-            stroke,
-        );
-        painter.line_segment(
-            [pos - egui::vec2(0.0, 11.0), pos - egui::vec2(0.0, 6.0)],
-            stroke,
-        );
-        painter.line_segment(
-            [pos + egui::vec2(0.0, 6.0), pos + egui::vec2(0.0, 11.0)],
-            stroke,
-        );
+        // 小十字光标：过点小十字（臂长 9px，不贯穿整栏避免"分割图片"观感）；
+        // 黑衬底 + 白线保证任意背景可见
+        let under = egui::Stroke::new(2.5, egui::Color32::BLACK.gamma_multiply(0.7));
+        let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE.gamma_multiply(0.95));
+        let arm = 9.0;
+        for s in [under, stroke] {
+            painter.line_segment(
+                [egui::pos2(pos.x - arm, pos.y), egui::pos2(pos.x + arm, pos.y)],
+                s,
+            );
+            painter.line_segment(
+                [egui::pos2(pos.x, pos.y - arm), egui::pos2(pos.x, pos.y + arm)],
+                s,
+            );
+        }
         // 信息文字按栏类型分流：图像栏 = 原图坐标 + RGB + YUV（BT.601）；
         // raw 栏 = 存储原值按格式分流（NV12/YUV420→YUV / GRAY→亮度 /
         // RGB24→RGB / BAYER→2×2）
-        let (text, dark_bg) = match target {
+        let text = match target {
             PaneKind::Raw(info) => {
                 let (w, h) = (info.w.max(1) as f32, info.h.max(1) as f32);
                 let x = ((probe.uv.x * w) as u32).min(info.w.saturating_sub(1));
                 let y = ((probe.uv.y * h) as u32).min(info.h.saturating_sub(1));
-                let lum_ok =
-                    |v: u32, bits: u32| (if bits <= 8 { v } else { v >> (bits - 8) }) >= 128;
                 match self
                     .rawdec
                     .probe(pane_key)
                     .and_then(|e| e.res.as_ref().cloned())
                 {
-                    Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => (
-                        format!("[{x}, {y}]  4:2:0\nY({yv}) U({u}) V({v})"),
-                        u32::from(yv) * 299 + u32::from(u) * 587 + u32::from(v) * 114 >= 128_000,
-                    ),
-                    Some(Ok(rawdec::RawProbe::Rgb { r, g, b })) => (
-                        format!("[{x}, {y}]  RGB888\nR({r}) G({g}) B({b})"),
-                        u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 >= 128_000,
-                    ),
-                    Some(Ok(rawdec::RawProbe::Gray { v, bits })) => (
-                        format!("[{x}, {y}]  {bits}bit\nGRAY({v})"),
-                        lum_ok(u32::from(v), bits),
-                    ),
+                    Some(Ok(rawdec::RawProbe::Nv12 { y: yv, u, v })) => {
+                        format!("[{x}, {y}]  4:2:0\nY({yv}) U({u}) V({v})")
+                    }
+                    Some(Ok(rawdec::RawProbe::Rgb { r, g, b })) => {
+                        format!("[{x}, {y}]  RGB888\nR({r}) G({g}) B({b})")
+                    }
+                    Some(Ok(rawdec::RawProbe::Gray { v, bits })) => {
+                        format!("[{x}, {y}]  {bits}bit\nGRAY({v})")
+                    }
                     Some(Ok(rawdec::RawProbe::Bayer {
                         layout,
                         block,
                         bits,
-                    })) => {
-                        // 取样点亮度按其在 2×2 块内的位置取
-                        let v = block[(y & 1) as usize][(x & 1) as usize];
-                        (
-                            format!(
-                                "[{x}, {y}]  {layout} {bits}bit\n[{} {}]\n[{} {}]",
-                                block[0][0], block[0][1], block[1][0], block[1][1]
-                            ),
-                            lum_ok(u32::from(v), bits),
-                        )
-                    }
-                    Some(Err(e)) => (format!("探针失败：{e}"), false),
-                    None => ("读取中…".to_string(), false),
+                    })) => format!(
+                        "[{x}, {y}]  {layout} {bits}bit\n[{} {}]\n[{} {}]",
+                        block[0][0],
+                        block[0][1],
+                        block[1][0],
+                        block[1][1]
+                    ),
+                    Some(Err(e)) => format!("探针失败：{e}"),
+                    None => "读取中…".to_string(),
                 }
             }
             _ => match self.img.original_pixel(pane_key, probe.uv) {
                 Some(((x, y), rgb)) => {
                     let (ty, tu, tv) = yuv_from_rgb(rgb);
-                    (
-                        // 三行紧凑：坐标 / RGB / YUV（BT.601）
-                        format!(
-                            "[{x}, {y}]\nR({}) G({}) B({})\nY({ty}) U({tu}) V({tv})",
-                            rgb[0], rgb[1], rgb[2]
-                        ),
-                        // 取样像素亮度 ≥128 → 背景偏白用黑字
-                        u32::from(rgb[0]) * 299 + u32::from(rgb[1]) * 587 + u32::from(rgb[2]) * 114
-                            >= 128_000,
+                    // 三行紧凑：坐标 / RGB / YUV（BT.601）
+                    format!(
+                        "[{x}, {y}]\nR({}) G({}) B({})\nY({ty}) U({tu}) V({tv})",
+                        rgb[0], rgb[1], rgb[2]
                     )
                 }
-                None => ("原图未保留".to_string(), false),
+                None => "原图未保留".to_string(),
             },
         };
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let color = if dark_bg {
-            egui::Color32::BLACK
-        } else {
-            egui::Color32::WHITE
-        };
-        let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
-        let shadow = painter.layout_no_wrap(
-            text,
-            font,
-            if dark_bg {
-                egui::Color32::WHITE.gamma_multiply(0.5)
-            } else {
-                egui::Color32::BLACK.gamma_multiply(0.5)
-            },
-        );
-        let mut anchor = pos + egui::vec2(14.0, 14.0);
+        let galley =
+            painter.layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE);
+        let mut anchor = pos + egui::vec2(10.0, 10.0);
         if anchor.x + galley.size().x > clip.right() {
-            anchor.x = (pos.x - 14.0 - galley.size().x).max(clip.left() + 2.0);
+            anchor.x = (pos.x - 10.0 - galley.size().x).max(clip.left() + 2.0);
         }
         if anchor.y + galley.size().y > clip.bottom() {
-            anchor.y = (pos.y - 14.0 - galley.size().y).max(clip.top() + 2.0);
+            anchor.y = (pos.y - 10.0 - galley.size().y).max(clip.top() + 2.0);
         }
-        painter.galley(anchor + egui::vec2(1.0, 1.0), shadow, color);
-        painter.galley(anchor, galley, color);
+        // 黑色 8 向包边（±1px）：白字任何背景可读，无需探测底色
+        let outline =
+            painter.layout_no_wrap(text, font, egui::Color32::BLACK.gamma_multiply(0.8));
+        for (dx, dy) in [
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (0.0, -1.0),
+            (0.0, 1.0),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, 1.0),
+        ] {
+            painter.galley(anchor + egui::vec2(dx, dy), outline.clone(), egui::Color32::BLACK);
+        }
+        painter.galley(anchor, galley, egui::Color32::WHITE);
     }
 
     /// 锚点缩放：保持锚点下的图像点不动（锚点 rel 相对视口中心）。

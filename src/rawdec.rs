@@ -566,6 +566,9 @@ struct RawFrameDone {
     idx: usize,
     contrast: i32,
     res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
+    /// bayer_auto16le 预解析结果（同 RawProbeDone.resolved：探针与帧解码
+    /// 共用同一份 per-key 缓存）
+    resolved: Option<String>,
 }
 
 /// raw 探针读数（各内建格式各自的"真实值"，全部为**文件存储原值**——
@@ -595,6 +598,9 @@ struct RawProbeDone {
     idx: usize,
     uv: egui::Vec2,
     res: Result<RawProbe, String>,
+    /// bayer_auto16le 预解析结果（resolved pixfmt）：首请求解析后 UI 线程
+    /// 按 key 缓存，后续探针/帧解码直接复用不再重跑整帧探测
+    resolved: Option<String>,
 }
 
 enum RawMsg {
@@ -617,6 +623,11 @@ pub(crate) struct RawFrameService {
     /// 语义——帧游标或取样点变化由 UI 重发（request_probe 幂等），读源
     /// 直接按字节偏移取所需几个字节，无解码成本
     probes: HashMap<ImgKey, ProbeEntry>,
+    /// 已解析的 bayer_auto16le 排列（key → 落定 pixfmt）：解析 = 整帧读 +
+    /// 全图统计（24MP 16bit 一帧 48MB），排列只依赖数据内容整包不变——
+    /// 不缓存则每次探针点击 / 每帧解码都重跑一遍（多栏对比一次点击 ×N 份）。
+    /// 探针与帧解码两条链共用；retain 随窗口清理
+    resolved: HashMap<ImgKey, String>,
     ctx: egui::Context,
 }
 
@@ -637,6 +648,7 @@ impl RawFrameService {
             frames: HashMap::new(),
             errs: HashMap::new(),
             probes: HashMap::new(),
+            resolved: HashMap::new(),
             ctx,
         }
     }
@@ -664,29 +676,44 @@ impl RawFrameService {
         }
         self.pending.insert((key, fi, contrast), Instant::now());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        let (source, info) = (source.clone(), info.clone());
+        let mut info = info.clone();
+        // 排列缓存命中：pixfmt 落定 + auto_bayer 清位，worker 直接按已解
+        // 析格式解码（resolve_info_bayer 见 auto_bayer=false 即直通）
+        if let Some(name) = self.resolved.get(&key) {
+            info.pixfmt = name.clone();
+            info.auto_bayer = false;
+        }
+        let source = source.clone();
         std::thread::Builder::new()
             .name("rawdec".into())
             .spawn(move || {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // 直方图顺手算（O(像素)，被解码耗时掩盖；与 imgview 解码
-                    // worker 同款先例）：contrast LUT 先落显示像素、直方图统计
-                    // LUT 后像素，与纹理同源
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // bayer_auto16le 首请求：先整帧探测排列（resolved 随消息
+                    // 回传供 UI 缓存），后续帧解码命中缓存零探测成本
+                    let resolved = resolve_info_bayer(&source, &mut info)?;
                     decode_raw_frame(&source, &info, fi).map(|(mut img, native)| {
+                        // 直方图顺手算（O(像素)，被解码耗时掩盖；与 imgview 解码
+                        // worker 同款先例）：contrast LUT 先落显示像素、直方图统计
+                        // LUT 后像素，与纹理同源
                         if let Some(l) = crate::imgview::contrast_lut(contrast) {
                             crate::imgview::apply_contrast(&mut img, &l);
                         }
                         let hist = Histogram::compute(&img);
                         (img, native, hist)
-                    })
+                    }).map(|v| (v, resolved))
                 }))
                 .map_err(|_| "raw 帧解码线程 panic".to_string())
                 .and_then(|r| r);
+                let (res, resolved) = match out {
+                    Ok((v, r)) => (Ok(v), r),
+                    Err(e) => (Err(e), None),
+                };
                 let _ = tx.send(RawMsg::Frame(RawFrameDone {
                     key,
                     idx: fi,
                     contrast,
                     res,
+                    resolved,
                 }));
                 ctx.request_repaint();
             })
@@ -720,20 +747,32 @@ impl RawFrameService {
             },
         );
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        let (source, info) = (source.clone(), info.clone());
+        let mut info = info.clone();
+        // 排列缓存命中：pixfmt 落定 + auto_bayer 清位（同 request 帧解码链）
+        if let Some(name) = self.resolved.get(&key) {
+            info.pixfmt = name.clone();
+            info.auto_bayer = false;
+        }
+        let source = source.clone();
         std::thread::Builder::new()
             .name("rawprobe".into())
             .spawn(move || {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    probe_raw_pixel(&source, &info, fi, uv)
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let resolved = resolve_info_bayer(&source, &mut info)?;
+                    probe_raw_pixel(&source, &info, fi, uv).map(|p| (p, resolved))
                 }))
                 .map_err(|_| "raw 探针线程 panic".to_string())
                 .and_then(|r| r);
+                let (res, resolved) = match out {
+                    Ok((v, r)) => (Ok(v), r),
+                    Err(e) => (Err(e), None),
+                };
                 let _ = tx.send(RawMsg::Probe(RawProbeDone {
                     key,
                     idx: fi,
                     uv,
                     res,
+                    resolved,
                 }));
                 ctx.request_repaint();
             })
@@ -752,6 +791,11 @@ impl RawFrameService {
             match m {
                 RawMsg::Frame(m) => {
                     self.pending.remove(&(m.key, m.idx, m.contrast));
+                    // 首请求的排列解析结果入缓存（帧解码失败排列仍有效——
+                    // 探测成功即数据可辨，失败多半是别的原因）
+                    if let Some(name) = m.resolved {
+                        self.resolved.insert(m.key, name);
+                    }
                     match m.res {
                         Ok((img, _native, hist)) => {
                             let tex = self.ctx.load_texture(
@@ -776,6 +820,9 @@ impl RawFrameService {
                     }
                 }
                 RawMsg::Probe(m) => {
+                    if let Some(name) = m.resolved {
+                        self.resolved.insert(m.key, name);
+                    }
                     // 只收当前请求的 (帧号, 点)：UI 已换请求后迟到的结果丢弃
                     if let Some(e) = self.probes.get_mut(&m.key) {
                         if e.idx == m.idx && e.uv == m.uv {
@@ -812,6 +859,7 @@ impl RawFrameService {
         self.errs.retain(|k, _| keys.contains(k));
         self.pending.retain(|(k, _, _), _| keys.contains(k));
         self.probes.retain(|k, _| keys.contains(k));
+        self.resolved.retain(|k, _| keys.contains(k));
     }
 }
 
@@ -1182,6 +1230,28 @@ fn probe_raw_pixel(
             rl.pixfmt
         )),
     }
+}
+
+/// worker 侧 bayer_auto16le 预解析：读首帧探测排列并改写 info（pixfmt
+/// 落定 + auto_bayer 清位），解析结果随消息回传供 UI 线程按 key 缓存。
+/// 非 auto 伪格式（含缓存命中已落定的）直通 None——bayer 排列只依赖
+/// 数据内容整包不变，缓存后探针点击/帧解码零探测成本
+fn resolve_info_bayer(
+    source: &ImageSource,
+    info: &mut RawFrameInfo,
+) -> Result<Option<String>, String> {
+    use std::io::{Seek, SeekFrom};
+    if !info.auto_bayer {
+        return Ok(None);
+    }
+    let mut r = open_frame_reader(source)?;
+    r.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek 失败: {e}"))?;
+    let mut rl = info.to_raw_load();
+    resolve_auto_bayer(&mut rl, &mut r);
+    info.pixfmt = rl.pixfmt.clone();
+    info.auto_bayer = false;
+    Ok(Some(info.pixfmt.clone()))
 }
 
 #[cfg(test)]
