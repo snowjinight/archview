@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn history_roundtrip() {
         // 用 cargo test 的临时目录，不碰真实 config 位置
-        let dir = std::env::temp_dir().join("archview_history_test");
+        let dir = std::env::temp_dir().join(format!("archview_history_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("search_history.toml");
         let _ = std::fs::remove_file(&path);

@@ -479,7 +479,7 @@ mod tests {
     /// write/read_sidecar_rating 往返 + r=0 清除（真实临时文件）
     #[test]
     fn sidecar_写入读取清除往返() {
-        let dir = std::env::temp_dir().join("archview_meta_test");
+        let dir = std::env::temp_dir().join(format!("archview_meta_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("t1.jpg");
         let side = sidecar_path(&img);
@@ -520,7 +520,7 @@ mod tests {
     /// write_orientation(3) 读回（二次写回覆盖既有 EXIF——PNG 走
     /// eXIf 替换分支）→ 解码验证 → 返回终值
     fn 写回往返诊断(ext: &str, fmt: image::ImageFormat) -> Option<u8> {
-        let dir = std::env::temp_dir().join("archview_meta_test_diag");
+        let dir = std::env::temp_dir().join(format!("archview_meta_test_diag_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("t_diag.{ext}"));
         let _ = std::fs::remove_file(&path);

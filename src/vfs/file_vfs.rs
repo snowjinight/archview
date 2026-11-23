@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn 单文件vfs_文件不存在报错() {
-        let p = std::env::temp_dir().join("file_vfs_missing_definitely.bin");
+        let p = std::env::temp_dir().join(format!("file_vfs_missing_definitely_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&p);
         assert!(SingleFileVFS::open(p).is_err());
     }

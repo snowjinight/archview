@@ -613,7 +613,10 @@ impl RarVFS {
             Some(p) => Archive::with_password(&self.path, p),
             None => Archive::new(&self.path),
         };
-        let tmp = super::tmp_path(&std::env::temp_dir().join("archview_pw_probe.tmp"));
+        let tmp = super::tmp_path(
+            &std::env::temp_dir()
+                .join(format!("archview_pw_probe_{}.tmp", std::process::id())),
+        );
         let mut open = arch.open_for_processing().map_err(|e| {
             VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display()))
         })?;
@@ -658,46 +661,23 @@ impl RarVFS {
 mod tests {
     use super::*;
 
-    /// RAR 压缩是专有格式（无开源编码器），测试需借助 WinRAR 的 rar.exe：
-    /// 探测 ARCHVIEW_TEST_RAR 环境变量 → Program Files 标准位置，找不到则跳过。
-    /// 注：解压运行时用 unrar crate（内置编译），与 rar.exe 无关。
-    fn rar_exe() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("ARCHVIEW_TEST_RAR") {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                return Some(pb);
-            }
-        }
-        for base in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Ok(pf) = std::env::var(base) {
-                let p = PathBuf::from(pf).join("WinRAR").join("rar.exe");
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-        }
-        None
+    /// RAR 夹具由 cargo run --bin smoke_setup 预生成于 smoke/rar/
+    /// （WinRAR rar.exe 造包，payload 与断言逐字节一致），缺失即 panic
+    /// 禁止静默跳过（src/smoke.rs）。解压产物落本测试独立 scratch 目录，
+    /// 不写夹具目录。注：解压运行时用 unrar crate（内置编译），与 rar.exe 无关。
+
+    /// 每测试独立 scratch 目录（pid 隔离，防并行抢占）
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rar_test_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
     fn list_and_extract() {
-        let Some(rar) = rar_exe() else {
-            eprintln!("跳过：未找到 WinRAR rar.exe（可设 ARCHVIEW_TEST_RAR 指定）");
-            return;
-        };
-        let dir = std::env::temp_dir().join(format!("rar_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let payload = dir.join("a.bin");
-        std::fs::write(&payload, vec![9u8; 50_000]).unwrap();
-        let arch = dir.join("test.rar");
-        let st = std::process::Command::new(&rar)
-            .arg("a") // 添加
-            .arg("-ep") // 不存路径（用 -ep 加子目录路径前缀手动拼）
-            .arg(&arch)
-            .arg(&payload)
-            .output()
-            .unwrap();
-        assert!(st.status.success(), "rar.exe 打包失败");
+        let arch = crate::smoke::require("rar/test.rar");
+        let dir = scratch("single");
 
         let vfs = RarVFS::open(&arch, None).unwrap();
         let entries = vfs.list();
@@ -719,44 +699,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 造包：3 × 30KB 不同填充字节的文件（f0=7, f1=8, f2=9，解出可校验）。
-    /// solid=true 加 -s（主头 ROADF_SOLID）；rar 默认（无 -s）即非固态。
-    /// 返回 (包路径, 临时目录)
-    fn make_rar(tag: &str, solid: bool) -> Option<(PathBuf, PathBuf)> {
-        let rar = rar_exe()?;
-        let dir =
-            std::env::temp_dir().join(format!("rar_mode_test_{}_{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let arch = dir.join(if solid { "solid.rar" } else { "plain.rar" });
-        let mut cmd = std::process::Command::new(&rar);
-        cmd.arg("a").arg("-ep"); // 包名必须紧跟命令，文件列表在后
-        if solid {
-            cmd.arg("-s");
-        }
-        cmd.arg(&arch);
-        for (i, fill) in [7u8, 8, 9].into_iter().enumerate() {
-            let p = dir.join(format!("f{i}.bin"));
-            std::fs::write(&p, vec![fill; 30_000]).unwrap();
-            cmd.arg(&p);
-        }
-        let st = cmd.output().unwrap();
-        assert!(
-            st.status.success(),
-            "rar.exe 打包失败: {}",
-            String::from_utf8_lossy(&st.stderr)
-        );
-        Some((arch, dir))
-    }
-
     /// 非固态 RAR（rar 默认）→ AccessMode::SingleFile：随机访问只解点击项，
     /// 无上游免费区（skip 是廉价头跳转，整前缀预取等于白白解码）。中间条目
     /// 直接解压成功 = 真随机访问语义（不等价于顺序流定位）
     #[test]
     fn non_solid_rar_routes_single_file() {
-        let Some((arch, dir)) = make_rar("ns", false) else {
-            eprintln!("跳过：未找到 WinRAR rar.exe（可设 ARCHVIEW_TEST_RAR 指定）");
-            return;
-        };
+        let arch = crate::smoke::require("rar/plain.rar");
+        let dir = scratch("non_solid");
         let vfs = RarVFS::open(&arch, None).unwrap();
         assert_eq!(
             vfs.access_mode(),
@@ -790,10 +739,8 @@ mod tests {
     /// 头尾两目标（skip 非目标、顺带解目标）
     #[test]
     fn solid_rar_routes_solid_and_batch_extracts() {
-        let Some((arch, dir)) = make_rar("so", true) else {
-            eprintln!("跳过：未找到 WinRAR rar.exe（可设 ARCHVIEW_TEST_RAR 指定）");
-            return;
-        };
+        let arch = crate::smoke::require("rar/solid.rar");
+        let dir = scratch("solid");
         let vfs = RarVFS::open(&arch, None).unwrap();
         assert_eq!(vfs.access_mode(), AccessMode::Solid, "-s 打包应判为固态");
         assert_eq!(

@@ -1114,12 +1114,9 @@ mod tests {
 
     #[test]
     fn webp_animated_动画为是() {
-        // 夹具同 imgview::decode_动画webp逐帧：testdata/anim2.webp（ffmpeg
-        // libwebp 2 帧动画，生成命令见该测试注释），缺失时跳过
-        let Ok(bytes) = std::fs::read("testdata/anim2.webp") else {
-            eprintln!("跳过：testdata/anim2.webp 不存在（生成命令见 imgview 测试注释）");
-            return;
-        };
+        // 夹具同 imgview::decode_动画webp逐帧：smoke/img/anim2.webp（ffmpeg
+        // libwebp 2 帧动画，cargo run --bin smoke_setup 生成），缺失即 panic
+        let bytes = std::fs::read(crate::smoke::require("img/anim2.webp")).unwrap();
         let dir = std::env::temp_dir().join(format!("archview_cmptest_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("anim2.webp");

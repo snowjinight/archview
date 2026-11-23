@@ -629,54 +629,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- 引擎 e2e（需 libmpv-2.dll + ffmpeg，缺任一则跳过；模式同
-    //      player::tests 的 e2e_rawvideo_dump_with_demux_opts）----
+    // ---- 引擎 e2e（需 smoke/encode_e2e 夹具 libmpv-2.dll，缺失即 panic；
+    //      模式同 player::tests 的 e2e_rawvideo_dump_with_demux_opts）----
 
-    fn find_mpv_dll_dir() -> Option<PathBuf> {
-        let mut cands: Vec<PathBuf> = vec![];
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(d) = exe.parent() {
-                cands.push(d.to_path_buf());
-                if let Some(dd) = d.parent() {
-                    cands.push(dd.to_path_buf());
-                }
-            }
-        }
-        if let Ok(m) = std::env::var("CARGO_MANIFEST_DIR") {
-            for prof in ["debug", "release"] {
-                cands.push(PathBuf::from(&m).join("target").join(prof));
-            }
-        }
-        cands.into_iter().find(|d| d.join("libmpv-2.dll").exists())
-    }
-
-    /// ffprobe 探测（rar_vfs::rar_exe 同款三级模式）：
-    /// PATH → ARCHVIEW_TEST_FFMPEG 环境变量 → 本机固定目录。
-    /// 返回 exe 完整路径（调用处不再裸用 "ffprobe"，防 PATH 无工具时静默跳过）
+    /// ffprobe 可选探测：smoke/env.toml [tools] 登记（smoke_setup 写入），
+    /// 缺则软降级跳过精确帧数断言（核心链路已由 mpv 回读覆盖）
     fn ffprobe_exe() -> Option<PathBuf> {
-        if std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return Some(PathBuf::from("ffprobe"));
-        }
-        if let Ok(p) = std::env::var("ARCHVIEW_TEST_FFMPEG") {
-            let pb = PathBuf::from(p);
-            // 环境变量给目录或 ffprobe.exe 完整路径均可
-            let cand = if pb.extension().is_some() {
-                pb
-            } else {
-                pb.join("ffprobe.exe")
-            };
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-        // 本机固定位置（换机时设 ARCHVIEW_TEST_FFMPEG 或改这里）
-        let local = PathBuf::from(r"D:\11_software\ffprobe.exe");
-        local.exists().then_some(local)
+        crate::smoke::tool("ffprobe")
     }
 
     /// nv12 dump 序列（分 2 个文件）→ 编码 → 第二个 mpv 实例回读输出验证
@@ -685,10 +644,7 @@ mod tests {
     /// 输出文件有效性
     #[test]
     fn e2e_encode_nv12_sequence() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
+        let dll_dir = crate::smoke::require_dll_dir("encode_e2e");
         // 造数据（纯 Rust，不依赖 ffmpeg）：64x48 nv12 每帧 4608B
         // （Y 平面 3072 + UV 平面 1536），每帧恒定亮度（帧号×25）、
         // 中性色度 128——内容只需确定性，rawvideo 编码不在乎语义

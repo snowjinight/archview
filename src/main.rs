@@ -20,6 +20,9 @@ mod meta;
 mod player;
 // raw 裸数据媒体层：预设校验 / Bayer 探测 / 软解帧提取（mpv 播放与对比视图两路消费）
 mod rawdec;
+// 冒烟测试夹具定位（#[cfg(test)]）：require 系列，夹具缺失即 panic 禁止静默跳过
+#[cfg(test)]
+mod smoke;
 // 高级搜索：语法引擎 + 搜索历史（AND/OR/NOT/短语/通配/分组）
 mod search;
 mod ui;

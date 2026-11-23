@@ -909,82 +909,18 @@ mod tests {
     //! 自动化端到端播放测试：无需 UI/人工，模拟真实用户播放。
     //! headless mpv（vo=null ao=null）+ cache=no（强制每次 seek 打到 VFS 层），
     //! 覆盖：mpv FFI 加载、zvf:// stream_cb open/read/seek/close、deflate seek 适配器。
-    //! 前置：libmpv-2.dll（build.rs 已复制到 target）+ ffmpeg 生成测试视频，缺任一则跳过。
+    //! 前置：smoke/player_e2e 夹具（libmpv-2.dll + clip.mp4 + test.zip，由
+    //! cargo run --bin smoke_setup 生成），缺失即 panic 禁止静默跳过
+    //! （src/smoke.rs::require）。
 
     use super::*;
     use crate::vfs::zip_vfs::ZipVFS;
     use crate::vfs::ArchiveVFS;
     use std::path::PathBuf;
 
-    /// 查找 libmpv-2.dll 所在目录：test exe 在 target\{debug,release}\deps\ 下，
-    /// dll 在上一级；也兼容直接 target\{debug,release}\ 与 CARGO_MANIFEST_DIR。
-    fn find_mpv_dll_dir() -> Option<PathBuf> {
-        let mut cands: Vec<PathBuf> = vec![];
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(d) = exe.parent() {
-                cands.push(d.to_path_buf());
-                if let Some(dd) = d.parent() {
-                    cands.push(dd.to_path_buf());
-                }
-            }
-        }
-        if let Ok(m) = std::env::var("CARGO_MANIFEST_DIR") {
-            for prof in ["debug", "release"] {
-                cands.push(PathBuf::from(&m).join("target").join(prof));
-            }
-        }
-        cands.into_iter().find(|d| d.join("libmpv-2.dll").exists())
-    }
-
-    /// ffmpeg 是否可用
-    fn have_ffmpeg() -> bool {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    /// 生成 3 秒测试视频并打进 deflate zip（两个 entry），返回 zip 路径
-    fn make_test_zip() -> Option<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("zvf_e2e_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
-        let mp4 = dir.join("clip.mp4");
-        // 3 秒 320x180 testsrc2，超快速编码
-        let st = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=duration=3:size=320x180:rate=15",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-pix_fmt",
-                "yuv420p",
-            ])
-            .arg(&mp4)
-            .output()
-            .ok()?;
-        if !st.status.success() {
-            eprintln!("ffmpeg 生成失败: {}", String::from_utf8_lossy(&st.stderr));
-            return None;
-        }
-        let data = std::fs::read(&mp4).ok()?;
-        let zip_path = dir.join("test.zip");
-        let f = std::fs::File::create(&zip_path).ok()?;
-        let mut w = zip::ZipWriter::new(f);
-        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        w.start_file("clip.mp4", opts).ok()?;
-        std::io::Write::write_all(&mut w, &data).ok()?;
-        // 第二个 entry：用于"播完后切换视频"场景
-        w.start_file("clip2.mp4", opts).ok()?;
-        std::io::Write::write_all(&mut w, &data).ok()?;
-        w.finish().ok()?;
-        Some(zip_path)
+    /// mpv e2e 夹具族目录（DLL/clip.mp4/test.zip 都在 smoke/player_e2e/）
+    fn mpv_fixture() -> PathBuf {
+        crate::smoke::require_dll_dir("player_e2e")
     }
 
     /// 轮询直到属性满足条件，超时返回 None
@@ -1011,18 +947,8 @@ mod tests {
     /// 端到端：zip 内 deflate 视频 → zvf:// 流 → headless mpv 播放 + 下游/上游 seek
     #[test]
     fn e2e_playback_with_seek_via_stream_cb() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
-        if !have_ffmpeg() {
-            eprintln!("跳过：未找到 ffmpeg");
-            return;
-        }
-        let Some(zip_path) = make_test_zip() else {
-            eprintln!("跳过：测试 zip 生成失败");
-            return;
-        };
+        let dll_dir = mpv_fixture();
+        let zip_path = crate::smoke::require("player_e2e/test.zip");
 
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
 
@@ -1151,51 +1077,56 @@ mod tests {
         );
 
         mpv_ffi::destroy(ctx);
-        let _ = std::fs::remove_dir_all(zip_path.parent().unwrap());
+        // zip_path 是 smoke/ 只读夹具，不清理其所在目录
         eprintln!("端到端播放+seek 测试通过 ✓");
     }
 
-    /// 端到端（raw dump）：ffmpeg 造 nv12 裸帧文件 → loadfile 第四参数下发
+    /// 端到端（raw dump）：纯 Rust 造 nv12 裸帧文件 → loadfile 第四参数下发
     /// rawvideo demuxer 选项（同 extract.rs raw_demux_opts 拼参格式）→
     /// 起播 / 时长=帧数÷fps / w·h 由选项解析 / 帧精确 seek；再装载一个
     /// 不存在的文件验证 END_FILE(ERROR) 事件与 error 级日志行可读——
-    /// §4.6 回显通道的素材链路。前置同上，缺则跳过。
+    /// §4.6 回显通道的素材链路。前置夹具同上（smoke/player_e2e）。
     /// 注意：不能用「非法选项值」触发——选项解析失败只发 START_FILE+
     /// 日志、不发 END_FILE（本 libmpv 实测）；UI 层 raw_demux_opts 已在
     /// 下发前校验 pixfmt，选项坏值路径到不了 mpv，真失败源是文件级错误
     #[test]
     fn e2e_rawvideo_dump_with_demux_opts() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
-        if !have_ffmpeg() {
-            eprintln!("跳过：未找到 ffmpeg");
-            return;
-        }
+        let dll_dir = mpv_fixture();
 
-        // 64x48 nv12，10 帧 @ 10fps（每帧 4608 B，共 46080 B，时长 1s）
+        // 64x48 nv12，10 帧 @ 10fps（每帧 4608 B，共 46080 B，时长 1s）。
+        // 纯 Rust 造：Y 平面随机字节（纳秒+pid 种子 LCG，每次运行数据不同，
+        // 断言不含内容只锚定尺寸/时长/seek），UV 平面固定 128（中性色度）
         let dir = std::env::temp_dir().join(format!("zvf_raw_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let nv12 = dir.join("t.nv12");
-        let st = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=duration=1:size=64x48:rate=10",
-                "-frames:v",
-                "10",
-                "-pix_fmt",
-                "nv12",
-                "-f",
-                "rawvideo",
-            ])
-            .arg(&nv12)
-            .output()
-            .unwrap();
-        assert!(st.status.success(), "ffmpeg 生成 nv12 失败");
+        {
+            let (w, h, frames) = (64usize, 48usize, 10usize);
+            let y_len = w * h;
+            let frame_len = y_len * 3 / 2;
+            let mut data = vec![0u8; frames * frame_len];
+            let mut seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos() as u64
+                ^ ((std::process::id() as u64) << 32)
+                | 1;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for f in 0..frames {
+                let y_start = f * frame_len;
+                for y in data[y_start..y_start + y_len].iter_mut() {
+                    *y = next() as u8;
+                }
+                for uv in data[y_start + y_len..y_start + frame_len].iter_mut() {
+                    *uv = 128;
+                }
+            }
+            std::fs::write(&nv12, &data).unwrap();
+        }
         // 尺寸自检：与 raw_demux_opts 的整除校验同口径（W·H·12bit/8）
         assert_eq!(
             std::fs::metadata(&nv12).unwrap().len(),
@@ -1308,42 +1239,16 @@ mod tests {
     }
 
     /// 端到端（慢路径）：7z 包内视频 → SevenzVFS 后台解压 → headless mpv 播本地文件 + seek。
-    /// 7z 测试包用 sevenz-rust writer 纯 Rust 自造，无需外部 7z.exe。
+    /// 7z 测试包用 sevenz-rust writer 纯 Rust 自造，无需外部 7z.exe；
+    /// 内嵌视频直接引用 smoke/player_e2e/clip.mp4 夹具（只读）
     #[test]
     fn e2e_playback_7z_extract_then_play() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
-        if !have_ffmpeg() {
-            eprintln!("跳过：未找到 ffmpeg");
-            return;
-        }
-
-        // 生成 3 秒测试视频
-        let dir = std::env::temp_dir().join(format!("zvf_7z_e2e_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mp4 = dir.join("clip.mp4");
-        let st = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=duration=3:size=320x180:rate=15",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-pix_fmt",
-                "yuv420p",
-            ])
-            .arg(&mp4)
-            .output()
-            .unwrap();
-        assert!(st.status.success(), "ffmpeg 生成失败");
+        let dll_dir = mpv_fixture();
+        let mp4 = crate::smoke::require("player_e2e/clip.mp4");
 
         // 纯 Rust 打 7z 包（LZMA2）
+        let dir = std::env::temp_dir().join(format!("zvf_7z_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let arch_path = dir.join("test.7z");
         let mut w = sevenz_rust::SevenZWriter::create(&arch_path).unwrap();
         let entry = sevenz_rust::SevenZArchiveEntry::from_path(&mp4, "movies/clip.mp4".into());
@@ -1405,10 +1310,7 @@ mod tests {
     /// 语义为准；真机 d3d11va + libmpv render 路径建议人工确认一次画面变化。
     #[test]
     fn e2e_gamma_property_available() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
+        let dll_dir = mpv_fixture();
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
         let ctx = mpv_ffi::create().unwrap();
         mpv_ffi::set_option_string(ctx, "terminal", "yes").unwrap();
@@ -1445,29 +1347,27 @@ mod tests {
         assert!((gamma_f64(ctx) + 30.0).abs() < 1e-6);
         mpv_ffi::set_property_string(ctx, "gamma", "0").unwrap();
 
-        // ④ 播放中运行时写入（ffmpeg 可用时走真实解码流）
-        if have_ffmpeg() {
-            if let Some(zip_path) = make_test_zip() {
-                let vfs = ZipVFS::open(&zip_path, None).unwrap();
-                let arc: std::sync::Arc<dyn crate::vfs::ArchiveVFS> =
-                    std::sync::Arc::new(vfs);
-                let (archive_id, _) =
-                    stream_cb::register_with_progress(arc, &zip_path, &|_, _| {});
-                mpv_ffi::stream_cb_add_ro(ctx, "zvf", std::ptr::null_mut(), stream_cb::open_cb)
-                    .expect("注册 zvf:// 失败");
-                let uri = stream_cb::entry_uri(archive_id, 0, 0);
-                mpv_ffi::command_string(ctx, &format!("loadfile {uri}")).expect("loadfile 失败");
-                wait_prop(ctx, "time-pos", |t| t > 0.2, 30).expect("未起播");
-                // core 忙碌中异步属性写入（UI 快捷键的实际调用路径）不报错；
-                // 异步写要等 core 空出手才应用，立即同步读会竞态——轮询等待
-                mpv_ffi::set_property_string_async(ctx, "gamma", "40")
-                    .expect("播放中 gamma 写入应成功");
-                assert!(
-                    wait_prop(ctx, "gamma", |g| (g - 40.0).abs() < 1e-6, 10).is_some(),
-                    "播放中异步写入应生效"
-                );
-                mpv_ffi::command_string(ctx, "stop").ok();
-            }
+        // ④ 播放中运行时写入（真实解码流）
+        {
+            let zip_path = crate::smoke::require("player_e2e/test.zip");
+            let vfs = ZipVFS::open(&zip_path, None).unwrap();
+            let arc: std::sync::Arc<dyn crate::vfs::ArchiveVFS> = std::sync::Arc::new(vfs);
+            let (archive_id, _) =
+                stream_cb::register_with_progress(arc, &zip_path, &|_, _| {});
+            mpv_ffi::stream_cb_add_ro(ctx, "zvf", std::ptr::null_mut(), stream_cb::open_cb)
+                .expect("注册 zvf:// 失败");
+            let uri = stream_cb::entry_uri(archive_id, 0, 0);
+            mpv_ffi::command_string(ctx, &format!("loadfile {uri}")).expect("loadfile 失败");
+            wait_prop(ctx, "time-pos", |t| t > 0.2, 30).expect("未起播");
+            // core 忙碌中异步属性写入（UI 快捷键的实际调用路径）不报错；
+            // 异步写要等 core 空出手才应用，立即同步读会竞态——轮询等待
+            mpv_ffi::set_property_string_async(ctx, "gamma", "40")
+                .expect("播放中 gamma 写入应成功");
+            assert!(
+                wait_prop(ctx, "gamma", |g| (g - 40.0).abs() < 1e-6, 10).is_some(),
+                "播放中异步写入应生效"
+            );
+            mpv_ffi::command_string(ctx, "stop").ok();
         }
 
         mpv_ffi::destroy(ctx);
@@ -1479,10 +1379,7 @@ mod tests {
     /// muted_cache 帧路径正确性依赖这两者
     #[test]
     fn ffi_observe_property() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
+        let dll_dir = mpv_fixture();
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
         let ctx = mpv_ffi::create().unwrap();
         mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
@@ -1544,28 +1441,10 @@ mod tests {
         assert!(recv_flag(b"pause", true), "cycle 后应收到 pause=true 推送");
 
         // 4) DOUBLE 订阅实证：播放中 time-pos 以 DOUBLE 推送且推进、duration
-        //    装载即推——钉死 MPV_FORMAT_DOUBLE=5 与 f64 解码（time_pos_cache/
-        //    duration_cache 帧路径正确性依赖此点）。无 ffmpeg 时跳过
-        if have_ffmpeg() {
-            let mp4 = std::env::temp_dir().join(format!("zvf_dbl_{}.mp4", std::process::id()));
-            let st = std::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "testsrc2=duration=3:size=320x180:rate=15",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-pix_fmt",
-                    "yuv420p",
-                ])
-                .arg(&mp4)
-                .output()
-                .unwrap();
-            assert!(st.status.success(), "ffmpeg 生成失败");
+        //    装载即推——钉死 MPV_FORMAT_DOUBLE=5 与 f64 解析（time_pos_cache/
+        //    duration_cache 帧路径正确性依赖此点）
+        {
+            let mp4 = crate::smoke::require("player_e2e/clip.mp4");
             // 3) 末尾把 pause 翻成了 true，先解除再起播（否则 time-pos 不推进）
             mpv_ffi::command_string(ctx, "no-osd cycle pause").unwrap();
             assert!(
@@ -1614,9 +1493,7 @@ mod tests {
                 recv_double(b"duration", &|v| v > 2.0 && v < 4.0).is_some(),
                 "装载后应收到 duration DOUBLE 推送（3s 视频）"
             );
-            let _ = std::fs::remove_file(&mp4);
-        } else {
-            eprintln!("跳过 DOUBLE 订阅段：无 ffmpeg");
+            // mp4 是 smoke/ 只读夹具，不删除
         }
 
         mpv_ffi::destroy(ctx);
@@ -1629,10 +1506,7 @@ mod tests {
     /// 写入走异步（set_prop_str_async）的底层依据
     #[test]
     fn ffi_set_property_async() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
+        let dll_dir = mpv_fixture();
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
         let ctx = mpv_ffi::create().unwrap();
         mpv_ffi::set_option_string(ctx, "vo", "null").unwrap();
@@ -1683,24 +1557,11 @@ mod tests {
     /// A zvf:// 冷启（生产链路）→ B file:/// 直读（绕过 zvf，隔离 mpv/lavf
     /// 对 webp 本身的处理）→ C zvf:// 切换（复现"上一个 webp 切下一个"）。
     /// 逐条打印 mpv 内部日志（带时间戳，level=v），到 PLAYBACK_RESTART
-    /// （首帧呈现）为止。前置：libmpv-2.dll + test_media\641.webp、1000.webp。
+    /// （首帧呈现）为止。前置：smoke/diag 夹具（641.webp、1000.webp，setup 生成）
     #[test]
     fn diag_webp_load_latency() {
-        let Some(dll_dir) = find_mpv_dll_dir() else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
-            return;
-        };
-        let Some(media_dir) = std::env::var("CARGO_MANIFEST_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .map(|m| m.join("test_media"))
-        else {
-            return;
-        };
-        if !media_dir.join("641.webp").exists() || !media_dir.join("1000.webp").exists() {
-            eprintln!("跳过：test_media 缺 641.webp / 1000.webp");
-            return;
-        }
+        let dll_dir = mpv_fixture();
+        let media_dir = crate::smoke::require("diag");
 
         mpv_ffi::init(&dll_dir).expect("加载 libmpv 失败");
 

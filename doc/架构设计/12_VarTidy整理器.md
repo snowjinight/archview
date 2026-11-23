@@ -101,8 +101,10 @@ AES coder 检测）。探测命中后带锁定密码执行，执行期不再换�
 选列表而非交互输入的原因：SendTo 无 stdin；N 个包批量逐个提示体验差；包密码来源固定（几个站点各一个），
 小列表即真实心智模型。密码仅用于解压，不写入日志与报告。
 
-**冒烟测试**：`test_tidy\setup.bat`（目录已 gitignore）一键全链路——构建 → `examples\make_smoke_fixtures`
-生成测试源（明文/AES zip/明文/内容加密 7z + 既有仓库）→ dry-run → 实际整理（含加密包打开期密码锁定）→ 幂等重跑。
+**冒烟测试**：`run_tests.bat` 第 3 段（夹具由第 1 段 `cargo run --bin smoke_setup`
+生成于 `smoke/vartidy/`，目录已 gitignore）——dry-run → 实际整理（含加密包打开期
+密码锁定）→ 幂等重跑，测试源为 6 个测试包（明文/AES zip/明文/内容加密 7z +
+特殊字符密码 + 既有仓库）。
 
 ### 12.6 配置（config.toml 新增节，代码零硬编码）
 
