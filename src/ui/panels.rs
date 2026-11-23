@@ -164,7 +164,6 @@ impl App {
                             ("PgUp / PgDn", "上一个 / 下一个（对比时整组一起翻）"),
                             ("鼠标滚轮（预览窗口内）", "上一个 / 下一个"),
                             ("N", "打开下一个压缩包"),
-                            ("B", "跳到最后播放的位置"),
                             ("回车", "全屏 / 退出全屏"),
                             ("Esc", "退出全屏"),
                             ("W / S", "显示对比度 ×1.25 / ×0.8（当前文件记忆）"),
@@ -193,6 +192,9 @@ impl App {
                             ("Home", "适应窗口"),
                             ("鼠标拖拽", "移动放大的图片"),
                             ("双击图片", "适应窗口 / 原始尺寸，来回切换"),
+                            ("R", "顺时针旋转 90°"),
+                            ("1 ~ 5", "图片评级（星级）"),
+                            ("Q", "清除评级"),
                         ],
                     ),
                     (
@@ -203,7 +205,6 @@ impl App {
                         &[
                             ("C", "开始对比：先按住 Ctrl 点选 2~6 张图片"),
                             ("← / →", "所有画面同步翻帧（多帧 RAW 对比时有效）"),
-                            ("B", "跳到最后播放的位置"),
                             ("0", "按原始尺寸显示（以最近点击的那格为准）"),
                             ("双击任意一格", "全部恢复适应窗口"),
                             ("2 ~ 6", "调整同时对比的张数"),
@@ -984,19 +985,17 @@ impl App {
                     egui::pos2(area.right(), area.bottom() - 4.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                    // 半透明底色：叠在列表上仍能透出底下内容
-                    let bg = ui.visuals().window_fill;
-                    let fill = egui::Color32::from_rgba_premultiplied(bg.r(), bg.g(), bg.b(), 190);
+                    // 背景全透明：不遮列表内容（叠加层视觉纯文字按钮）
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         if ui
                             .add(
-                                egui::Button::new("回到锚点")
-                                    .fill(fill)
+                                egui::Button::new("跳至解压处")
+                                    .fill(egui::Color32::TRANSPARENT)
                                     .corner_radius(6)
                                     .min_size(egui::vec2(0.0, 40.0)),
                             )
                             .on_hover_text(format!(
-                                "回到解压锚点：{entry_name}（快捷键 B）。已落地则秒开，\
+                                "跳至解压处：{entry_name}（快捷键 B）。已落地则秒开，\
                                  未落地则跳回等待、落地自动播放"
                             ))
                             .clicked()
