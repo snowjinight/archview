@@ -157,6 +157,50 @@ enum EncodeMsg {
     Failed(String),
 }
 
+/// 评级同步任务（延迟批量写落盘）：worker 线程逐项写 meta::write_rating，
+/// mpsc 回报单项结果/终态。手动同步（右键菜单「同步评级到文件」）与
+/// 退出自动保存共用；同时仅一个（start_rating_sync 防重入门控）
+struct RatingSyncJob {
+    rx: std::sync::mpsc::Receiver<RatingSyncMsg>,
+    /// 快照项数（进度条分母）
+    total: usize,
+    done: usize,
+    /// 文件已不存在而跳过的项数（删除语义：不算失败、不碰任何文件）
+    skipped: usize,
+    failed: Vec<String>,
+    /// true = 退出自动保存（收尾放行 ViewportCommand::Close）；
+    /// false = 手动同步（notice/err 汇总）
+    exiting: bool,
+}
+
+/// 评级同步线程 → UI 消息
+enum RatingSyncMsg {
+    Ok,
+    Skipped,
+    Failed(String),
+    Done,
+}
+
+/// 评级探测 worker 命令：一批探测项（entry 下标 + 路径 + 文件名）。
+/// 名单外格式（目录行等）一并传入，worker 内 rating_kind 过滤不读盘
+type RatingProbeBatch = Vec<(usize, PathBuf, String)>;
+
+/// 按需评级探测任务（目录模式，视口惰性）：常驻 worker 逐批读评级回传，
+/// 同时仅一个。换包清理 = drop 整个 job（tx 断连 worker 退出、旧 rx 随
+/// 句柄丢弃，迟到结果天然不串包）
+struct RatingProbeJob {
+    tx: std::sync::mpsc::Sender<RatingProbeBatch>,
+    rx: std::sync::mpsc::Receiver<Vec<(usize, u8)>>,
+}
+
+/// 探测窗口 = 可见行数 × 此倍数（可见 ± 1 个视口行，总窗 ≈ 3×视口）。
+/// 设计目标值非调参项，不进 config
+const RATING_PROBE_VIEWPORT_MULT: usize = 3;
+
+/// 视口窗口稳定多久才真正入队（拖动穿越 debounce，见
+/// App.rating_probe_intent）；首帧 probed 空例外立即入队
+const RATING_PROBE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// 「删除选中」确认窗状态：选中的条目下标（entries 寻址，目录模式）。
 /// 配合星级筛选使用：筛出不要的 → 全选/多选 → 右键菜单 / Ctrl+Delete
 /// → 确认后逐条 trash::delete 进回收站（可从回收站还原）
@@ -436,15 +480,42 @@ pub struct App {
     // ImageService 共享 Rc<RefCell> 单源真值：视频走 mpv contrast 属性、
     // 图片/raw 走 LUT
     contrast_map: ContrastMap,
-    /// 目录模式后台评级扫描：(archive_id, 结果接收端)。线程遍历图片条目读
-    /// EXIF Rating，完成后一次性回传 Vec<(entry_idx, 星级)>；poll 合并进
-    /// ArchiveState.ratings（会话值优先不覆盖）。换包后按 id 丢弃
-    rating_scan: Option<(u64, std::sync::mpsc::Receiver<Vec<(usize, u8)>>)>,
+    /// 目录模式按需评级探测（视口惰性，取代旧一次性全量扫描）：worker
+    /// 常驻线程收 `RatingProbeBatch` 命令逐项读分格式矩阵评级，每批处理完
+    /// 回传一条 Vec<(entry_idx, 星级)>（空批也发——inflight 计账需要）。
+    /// tx drop = worker 退出（换包清理点）。App 侧无可插入的 pending 队列：
+    /// 去重唯一状态是 rating_probed 位图（mark-at-enqueue，见 enqueue 注释）
+    rating_probe: Option<RatingProbeJob>,
+    /// 已入队探测的 entry 下标位图：入队瞬间置位（false→true 才真正发送），
+    /// 同一 idx 结构上不可能二次入队——无 pending 集、无查询去重。
+    /// idx 是致密域（0..entries.len()），位图下标直寻 O(1) 零哈希，
+    /// 比 HashSet 少一次哈希且缓存友好（1 字节/条目）
+    rating_probed: Vec<bool>,
+    /// 上次入队的列表窗口（视图行区间）：每帧一次比较，窗口没移动零开销；
+    /// 移动才把意图窗口交给 debounce 判定入队
+    rating_probe_window: Option<(usize, usize)>,
+    /// 意图窗口与入队时刻（debounce）：快速拖动滚动条穿越万级行时每帧窗口
+    /// 都在变，立即入队会结构上全量入队——稳定 RATING_PROBE_DEBOUNCE 未再
+    /// 变化才真正入队（拖动途中零读盘 IO，停在哪探测哪）
+    rating_probe_intent: Option<(std::time::Instant, (usize, usize))>,
+    /// 打开时图片条目 idx 快照（筛选取样全集）：星级筛选激活时遍历补扫
+    /// 剩余未探测项（insert-noop 天然只入新项）；压缩包模式为空
+    rating_image_idx: Vec<usize>,
+    /// 已入队未收回的探测条数：星级筛选门控（==0 才让筛选谓词生效）+
+    /// 下拉"扫描中…"后缀的依据
+    rating_inflight: usize,
     /// 星级筛选（图片标签页筛选条）：None=全部；Some(0)=未评；
     /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）
     rating_filter: Option<u8>,
     /// 「删除筛选结果」确认窗（星级删除入口；仅目录模式可达）
     delete_confirm: Option<DeleteConfirm>,
+    /// 评级延迟写 dirty 集（目录模式）：图片绝对路径 → 最新评级（0=清除
+    /// 语义）。评级按键只进这里不落盘（消除即时写的 IO 卡顿）；落盘 =
+    /// 右键「同步评级到文件」/ 退出静默自动保存（两者带进度条，见
+    /// RatingSyncJob）。压缩包模式不进（不写盘）；删除链顺手移除防幽灵写
+    rating_dirty: std::collections::HashMap<PathBuf, u8>,
+    /// 后台评级同步任务（None = 空闲；同时仅一个，防重入门控在启动处）
+    rating_sync: Option<RatingSyncJob>,
 }
 
 /// per-file 显示对比度共享映射（见 App.contrast_map 字段注释）
@@ -559,9 +630,16 @@ impl App {
             hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone()),
             arrow_hold: None,
             contrast_map,
-            rating_scan: None,
+            rating_probe: None,
+            rating_probed: Vec::new(),
+            rating_probe_window: None,
+            rating_probe_intent: None,
+            rating_image_idx: Vec::new(),
+            rating_inflight: 0,
             rating_filter: None,
             delete_confirm: None,
+            rating_dirty: std::collections::HashMap::new(),
+            rating_sync: None,
         }
     }
 
@@ -640,9 +718,16 @@ impl App {
             hist_raw: crate::rawdec::HistService::new(ctx.clone()),
             arrow_hold: None,
             contrast_map,
-            rating_scan: None,
+            rating_probe: None,
+            rating_probed: Vec::new(),
+            rating_probe_window: None,
+            rating_probe_intent: None,
+            rating_image_idx: Vec::new(),
+            rating_inflight: 0,
             rating_filter: None,
             delete_confirm: None,
+            rating_dirty: std::collections::HashMap::new(),
+            rating_sync: None,
         }
     }
 
@@ -724,6 +809,20 @@ impl eframe::App for App {
     #[allow(unused_assignments)]
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // —— 退出拦截（评级自动保存）——
+        // 评级是延迟批量写：点 X 时 dirty 非空 → 拦截关闭（CancelClose）+
+        // 静默启动自动保存（进度窗提示，无询问弹窗）；同步进行中同样拦截，
+        // 直到 poll_rating_sync 收尾放行（ViewportCommand::Close → 下一帧
+        // close_requested 复现、此时 dirty/sync 均空 → 不拦截自然退出）。
+        // dirty 空 + 无同步 = 放行，on_exit/Drop 路径零改动
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.rating_sync.is_some() || !self.rating_dirty.is_empty())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.rating_sync.is_none() {
+                self.start_rating_sync(true);
+            }
+        }
         // —— 输入帧节流 ——
         // egui-winit 对 CursorMoved 无条件 request_repaint（egui-winit 0.36
         // lib.rs:352-358，无内置节流；eframe 的 max_fps 仅 web 后端实现），
@@ -835,8 +934,8 @@ impl eframe::App for App {
         self.poll_open();
         probe!("poll_open");
         // 目录模式评级扫描轮询（EXIF Rating → 列表亮星/筛选条）
-        self.poll_rating_scan();
-        probe!("poll_rating_scan");
+        self.poll_rating_probe();
+        probe!("poll_rating_probe");
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
         probe!("poll_extract");
@@ -881,6 +980,10 @@ impl eframe::App for App {
         // 「删除筛选结果」确认窗（星级筛选一键删除，仅目录模式）
         self.delete_confirm_window(&ctx);
         probe!("delete_confirm");
+        // 评级同步进度窗 + 后台任务轮询（延迟批量写：手动同步 / 退出自动保存）
+        self.rating_sync_window(&ctx);
+        self.poll_rating_sync();
+        probe!("poll_rating_sync");
 
         if self.fullscreen {
             // 全屏：隐藏所有面板，只留视频+底部进度条

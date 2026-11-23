@@ -236,7 +236,6 @@ name = "archview"
 version = "1.3.0"
 dependencies = [
  "alphanumeric-sort",
- "crc32fast",
  "eframe",
  "egui",
  "egui_alignments",
@@ -244,6 +243,7 @@ dependencies = [
  "fast_image_resize",
  "glow",
  "image",
+ "img-parts",
  "kamadak-exif",
  "libloading",
  "little_exif",
@@ -1693,6 +1693,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "img-parts"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93567ea8788640e566a8992a28f4ff64a89b88a369ad05c4198ea6dc8a42ce2b"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2018,6 +2029,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
+ "serde",
  "simd-adler32",
 ]
 

@@ -681,23 +681,20 @@ impl App {
         tracing::info!("旋转 {ename}: orient {cur}→{new} written={written}");
     }
 
-    /// 1-5/Q 键：评级（r=0 清除）。写入只走 sidecar `.xmp`（原文件字节
-    /// 零改动，全格式统一可用，不再写 EXIF 18246/18249——见 meta.rs 头注）；
-    /// sidecar 写失败降级会话内（a.ratings 表，列表星级/筛选消费）。
-    /// 评级只影响 sidecar 不动像素，无需失效任何缓存
+    /// 1-5/Q 键：评级（r=0 清除）。**延迟批量写**（2026-11-23 定版）：
+    /// 目录模式只进 rating_dirty 内存表（路径 → 最新值），落盘 = 右键
+    /// 「同步评级到文件」/ 退出静默自动保存（都带进度条）；压缩包模式
+    /// 维持会话内记忆（不可写回文件）。评级真相矩阵见 meta.rs 头注
     fn rate_image(&mut self, r: u8) {
         let Some((_, idx, path)) = self.image_meta_ctx() else {
             return;
         };
         let ename = self.archive.as_ref().unwrap().entries[idx].name.clone();
-        let mut written = false;
+        let mut dirty = false;
         if let Some(p) = &path {
-            match crate::meta::write_sidecar_rating(p, r) {
-                Ok(()) => written = true,
-                Err(e) => {
-                    self.set_err(format!("评级 sidecar 写入失败（仅会话内记录）: {e}"));
-                }
-            }
+            // 延迟写：同文件反复改评/清除只保留最新值（0 = 清除语义）
+            self.rating_dirty.insert(p.clone(), r.min(5));
+            dirty = true;
         }
         let a = self.archive.as_mut().unwrap();
         if r == 0 {
@@ -720,13 +717,13 @@ impl App {
             self.selected.retain(|i| visible.contains(i));
             self.select_anchor = self.select_anchor.filter(|i| visible.contains(i));
         }
-        let tail = if written { "（已写入 sidecar）" } else { "（会话内）" };
+        let tail = if dirty { "（待同步，退出时自动保存）" } else { "（会话内）" };
         self.set_notice(if r == 0 {
             format!("已清除评级{tail}")
         } else {
             format!("已评 {}{tail}", "★".repeat(r as usize))
         });
-        tracing::info!("评级 {ename}: {r} sidecar={written}");
+        tracing::info!("评级 {ename}: {r} dirty={dirty}");
     }
 
     // ---- 方向键长按连发 ----

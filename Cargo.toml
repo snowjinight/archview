@@ -39,13 +39,13 @@ raw-files = "0.6"
 # 600ms→~80ms）：full 高清档与基础档预放大共用
 fast_image_resize = "5"
 egui_alignments = "0.3.9"
-# EXIF 读取（内存 buffer 支持，zip 流路径必需）：解码链方向矫正 + 评级扫描
+# EXIF 读取（内存 buffer 支持，zip 流路径必需）：解码链方向矫正
 kamadak-exif = "0.6"
-# EXIF 写入（纯 Rust，JPEG/PNG/TIFF/WebP-lossless）：旋转/评级写回文件元数据
+# EXIF 写入（纯 Rust，JPEG/PNG/TIFF/WebP-lossless）：旋转写回文件元数据 + EXIF tag 编码
 little_exif = "0.6"
-# PNG eXIf 块注入的 CRC32（little_exif 写 PNG 只产 zTXt 旧形态不认 eXIf，
-# 见 meta.rs write_png_orientation；image→png 传递已有，显式声明零编译成本）
-crc32fast = "1"
+# 容器级手术（纯 Rust）：JPEG APP1/PNG chunk/RIFF WebP 增删改——评级嵌入式 XMP
+# 注入 + PNG eXIf 方向写回（替代原手写 chunk 注入，CRC 由库内计算）
+img-parts = "0.4"
 # 用户文件删除进回收站（不直接 fs::remove）：按星级删除
 trash = "5"
 

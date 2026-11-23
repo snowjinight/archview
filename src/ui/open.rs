@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// 探测一批条目的评级（纯函数，单测覆盖）：分格式真相矩阵读取（嵌入式
+/// 头部 ≤512KB / sidecar .xmp，meta::read_rating 内部按 rating_kind 分流），
+/// 名单外格式（目录行/非图片，rating_kind None）直接跳过不读盘；只回传
+/// 有评级的项（ratings 表只存有星条目，未评级=None 不占行）
+fn probe_batch(batch: RatingProbeBatch) -> Vec<(usize, u8)> {
+    let mut out = Vec::new();
+    for (idx, p, name) in batch {
+        if let Some(r) = crate::meta::read_rating(&p, &name) {
+            out.push((idx, r));
+        }
+    }
+    out
+}
+
 impl App {
     // ---- 打开压缩包 ----
 
@@ -336,46 +350,54 @@ impl App {
         self.rating_filter = None;
         self.delete_confirm = None;
         self.rebuild_view();
-        // 目录模式：后台扫描图片评级（星级筛选/列表亮星的数据源）。压缩包
-        // 模式无磁盘路径跳过。评级读取三级优先：sidecar .xmp > 嵌入式 XMP
-        // > EXIF 18246/18249 存量（见 meta.rs 头注）。结果一次性回传，
-        // poll_rating_scan 合并进 a.ratings——线程持目录路径与名字快照，
-        // 不持 ArchiveState 引用（UI 线程独占）；换包后旧结果按 id 丢弃
-        self.rating_scan = None;
+        // 目录模式：按需评级探测（视口惰性，取代旧一次性全量扫描——万级
+        // 目录打开即全量扫是纯浪费，评级的消费者只有列表亮星与星级筛选）。
+        // 打开时只登记图片条目下标快照 + 常驻 worker，探测批次由列表视口
+        // 钩子按需入队（panels.rs debounce 后调 rating_probe_enqueue，首帧
+        // 空集立即入队头部窗口）。压缩包模式无磁盘路径不探测（会话内评级）。
+        // 评级按分格式真相矩阵读取（meta.rs 头注）；换包 = drop job：
+        // worker 随 tx 断连退出、旧 rx 随句柄丢弃（迟到结果不串包）
+        self.rating_probe = None;
+        self.rating_probed = Vec::new();
+        self.rating_probe_window = None;
+        self.rating_probe_intent = None;
+        self.rating_inflight = 0;
+        self.rating_image_idx = Vec::new();
         if path.is_dir() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let dir = path.clone();
-            let names: Vec<(usize, String)> = self
+            // 位图按 entries.len() 分配（idx 致密域：下标直寻去重）
+            self.rating_probed = vec![false; self.archive.as_ref().unwrap().entries.len()];
+            self.rating_image_idx = self
                 .archive
                 .as_ref()
                 .unwrap()
                 .entries
                 .iter()
                 .enumerate()
-                // sidecar 评级全格式可用（含 RAW/GIF/BMP）→ 不再限
-                // meta_writable，按图片扩展名全集扫描
+                // sidecar 评级全格式可用（含 RAW/GIF/BMP）→ 不限
+                // meta_writable，按图片扩展名全集取样（筛选补扫全集）
                 .filter(|(_, e)| !e.is_dir && self.cfg.is_image_ext(&e.name))
-                .map(|(i, e)| (i, e.name.clone()))
+                .map(|(i, _)| i)
                 .collect();
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RatingProbeBatch>();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let egui_ctx = self.egui_ctx.clone();
             std::thread::Builder::new()
-                .name("ratingscan".into())
+                .name("ratingprobe".into())
                 .spawn(move || {
-                    let mut out = Vec::new();
-                    for (i, name) in names {
-                        let p = dir.join(&name);
-                        // 三级优先：sidecar（本应用写）> 嵌入式 XMP
-                        //（Lightroom 等主流软件写）> EXIF 18246/18249 存量
-                        let r = crate::meta::read_sidecar_rating(&crate::meta::sidecar_path(&p))
-                            .or_else(|| crate::meta::read_embedded_xmp_rating(&p))
-                            .or_else(|| crate::meta::read_meta_path(&p).and_then(|m| m.rating));
-                        if let Some(r) = r {
-                            out.push((i, r));
+                    // 常驻：cmd_rx 断连（UI 端换包 drop job）即退出；逐批
+                    // 处理，每批回传一条（可能为空——poll 按批长计账）。
+                    // 有结果即唤醒 UI（空闲全事件驱动：结果不靠下一次
+                    // 用户事件才显示）
+                    for batch in cmd_rx {
+                        let out = probe_batch(batch);
+                        if !out.is_empty() {
+                            egui_ctx.request_repaint();
                         }
+                        let _ = tx.send(out);
                     }
-                    let _ = tx.send(out);
                 })
                 .ok();
-            self.rating_scan = Some((id, rx));
+            self.rating_probe = Some(RatingProbeJob { tx: cmd_tx, rx });
         }
         // 单媒体文件入口：目标文件所在目录打开完成（仅目录模式消费——
         // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。
@@ -453,38 +475,82 @@ impl App {
         retry_play.map(|(entry_idx, _)| entry_idx).or(focus_idx)
     }
 
-    /// 目录模式后台评级扫描轮询：扫描线程完成时一次性收到
-    /// Vec<(entry_idx, 星级)>，合并进 a.ratings（**会话值优先**——用户
-    /// 扫描期间手动评的星不被覆盖）。合并后清扫描任务；若星级筛选
-    /// 条已启用则重建视图（扫描前筛选条件暂不生效，防列表闪烁）。
-    /// 换包后 archive.id 变化，旧结果按 id 丢弃
-    pub(super) fn poll_rating_scan(&mut self) {
-        // 先试收（借用随语句结束），有结果再清任务、后合并
-        let results = self
-            .rating_scan
-            .as_ref()
-            .and_then(|(_, rx)| rx.try_recv().ok());
-        let Some(results) = results else {
+    /// 按需评级探测入队（panels.rs 视口钩子与筛选补扫共用）：**mark-at-enqueue**
+    /// ——入队瞬间 `rating_probed[idx]` 置位（false→true 才真正发送），同一
+    /// idx 在生命周期内结构上不可能二次入队；无独立 pending 集，入队调用方
+    /// 只在窗口变化/筛选激活等离散事件发生，不逐帧去重。单条去重成本 =
+    /// 一次位图下标读写（零哈希零扫描，与已标记量无关）。inflight 随入队
+    /// 累加，poll 按批长扣减。job 缺位（压缩包模式）零动作
+    pub(super) fn rating_probe_enqueue(&mut self, items: RatingProbeBatch) {
+        let Some(job) = &self.rating_probe else {
             return;
         };
-        let (aid, _) = self.rating_scan.take().unwrap();
-        let Some(a) = self.archive.as_mut() else {
-            return;
-        };
-        if a.id != aid {
-            return; // 旧包迟到结果
+        let mut batch: RatingProbeBatch = Vec::new();
+        for (idx, p, name) in items {
+            if idx < self.rating_probed.len() && !self.rating_probed[idx] {
+                self.rating_probed[idx] = true;
+                batch.push((idx, p, name));
+            }
         }
-        let merged = {
-            let a = self.archive.as_mut().unwrap();
+        if batch.is_empty() {
+            return;
+        }
+        self.rating_inflight += batch.len();
+        let _ = job.tx.send(batch);
+    }
+
+    /// 视口窗口入队便捷层：entry 下标切片 → (idx, 路径, 文件名) 探测项。
+    /// 视口钩子（panels.rs）与筛选补扫共用；archive 缺位零动作
+    pub(super) fn rating_probe_enqueue_rows(&mut self, idxs: &[usize]) {
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
+        let dir = a.path.clone();
+        let items: RatingProbeBatch = idxs
+            .iter()
+            .filter_map(|&i| {
+                a.entries
+                    .get(i)
+                    .map(|e| (i, dir.join(&e.name), e.name.clone()))
+            })
+            .collect();
+        self.rating_probe_enqueue(items);
+    }
+
+    /// 星级筛选激活补扫：遍历打开时登记的图片条目快照，enqueue 的
+    /// insert-noop 天然只入未探测的剩余项（已入队/已完成的不会重发）
+    /// ——"筛选只扫剩下没扫过的"。压缩包模式快照为空零动作
+    pub(super) fn rating_probe_scan_rest(&mut self) {
+        let idxs: Vec<usize> = self.rating_image_idx.clone();
+        self.rating_probe_enqueue_rows(&idxs);
+    }
+
+    /// 按需评级探测轮询：收当帧全部批次结果，合并进 a.ratings（**会话值
+    /// 优先**——用户探测期间手动评的星不被覆盖），按批长扣 inflight；
+    /// inflight 归零且星级筛选已选时重建视图（筛选谓词等全量事实就绪才
+    /// 生效，防列表中途反复闪变）。唤醒由 worker request_repaint 承担，
+    /// 本函数不排帧
+    pub(super) fn poll_rating_probe(&mut self) {
+        let mut got = false;
+        loop {
+            let Some(job) = &self.rating_probe else {
+                return;
+            };
+            let Ok(results) = job.rx.try_recv() else {
+                break;
+            };
+            got = true;
+            self.rating_inflight = self.rating_inflight.saturating_sub(results.len());
+            let Some(a) = self.archive.as_mut() else {
+                break;
+            };
             for (idx, r) in results {
                 a.ratings.entry(idx).or_insert(r);
             }
-            a.ratings.len()
-        };
-        if self.rating_filter.is_some() {
+        }
+        if got && self.rating_inflight == 0 && self.rating_filter.is_some() {
             self.rebuild_view();
         }
-        tracing::info!("评级扫描完成：合并 {} 条 EXIF Rating", merged);
     }
 
     /// 重新计算过滤视图：搜索框高级语法匹配（search_engine：空格 AND、| OR、
@@ -510,10 +576,10 @@ impl App {
         // 要过 3 遍 is_video_ext，万级条目 × raw 预设回溯时开销放大 3 倍
         let query = crate::search::parse_query(&self.search);
         // 星级筛选谓词（仅图片条目；与文本搜索 AND）：Some(0)=未评、
-        // Some(n)=≥n 星。扫描未完成时暂不生效（poll_rating_scan 合并后
-        // 重建视图）——防扫描中途列表反复闪变。已删除条目（trash 删除
+        // Some(n)=≥n 星。探测未收齐（inflight>0）时暂不生效（poll_rating_probe
+        // 归零后重建视图）——防列表中途反复闪变。已删除条目（trash 删除
         // 后的会话标记）无条件剔除
-        let filter_active = self.rating_scan.is_none() && self.rating_filter.is_some();
+        let filter_active = self.rating_inflight == 0 && self.rating_filter.is_some();
         let rating_filter = self.rating_filter;
         let mut classified: Vec<(usize, bool)> = a
             .entries
@@ -617,5 +683,48 @@ impl App {
             })
             .collect();
         self.list_counts = counts;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_batch;
+
+    /// probe_batch 矩阵分流：嵌入式（jpg 签名 + 属性式 Rating）命中 /
+    /// sidecar（bmp + .xmp）命中 / 名单外格式（txt）跳过 / 未评级 None 不占行。
+    /// 独立 pid 临时目录（并行测试竞态惯例：禁共享目录 whole-dir 清理互删）
+    #[test]
+    fn probe_batch_矩阵分流与名单外跳过() {
+        let dir = std::env::temp_dir().join(format!("archview_probe_batch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 嵌入式：JPEG 签名 + 属性式 Rating（头部文本搜索命中）
+        std::fs::write(
+            dir.join("a.jpg"),
+            b"\xff\xd8\xff\xe0<rdf:Description xmp:Rating=\"4\"/>",
+        )
+        .unwrap();
+        // sidecar 族：bmp 文件本体无 Rating 文本，评级在 .xmp
+        std::fs::write(dir.join("p.bmp"), b"BMxxxx").unwrap();
+        std::fs::write(dir.join("p.xmp"), "<xmp:Rating>2</xmp:Rating>").unwrap();
+        // 名单外：txt 即使含 Rating 文本也不读（rating_kind None 零读盘语义）
+        std::fs::write(dir.join("n.txt"), b"<xmp:Rating>5</xmp:Rating>").unwrap();
+        // 未评级 jpg：签名合法但无标记 → None 不入结果
+        std::fs::write(dir.join("u.jpg"), b"\xff\xd8\xff\xe0plain").unwrap();
+
+        let batch: Vec<(usize, std::path::PathBuf, String)> = [
+            (0usize, "a.jpg"),
+            (1, "p.bmp"),
+            (2, "n.txt"),
+            (3, "u.jpg"),
+            (4, "missing.jpg"), // 不存在的文件：read_rating 静默 None
+        ]
+        .iter()
+        .map(|&(i, n)| (i, dir.join(n), n.to_string()))
+        .collect();
+        let out = probe_batch(batch);
+
+        assert_eq!(out, vec![(0, 4), (1, 2)]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

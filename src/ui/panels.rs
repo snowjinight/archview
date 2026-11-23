@@ -677,11 +677,19 @@ impl App {
                     .find(|(v, _)| *v == self.rating_filter)
                     .map(|(_, l)| *l)
                     .unwrap_or("全部");
+                // 探测未收齐时加宽并缀"扫描中…"（按需探测：筛选谓词等
+                // 全量事实就绪才生效，poll_rating_probe 归零后重建视图）
+                let scanning = self.rating_inflight > 0;
                 egui::ComboBox::from_id_salt("rating_filter")
                     // 显式收窄：egui 默认宽 = interact_size.x×3 ≈ 120px，
-                    // 内容最长仅两字（"全部"/"≥5"），40px 即可
-                    .width(40.0)
-                    .selected_text(cur_label)
+                    // 内容最长仅两字（"全部"/"≥5"），40px 即可；扫描中
+                    // 后缀长，动态放宽避免截断
+                    .width(if scanning { 130.0 } else { 40.0 })
+                    .selected_text(if scanning {
+                        format!("{cur_label}（扫描中…）")
+                    } else {
+                        cur_label.to_string()
+                    })
                     .show_ui(ui, |ui| {
                         for (v, label) in opts {
                             ui.selectable_value(&mut self.rating_filter, v, label);
@@ -690,6 +698,9 @@ impl App {
                 if self.rating_filter != before {
                     self.selected.clear();
                     self.select_anchor = None;
+                    // 按需探测补扫：只扫未探测的剩余图片条目（insert-noop，
+                    // 已入队/已完成的不会重发）
+                    self.rating_probe_scan_rest();
                     self.rebuild_view();
                 }
             });
@@ -706,6 +717,9 @@ impl App {
         // 删除选中（进回收站）：仅目录模式可达（压缩包内无磁盘路径）
         let menu_delete_ok = self.archive.as_ref().is_some_and(|a| a.path.is_dir());
         let mut menu_delete = false;
+        // 同步评级到文件：目录模式 + dirty 非空（有未落盘的评级改动）
+        let menu_sync_ok = menu_delete_ok && !self.rating_dirty.is_empty();
+        let mut menu_sync = false;
         let mut scrolled = false;
         // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
         // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
@@ -718,6 +732,9 @@ impl App {
             })
             .flatten();
         let mut measured: Option<f32> = None;
+        // 评级探测钩子：视口闭包只收集本帧探测窗口（可见 ±1 个视口行），
+        // 真正入队在闭包外（debounce 判定需要 &mut self，见 show_viewport 后）
+        let mut probe_want: Option<(usize, usize)> = None;
         // 行高：上一帧的实测值（滚动换算与实际布局零漂移）；首帧用 interact_size 估计
         let row_h = self.row_h.unwrap_or_else(|| ui.spacing().interact_size.y);
         // 预收集不可变数据，避免渲染闭包内借用 self
@@ -759,6 +776,15 @@ impl App {
                     min_row = total.saturating_sub(diff);
                 }
                 let range = min_row..max_row;
+                // 评级探测窗口：绘制范围每侧再外扩 vh×(倍数-1)/2（倍数 3
+                // 时即 1 个视口行，总窗 ≈RATING_PROBE_VIEWPORT_MULT×视口）。
+                // 只记意图不入队——入队在闭包外 debounce 判定（拖动穿越
+                // 零 IO，停在哪探测哪）
+                let vh = (((viewport.max.y - viewport.min.y) / step).ceil() as usize).max(1);
+                let margin = vh * (RATING_PROBE_VIEWPORT_MULT - 1) / 2;
+                let pw0 = min_row.saturating_sub(margin);
+                let pw1 = (max_row + margin).min(total);
+                probe_want = Some((pw0, pw1));
                 // 与 show_rows 相同的布局方式：按行范围圈出矩形再渲染，
                 // skip_ahead_auto_ids 保证行 widget Id 跨帧稳定（虚拟化必须）
                 let y_min = ui.max_rect().top() + min_row as f32 * step;
@@ -947,6 +973,24 @@ impl App {
                             {
                                 menu_delete = true;
                             }
+                            // 同步评级到文件（延迟批量写的手动入口；1-5/Q 评级
+                            // 只进内存 dirty，这里一次写盘。带进度窗）
+                            if ui
+                                .add_enabled(
+                                    menu_sync_ok,
+                                    egui::Button::new(if menu_sync_ok {
+                                        "同步评级到文件"
+                                    } else {
+                                        "同步评级到文件：无待同步评级"
+                                    }),
+                                )
+                                .on_hover_text(
+                                    "把本次会话的评级改动写入文件（嵌入式 XMP / sidecar，快捷路径无此键时退出会自动保存）",
+                                )
+                                .clicked()
+                            {
+                                menu_sync = true;
+                            }
                             if ui.button("全选（Ctrl+A）").clicked() {
                                 menu_all = true;
                             }
@@ -968,6 +1012,40 @@ impl App {
             });
         if scrolled {
             self.scrolled_to = self.playing;
+        }
+        // 评级探测视口钩子（目录模式 job 存在才跑）：窗口与上次已入队窗口
+        // 比较（每帧一次元组比较，没移动零开销），移动了记意图窗口；意图
+        // 稳定 RATING_PROBE_DEBOUNCE 才真正入队（拖动穿越万级行时每帧都
+        // 在变，立即入队 = 结构上全量入队）。首帧例外：从未入队过
+        // （rating_probe_window None）立即入队——保住"打开即探列表头部
+        // 第一批"不引入 debounce 延迟。入队内容 = 窗口内视图行映射的
+        // entry idx（mark-at-enqueue 位图去重）
+        if self.rating_probe.is_some() {
+            if let Some(w) = probe_want {
+                if self.rating_probe_window != Some(w) {
+                    match &self.rating_probe_intent {
+                        Some((_, iw)) if *iw == w => {}
+                        _ => {
+                            self.rating_probe_intent = Some((std::time::Instant::now(), w));
+                        }
+                    }
+                }
+            }
+            if let Some((t, w)) = self.rating_probe_intent {
+                if self.rating_probe_window.is_none()
+                    || t.elapsed() >= RATING_PROBE_DEBOUNCE
+                {
+                    self.rating_probe_intent = None;
+                    self.rating_probe_window = Some(w);
+                    let end = w.1.min(rows.len());
+                    let start = w.0.min(end);
+                    let idxs: Vec<usize> = rows[start..end].iter().map(|r| r.idx).collect();
+                    self.rating_probe_enqueue_rows(&idxs);
+                } else {
+                    self.egui_ctx
+                        .request_repaint_after(RATING_PROBE_DEBOUNCE.saturating_sub(t.elapsed()));
+                }
+            }
         }
         // 回到上次位置：盖在列表底部中央的悬浮按钮（约两行高、半透明、不占满
         // 整行——按钮四周的列表项仍可点击）。目标 = last_focus（最后一次
@@ -1033,6 +1111,10 @@ impl App {
         // 删除选中：确认窗（数量/体积）二次确认后 trash::delete
         if menu_delete {
             self.open_delete_confirm_for_selection();
+        }
+        // 同步评级到文件：直接启动 worker（进度窗居中弹出）
+        if menu_sync {
+            self.start_rating_sync(false);
         }
         if menu_clear {
             self.selected.clear();

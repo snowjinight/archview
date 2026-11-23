@@ -684,6 +684,147 @@ impl App {
         }
     }
 
+    // ---- 评级延迟批量写落盘（手动同步 + 退出自动保存，2026-11-23 定版）----
+
+    /// 启动评级同步 worker：drain dirty 快照（按路径排序，写序确定）
+    /// spawn "ratingsync" 线程逐项写 meta::write_rating。防重入（进行中
+    /// 直接返回）；exiting = 退出自动保存（dirty 空时直接放行 Close）。
+    /// 删除文件语义在 worker 层：写前 path.exists() 检查，不存在 = 跳过
+    ///（不算失败、不碰任何文件含残留 sidecar）——write_rating 保持严格
+    pub(super) fn start_rating_sync(&mut self, exiting: bool) {
+        if self.rating_sync.is_some() {
+            return;
+        }
+        let mut items: Vec<(std::path::PathBuf, u8)> =
+            self.rating_dirty.drain().collect();
+        if items.is_empty() {
+            if exiting {
+                self.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let total = items.len();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        std::thread::Builder::new()
+            .name("ratingsync".into())
+            .spawn(move || {
+                for (p, r) in &items {
+                    let msg = if !p.exists() {
+                        RatingSyncMsg::Skipped
+                    } else {
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        match crate::meta::write_rating(p, &name, *r) {
+                            Ok(()) => RatingSyncMsg::Ok,
+                            Err(e) => RatingSyncMsg::Failed(e),
+                        }
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                let _ = tx.send(RatingSyncMsg::Done);
+                ctx.request_repaint();
+            })
+            .ok();
+        self.rating_sync = Some(RatingSyncJob {
+            rx,
+            total,
+            done: 0,
+            skipped: 0,
+            failed: Vec::new(),
+            exiting,
+        });
+        tracing::info!("评级同步启动: {total} 项 exiting={exiting}");
+    }
+
+    /// 评级同步任务轮询（update 每帧）：Item 计数；Done 收尾——exiting 时
+    /// dirty 又非空（同步期间又评了新项）→ 再启一轮收敛，否则放行退出
+    ///（ViewportCommand::Close）；手动同步 → notice/err 汇总。失败不回灌
+    /// dirty（用户可再次手动同步重试）
+    pub(super) fn poll_rating_sync(&mut self) {
+        let mut finished = false;
+        if let Some(job) = self.rating_sync.as_mut() {
+            loop {
+                match job.rx.try_recv() {
+                    Ok(RatingSyncMsg::Ok) => job.done += 1,
+                    Ok(RatingSyncMsg::Skipped) => {
+                        job.done += 1;
+                        job.skipped += 1;
+                    }
+                    Ok(RatingSyncMsg::Failed(e)) => {
+                        job.done += 1;
+                        job.failed.push(e);
+                    }
+                    Ok(RatingSyncMsg::Done) | Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
+        if !finished {
+            return;
+        }
+        let job = self.rating_sync.take().unwrap();
+        if job.exiting {
+            if self.rating_dirty.is_empty() {
+                self.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.start_rating_sync(true);
+            }
+            return;
+        }
+        let n = job.total - job.skipped - job.failed.len();
+        let mut msg = format!("评级已同步：{n} 项写入");
+        if job.skipped > 0 {
+            msg += &format!("，{} 项跳过（文件已不存在）", job.skipped);
+        }
+        if job.failed.is_empty() {
+            self.set_notice(msg);
+        } else {
+            self.set_err(format!(
+                "{msg}，{} 项失败：{}",
+                job.failed.len(),
+                job.failed.join("；")
+            ));
+        }
+    }
+
+    /// 评级同步进度窗（居中 ProgressBar，无取消按钮——退出保存不可中断，
+    /// 手动同步项数小无需取消）
+    pub(super) fn rating_sync_window(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.rating_sync.as_ref() else {
+            return;
+        };
+        let (done, total, skipped, failed) =
+            (job.done, job.total, job.skipped, job.failed.len());
+        let exiting = job.exiting;
+        egui::Window::new(if exiting { "退出自动保存中…" } else { "同步评级到文件" })
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .show_percentage(),
+                );
+                ui.weak(format!(
+                    "{done}/{total} · 跳过 {skipped}（文件已不存在）· 失败 {failed}"
+                ));
+                if !exiting {
+                    ui.weak("写盘在后台进行，可继续浏览");
+                }
+            });
+    }
+
     // ---- 选中集删除（仅目录模式，PLAN_image_meta.md §5F；右键菜单 /
     // Ctrl+Delete 两入口。配合星级筛选：筛出不要的 → Ctrl+A 全选 → 删除） ----
 
@@ -778,6 +919,10 @@ impl App {
             match trash::delete(dir.join(&name)) {
                 Ok(()) => {
                     deleted += 1;
+                    // dirty 集同步移除防幽灵写：文件已删，评级延迟写若残留
+                    // 会在同步/退出时把该路径复活成孤儿（worker 跳过不存在的
+                    // 文件，但这里清得更干净——语义上"已删除的文件无评级可写"）
+                    self.rating_dirty.remove(&dir.join(&name));
                     let key = (aid, *idx);
                     // 像素缓存失效（含 natives：文件已不存在，原图不再有效）
                     self.img.invalidate_full(key);

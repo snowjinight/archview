@@ -31,7 +31,7 @@
 | [§14 直方图专项](14_直方图专项.md) | Ctrl+H 图片直方图：软解旁路方案取舍（否决显示改道）/ 位深全量程压缩到 0-255 / 非凸轮廓三角带 Mesh / Color32 预乘还原 | [ARCHITECTURE §6.5](../架构设计/06_图片预览模块.md) |
 | [§15 日志与控制台子系统专项](15_控制台窗口显隐与ANSI颜色专项.md) | release 切 windows 子系统彻底无黑框（旧：console 子系统运行时隐藏，父进程判定有 PID 复用竞态）+ logsink 日志管线（600 行环形缓冲 F12 界面面板 + 5s/64KB 定时落盘 archview.log + 4MB 轮转）+ CLI Attach/AllocConsole 接入 + VT Processing 治 ANSI 乱码 | src/console.rs · src/logsink.rs · [ARCHITECTURE §7](../架构设计/07_配置文件设计.md) |
 | [§16 图片高清档密度重构专项](16_图片高清档密度重构专项.md) | full 档密度 ×ppp×2→×3 + 预算制（12288/100MP）/ orig-lru 免二次解码（单槽起步，后 LRU 化见 §12）/ fast_image_resize SIMD / 锐化默认关+前移 / 观感增强链 YUV 域重构 + Y·增强量 dump；预算 clamp 取整 floor 教训 | [ARCHITECTURE §13.4 / §6.3](../架构设计/13_渲染架构迁移.md) |
-| [§17 图片元数据方向与评星专项](17_图片元数据方向与评星专项.md) | EXIF 方向矫正 + R 旋转 / 1-5 评星写回（kamadak-exif 读 + little_exif 写，旋转不重写像素只改 tag）/ 后台评级扫描 / 星级筛选 + trash 回收站删除（**deleted 标记集不物理移除 entries**——下标稳定防缓存错位）；little_exif API 坑与 crate 版本记忆坑 | [ARCHITECTURE §6.7](../架构设计/06_图片预览模块.md) |
+| [§17 图片元数据方向与评星专项](17_图片元数据方向与评星专项.md) | EXIF 方向矫正 + R 旋转（little_exif 写，旋转不重写像素只改 tag）；2026-11-23 评级重构（17.7 取代 17.6 兼容开关）：**分格式真相矩阵**（jpg/png/webp 嵌入式 XMP img-parts 容器手术 + XMP 文本三件套；tif/RAW/bmp/gif sidecar `.xmp`；EXIF 18246 评级链彻底删除）+ **延迟批量写**（dirty 内存集 + 右键同步/退出静默自动保存 CancelClose 状态机）+ 删除文件跳过语义（exists 检查不碰残留 sidecar）/ **按需评级探测**（17.8：视口惰性 ≈3×视口窗口 + mark-at-enqueue 位图去重 + 拖动穿越 debounce + 筛选补扫 inflight 门控，取代一次性全量扫描）/ 星级筛选 + trash 删除（**deleted 标记集不物理移除 entries**）；手拼 RIFF WebP 夹具三连坑、PNG eXIf 库读写不对称坑 | [ARCHITECTURE §6.7](../架构设计/06_图片预览模块.md) |
 
 ## 维护约定（强制）
 
