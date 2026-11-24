@@ -900,6 +900,14 @@ impl App {
                                     .truncate()
                             }
                         };
+                        // 行全宽热区：Button 默认收缩到文本宽，短文件名必须点中文字
+                        // 才有效。min_size 抬宽下限到整行（高度 0 保持内容行高，
+                        // 不破坏虚拟化等高前提）。宽度 = 内容区 available_width，
+                        // egui 计算 inner_rect 时已扣除滚动条条带（scroll_area.rs
+                        // begin_pass），不会与滚动条重叠；即使重叠，hit-test 同层
+                        // tie 取后注册者，滚动条在 ScrollArea::end 才注册必胜。
+                        let btn =
+                            btn.min_size(egui::vec2(ui.available_width().max(1.0), 0.0));
                         let mut resp = btn.ui(ui);
                         // 悬停气泡：完整包内路径。render API 后整个窗口只有 egui
                         // 一个平面，气泡盖在视频画面上不再被 mpv 原生子窗口遮挡
@@ -967,9 +975,9 @@ impl App {
                                 .add_enabled(
                                     cmp_ok,
                                     egui::Button::new(if sel.is_empty() {
-                                        "对比显示：先 Ctrl+点选 2~6 张"
+                                        "分栏对比显示（C）：暂无文件选中"
                                     } else {
-                                        "对比显示"
+                                        "分栏对比显示（C）"
                                     }),
                                 )
                                 .clicked()
@@ -981,12 +989,12 @@ impl App {
                                 .add_enabled(
                                     menu_delete_ok && !sel.is_empty(),
                                     egui::Button::new(if sel.is_empty() {
-                                        "删除选中：先 Ctrl+点选"
+                                        "删除所选媒体（Ctrl+Del）：暂无文件选中"
                                     } else {
-                                        "删除选中（进回收站）"
+                                        "删除所选媒体（Ctrl+Del）"
                                     }),
                                 )
-                                .on_hover_text("删除当前选中的全部文件（快捷键 Ctrl+Delete）")
+                                .on_hover_text("删除当前选中的全部媒体文件")
                                 .clicked()
                             {
                                 menu_delete = true;
@@ -997,9 +1005,9 @@ impl App {
                                 .add_enabled(
                                     menu_sync_ok,
                                     egui::Button::new(if menu_sync_ok {
-                                        "同步评级到文件（Ctrl+S）"
+                                        "写入评级到文件（Ctrl+S）"
                                     } else {
-                                        "同步评级到文件：无待同步评级"
+                                        "写入评级到文件（Ctrl+S）：暂无待写入评级"
                                     }),
                                 )
                                 .on_hover_text(
@@ -1009,11 +1017,11 @@ impl App {
                             {
                                 menu_sync = true;
                             }
-                            if ui.button("全选（Ctrl+A）").clicked() {
+                            if ui.button("全选列表（Ctrl+A）").clicked() {
                                 menu_all = true;
                             }
                             if ui
-                                .add_enabled(!sel.is_empty(), egui::Button::new("清除选择（Ctrl+Q）"))
+                                .add_enabled(!sel.is_empty(), egui::Button::new("取消全部选择（Ctrl+Q）"))
                                 .clicked()
                             {
                                 menu_clear = true;
