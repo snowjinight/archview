@@ -1692,3 +1692,83 @@ fn replay_current_exits_compare_and_noop_safe() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 对比模式预取让路（窗口优先）：窗口变更瞬间窗口栏 pending 在途，预取候选
+/// （含流式）不得并发发起——慢盘上预取流的随机读会与正在等待的窗口栏交错
+/// （同单图预取串行链哲学）；窗口栏纹理全部就绪后 compare_tick 统一补发，
+/// 滑动就绪闸门的零等待换屏前置条件保持
+#[test]
+fn compare_prefetch_deferred_until_window_ready() {
+    let dir = make_png_dir("cmppf", &["p0.png", "p1.png", "p2.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 11, &dir, 3);
+    // 选中 p0/p1 入栏（2 栏窗口），domain 全集含 p2 = 前进方向预取候选
+    app.selected = [0, 1].into_iter().collect();
+    app.try_enter_compare();
+    assert!(app.compare.is_some(), "2 张合格静态图应放行进入对比");
+    // 窗口栏已发起解码
+    for i in 0..2 {
+        assert!(
+            app.img.is_pending((11, i)) || app.img.has((11, i)),
+            "窗口栏 {i} 应已发起解码"
+        );
+    }
+    // 预取候选未发起（旧实现流式在 after_change 立即并发，此处钉死让路语义）
+    assert!(
+        !app.img.is_pending((11, 2)) && !app.img.has((11, 2)),
+        "窗口未就绪时预取候选不得发起解码"
+    );
+    // 窗口栏纹理就绪 → tick 补发预取候选
+    wait_texture(&mut app, (11, 0), "对比栏0");
+    wait_texture(&mut app, (11, 1), "对比栏1");
+    app.compare_tick();
+    assert!(
+        app.img.is_pending((11, 2)) || app.img.has((11, 2)),
+        "窗口就绪后预取候选应被 tick 补发"
+    );
+    wait_texture(&mut app, (11, 2), "对比预取候选");
+    app.exit_compare();
+    assert!(app.compare.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 预取串行链（当前张 → +1 → -1，任一时刻最多 1 路预取在途）：巨图多路
+/// 并行解码抢 CPU/内存带宽会把当前张出图拖到秒级（8192 级实测 5s+）——
+/// 当前张解码中预取让路，就绪后 poll_img 补发 +1，+1 就绪再补发 -1。
+/// 三张 1200×900 png 走真实解码链（decode → Ready → poll 上传 → 事件
+/// 触发）钉死整链语义
+#[test]
+fn prefetch_serial_chain_current_first_then_plus1_then_minus1() {
+    let dir = make_png_dir("chain", &["p0.png", "p1.png", "p2.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 12, &dir, 3);
+
+    let key = |app: &App, i: usize| (app.archive.as_ref().unwrap().id, i);
+    let (k_cur, k_plus, k_minus) = (key(&app, 1), key(&app, 2), key(&app, 0));
+
+    // 1) 当前张解码中：预取让路（±1 都不得发起）。播中间张（±1 邻居齐全）
+    app.play(1);
+    assert!(app.img.is_pending(k_cur), "当前张应立即发起解码");
+    assert!(
+        !app.img.is_pending(k_plus) && !app.img.is_pending(k_minus),
+        "当前张解码中预取必须让路（3 路并行是巨图出图慢的根因）"
+    );
+
+    // 2) 当前张就绪 → poll_img 补发 +1（单在途，-1 不动）
+    wait_texture(&mut app, k_cur, "当前张");
+    assert!(app.img.is_pending(k_plus), "当前张就绪后应补发 +1 预取");
+    assert!(!app.img.is_pending(k_minus), "+1 在途时 -1 不得并发（单在途名额）");
+
+    // 3) +1 就绪 → 补发 -1 → 全链收敛
+    wait_texture(&mut app, k_plus, "+1 预取");
+    assert!(app.img.is_pending(k_minus), "+1 就绪后应补发 -1 预取");
+    wait_texture(&mut app, k_minus, "-1 预取");
+    assert!(app.error.is_none(), "串行链全程无错误");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

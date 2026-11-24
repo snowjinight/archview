@@ -189,13 +189,17 @@ impl App {
 
     /// 每帧轮询图片解码结果：Ready 纹理已由服务上传进 LRU（绘制时查缓存，
     /// 无需额外处理）；Failed 清 pending，当前显示的图回退 mpv 兜底播放，
-    /// 预取图只记日志（用户翻到时 mpv 不一定可用，见 img_fallback_mpv）
+    /// 预取图只记日志（用户翻到时 mpv 不一定可用，见 img_fallback_mpv）。
+    /// 任一解码结束（当前张就绪/失败、预取就绪）即补发下一个预取——
+    /// 配合 prefetch_images 的让路守卫与单在途名额，构成
+    /// 当前张 → +1 → -1 的预取串行链
     pub(super) fn poll_img(&mut self) {
-        for ev in self.img.poll() {
+        let events = self.img.poll();
+        for ev in events.iter() {
             match ev {
                 ImgEvent::Ready(key) => tracing::debug!("图片纹理就绪: {key:?}"),
                 ImgEvent::Failed(key, e) => {
-                    if self.tex_image_key() == Some(key) {
+                    if self.tex_image_key() == Some(*key) {
                         tracing::warn!("图片解码失败，回退 mpv 播放: {e}");
                         self.img_fallback_mpv(key.1);
                     } else {
@@ -203,6 +207,9 @@ impl App {
                     }
                 }
             }
+        }
+        if !events.is_empty() {
+            self.prefetch_images();
         }
         self.heal_current_image();
     }
@@ -297,20 +304,35 @@ impl App {
 
     /// 图片 ±1 预取：view 中相邻条目里的图片（含 gif 动图）请求后台解码，翻页零
     /// 等待（LRU 上限自然淘汰）。7z/RAR 仅对已完整落盘的条目发起——未落盘的
-    /// 归 extract 会话管（半截文件也解不出图）
+    /// 归 extract 会话管（半截文件也解不出图）。
+    ///
+    /// 串行链（当前张 → +1 → -1）：当前张解码中（base pending / full 升级
+    /// pending）或对比模式下不发起——每张图独立 imgdec 线程并行解码，8192 级
+    /// 巨图 3 路并行抢 CPU/内存带宽会把点击出图拖到秒级，预取必须严格排在
+    /// 当前张之后；任一时刻最多 1 路预取在途（已在解码中的候选占住名额），
+    /// 触发时机 = poll 每收到解码完成事件（见 poll_img）补发下一个
     fn prefetch_images(&mut self) {
-        // 阶段一（不可变借用）：收集邻居候选（位置 → key + 解码源 + 名）
+        if self.compare.is_some() {
+            return;
+        }
+        // 阶段一（不可变借用）：收集邻居候选（位置 → key + 解码源 + 名），
+        // +1 在前 -1 在后（下游优先）
         let cands: Vec<(ImgKey, ImageSource, String)> = {
             let Some(arch) = self.archive.as_ref() else {
                 return;
             };
             let Some(cur) = self.playing else { return };
+            // 当前张解码中：预取让路，等 poll 的就绪事件再来
+            let cur_key = (arch.id, cur);
+            if self.img.is_pending(cur_key) || self.img.is_full_pending(cur_key) {
+                return;
+            }
             let Some(pos) = arch.view.iter().position(|&i| i == cur) else {
                 return;
             };
             let dir = cache::cache_dir(&self.cfg);
             let mut v = Vec::with_capacity(2);
-            for p in [pos.checked_sub(1), Some(pos + 1)].into_iter().flatten() {
+            for p in [Some(pos + 1), pos.checked_sub(1)].into_iter().flatten() {
                 let Some(&i) = arch.view.get(p) else { continue };
                 let e = &arch.entries[i];
                 if !crate::imgview::wants_texture(&self.cfg, &e.name) {
@@ -333,16 +355,23 @@ impl App {
             }
             v
         };
-        // 阶段二（可变借用）：已缓存/解码中的跳过（has 不打乱 LRU）；
-        // 曾回退 mpv 的条目跳过（mpv 链路显示，不再纹理解码）
+        // 阶段二（可变借用）：单在途——已缓存的跳过（has 不打乱 LRU）；
+        // 曾回退 mpv 的条目跳过（mpv 链路显示，不再纹理解码）；已在解码中
+        // 的候选占住唯一在途名额（等它就绪后的下一轮触发再补下一个）；
+        // 名额空闲时按收集顺序（+1 优先）只发一个新请求
         let max_dim = self.cfg.image.image_max_dim;
         for (key, src, name) in cands {
             if self.img_fallback.contains(&key) {
                 continue;
             }
-            if !self.img.has(key) && !self.img.is_pending(key) {
-                self.img.request(key, src, max_dim, &name);
+            if self.img.has(key) {
+                continue;
             }
+            if self.img.is_pending(key) {
+                return;
+            }
+            self.img.request(key, src, max_dim, &name);
+            return;
         }
     }
 

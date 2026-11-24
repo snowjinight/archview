@@ -417,9 +417,9 @@ impl App {
                 .collect();
             // 预取候选：窗口前/后各 1 张合格静态图（滑动 Incoming 恒在
             // 其中）。深度 1 = "栏数+1"语义：稳态翻页延迟由就绪闸门 + 解码
-            // 耗时吸收，不为连续快翻预驻一整组纹理。流式包立即发起解码；
-            // 非流式包只记键——文件落地后由 compare_tick 补发（landed 前
-            // 解码必失败，污染闸门同 raw 栏）
+            // 耗时吸收，不为连续快翻预驻一整组纹理。候选一律只记键不立即
+            // 发起——窗口栏全部就绪后由 compare_tick 统一补发（含流式），
+            // 预取流的随机读不与正在等待的窗口栏交错（窗口优先、预取让路）
             let mut cands: Vec<(ImgKey, ImageSource, String, u64)> = Vec::new();
             if let Some(a) = self.archive.as_ref() {
                 let pf = s
@@ -472,7 +472,7 @@ impl App {
         };
         // LRU 保护集 = 当前窗口 + 预取候选（窗口纹理与预取纹理都不被逐出，
         // 滑动换屏时 Incoming 恒命中——6+2 语义）；候选同步入会话供
-        // compare_tick 补发非流式解码
+        // compare_tick 在窗口就绪后统一补发
         let mut protect = keys.clone();
         protect.extend(cands.iter().map(|(k, _, _, _)| *k));
         if let Some(s) = &mut self.compare {
@@ -484,15 +484,9 @@ impl App {
         for (key, source, name) in wants {
             self.img.request(key, source, max_dim, &name);
         }
-        // 预取解码：流式立即发起；非流式候选的落地检查在 compare_tick
-        for (key, source, name, _) in &cands {
-            if matches!(source, ImageSource::Stream(..))
-                && !self.img.has(*key)
-                && !self.img.is_pending(*key)
-            {
-                self.img.request(*key, source.clone(), max_dim, name);
-            }
-        }
+        // 预取候选不在此处发起：窗口栏全部就绪后由 compare_tick 统一补发
+        // （窗口优先、预取让路，防慢盘上预取流的随机读与窗口栏交错拖慢
+        // 整组渐进显示；快盘下窗口毫秒级就绪、预取紧跟无损失）
         // raw 帧对齐游标（进入/滑动后游标已重置/保持，按需补发）
         self.compare_request_raw_frames();
     }
@@ -595,21 +589,32 @@ impl App {
             tracing::warn!("对比栏图片不在缓存且无在途解码，补发请求: {name}");
             self.img.request(key, source, max_dim, &name);
         }
-        // 预取候选补发：非流式邻居文件落地后发起解码（流式已在
-        // compare_after_change 发起；source_ready 防半截文件污染）——
-        // 让预取纹理在用户滑动前就绪，配合滑动就绪闸门实现零等待换屏
-        let cands = self
-            .compare
-            .as_ref()
-            .map(|s| s.prefetch.clone())
-            .unwrap_or_default();
-        for (key, source, name, size) in cands {
-            if matches!(source, ImageSource::File(..))
-                && !self.img.has(key)
-                && !self.img.is_pending(key)
-                && source_ready(&source, size)
-            {
-                self.img.request(key, source, max_dim, &name);
+        // 预取候选补发：窗口栏全部就绪（landed 图片栏无在途解码）后才统一
+        // 发起（含流式）——窗口优先、预取让路，同单图预取串行链哲学：慢盘
+        // 上预取流的随机读不与正在等待的窗口栏交错；source_ready 防半截
+        // 文件污染（raw 栏的 rawdec 队列本就单 worker 串行，不参与本闸门）
+        // ——让预取纹理在用户滑动前就绪，配合滑动就绪闸门实现零等待换屏
+        let window_busy = self.compare.as_ref().is_some_and(|s| {
+            s.panes
+                .iter()
+                .any(|p| matches!(p.kind, PaneKind::Image) && p.landed && self.img.is_pending(p.key))
+        });
+        if !window_busy {
+            let cands = self
+                .compare
+                .as_ref()
+                .map(|s| s.prefetch.clone())
+                .unwrap_or_default();
+            for (key, source, name, size) in cands {
+                if !self.img.has(key) && !self.img.is_pending(key) {
+                    let ready = match &source {
+                        ImageSource::File(_) => source_ready(&source, size),
+                        ImageSource::Stream(..) => true,
+                    };
+                    if ready {
+                        self.img.request(key, source, max_dim, &name);
+                    }
+                }
             }
         }
         // 解压会话触发：主栏为非流式源、未落地、当前解压会话未覆盖主栏时

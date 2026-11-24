@@ -988,13 +988,13 @@ impl App {
                                 .add_enabled(
                                     menu_sync_ok,
                                     egui::Button::new(if menu_sync_ok {
-                                        "同步评级到文件"
+                                        "同步评级到文件（Ctrl+S）"
                                     } else {
                                         "同步评级到文件：无待同步评级"
                                     }),
                                 )
                                 .on_hover_text(
-                                    "把本次会话的评级改动写入文件（嵌入式 XMP / sidecar，快捷路径无此键时退出会自动保存）",
+                                    "把本次会话的评级改动写入文件（嵌入式 XMP / sidecar，切换目录或者程序退出时会自动保存）",
                                 )
                                 .clicked()
                             {
