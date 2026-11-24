@@ -19,6 +19,87 @@ impl App {
         tracing::info!("全屏: {on}");
     }
 
+    /// 列表选择快捷键：Ctrl+A 全选当前列表 / Ctrl+Q 清除全部选中
+    /// （2026-11-24 新增，与 Ctrl+A 成对；§15.5 多选基建）。让位：搜索框
+    /// 聚焦（文本框原生收键）、密码/编码确认窗在场（它们的 TextEdit 要
+    /// 收事件）。独立成方法：先于对比模态分派调用（两模态都可用），
+    /// 且 handle_shortcuts 携 eframe::Frame 构不出测试态，抽出便于单测
+    pub(super) fn selection_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pw_prompt.is_none()
+            && self.encode_dialog.is_none()
+            && !self.list_rows.is_empty()
+            && ctx.memory(|m| m.focused()) != Some(search_box_id())
+        {
+            let mut select_all = false;
+            let mut clear_sel = false;
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        // command = Ctrl（或 mac Cmd），与 Ctrl+A 既有语义一致
+                        if modifiers.command {
+                            match key {
+                                egui::Key::A => {
+                                    select_all = true;
+                                    return false;
+                                }
+                                egui::Key::Q => {
+                                    clear_sel = true;
+                                    return false;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    true
+                });
+            });
+            if select_all {
+                self.selected = self.list_rows.iter().map(|r| r.idx).collect();
+            }
+            if clear_sel {
+                let n = self.selected.len();
+                self.selected.clear();
+                if n > 0 {
+                    tracing::info!("Ctrl+Q 清除全部选中（{n} 项）");
+                }
+            }
+        }
+    }
+
+    /// Ctrl+S=手动同步评级到文件（=右键菜单同项）。评级脏表是全局态
+    /// （单图/对比模式评星都写入），同步入口必须两模态可达——调用点在
+    /// handle_shortcuts 中先于对比模态分派。防重入在 start_rating_sync
+    /// 内部（job 在跑直接忽略）。独立成方法便于单测（同 selection_shortcuts）
+    pub(super) fn rating_sync_shortcut(&mut self, ctx: &egui::Context) {
+        if self.config_editor.is_some() {
+            return;
+        }
+        let sync_now = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::S,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl
+                )
+            })
+        });
+        if sync_now {
+            self.start_rating_sync(false);
+        }
+    }
+
     /// 空格=暂停/播放，←/→=±5s（图片模式=上一张/下一张；视频暂停时=上一帧/下一帧），
     /// ↑/↓=模式分治：图片=缩放步进、视频=音量±5；M=静音（仅视频；
     /// 真相在 cfg，未播放/未开文件也可预设），
@@ -26,8 +107,9 @@ impl App {
     /// L=视频播放模式三态循环（定格→列表→循环），
     /// N=打开下一个压缩包，B=回到锚点，回车=全屏切换，Esc=退出全屏；
     /// 图片模式：+/−/↑/↓=缩放（锚视口中心），0=100%，Home=适应窗口，
-    /// R=顺时针旋转 90°，1-5=评星，Q=清除评级；Ctrl+Delete=删除选中
-    /// 文件（目录模式，确认窗二次确认；同右键菜单项）
+    /// R=顺时针旋转 90°，1-5=评星，Q=清除评级；Ctrl+A=全选、Ctrl+Q=清除
+    /// 全部选中、Ctrl+S=同步评级到文件；Ctrl+Delete=删除选中文件（目录
+    /// 模式，确认窗二次确认；同右键菜单项）
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // F12 = 运行日志面板开关（诊断性质，任何模态/焦点下都可用）。
         // release 无控制台（windows 子系统），日志走 logsink 环形缓冲 +
@@ -71,67 +153,26 @@ impl App {
         if self.config_editor.is_some() {
             return;
         }
-        // Ctrl+A = 全选当前列表（§15.5 多选基建）。让位：搜索框聚焦（文本框
-        // 原生全选）、密码/配置编辑器/编码确认窗在场（它们的 TextEdit 要收
-        // 事件）。先于下方"无播放器早退"——列表选择与播放无关
-        if self.pw_prompt.is_none()
-            && self.encode_dialog.is_none()
-            && !self.list_rows.is_empty()
-            && ctx.memory(|m| m.focused()) != Some(search_box_id())
-        {
-            let mut select_all = false;
-            ctx.input_mut(|i| {
-                i.events.retain(|e| {
-                    if let egui::Event::Key {
-                        key: egui::Key::A,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                        ..
-                    } = e
-                    {
-                        if modifiers.command {
-                            select_all = true;
-                            return false;
-                        }
-                    }
-                    true
-                });
-            });
-            if select_all {
-                self.selected = self.list_rows.iter().map(|r| r.idx).collect();
-            }
-        }
+        // 列表选择快捷键（Ctrl+A 全选 / Ctrl+Q 清除全部选中）。让位：搜索
+        // 框聚焦（文本框原生收键）、密码/编码确认窗在场（它们的 TextEdit
+        // 要收事件）。先于对比模态分派——列表选择与播放模式无关
+        self.selection_shortcuts(ctx);
+        // Ctrl+S=手动同步评级到文件（=右键菜单同项）。**必须先于对比模态
+        // 分派**（2026-11-24 修复：原位置在 compare 分派短路 return 之后，
+        // 对比模式 Ctrl+S 永远失联——对比模式评主栏同样会积累评级脏表，
+        // 同步入口必须全局可达）。作用域区分 config 编辑器：编辑器窗口
+        // 开着时 Ctrl+S 归编辑器保存（其窗口内自行匹配同款事件），这里
+        // 整体跳过不抢；修饰键取 Key 事件内联快照（11_修饰键两条数据
+        // 路径.md——key_pressed 依赖跨帧状态，有失焦清零坑）。防重入在
+        // start_rating_sync 内部（job 在跑直接忽略）
+        self.rating_sync_shortcut(ctx);
         // 对比模态：独立键表全权接管（mpv 播放键全禁，分派单位是模式）。
         // 先于"无播放器早退"——对比模式 mpv 不在场（纹理/raw 软解），无
-        // 播放器也成立
+        // 播放器也成立。**此处开始短路 return**：模态媒体键归 compare 键
+        // 表，全局工具键（选择/评级同步）必须排在本分派之前
         if self.compare.is_some() {
             self.compare_shortcuts(ctx, frame);
             return;
-        }
-        // Ctrl+S=手动同步评级到文件（=右键菜单同项）。作用域区分 config
-        // 编辑器：编辑器窗口开着时 Ctrl+S 归编辑器保存（其窗口内自行匹配
-        // 同款事件），这里整体跳过不抢；修饰键取 Key 事件内联快照
-        //（11_修饰键两条数据路径.md——key_pressed 依赖跨帧状态，有失焦
-        // 清零坑）。防重入在 start_rating_sync 内部（job 在跑直接忽略）
-        if self.config_editor.is_none() {
-            let sync_now = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key {
-                            key: egui::Key::S,
-                            pressed: true,
-                            repeat: false,
-                            modifiers,
-                            ..
-                        } if modifiers.ctrl
-                    )
-                })
-            });
-            if sync_now {
-                self.start_rating_sync(false);
-            }
         }
         // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
         if self.player.is_none() && self.tex_image_key().is_none() {
@@ -654,6 +695,26 @@ impl App {
         Some((key, key.1, path))
     }
 
+    /// 对比模式主栏条目的元数据操作上下文（返回形态同 image_meta_ctx）。
+    /// 仅静态图栏可评（PaneKind::Image）——raw 栏（nv12/yuv400/raw dump）
+    /// 不在评级真相矩阵、RawErr/Unsupported 占位栏同理；None = 主栏
+    /// 不存在/不可评
+    pub(super) fn compare_master_meta_ctx(&self) -> Option<(ImgKey, usize, Option<PathBuf>)> {
+        let s = self.compare.as_ref()?;
+        let p = s.panes.get(s.master)?;
+        if !matches!(p.kind, PaneKind::Image) {
+            return None;
+        }
+        let a = self.archive.as_ref()?;
+        let entry = a.entries.get(p.idx)?;
+        let path = if a.path.is_dir() {
+            Some(a.path.join(&entry.name))
+        } else {
+            None
+        };
+        Some((p.key, p.idx, path))
+    }
+
     /// R 键：当前图片顺时针旋转 90°。方向真相 = 文件 EXIF Orientation
     /// tag（写回后重解码显示，位图零重写）；不可写格式（压缩包内 /
     /// GIF/BMP/写失败）降级会话内 override（rotoverride 表，request
@@ -710,9 +771,16 @@ impl App {
     /// 「同步评级到文件」/ 退出静默自动保存（都带进度条）；压缩包模式
     /// 维持会话内记忆（不可写回文件）。评级真相矩阵见 meta.rs 头注
     fn rate_image(&mut self, r: u8) {
-        let Some((_, idx, path)) = self.image_meta_ctx() else {
+        let Some(ctx) = self.image_meta_ctx() else {
             return;
         };
+        self.rate_ctx(r, ctx);
+    }
+
+    /// 评级落点（单图 image_meta_ctx / 对比模式主栏
+    /// compare_master_meta_ctx 共用；r=0 清除）
+    pub(super) fn rate_ctx(&mut self, r: u8, ctx: (ImgKey, usize, Option<PathBuf>)) {
+        let (_, idx, path) = ctx;
         let ename = self.archive.as_ref().unwrap().entries[idx].name.clone();
         let mut dirty = false;
         if let Some(p) = &path {

@@ -207,7 +207,8 @@ impl App {
                             ("← / →", "所有画面同步翻帧（多帧 RAW 对比时有效）"),
                             ("0", "按原始尺寸显示（以最近点击的那格为准）"),
                             ("双击任意一格", "全部恢复适应窗口"),
-                            ("2 ~ 6", "调整同时对比的张数"),
+                            ("1 ~ 5 / Q", "给最近点击的那格评星 / 清除评级"),
+                            ("Z / X", "减少 / 增加对比张数（Z 减到 2 格退出对比）"),
                             ("单击某一格", "选中它（大图加载跟随这一格）"),
                             ("控制栏 < / >", "上一组 / 下一组"),
                             ("控制栏 ▶ / ||", "对比模式下不使用"),
@@ -478,6 +479,17 @@ impl App {
             .unwrap_or(i.modifiers)
     }
 
+    /// 列表高亮/滚动追踪焦点：单图态 = playing；对比态 = 主栏条目（主栏
+    /// 语义 = 最后点击的栏，翻页时位置保持 → 高亮每页推进 1，单击设主栏/
+    /// B 键回锚点即时跟随；退出对比回放主栏条目后 playing 无缝接管）。
+    /// playing 在对比模式恒 None，不能直接用
+    pub(super) fn list_focus_idx(&self) -> Option<usize> {
+        self.playing.or_else(|| {
+            let s = self.compare.as_ref()?;
+            s.panes.get(s.master).map(|p| p.idx)
+        })
+    }
+
     pub(super) fn file_list(&mut self, ui: &mut egui::Ui) {
         // 压缩包名（仅文件名，无路径；完整路径悬停显示）
         if let Some(a) = &self.archive {
@@ -730,15 +742,13 @@ impl App {
         let menu_sync_ok = menu_delete_ok && !self.rating_dirty.is_empty();
         let mut menu_sync = false;
         let mut scrolled = false;
-        // 高亮跟踪：playing 变化（快捷键/箭头切换/点击/锚点落地自动播放）
-        // 时滚动到该行（居中）。虚拟化下行可能不在渲染范围内，用行号×行高
-        // 换算矩形再 scroll_to_rect
-        let scroll_pending = self.scrolled_to != self.playing;
+        // 高亮跟踪：焦点条目变化（快捷键/箭头切换/点击/锚点落地自动播放/
+        // 对比模式翻页换主栏）时滚动到该行（居中）。虚拟化下行可能不在
+        // 渲染范围内，用行号×行高换算矩形再 scroll_to_rect
+        let focus = self.list_focus_idx();
+        let scroll_pending = self.scrolled_to != focus;
         let target_row = scroll_pending
-            .then(|| {
-                self.playing
-                    .and_then(|p| self.list_rows.iter().position(|r| r.idx == p))
-            })
+            .then(|| focus.and_then(|p| self.list_rows.iter().position(|r| r.idx == p)))
             .flatten();
         let mut measured: Option<f32> = None;
         // 评级探测钩子：视口闭包只收集本帧探测窗口（可见 ±1 个视口行），
@@ -753,7 +763,7 @@ impl App {
         let cfg = &self.cfg;
         // hover 气泡要完整包内路径（含目录段），与 rows 一样预取引用进闭包
         let entries = self.archive.as_ref().map(|a| &a.entries);
-        let playing = self.playing;
+        let playing = focus;
         let has_archive = self.archive.is_some();
         let item_spacing_y = ui.spacing().item_spacing.y;
         // auto_shrink=false：滚动区域宽度固定占满面板，滚动条钉在右边界（不随文件名长度缩进）
@@ -1004,7 +1014,7 @@ impl App {
                                 menu_all = true;
                             }
                             if ui
-                                .add_enabled(!sel.is_empty(), egui::Button::new("清除选择"))
+                                .add_enabled(!sel.is_empty(), egui::Button::new("清除选择（Ctrl+Q）"))
                                 .clicked()
                             {
                                 menu_clear = true;
@@ -1020,7 +1030,7 @@ impl App {
                 });
             });
         if scrolled {
-            self.scrolled_to = self.playing;
+            self.scrolled_to = focus;
         }
         // 评级探测视口钩子（目录模式 job 存在才跑）：窗口与上次已入队窗口
         // 比较（每帧一次元组比较，没移动零开销），移动了记意图窗口；意图

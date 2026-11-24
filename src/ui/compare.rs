@@ -746,7 +746,8 @@ impl App {
         self.compare_after_change();
     }
 
-    /// 栏数动态切换（数字键 2~6 = 窗口宽度语义）：缩小保前栏、放大追加
+    /// 栏数动态切换（compare_step_count 的 Z/X 步进落点 = 窗口宽度语义）：
+    /// 缩小保前栏、放大追加
     pub(super) fn compare_set_count(&mut self, n: usize) {
         let n = n.clamp(COMPARE_MIN, COMPARE_MAX);
         let (cur, result) = {
@@ -792,6 +793,39 @@ impl App {
         s.panes = panes;
         s.master = s.master.min(s.panes.len() - 1);
         self.compare_after_change();
+    }
+
+    /// 栏数 ±1 步进（Z/X）：下界 COMPARE_MIN，2 栏再减 = 自然退出对比
+    /// 模式（回落播放主栏条目，与 Esc 退出同一路径）；上界 COMPARE_MAX。
+    /// 窗口重算复用 compare_set_count（缩小保前栏、放大 grow_window 追加）
+    pub(super) fn compare_step_count(&mut self, dir: i32) {
+        let cur = self
+            .compare
+            .as_ref()
+            .map(|s| s.panes.len())
+            .unwrap_or(0);
+        if dir < 0 {
+            if cur <= COMPARE_MIN {
+                self.exit_compare();
+            } else {
+                self.compare_set_count(cur - 1);
+            }
+        } else if cur < COMPARE_MAX {
+            self.compare_set_count(cur + 1);
+        }
+    }
+
+    /// 对比模式评星（1-5/Q）：目标 = 主栏条目（主栏语义 = 最后点击的栏，
+    /// 翻页时位置保持、B 键回锚点吸附）。仅静态图栏可评——raw 栏不在
+    /// 评级真相矩阵、占位栏同理，不可评给明确提示不静默。
+    /// 存储链与单图模式共用 rate_ctx：目录模式延迟批量写、压缩包会话内
+    /// 记忆，列表 ★ 前缀随 a.ratings 即时亮起
+    pub(super) fn compare_rate_image(&mut self, r: u8) {
+        let Some(ctx) = self.compare_master_meta_ctx() else {
+            self.set_notice("主栏不支持评级（仅静态图栏可评，单击某栏设为主栏）");
+            return;
+        };
+        self.rate_ctx(r, ctx);
     }
 
     /// 回到锚点（对比模式语义，B 键）：锚点条目在滑动域内 → 整组滑窗
@@ -863,7 +897,12 @@ impl App {
         }
         let mut slide = 0i32;
         let mut step = 0i32;
-        let mut count: Option<usize> = None;
+        // Z/X = 栏数 ±1 步进（下界 2，2 栏再减 = 退出对比；上界 6）——
+        // 数字键 1-5 让位给评主栏（2026-11-24 用户定案）
+        let (mut count_down, mut count_up) = (false, false);
+        // 1-5=评主栏星、Q=清除主栏评级（与主键表同语义；主栏 = 最后点击
+        // 的栏，见 compare_rate_image）
+        let mut rate_set: Option<u8> = None;
         let (mut zin, mut zout, mut zfit) = (false, false, false);
         let mut exit = false;
         // 回车 = 全屏切换（通用键，与主键表同义；对比模态全权接管后
@@ -893,6 +932,26 @@ impl App {
                     }
                     if t == "s" || t == "S" {
                         contrast_down = true;
+                        return false;
+                    }
+                    // Q/数字 同理：评主栏（1-5=星、Q=清除，与主键表同语义）
+                    if t == "q" || t == "Q" {
+                        rate_set = Some(0);
+                        return false;
+                    }
+                    if let Ok(n) = t.parse::<u8>() {
+                        if (1..=5).contains(&n) {
+                            rate_set = Some(n);
+                            return false;
+                        }
+                    }
+                    // Z/X 同理：栏数 −1/+1
+                    if t == "z" || t == "Z" {
+                        count_down = true;
+                        return false;
+                    }
+                    if t == "x" || t == "X" {
+                        count_up = true;
                         return false;
                     }
                     return true;
@@ -940,24 +999,40 @@ impl App {
                         step = 1;
                         false
                     }
+                    // 1-5 = 评主栏星（Q 臂在下方；0 已被主栏 100% 占用，
+                    // 2~5 不再承担栏数切换——栏数改 Z/X 步进）
+                    egui::Key::Num1 => {
+                        rate_set = Some(1);
+                        false
+                    }
                     egui::Key::Num2 => {
-                        count = Some(2);
+                        rate_set = Some(2);
                         false
                     }
                     egui::Key::Num3 => {
-                        count = Some(3);
+                        rate_set = Some(3);
                         false
                     }
                     egui::Key::Num4 => {
-                        count = Some(4);
+                        rate_set = Some(4);
                         false
                     }
                     egui::Key::Num5 => {
-                        count = Some(5);
+                        rate_set = Some(5);
                         false
                     }
-                    egui::Key::Num6 => {
-                        count = Some(6);
+                    egui::Key::Q => {
+                        rate_set = Some(0);
+                        false
+                    }
+                    // Z/X = 栏数 −1/+1（下界 2，2 栏再减 = 退出对比模式；
+                    // 上界 6——见 compare_step_count）
+                    egui::Key::Z => {
+                        count_down = true;
+                        false
+                    }
+                    egui::Key::X => {
+                        count_up = true;
                         false
                     }
                     egui::Key::Plus | egui::Key::Equals => {
@@ -1030,8 +1105,14 @@ impl App {
         if slide != 0 {
             self.compare_slide(slide);
         }
-        if let Some(n) = count {
-            self.compare_set_count(n);
+        if count_down {
+            self.compare_step_count(-1);
+        }
+        if count_up {
+            self.compare_step_count(1);
+        }
+        if let Some(r) = rate_set {
+            self.compare_rate_image(r);
         }
         if zin {
             if let Some(s) = &mut self.compare {

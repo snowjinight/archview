@@ -1735,6 +1735,144 @@ fn compare_prefetch_deferred_until_window_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 选择快捷键（2026-11-24）：Ctrl+A 全选 / Ctrl+Q 清除全部选中。
+/// selection_shortcuts 独立成方法（handle_shortcuts 携 eframe::Frame
+/// 构不出测试态），经 ctx.run_ui 注入真实 Key 事件钉死语义
+#[test]
+fn selection_shortcuts_ctrl_a_select_all_and_ctrl_q_clear() {
+    let dir = make_png_dir("selsc", &["p0.png", "p1.png", "p2.png"]);
+    let mut app = App::new_for_test(crate::config::Config::default());
+    png_archive(&mut app, 14, &dir, 3);
+    app.rebuild_view();
+    let ctx = egui::Context::default();
+    let key_raw = |key: egui::Key| {
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            // 必须用 COMMAND（ctrl+command 双置位）：选择快捷键匹配
+            // modifiers.command（winit 桥在 Windows 上把 Ctrl 映射为
+            // command），egui::Modifiers::CTRL 常量不含 command 标志
+            modifiers: egui::Modifiers::COMMAND,
+            physical_key: None,
+        });
+        raw
+    };
+    // Ctrl+A 全选
+    ctx.run_ui(key_raw(egui::Key::A).take(), |ctx| app.selection_shortcuts(ctx))
+        .drop_without_applying_deltas();
+    assert_eq!(app.selected.len(), 3, "Ctrl+A 应全选当前列表");
+    // Ctrl+Q 清除全部选中
+    ctx.run_ui(key_raw(egui::Key::Q).take(), |ctx| app.selection_shortcuts(ctx))
+        .drop_without_applying_deltas();
+    assert!(app.selected.is_empty(), "Ctrl+Q 应清除全部选中");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ctrl+S 门控修复（2026-11-24）：评级同步入口原先排在对比模态分派
+/// （短路 return）之后，对比模式 Ctrl+S 永远失联——对比模式评主栏同样
+/// 会积累评级脏表，同步入口必须两模态可达。rating_sync_shortcut 抽出
+/// 独立方法 + 调用点前移后钉死"对比态按 Ctrl+S 启动同步"
+#[test]
+fn rating_sync_shortcut_works_in_compare_mode() {
+    let dir = make_png_dir("syncsc", &["p0.png", "p1.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 15, &dir, 2);
+    app.rebuild_view();
+    // 预置评级脏表（对比模式评主栏积累的同款状态）
+    app.rating_dirty.insert(dir.join("p0.png"), 3);
+    app.selected = [0, 1].into_iter().collect();
+    app.try_enter_compare();
+    assert!(app.compare.is_some());
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    raw.events.push(egui::Event::Key {
+        key: egui::Key::S,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+        physical_key: None,
+    });
+    ctx.run_ui(raw.take(), |ctx| app.rating_sync_shortcut(ctx))
+        .drop_without_applying_deltas();
+    assert!(
+        app.rating_sync.is_some(),
+        "对比模式 Ctrl+S 应启动评级同步（门控修复回归）"
+    );
+    // 收尾：同步 worker 后台跑完即退（文件不存在 → Skipped，无残留）
+    for _ in 0..200 {
+        app.poll_rating_sync();
+        if app.rating_sync.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.rating_sync.is_none(), "同步 job 应收敛退出");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 对比模式列表追踪焦点 + 评主栏（2026-11-24）：
+/// 1) 列表高亮/滚动追踪焦点 = 主栏条目（list_focus_idx）：初始/单击设
+///    主栏/加栏/整组滑动后焦点随主栏推进；playing 在对比态恒 None；
+/// 2) 1-5/Q 评主栏：目录模式 rating_dirty + a.ratings 即时，Q 清除；
+/// 3) X/Z = 栏数 ±1 步进，2 栏再减（Z）自然退出对比并回落播放主栏条目
+#[test]
+fn compare_list_focus_and_master_rating() {
+    let dir = make_png_dir("cmpfocus", &["p0.png", "p1.png", "p2.png", "p3.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 13, &dir, 4);
+    app.selected = [0, 1].into_iter().collect();
+    app.try_enter_compare();
+    assert!(app.compare.is_some(), "2 张合格静态图应放行进入对比");
+    // 焦点 = 主栏条目（初始 master = 0）
+    assert_eq!(app.list_focus_idx(), Some(0));
+    // 单击语义等价（主栏切到栏 1）→ 焦点即时跟随
+    app.compare.as_mut().unwrap().master = 1;
+    assert_eq!(app.list_focus_idx(), Some(1));
+    // X 加一栏（domain 前进方向有 p2/p3）→ 3 栏，主栏位置保持 → 焦点不变
+    app.compare_step_count(1);
+    assert_eq!(app.compare.as_ref().unwrap().panes.len(), 3);
+    assert_eq!(app.list_focus_idx(), Some(1));
+    // 整组滑动：主栏位置保持 → 焦点推进 1。流式 Incoming（p3）未就绪时
+    // 滑动被就绪闸门挂起（当场发起解码），tick 轮询就绪后自动滑
+    app.compare_slide(1);
+    if app.compare.as_ref().unwrap().pending_slide.is_some() {
+        wait_texture(&mut app, (13, 3), "对比滑动 Incoming");
+        app.compare_tick();
+    }
+    assert!(app.compare.as_ref().unwrap().pending_slide.is_none());
+    assert_eq!(app.compare.as_ref().unwrap().panes[2].idx, 3);
+    assert_eq!(app.list_focus_idx(), Some(2));
+    // 评主栏（目录模式：ratings 即时 + rating_dirty 延迟落盘）
+    let idx = app.list_focus_idx().unwrap();
+    app.compare_rate_image(4);
+    assert_eq!(app.archive.as_ref().unwrap().ratings.get(&idx), Some(&4));
+    assert!(
+        app.rating_dirty.iter().any(|(_, r)| *r == 4),
+        "目录模式评级应进延迟落盘表"
+    );
+    // Q 清除主栏评级
+    app.compare_rate_image(0);
+    assert_eq!(app.archive.as_ref().unwrap().ratings.get(&idx), None);
+    assert!(app.rating_dirty.iter().any(|(_, r)| *r == 0), "0 = 清除语义");
+    // Z 逐步减栏：3→2；2 栏再减 = 自然退出对比并回落播放主栏条目
+    app.compare_step_count(-1);
+    assert_eq!(app.compare.as_ref().unwrap().panes.len(), 2);
+    let master_idx = {
+        let s = app.compare.as_ref().unwrap();
+        s.panes[s.master].idx
+    };
+    app.compare_step_count(-1);
+    assert!(app.compare.is_none(), "2 栏再减应自然退出对比模式");
+    assert_eq!(app.playing, Some(master_idx), "退出对比回落播放主栏条目");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 预取串行链（当前张 → +1 → -1，任一时刻最多 1 路预取在途）：巨图多路
 /// 并行解码抢 CPU/内存带宽会把当前张出图拖到秒级（8192 级实测 5s+）——
 /// 当前张解码中预取让路，就绪后 poll_img 补发 +1，+1 就绪再补发 -1。
