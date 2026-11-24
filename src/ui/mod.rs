@@ -917,6 +917,13 @@ impl eframe::App for App {
         } else if self.slideshow_on && self.tex_image_key().is_some() {
             let now = ctx.input(|i| i.time);
             ctx.request_repaint_after(self.slideshow_rest(now));
+        } else if let Some(rest) = {
+            let now = ctx.input(|i| i.time);
+            self.compare_autoplay_rest(now)
+        } {
+            // 对比自动翻页开启（空格）：同样精确排到下次整组滑动——
+            // 幻灯片类"允许主动排帧"白名单场景，无周期心跳
+            ctx.request_repaint_after(rest);
         }
         probe!("repaint决策");
         // 任意鼠标点击即清绿色提示（见 clear_notice_on_click；键盘操作
@@ -957,6 +964,9 @@ impl eframe::App for App {
         // 图片自动翻页（PPT 式）
         self.slideshow_tick(&ctx);
         probe!("slideshow");
+        // 对比模式整组自动翻页（空格开关）
+        self.compare_autoplay_tick(&ctx);
+        probe!("compare_autoplay");
         // 列表播放：视频 EOF 自动切下一个（循环模式/图片不动作）
         self.video_eof_tick();
         probe!("eof_tick");

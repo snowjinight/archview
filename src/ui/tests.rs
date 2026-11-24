@@ -1814,6 +1814,89 @@ fn rating_sync_shortcut_works_in_compare_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 对比模式空格自动翻页（2026-11-24）：开关随会话记忆（CompareSession 内，
+/// 不泄漏回单图幻灯片）；tick 到期整组前滑 1（复用 compare_slide 就绪闸门
+/// ——流式 Incoming 未就绪挂起、就绪补滑），窗口换血重置锚点（手动滑动
+/// 重置计时与单图幻灯片一致），末组停住且锚点重置（不逐帧重试风暴），
+/// 精确排帧 rest() 开才有值关为 None
+#[test]
+fn compare_autoplay_tick_slides_and_resets_anchor() {
+    let dir = make_png_dir("cmpauto", &["p0.png", "p1.png", "p2.png", "p3.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 16, &dir, 4);
+    app.selected = [0, 1].into_iter().collect();
+    app.try_enter_compare();
+    assert!(app.compare.is_some());
+    let secs = app.cfg.ui.slideshow_secs;
+    let ctx = egui::Context::default();
+    let raw_at = |t: f64| egui::RawInput {
+        time: Some(t),
+        ..Default::default()
+    };
+    let run = |app: &mut App, t: f64| {
+        ctx.run_ui(raw_at(t).take(), |ctx| app.compare_autoplay_tick(ctx))
+            .drop_without_applying_deltas()
+    };
+    // 关（初始）：rest None、tick 无动作
+    assert!(app.compare_autoplay_rest(0.5).is_none());
+    run(&mut app, 0.6);
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 0);
+    // 开启（模拟空格臂落点状态：锚点 = 开启时刻 + 窗口首栏条目）
+    {
+        let s = app.compare.as_mut().unwrap();
+        s.autoplay = true;
+        s.autoplay_anchor = 1.0;
+        s.autoplay_idx = Some(0);
+    }
+    assert_eq!(
+        app.compare_autoplay_rest(1.5).map(|d| d.as_secs_f64() < secs),
+        Some(true),
+        "开启后 rest 应有值且未到期"
+    );
+    // 未到期：不滑
+    run(&mut app, 1.0 + secs * 0.5);
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 0);
+    // 到期：发起整组前滑——流式 Incoming（p2）未就绪 → 就绪闸门挂起不换屏
+    run(&mut app, 1.0 + secs + 0.05);
+    assert!(app.compare.as_ref().unwrap().pending_slide.is_some());
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 0);
+    // Incoming 就绪 → tick 补滑：窗口 [1,2]，窗口换血 → 锚点重置
+    wait_texture(&mut app, (16, 2), "自动翻页 Incoming");
+    app.compare_tick();
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 1);
+    let t_landed = 1.0 + secs + 0.3;
+    run(&mut app, t_landed);
+    assert_eq!(
+        app.compare.as_ref().unwrap().autoplay_anchor,
+        t_landed,
+        "窗口落地（首栏条目变化）应重置计时锚点"
+    );
+    // 第二个间隔到期：发起前滑 [2,3]。p3 可能已被预取候选收口提前解码
+    // （立即滑动）或仍在途（闸门挂起 → wait + tick 补滑）——两路都收敛
+    // 到窗口 [2,3]
+    let t2 = t_landed + secs + 0.05;
+    run(&mut app, t2);
+    if app.compare.as_ref().unwrap().pending_slide.is_some() {
+        wait_texture(&mut app, (16, 3), "自动翻页第二组 Incoming");
+        app.compare_tick();
+    }
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 2);
+    // 末组 [2,3] 再到期：domain 尽头无滑动（不跨包）且锚点重置——不逐帧
+    // 重试风暴（立即路径在本 tick 走 elapsed 分支；闸门路径上一次 run 已
+    // 走 idx 变化分支重置，此处断言同一收敛值）
+    let t_end = t2 + secs + 0.1;
+    run(&mut app, t_end);
+    assert_eq!(app.compare.as_ref().unwrap().panes[0].idx, 2);
+    assert_eq!(
+        app.compare.as_ref().unwrap().autoplay_anchor,
+        t_end,
+        "末组停住也应重置锚点防逐帧重试"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 对比模式列表追踪焦点 + 评主栏（2026-11-24）：
 /// 1) 列表高亮/滚动追踪焦点 = 主栏条目（list_focus_idx）：初始/单击设
 ///    主栏/加栏/整组滑动后焦点随主栏推进；playing 在对比态恒 None；

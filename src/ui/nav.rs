@@ -509,7 +509,7 @@ impl App {
         // 空格：视频=暂停/恢复，图片=自动翻页开关（与控制栏中间按钮一致）
         if do_pause {
             if self.playing_is_image() {
-                self.slideshow_on = !self.slideshow_on;
+                self.toggle_slideshow();
             } else if let Some(p) = &self.player {
                 p.toggle_pause();
             }
@@ -927,6 +927,13 @@ impl App {
             same_kind[np as usize]
         };
         self.play(ei);
+    }
+
+    /// 图片自动翻页开关：**空格快捷键与控制栏 ▶/|| 中键共用同一动作**
+    /// （同状态两入口不漂移；对齐对比模式 compare_toggle_autoplay 先例——
+    /// 此前两处各自内联翻转同一字段，语义一致但代码路径分叉）
+    pub(super) fn toggle_slideshow(&mut self) {
+        self.slideshow_on = !self.slideshow_on;
     }
 
     /// 图片自动播放（PPT 式翻页）：间隔到了切下一张；手动切换会重置计时。

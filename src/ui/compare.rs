@@ -77,6 +77,16 @@ pub(super) struct CompareSession {
     /// 就绪的主栏才更新）。0 键"主栏 100%"的换算依据——共享 zoom 是
     /// 相对各栏 fit 的倍率，无单一 100% 语义，只能锚定主栏换算
     pub master_fit: Option<(egui::Vec2, egui::Vec2)>,
+    /// 空格自动翻页开关（对比会话内记忆，随会话消亡——退出对比不泄漏
+    /// 回单图幻灯片）：间隔复用 cfg.ui.slideshow_secs，到期整组前滑 1
+    /// （compare_slide：就绪闸门/末组停住语义免费复用）
+    pub autoplay: bool,
+    /// 自动翻页计时锚点（秒，ctx.input time 同源）：窗口首栏条目变化
+    /// （自动/手动滑动、Z/X 换血、B 回锚点）即重置——手动操作重置计时
+    /// 与单图幻灯片一致
+    pub autoplay_anchor: f64,
+    /// 锚点对应的窗口首栏条目（变化检测用）
+    pub autoplay_idx: Option<usize>,
 }
 
 impl CompareSession {
@@ -398,6 +408,9 @@ impl App {
             pending_slide: None,
             prefetch: Vec::new(),
             master_fit: None,
+            autoplay: false,
+            autoplay_anchor: 0.0,
+            autoplay_idx: None,
         });
         self.compare_after_change();
     }
@@ -828,6 +841,75 @@ impl App {
         self.rate_ctx(r, ctx);
     }
 
+    /// 整组自动翻页开关：**空格快捷键与控制栏 ▶/|| 中键共用同一动作**
+    /// （同状态同文案，两入口不会漂移）。开启即重置计时锚点；notice 反馈
+    /// 当前状态。不在对比态时静默返回（控制栏按钮只在对比态显示，快捷键
+    /// 非对比态走不到这里）
+    pub(super) fn compare_toggle_autoplay(&mut self, ctx: &egui::Context) {
+        let (on, secs) = {
+            let now = ctx.input(|i| i.time);
+            let Some(s) = self.compare.as_mut() else {
+                return;
+            };
+            s.autoplay = !s.autoplay;
+            s.autoplay_anchor = now;
+            s.autoplay_idx = s.panes.first().map(|p| p.idx);
+            (s.autoplay, self.cfg.ui.slideshow_secs)
+        };
+        tracing::info!("对比自动翻页: {on}");
+        self.set_notice(if on {
+            format!("对比自动翻页：开（间隔 {secs:.1}s，空格停止）")
+        } else {
+            "对比自动翻页：关".to_owned()
+        });
+    }
+
+    /// 对比自动翻页计时（空格开关）：窗口首栏条目变化（自动/手动滑动、
+    /// Z/X 换血、B 回锚点）即重置锚点——与单图幻灯片"手动切换重置计时"
+    /// 一致；间隔到点整组前滑 1（compare_slide：Incoming 未就绪挂起、
+    /// 就绪自动滑、末组停住）。到期翻页由精确排帧唤醒（mod.rs 心跳决策
+    /// `request_repaint_after(compare_autoplay_rest)`），无周期心跳轮询
+    pub(super) fn compare_autoplay_tick(&mut self, ctx: &egui::Context) {
+        if !self.compare.as_ref().is_some_and(|s| s.autoplay) {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let secs = self.cfg.ui.slideshow_secs;
+        let Some(s) = self.compare.as_mut() else {
+            return;
+        };
+        let first = s.panes.first().map(|p| p.idx);
+        if s.autoplay_idx != first {
+            // 窗口换血（滑动/换栏/回锚点）：重置计时
+            s.autoplay_idx = first;
+            s.autoplay_anchor = now;
+            return;
+        }
+        if now - s.autoplay_anchor >= secs {
+            // 锚点先重置再滑动：末组停住（compare_slide 无动）不致逐帧
+            // 重试；滑动实际完成（含闸门挂起后补滑）由上面的 idx 变化
+            // 检测再次重置，计时从窗口落地重新起算
+            s.autoplay_anchor = now;
+            drop(s); // 结束 &mut 借用再滑动（compare_slide 借整个 self）
+            self.compare_slide(1);
+        }
+    }
+
+    /// 距下次对比自动翻页的剩余时长（saturating；mod.rs 心跳决策据此精确
+    /// 排帧，每个间隔只醒一次）。未开启/不在对比态返回 None。`now` =
+    /// ctx.input time（秒，与 compare_autoplay_tick 计时同源同帧同值）
+    pub(super) fn compare_autoplay_rest(&self, now: f64) -> Option<std::time::Duration> {
+        let s = self.compare.as_ref()?;
+        if !s.autoplay {
+            return None;
+        }
+        let rest = (self.cfg.ui.slideshow_secs - (now - s.autoplay_anchor)).max(0.0);
+        // 下限 1ms 防零时长忙转；上限防病态配置撑爆 Duration（同 slideshow_rest）
+        Some(std::time::Duration::from_millis(
+            ((rest * 1000.0) as u64).clamp(1, 3_600_000),
+        ))
+    }
+
     /// 回到锚点（对比模式语义，B 键）：锚点条目在滑动域内 → 整组滑窗
     /// 吸附到它并设为主栏（锚点尽量靠窗口中部）；不在域内提示。
     /// zoom/center/cursor 保持——回看锚点不该丢用户调好的视图
@@ -918,6 +1000,8 @@ impl App {
         // Ctrl+H = 直方图开关（通用键补位）：与单图模式共用同一开关状态，
         // 每栏各画缩小版覆盖层（图片栏读 LRU、raw 栏读软解帧顺手算的直方图）
         let mut hist_toggle = false;
+        // 空格 = 整组自动翻页开关（对比会话内记忆，见 compare_autoplay_tick）
+        let mut autoplay_toggle = false;
         // W/S = 对比度步进（通用键补位）：当前全部栏各调一步（对比场景调
         // 对比度通常为公平比较，逐栏同调；见 compare_adjust_contrast）
         let (mut contrast_up, mut contrast_down) = (false, false);
@@ -1078,6 +1162,12 @@ impl App {
                         ask_next = true;
                         false
                     }
+                    // 空格 = 整组自动翻页开关（与单图图片态空格=幻灯片同心智；
+                    // 视频空格=暂停/恢复在对比模态无对象——mpv 不在场）
+                    egui::Key::Space => {
+                        autoplay_toggle = true;
+                        false
+                    }
                     _ => true,
                 }
             });
@@ -1113,6 +1203,11 @@ impl App {
         }
         if let Some(r) = rate_set {
             self.compare_rate_image(r);
+        }
+        // 空格：整组自动翻页开关（控制栏 ▶/|| 中键同一动作，见
+        // compare_toggle_autoplay）
+        if autoplay_toggle {
+            self.compare_toggle_autoplay(ctx);
         }
         if zin {
             if let Some(s) = &mut self.compare {
