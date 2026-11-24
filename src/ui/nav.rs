@@ -109,6 +109,30 @@ impl App {
             self.compare_shortcuts(ctx, frame);
             return;
         }
+        // Ctrl+S=手动同步评级到文件（=右键菜单同项）。作用域区分 config
+        // 编辑器：编辑器窗口开着时 Ctrl+S 归编辑器保存（其窗口内自行匹配
+        // 同款事件），这里整体跳过不抢；修饰键取 Key 事件内联快照
+        //（11_修饰键两条数据路径.md——key_pressed 依赖跨帧状态，有失焦
+        // 清零坑）。防重入在 start_rating_sync 内部（job 在跑直接忽略）
+        if self.config_editor.is_none() {
+            let sync_now = ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::S,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl
+                    )
+                })
+            });
+            if sync_now {
+                self.start_rating_sync(false);
+            }
+        }
         // 视频需 mpv；图片纹理模式没有播放器也放行（翻页/缩放/全屏键可用）
         if self.player.is_none() && self.tex_image_key().is_none() {
             // 未开任何文件时 M 仍可预设静音——真相在 cfg（与控制栏 ♪ 按钮一致），

@@ -302,6 +302,13 @@ impl App {
         entries: Vec<VirtualEntry>,
         pw: Option<String>,
     ) -> Option<usize> {
+        // 切换目录自动保存：旧目录还有待同步评级 → 立即启动同步 worker。
+        // worker 持有的是排空后的 (PathBuf, 值) 列表，与新会话零耦合（异步
+        // 落盘，新目录加载与写入并行）；dirty 只在目录模式产生（压缩包模式
+        // 评级一律会话内），守卫在压缩包/密码重试路径上恒为空操作
+        if !self.rating_dirty.is_empty() {
+            self.start_rating_sync(false);
+        }
         // 切换压缩包：按配置清理上一个包的解压缓存（默认不清理——保留可命中）
         if self.cfg.cache.clean_on_switch {
             if let Some(old) = &self.archive {
