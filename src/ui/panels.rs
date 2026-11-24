@@ -205,12 +205,12 @@ impl App {
                         "对比模式（其余按键同图片模式）",
                         &[
                             ("C", "以当前所选图片开始分栏对比"),
-                            ("← / →", "多帧raw图帧步进"),
+                            ("单击某一栏", "设置为主栏"),
+                            ("← / →", "多帧raw帧步进"),
                             ("0", "主栏按原始尺寸显示"),
                             ("双击任意一栏", "全栏适应窗口"),
                             ("1 ~ 5 / Q", "主栏评级 / 清除主栏评级"),
                             ("Z / X", "减少 / 增加对比栏位"),
-                            ("单击某一栏", "设置为主栏"),
                             ("Esc", "退出分栏对比模式"),
                         ],
                     ),
@@ -2153,6 +2153,16 @@ impl App {
         let master = self.compare.as_ref().map(|s| s.master).unwrap_or(0);
         for i in 0..n {
             let Some(cell) = cells.get(i) else { break };
+            // 主栏琥珀描边标识当前主栏（Inside 收边防被相邻栏裁剪；
+            // 与徽标同色系，覆盖全部栏型——占位/错误栏也可为主栏）
+            if i == master {
+                ui.painter_at(*cell).rect_stroke(
+                    *cell,
+                    0.0,
+                    egui::Stroke::new(1.0, amber),
+                    egui::StrokeKind::Inside,
+                );
+            }
             let name = self.compare.as_ref().unwrap().panes[i].name.clone();
             let prefix = if i == master { "★ " } else { "" };
             ui.painter_at(*cell).text(

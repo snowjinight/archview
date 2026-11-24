@@ -875,22 +875,25 @@ impl App {
         }
         let now = ctx.input(|i| i.time);
         let secs = self.cfg.ui.slideshow_secs;
-        let Some(s) = self.compare.as_mut() else {
-            return;
+        let due = {
+            let Some(s) = self.compare.as_mut() else {
+                return;
+            };
+            let first = s.panes.first().map(|p| p.idx);
+            if s.autoplay_idx != first {
+                // 窗口换血（滑动/换栏/回锚点）：重置计时，本 tick 不翻页
+                s.autoplay_idx = first;
+                s.autoplay_anchor = now;
+                return;
+            }
+            now - s.autoplay_anchor >= secs
         };
-        let first = s.panes.first().map(|p| p.idx);
-        if s.autoplay_idx != first {
-            // 窗口换血（滑动/换栏/回锚点）：重置计时
-            s.autoplay_idx = first;
-            s.autoplay_anchor = now;
-            return;
-        }
-        if now - s.autoplay_anchor >= secs {
+        if due {
             // 锚点先重置再滑动：末组停住（compare_slide 无动）不致逐帧
             // 重试；滑动实际完成（含闸门挂起后补滑）由上面的 idx 变化
-            // 检测再次重置，计时从窗口落地重新起算
-            s.autoplay_anchor = now;
-            drop(s); // 结束 &mut 借用再滑动（compare_slide 借整个 self）
+            // 检测再次重置，计时从窗口落地重新起算。借用块已结束，这里
+            // 可直接借整个 self 调 compare_slide
+            self.compare.as_mut().unwrap().autoplay_anchor = now;
             self.compare_slide(1);
         }
     }
