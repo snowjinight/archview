@@ -347,6 +347,53 @@ impl App {
         }
     }
 
+    /// 快速对比入口（主键表 X，无选中兜底）：以当前播放条目为起点，自动
+    /// 携带视图序下一个合格条目，2 栏进入对比。与选中集入口（C）互补：
+    /// - 仅选中集为空时生效（有选中走 C，X 不响应，入口语义不交叠）；
+    /// - 当前未播放 / 播放的是标准视频（谓词不含）提示不放行；
+    /// - 起点已是 domain 最后一项时回绕到第一个合格条目（任何位置按 X
+    ///   都能进入对比；PgUp/PgDn 组滑动不回绕，二者语义独立）
+    pub(super) fn try_quick_compare(&mut self) {
+        if self.compare.is_some() || !self.selected.is_empty() {
+            return;
+        }
+        let Some(a) = self.archive.as_ref() else {
+            self.set_notice("未打开压缩包，无法对比显示");
+            return;
+        };
+        let Some(cur) = self.playing else {
+            self.set_notice("未在播放图片，无法快速对比（选中条目后按 C 进入对比）");
+            return;
+        };
+        if !compare_eligible(&self.cfg, &a.entries[cur].name) {
+            self.set_notice("当前播放的不是图片或 raw，无法快速对比");
+            return;
+        }
+        // domain = view ∩ 谓词快照（与选中集入口同一构造，见 try_enter_compare）
+        let domain: Vec<usize> = a
+            .view
+            .iter()
+            .copied()
+            .filter(|i| compare_eligible(&self.cfg, &a.entries[*i].name))
+            .collect();
+        let Some(pos) = domain.iter().position(|&i| i == cur) else {
+            // playing 已被搜索过滤出当前视图：不猜测用户意图，提示后重试
+            self.set_notice("当前播放条目不在当前视图中，无法快速对比");
+            return;
+        };
+        if domain.len() < COMPARE_MIN {
+            self.set_notice("视图中合格条目不足（需 2 个以上静态图或 raw 预设命中）");
+            return;
+        }
+        // 下一个合格条目：cur 之后第一个，末尾回绕到第一个（回绕语义用户定案）
+        let next = domain[(pos + 1) % domain.len()];
+        let panes = vec![
+            self.build_compare_pane(a, cur),
+            self.build_compare_pane(a, next),
+        ];
+        self.enter_compare_with(domain, panes);
+    }
+
     fn build_compare_pane(&self, a: &super::ArchiveState, idx: usize) -> ComparePane {
         let e = &a.entries[idx];
         let key = (a.id, idx);
@@ -1039,6 +1086,17 @@ impl App {
                     }
                     if t == "x" || t == "X" {
                         count_up = true;
+                        return false;
+                    }
+                    // B/N 同理：回锚点 / 下一个压缩包（无模式门控，与
+                    // Key::B / Key::N 臂一致；此前仅 Key 臂可触发，IME
+                    // 开启时两键失灵——主键表同款修复）
+                    if t == "b" || t == "B" {
+                        go_focus = true;
+                        return false;
+                    }
+                    if t == "n" || t == "N" {
+                        ask_next = true;
                         return false;
                     }
                     return true;

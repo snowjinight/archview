@@ -1735,6 +1735,68 @@ fn compare_prefetch_deferred_until_window_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 快速对比入口（2026-11-24）：无选中按 X = 当前播放条目 + 视图序下一个
+/// 合格条目，2 栏进入对比（主栏 = 播放条目）；末项回绕到第一个合格条目；
+/// 未播放 / 播放标准视频（谓词不含）提示不放行；有选中时 X 不响应（选中
+/// 集入口是 C，两入口语义不交叠）
+#[test]
+fn quick_compare_playing_plus_next_wraps_at_end() {
+    let dir = make_png_dir("qcmp", &["p0.png", "p1.png", "p2.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    png_archive(&mut app, 16, &dir, 3);
+    // 常规：playing = p1 → 2 栏 [p1, p2]
+    app.playing = Some(1);
+    app.try_quick_compare();
+    {
+        let s = app.compare.as_ref().expect("playing 图片应放行进入对比");
+        assert_eq!(s.panes.len(), 2);
+        assert_eq!(s.panes[0].idx, 1, "首栏 = 当前播放条目");
+        assert_eq!(s.panes[1].idx, 2, "次栏 = 视图序下一个合格条目");
+        assert_eq!(s.master, 0, "主栏 = 当前播放条目");
+        assert_eq!(s.domain, vec![0, 1, 2], "domain = view ∩ 谓词快照");
+    }
+    app.exit_compare();
+    // 末尾回绕：playing = p2（最后一个合格）→ 次栏回绕到 p0
+    app.playing = Some(2);
+    app.try_quick_compare();
+    let s = app.compare.as_ref().expect("末项应回绕进入对比");
+    assert_eq!(s.panes[0].idx, 2);
+    assert_eq!(s.panes[1].idx, 0, "下一个回绕到第一个合格条目");
+    app.exit_compare();
+
+    // 未播放：提示不放行
+    app.playing = None;
+    app.try_quick_compare();
+    assert!(app.compare.is_none());
+    assert!(app.notice.is_some(), "未播放应有提示");
+
+    // 播放标准视频（对比谓词不含）：提示不放行
+    app.archive
+        .as_mut()
+        .unwrap()
+        .entries
+        .push(crate::vfs::VirtualEntry {
+            name: "v0.mp4".into(),
+            size: 100,
+            is_dir: false,
+            encrypted: false,
+            crc: None,
+        });
+    app.playing = Some(3);
+    app.try_quick_compare();
+    assert!(app.compare.is_none(), "标准视频不参与对比");
+
+    // 有选中：X 不响应（选中集入口是 C）
+    app.playing = Some(0);
+    app.selected = [1].into_iter().collect();
+    app.try_quick_compare();
+    assert!(app.compare.is_none(), "有选中时 X 不响应");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 选择快捷键（2026-11-24）：Ctrl+A 全选 / Ctrl+Q 清除全部选中。
 /// selection_shortcuts 独立成方法（handle_shortcuts 携 eframe::Frame
 /// 构不出测试态），经 ctx.run_ui 注入真实 Key 事件钉死语义

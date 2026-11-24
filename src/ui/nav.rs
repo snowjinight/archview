@@ -258,6 +258,9 @@ impl App {
         let (mut contrast_up, mut contrast_down) = (false, false);
         // C=进入多图对比（选中合格条目 ≥2；校验与提示在 try_enter_compare）
         let mut enter_compare = false;
+        // X=快速对比（无选中时以当前播放条目为起点 + 视图序下一个合格条目，
+        // 2 栏进入；校验与提示在 try_quick_compare）
+        let mut quick_compare = false;
         // R=图片顺时针旋转 90°；1-5=评星、Q=清除评级（0 键已被 100% 缩放
         // 占用）。EXIF 元数据写回，见 rotate_image_cw / rate_image
         let mut rotate_cw = false;
@@ -293,6 +296,23 @@ impl App {
                     // 校验与提示在 try_enter_compare 内部）
                     if t == "c" || t == "C" {
                         enter_compare = true;
+                        return false;
+                    }
+                    // X 同理：快速对比（无模式门控，与 Key::X 臂一致；
+                    // 校验与提示在 try_quick_compare 内部）
+                    if t == "x" || t == "X" {
+                        quick_compare = true;
+                        return false;
+                    }
+                    // B/N 同理：回锚点 / 下一个压缩包（无模式门控，与
+                    // Key::B / Key::N 臂一致；此前仅 Key 臂可触发，IME
+                    // 开启时两键失灵）
+                    if t == "b" || t == "B" {
+                        go_focus = true;
+                        return false;
+                    }
+                    if t == "n" || t == "N" {
+                        ask_next_key = true;
                         return false;
                     }
                     // W/S 同理：对比度步进（与 Key::W/Key::S 臂一致；
@@ -485,6 +505,12 @@ impl App {
                         enter_compare = true;
                         false
                     }
+                    // X=快速对比（无选中：当前播放条目 + 视图序下一个合格
+                    // 条目，2 栏进入；校验与提示在 try_quick_compare）
+                    egui::Key::X if m.is_none() => {
+                        quick_compare = true;
+                        false
+                    }
                     egui::Key::N if m.is_none() => {
                         ask_next_key = true;
                         false
@@ -574,6 +600,10 @@ impl App {
         // C：进入多图对比视图（选中集 ∩ 入口谓词 ≥2 才放行，校验在内部）
         if enter_compare {
             self.try_enter_compare();
+        }
+        // X：快速对比（无选中时以当前播放为起点，校验与提示在内部）
+        if quick_compare {
+            self.try_quick_compare();
         }
         // Ctrl+H：直方图覆盖层开关。发起是覆盖层绘制时的按需 ensure（幂等），
         // 这里只翻状态——未播放/标准视频下翻了也不画，无副作用
