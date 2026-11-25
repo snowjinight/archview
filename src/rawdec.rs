@@ -9,7 +9,9 @@
 
 use crate::config::Config;
 use crate::imgview::{Histogram, ImageSource, ImgKey};
-use std::collections::HashMap;
+use crate::iosched::{IoClass, IoScheduler};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
@@ -608,13 +610,29 @@ enum RawMsg {
     Probe(RawProbeDone),
 }
 
+/// deferred 帧请求条目：admission 拒绝的排队（FIFO），poll 完成事件放行
+#[derive(Clone)]
+struct DeferredRawFrame {
+    key: ImgKey,
+    fi: usize,
+    contrast: i32,
+    source: ImageSource,
+    info: RawFrameInfo,
+    /// 入队时刻（放行日志打等待时长）
+    at: Instant,
+}
+
 /// raw 帧解码服务（与 ImageService 并列，同一数据源不同消费者）
 pub(crate) struct RawFrameService {
+    /// 统一 IO 发牌调度器（帧软解走 Decode 类；探针豁免不碰调度器）
+    sched: Arc<IoScheduler>,
     tx: Sender<RawMsg>,
     rx: Receiver<RawMsg>,
     /// (key, 帧号, contrast) → 发起时刻（防重复 spawn；contrast 入键——调
     /// 对比度后同帧按新 contrast 重发，旧请求在途不阻塞新请求）
     pending: HashMap<(ImgKey, usize, i32), Instant>,
+    /// admission 拒绝的帧请求队列（FIFO）：完成事件驱动逐个放行
+    deferred: VecDeque<DeferredRawFrame>,
     /// 每栏已就绪帧（保留上一帧直到新帧就绪，切换无闪烁）
     frames: HashMap<ImgKey, RawFrameTex>,
     /// 确定性失败（格式不支持/数据坏）：不再重试
@@ -639,12 +657,14 @@ pub(crate) struct ProbeEntry {
 }
 
 impl RawFrameService {
-    pub(crate) fn new(ctx: egui::Context) -> Self {
+    pub(crate) fn new(ctx: egui::Context, sched: Arc<crate::iosched::IoScheduler>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
+            sched,
             tx,
             rx,
             pending: HashMap::new(),
+            deferred: VecDeque::new(),
             frames: HashMap::new(),
             errs: HashMap::new(),
             probes: HashMap::new(),
@@ -655,7 +675,9 @@ impl RawFrameService {
 
     /// 请求解码第 idx 帧（幂等；idx 按栏帧数钳制）。contrast = per-file 显示
     /// 对比度（步数 n）：worker 解码后 LUT，直方图在 LUT 后像素上统计
-    /// （显示帧与直方图一致，与 imgview poll 期语义同源）
+    /// （显示帧与直方图一致，与 imgview poll 期语义同源）。
+    /// 发牌 = Decode 类（整帧读，NAS 流式源与图片解码同介质）；拒绝挂
+    /// deferred，完成事件驱动放行
     pub(crate) fn request(
         &mut self,
         key: ImgKey,
@@ -674,7 +696,43 @@ impl RawFrameService {
         {
             return;
         }
+        if !self.sched.admission(IoClass::Decode) {
+            // IO 等待关键转折（info）：帧软解排队（NAS 流式源与图片解码同介质）
+            tracing::info!(
+                "IO 排队 Decode raw帧 [{key:?} f{fi}]（decode={}，队列 {}）",
+                self.sched.decode_out(),
+                self.deferred.len() + 1
+            );
+            self.deferred.push_back(DeferredRawFrame {
+                key,
+                fi,
+                contrast,
+                source: source.clone(),
+                info: info.clone(),
+                at: Instant::now(),
+            });
+            return;
+        }
+        self.spawn_frame(key, source, info, fi, contrast);
+    }
+
+    /// 发牌开工：记账 + 占 pending + spawn（request / deferred 放行共用；
+    /// spawn 失败即时回账）
+    fn spawn_frame(
+        &mut self,
+        key: ImgKey,
+        source: &ImageSource,
+        info: &RawFrameInfo,
+        fi: usize,
+        contrast: i32,
+    ) {
         self.pending.insert((key, fi, contrast), Instant::now());
+        self.sched.issue(IoClass::Decode);
+        // 开工细节（debug）：info 级转折在「IO 排队 / IO 放行」两处
+        tracing::debug!(
+            "IO 开工 Decode raw帧 [{key:?} f{fi}]（decode={}）",
+            self.sched.decode_out()
+        );
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let mut info = info.clone();
         // 排列缓存命中：pixfmt 落定 + auto_bayer 清位，worker 直接按已解
@@ -684,7 +742,7 @@ impl RawFrameService {
             info.auto_bayer = false;
         }
         let source = source.clone();
-        std::thread::Builder::new()
+        let r = std::thread::Builder::new()
             .name("rawdec".into())
             .spawn(move || {
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -716,12 +774,17 @@ impl RawFrameService {
                     resolved,
                 }));
                 ctx.request_repaint();
-            })
-            .ok();
+            });
+        if r.is_err() {
+            self.pending.remove(&(key, fi, contrast));
+            self.sched.complete(IoClass::Decode);
+        }
     }
 
     /// 像素探针取数（Alt+点击 raw 栏）：异步读源解析单点/2×2 块存储原值。
-    /// 幂等——同 key 同帧同点不重发；帧游标或取样点变化由 UI 重发覆盖
+    /// 幂等——同 key 同帧同点不重发；帧游标或取样点变化由 UI 重发覆盖。
+    /// **调度器豁免**：读源按字节偏移直取所需几个字节（3~8B 直读），无解码
+    /// 成本，纳管只会徒增交互延迟
     pub(crate) fn request_probe(
         &mut self,
         key: ImgKey,
@@ -791,6 +854,10 @@ impl RawFrameService {
             match m {
                 RawMsg::Frame(m) => {
                     self.pending.remove(&(m.key, m.idx, m.contrast));
+                    // 调度器回账（fail-open 口径：worker 已结束恒回账，无论
+                    // 结果是否被 UI 消费；此前缺失会永久撑爆 Decode 计数——
+                    // 一次 raw 帧软解后全类 admission 永拒死锁）
+                    self.sched.complete(IoClass::Decode);
                     // 首请求的排列解析结果入缓存（帧解码失败排列仍有效——
                     // 探测成功即数据可辨，失败多半是别的原因）
                     if let Some(name) = m.resolved {
@@ -833,9 +900,57 @@ impl RawFrameService {
             }
             repaint = true;
         }
+        // 看门狗（与 imgview 同款）：worker 卡死/消息丢失时剔除 pending 并
+        // 回账放行重发——否则 Decode 计数泄漏全类死锁
+        let expired: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, t0)| t0.elapsed() > crate::imgview::PENDING_TIMEOUT)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in expired {
+            tracing::warn!("raw 帧解码超时放弃 [{:?} f{}]", k.0, k.1);
+            self.pending.remove(&k);
+            self.sched.complete(IoClass::Decode);
+            self.errs.insert(k.0, "raw 帧解码超时".into());
+        }
+        // deferred 队列放行（FIFO，队首不满足即停；与 request 同一 spawn 入口）
+        loop {
+            let Some(d) = self.deferred.front().cloned() else {
+                break;
+            };
+            // 已被其它路径满足/失效的条目丢弃（幂等去重）
+            let drop = self
+                .frames
+                .get(&d.key)
+                .is_some_and(|t| t.idx == d.fi && t.contrast == d.contrast)
+                || self.pending.contains_key(&(d.key, d.fi, d.contrast))
+                || self.errs.contains_key(&d.key);
+            if drop {
+                self.deferred.pop_front();
+                continue;
+            }
+            if !self.sched.admission(IoClass::Decode) {
+                break;
+            }
+            let d = self.deferred.pop_front().expect("front 有效");
+            // IO 等待结束关键转折（info）：排过队的帧请求开工 + 等待时长
+            tracing::info!(
+                "IO 放行 raw帧 [{:?} f{}]（排队 {}ms）",
+                d.key,
+                d.fi,
+                d.at.elapsed().as_millis()
+            );
+            self.spawn_frame(d.key, &d.source, &d.info, d.fi, d.contrast);
+        }
         if repaint {
             self.ctx.request_repaint();
         }
+    }
+
+    /// deferred 队列长度（评级派发优先级闸门用：非空 = 有 raw 帧软解在排队）
+    pub(crate) fn deferred_len(&self) -> usize {
+        self.deferred.len()
     }
 
     /// 已就绪帧（不问帧号是否最新——新帧在途时保留旧帧绘制，无闪烁）
@@ -875,28 +990,46 @@ struct HistEntry {
     res: Result<Histogram, String>,
 }
 
+/// deferred 直方图请求条目（预设解析/帧参数已算好，只差发牌开工）
+#[derive(Clone)]
+struct DeferredHist {
+    key: ImgKey,
+    contrast: i32,
+    source: ImageSource,
+    name: String,
+    info: RawFrameInfo,
+    /// 入队时刻（放行日志打等待时长）
+    at: Instant,
+}
+
 /// raw 直方图软解服务（Ctrl+H 单图直方图的 raw 侧入口）：单图显示走
 /// mpv dump 播放（GPU 侧，无 CPU 像素），直方图需要像素 → 按需软解
 /// 第 0 帧（复用 decode_raw_frame：同一位移/转换链，直方图与屏幕显示
 /// 逐位一致）。事件驱动旁路消费者：Ctrl+H 才发起、后台线程、不干预
 /// mpv 显示路径；只算直方图不传纹理
 pub(crate) struct HistService {
+    /// 统一 IO 发牌调度器（软解整帧读走 Decode 类）
+    sched: Arc<IoScheduler>,
     tx: Sender<HistDone>,
     rx: Receiver<HistDone>,
     /// key → 发起时刻（防重复 spawn）
     pending: HashMap<ImgKey, Instant>,
+    /// admission 拒绝的请求队列（FIFO）：完成事件驱动逐个放行
+    deferred: VecDeque<DeferredHist>,
     /// 已就绪结果（Ok=直方图 / Err=确定性失败文案，不重试）
     done: HashMap<ImgKey, HistEntry>,
     ctx: egui::Context,
 }
 
 impl HistService {
-    pub(crate) fn new(ctx: egui::Context) -> Self {
+    pub(crate) fn new(ctx: egui::Context, sched: Arc<IoScheduler>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
+            sched,
             tx,
             rx,
             pending: HashMap::new(),
+            deferred: VecDeque::new(),
             done: HashMap::new(),
             ctx,
         }
@@ -958,7 +1091,42 @@ impl HistService {
                 return;
             }
         };
+        // 发牌 = Decode 类（软解整帧读）；拒绝挂 deferred（预设解析/帧参数
+        // 已算好，只差发牌开工）
+        if !self.sched.admission(IoClass::Decode) {
+            // IO 等待关键转折（info）：直方图软解排队
+            tracing::info!(
+                "IO 排队 Decode 直方图 [{name}]（decode={}，队列 {}）",
+                self.sched.decode_out(),
+                self.deferred.len() + 1
+            );
+            self.deferred.push_back(DeferredHist {
+                key,
+                contrast,
+                source: source.clone(),
+                name: name.to_owned(),
+                info,
+                at: Instant::now(),
+            });
+            return;
+        }
+        self.spawn_hist(key, source, name, info, contrast);
+    }
+
+    /// 发牌开工：记账 + 占 pending + spawn（request / deferred 放行共用；
+    /// spawn 失败即时回账并落确定性失败文案）
+    fn spawn_hist(
+        &mut self,
+        key: ImgKey,
+        source: &ImageSource,
+        name: &str,
+        info: RawFrameInfo,
+        contrast: i32,
+    ) {
         self.pending.insert(key, Instant::now());
+        self.sched.issue(IoClass::Decode);
+        // 开工细节（debug）：info 级转折在「IO 排队 / IO 放行」两处
+        tracing::debug!("IO 开工 Decode 直方图 [{name}]（decode={}）", self.sched.decode_out());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (source, name) = (source.clone(), name.to_owned());
         let r = std::thread::Builder::new()
@@ -983,6 +1151,7 @@ impl HistService {
             });
         if r.is_err() {
             self.pending.remove(&key);
+            self.sched.complete(IoClass::Decode); // issue 已记账，spawn 失败即时回账
             self.done.insert(
                 key,
                 HistEntry {
@@ -998,6 +1167,8 @@ impl HistService {
         let mut repaint = false;
         while let Ok(m) = self.rx.try_recv() {
             self.pending.remove(&m.key);
+            // 调度器回账：worker 已结束恒回账
+            self.sched.complete(IoClass::Decode);
             self.done.insert(
                 m.key,
                 HistEntry {
@@ -1007,9 +1178,61 @@ impl HistService {
             );
             repaint = true;
         }
+        // 看门狗（与 imgview 同款）：worker 卡死/消息丢失时剔除 pending 并
+        // 回账——done 落 Err 不拦重试（request 的幂等只认 Ok）
+        let expired: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, t0)| t0.elapsed() > crate::imgview::PENDING_TIMEOUT)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in expired {
+            tracing::warn!("raw 直方图解码超时放弃 [{k:?}]");
+            self.pending.remove(&k);
+            self.sched.complete(IoClass::Decode);
+            self.done.insert(
+                k,
+                HistEntry {
+                    contrast: i32::MAX, // 任意值：Err 本就不满足幂等重发条件
+                    res: Err("直方图解码超时".into()),
+                },
+            );
+        }
+        // deferred 队列放行（FIFO，队首不满足即停；与 request 同一 spawn 入口）
+        loop {
+            let Some(d) = self.deferred.front().cloned() else {
+                break;
+            };
+            // 已被其它路径满足/失效的条目丢弃（幂等去重）
+            let drop = self.pending.contains_key(&d.key)
+                || self
+                    .done
+                    .get(&d.key)
+                    .is_some_and(|e| e.contrast == d.contrast && e.res.is_ok());
+            if drop {
+                self.deferred.pop_front();
+                continue;
+            }
+            if !self.sched.admission(IoClass::Decode) {
+                break;
+            }
+            let d = self.deferred.pop_front().expect("front 有效");
+            // IO 等待结束关键转折（info）：排过队的直方图请求开工 + 等待时长
+            tracing::info!(
+                "IO 放行 直方图 [{}]（排队 {}ms）",
+                d.name,
+                d.at.elapsed().as_millis()
+            );
+            self.spawn_hist(d.key, &d.source, &d.name, d.info, d.contrast);
+        }
         if repaint {
             self.ctx.request_repaint();
         }
+    }
+
+    /// deferred 队列长度（评级派发优先级闸门用：非空 = 有直方图软解在排队）
+    pub(crate) fn deferred_len(&self) -> usize {
+        self.deferred.len()
     }
 
     /// Ok(Some(hist)) = 就绪；Ok(None) = 在途（软解中）；Err = 失败文案
@@ -1345,11 +1568,49 @@ mod tests {
     }
 
     #[test]
+    fn raw帧解码记账对齐_issue恒回账() {
+        // 记账回归（fail-open 口径）：request 发牌占槽 → worker 结果（此处
+        // 源缺失必 Err）poll 消费 → complete 回账归零。此前 Frame 处理器
+        // 缺回账——一次软解后 Decode 计数永久膨胀，max=1 下全类 admission
+        // 永拒死锁
+        let ctx = egui::Context::default();
+        let sched = crate::iosched::IoScheduler::new(&crate::config::IoConfig::default());
+        let mut svc = RawFrameService::new(ctx, sched);
+        let key: ImgKey = (0, 0);
+        let info = RawFrameInfo {
+            w: 4,
+            h: 4,
+            pixfmt: "rgb24".into(),
+            fps: 3.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: 48,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(std::path::PathBuf::from("nonexistent.bin"));
+        svc.request(key, &src, &info, 0, 0);
+        assert_eq!(svc.sched.decode_out(), 1, "发牌应占槽");
+        // worker 很快回报 Err（文件缺失），poll 排空后回账归零
+        for _ in 0..200 {
+            svc.poll();
+            if svc.sched.decode_out() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(svc.sched.decode_out(), 0, "worker 结束必须回账");
+        assert!(svc.errs.contains_key(&key), "解码失败应落 errs");
+    }
+
+    #[test]
     fn hist_service_非raw与预设错误直落结果() {
         // 非线程路径即答：标准容器（预设未命中）→"非 raw"；预设配置错
         // → 预设错误文案。两者不发软解线程，UI 覆盖层直接显示状态
         let ctx = egui::Context::default();
-        let mut svc = HistService::new(ctx);
+        let mut svc = HistService::new(
+            ctx,
+            crate::iosched::IoScheduler::new(&crate::config::IoConfig::default()),
+        );
         let key: ImgKey = (0, 0);
         let src = ImageSource::File(std::path::PathBuf::from("nonexistent.bin"));
         let cfg = crate::config::Config::default();

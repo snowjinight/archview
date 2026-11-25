@@ -163,7 +163,7 @@ impl App {
         // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
         self.img_source = Some((key, source.clone(), name.clone()));
         if !self.img.has(key) && !self.img.is_pending(key) {
-            self.img.request(key, source, max_dim, &name);
+            self.img.request(key, source, max_dim, &name, IoClass::Decode);
         }
         self.playing = Some(entry_idx);
         self.dragging = false;
@@ -262,7 +262,7 @@ impl App {
         let max_dim = self.cfg.image.image_max_dim;
         tracing::warn!("当前图不在缓存且无在途解码，补发请求: {name}");
         self.img_source = Some((key, src.clone(), name.clone()));
-        self.img.request(key, src, max_dim, &name);
+        self.img.request(key, src, max_dim, &name, IoClass::Decode);
     }
 
     /// 图片解码失败的 mpv 兜底：mpv 支持的图片格式更广。流式包直接 load
@@ -306,27 +306,21 @@ impl App {
     /// 等待（LRU 上限自然淘汰）。7z/RAR 仅对已完整落盘的条目发起——未落盘的
     /// 归 extract 会话管（半截文件也解不出图）。
     ///
-    /// 串行链（当前张 → +1 → -1）：当前张解码中（base pending / full 升级
-    /// pending）或对比模式下不发起——每张图独立 imgdec 线程并行解码，8192 级
-    /// 巨图 3 路并行抢 CPU/内存带宽会把点击出图拖到秒级，预取必须严格排在
-    /// 当前张之后；任一时刻最多 1 路预取在途（已在解码中的候选占住名额），
-    /// 触发时机 = poll 每收到解码完成事件（见 poll_img）补发下一个
+    /// 串行链（当前张 → +1 → -1）由调度器涌现：候选全部以 Prefetch 类 request，
+    /// admission 拒绝进 ImageService deferred 队列 FIFO——"当前张解码在途 →
+    /// 预取让路"与"预取单在途"都是调度规则，解码完成事件驱动逐个放行
+    /// （触发时机 = poll 每收到解码完成事件，见 poll_img）
     fn prefetch_images(&mut self) {
         if self.compare.is_some() {
             return;
         }
         // 阶段一（不可变借用）：收集邻居候选（位置 → key + 解码源 + 名），
-        // +1 在前 -1 在后（下游优先）
+        // +1 在前 -1 在后（下游优先；顺序即 deferred FIFO 的放行序）
         let cands: Vec<(ImgKey, ImageSource, String)> = {
             let Some(arch) = self.archive.as_ref() else {
                 return;
             };
             let Some(cur) = self.playing else { return };
-            // 当前张解码中：预取让路，等 poll 的就绪事件再来
-            let cur_key = (arch.id, cur);
-            if self.img.is_pending(cur_key) || self.img.is_full_pending(cur_key) {
-                return;
-            }
             let Some(pos) = arch.view.iter().position(|&i| i == cur) else {
                 return;
             };
@@ -355,11 +349,12 @@ impl App {
             }
             v
         };
-        // 阶段二（可变借用）：单在途——已缓存的跳过（has 不打乱 LRU）；
-        // 曾回退 mpv 的条目跳过（mpv 链路显示，不再纹理解码）；已在解码中
-        // 的候选占住唯一在途名额（等它就绪后的下一轮触发再补下一个）；
-        // 名额空闲时按收集顺序（+1 优先）只发一个新请求
+        // 阶段二（可变借用）：曾回退 mpv 的条目跳过（mpv 链路显示，不再
+        // 纹理解码）；已缓存/在途的候选幂等跳过（request/deferred 内部
+        // 同键去重兜底）；其余全部按序 Prefetch 类发起（单在途与让路
+        // 规则由调度器执行，无需此处手工名额）
         let max_dim = self.cfg.image.image_max_dim;
+        let mut queued = 0usize;
         for (key, src, name) in cands {
             if self.img_fallback.contains(&key) {
                 continue;
@@ -367,11 +362,16 @@ impl App {
             if self.img.has(key) {
                 continue;
             }
-            if self.img.is_pending(key) {
-                return;
+            self.img
+                .request(key, src, max_dim, &name, IoClass::Prefetch);
+            // is_deferred：本轮候选中被调度器排队等待的数量（debug 汇总，
+            // 逐项转折日志在 ImageService 排队/放行处）
+            if self.img.is_deferred(key) {
+                queued += 1;
             }
-            self.img.request(key, src, max_dim, &name);
-            return;
+        }
+        if queued > 0 {
+            tracing::debug!("预取 {queued} 项排队等待（让路/单在途），完成事件驱动放行");
         }
     }
 
@@ -1027,7 +1027,7 @@ impl App {
             // 记录解码源：放大到 1:1 附近时按需再解原图（image_view 触发）
             self.img_source = Some((key, src.clone(), name.clone()));
             if !self.img.has(key) && !self.img.is_pending(key) {
-                self.img.request(key, src, max_dim, &name);
+                self.img.request(key, src, max_dim, &name, IoClass::Decode);
             }
             self.img_view = ImgView::default();
             tracing::info!("图片装载: {name}");

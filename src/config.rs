@@ -14,6 +14,8 @@ const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     pub cache: CacheConfig,
     pub media: MediaConfig,
+    /// IO 调度（解码/预取/评级发牌让路规则）
+    pub io: IoConfig,
     /// 相机 RAW 照片与非标裸数据（raw dump）配置（PLAN_raw_media.md）
     pub raw: RawConfig,
     pub player: PlayerConfig,
@@ -149,6 +151,35 @@ pub struct MediaConfig {
     /// 目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
     /// 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
     pub file_open_depth: usize,
+}
+
+/// IO 调度配置（统一 IO 发牌层）：解码/预取/评级三类在统一介质上的
+/// 让路规则（doc/架构设计/17_IO调度层.md）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IoConfig {
+    /// IO 并行槽位数：解码（图片 base/full、raw 帧软解、raw 直方图）、
+    /// 预取、评级探测三类共用的统一在途槽位预算（优先级 解码 > 预取 >
+    /// 评级）。1 = 全链串行（机械盘/NAS 最优）；SSD 可调 4~6。
+    /// 超出上限的请求进 deferred 队列 FIFO 排队（钳制 1..=16）
+    pub io_parallel_max_num: usize,
+    /// 预取让路：true = 有解码在途时预取一律推迟（用户可见内容优先占住 IO）
+    pub prefetch_yield: bool,
+    /// 评级让路：true = 评级探测为最低优先级——解码/预取在 deferred 排队时
+    /// 让位不派发，在途评级文件读完让出（文件粒度抢占，worker 阻塞收单条
+    /// 命令零轮询）；槽位有空（total < io_parallel_max_num）时借空槽随行。
+    /// false = 后台扫（闸门旁路），槽位照样占
+    pub rating_yield: bool,
+}
+
+impl Default for IoConfig {
+    fn default() -> Self {
+        Self {
+            io_parallel_max_num: 1,
+            prefetch_yield: true,
+            rating_yield: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -919,6 +950,7 @@ impl Default for Config {
         Self {
             cache: CacheConfig::default(),
             media: MediaConfig::default(),
+            io: IoConfig::default(),
             raw: RawConfig::default(),
             player: PlayerConfig::default(),
             image: ImageConfig::default(),
@@ -1175,6 +1207,28 @@ image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",
 # 所在目录的递归收集深度：1 = 只收集同级媒体文件（默认，防盘根/超大
 # 目录全盘扫描）；N = 向下 N 层；0 = 不限制（与「打开媒体目录」一致）
 file_open_depth = 1
+
+# ============ IO 调度（解码/预取/评级发牌） ============
+[io]
+
+# IO 并行槽位数：解码（图片 base/full 解码、raw 帧软解、raw 直方图）、
+# 预取、评级探测三类共用的统一在途槽位预算（优先级 解码 > 预取 > 评级）。
+# 1 = 全链串行（机械盘/NAS 最优：随机读不交错）；SSD 可调 4~6 恢复并发。
+# 超出上限的请求进 deferred 队列 FIFO 排队，完成事件驱动逐个放行（0 会
+# 被钳回 1，上限 16）
+# 重载配置即时生效
+io_parallel_max_num = 1
+
+# 预取让路：true = 有解码在途时预取一律推迟（用户可见内容优先占住 IO，
+# 预取在解码间隙渐进推进）；false = 预取与解码并行抢 IO
+# 重载配置即时生效
+prefetch_yield = true
+
+# 评级让路：true = 评级探测为最低优先级——解码/预取在 deferred 排队时让位
+# 不派发，在途评级文件读完让出（文件粒度抢占）；槽位有空（total <
+# io_parallel_max_num）时借空槽随行。false = 后台扫（闸门旁路）
+# 重载配置即时生效
+rating_yield = true
 
 # ============ 非标裸数据（raw dump）预设 ============
 [raw]
@@ -1541,6 +1595,7 @@ mod tests {
         for head in [
             "[cache]",
             "[media]",
+            "[io]",
             "[raw]",
             "[player]",
             "[image]",

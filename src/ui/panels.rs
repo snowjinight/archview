@@ -336,16 +336,21 @@ impl App {
                 );
             }
             // 评级按需探测扫描中（inflight>0）：顶栏短标记 + 百分比。
-            // 已完成 = 已入队（位图标记数）- 在途（inflight），基数 = 打开时
-            // 登记的图片条目总数；归零即消失。仅扫描期每帧 O(图片数) 计数
-            //（worker 回传驱动重绘，10k 条目布尔读开销可忽略），平时零开销
-            if self.rating_inflight > 0 && !self.rating_image_idx.is_empty() {
+            // 已完成 = 已入队（位图标记数）- 在途 - 待派发（队列），基数 =
+            // 打开时登记的图片条目总数；归零即消失。仅扫描期每帧 O(图片数)
+            // 计数（worker 回传驱动重绘，10k 条目布尔读开销可忽略），平时
+            // 零开销
+            if (self.rating_inflight > 0 || !self.rating_queue.is_empty())
+                && !self.rating_image_idx.is_empty()
+            {
                 let marked = self
                     .rating_image_idx
                     .iter()
                     .filter(|&i| self.rating_probed[*i])
                     .count();
-                let done = marked.saturating_sub(self.rating_inflight);
+                let done = marked
+                    .saturating_sub(self.rating_inflight)
+                    .saturating_sub(self.rating_queue.len());
                 let pct = done * 100 / self.rating_image_idx.len();
                 ui.colored_label(
                     ui.visuals().weak_text_color(),
@@ -421,6 +426,8 @@ impl App {
         // 图片 LRU 容量：收缩在下次推入时生效
         self.img.set_cap(new_cfg.image.image_cache_count.max(1));
         self.img.set_orig_budget(new_cfg.image.image_orig_cache_mb);
+        // IO 调度预算：整体替换（已在途请求不受影响，超发只在新发牌时收回）
+        self.io.reload(&new_cfg.io);
         // 播放器统一销毁 + 播放中重播当前项（新配置全量生效，replay_current
         // 与控制栏「重播」按钮共用同一链路）；未播放时销毁后无重放动作
         self.cfg = new_cfg;

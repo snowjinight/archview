@@ -82,30 +82,38 @@ impl LogSink {
             .ok()
             .map(std::io::BufWriter::new);
         loop {
+            // 毒化恢复：任何持锁线程 panic 后，日志管线继续工作（数据可能
+            // 短暂不一致，好过锁死/ panic 风暴）
             let batch = {
-                let mut g = self.inner.lock().unwrap();
+                let mut g = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
                 // 增量未满阈值则等 5s（虚假唤醒无害：空批次直接跳过写）
                 if g.pending.len() < FLUSH_BYTES {
                     let (guard, _) = self
                         .kick
                         .wait_timeout(g, std::time::Duration::from_secs(5))
-                        .unwrap();
+                        .unwrap_or_else(|p| p.into_inner());
                     g = guard;
                 }
                 std::mem::take(&mut g.pending)
             };
-            if let Some(o) = out.as_mut() {
-                if !batch.is_empty() {
-                    let _ = o.write_all(&batch);
-                    let _ = o.flush();
-                }
+        if let Some(o) = out.as_mut() {
+            if !batch.is_empty() {
+                let _ = o.write_all(&batch);
+                let _ = o.flush();
             }
+        }
         }
     }
 
     /// fmt 层的唯一入口：增量入 pending + 拆行进环形缓冲
     fn push_bytes(&self, buf: &[u8]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(), // 毒化恢复：日志管线不 panic 风暴
+        };
         g.pending.extend_from_slice(buf);
         for &b in buf {
             if b == b'\n' {
@@ -128,15 +136,44 @@ impl LogSink {
         }
     }
 
-    /// 环形缓冲快照（UI 每帧克隆一次；600 行级容量，开销可忽略）
+    /// 环形缓冲快照（UI 每帧克隆一次；600 行级容量，开销可忽略）。
+    /// 毒化恢复同上
     fn snapshot(&self) -> Vec<String> {
-        self.inner.lock().unwrap().ring.iter().cloned().collect()
+        match self.inner.lock() {
+            Ok(g) => g.ring.iter().cloned().collect(),
+            Err(p) => p.into_inner().ring.iter().cloned().collect(),
+        }
     }
 }
 
 /// 当前环形缓冲快照（UI「F12 日志面板」用；未初始化 = 空）
 pub fn snapshot() -> Vec<String> {
     SINK.get().map(|s| s.snapshot()).unwrap_or_default()
+}
+
+/// 崩溃现场直接落盘（panic 钩子专用）：绕过 pending 批量管线，同步 append
+/// 写文件（进程即将终止，不等 5s 落盘线程）+ 环形缓冲（F12 面板可见）。
+/// 锁用毒化恢复——panic 钩子自身绝不能再 panic
+pub fn push_panic(text: &str) {
+    let line = format!("{text}\n");
+    if let Some(s) = SINK.get() {
+        let mut g = match s.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(), // 毒化也照收：数据可能不一致但可诊断
+        };
+        if g.ring.len() == RING_LINES {
+            g.ring.pop_front();
+        }
+        g.ring.push_back(text.to_string());
+        g.pending.extend_from_slice(line.as_bytes());
+        s.kick.notify_all();
+    }
+    // 直写文件（append）：panic 后进程随时终止，落盘线程不可依赖
+    if let Some(p) = PATH.get() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// 日志文件路径（UI「用记事本打开」用；未初始化 = None）
@@ -147,7 +184,10 @@ pub fn file_path() -> Option<PathBuf> {
 /// 清空环形缓冲（F12 面板「清屏」）：仅清界面视图，落盘增量与文件不动
 pub fn clear_view() {
     if let Some(s) = SINK.get() {
-        s.inner.lock().unwrap().ring.clear();
+        match s.inner.lock() {
+            Ok(mut g) => g.ring.clear(),
+            Err(p) => p.into_inner().ring.clear(),
+        }
     }
 }
 

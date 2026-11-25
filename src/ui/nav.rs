@@ -689,7 +689,7 @@ impl App {
                 // 按记录源立即重发——poll 上传期读 contrast_map 落 LUT
                 if let Some((src_key, source, name)) = self.img_source.clone() {
                     if src_key == k {
-                        self.img.request(k, source, max_dim, &name);
+                        self.img.request(k, source, max_dim, &name, IoClass::Decode);
                     }
                 }
             }
@@ -785,7 +785,7 @@ impl App {
         if let Some((src_key, source, name)) = self.img_source.clone() {
             if src_key == key {
                 let max_dim = self.cfg.image.image_max_dim;
-                self.img.request(key, source, max_dim, &name);
+                self.img.request(key, source, max_dim, &name, IoClass::Decode);
             }
         }
         self.set_notice(if written {

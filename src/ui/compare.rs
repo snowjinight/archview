@@ -444,6 +444,9 @@ impl App {
         self.error = None;
         self.notice = None;
         self.probe = None; // 探针锚定单图模式内容，进对比即失效
+        // 单图模式的 deferred 队列（含预取候选）对对比会话是陈旧意图：
+        // 换模态清空，窗口栏/候选由 compare_after_change 重发
+        self.img.clear_deferred();
         tracing::info!("进入对比视图: {} 栏", panes.len());
         self.compare = Some(CompareSession {
             domain,
@@ -542,11 +545,12 @@ impl App {
         self.rawdec.retain(&keys);
         let max_dim = self.cfg.image.image_max_dim;
         for (key, source, name) in wants {
-            self.img.request(key, source, max_dim, &name);
+            self.img
+                .request(key, source, max_dim, &name, IoClass::Decode);
         }
-        // 预取候选不在此处发起：窗口栏全部就绪后由 compare_tick 统一补发
-        // （窗口优先、预取让路，防慢盘上预取流的随机读与窗口栏交错拖慢
-        // 整组渐进显示；快盘下窗口毫秒级就绪、预取紧跟无损失）
+        // 预取候选不在此处发起：由 compare_tick 统一补发（Prefetch 类，
+        // 调度器 admission 内建"解码在途预取让路"规则，窗口优先由让路
+        // 规则涌现；快盘下窗口毫秒级就绪、预取紧跟无损失）
         // raw 帧对齐游标（进入/滑动后游标已重置/保持，按需补发）
         self.compare_request_raw_frames();
     }
@@ -647,33 +651,28 @@ impl App {
         let max_dim = self.cfg.image.image_max_dim;
         for (key, source, name) in heals {
             tracing::warn!("对比栏图片不在缓存且无在途解码，补发请求: {name}");
-            self.img.request(key, source, max_dim, &name);
+            self.img
+                .request(key, source, max_dim, &name, IoClass::Decode);
         }
-        // 预取候选补发：窗口栏全部就绪（landed 图片栏无在途解码）后才统一
-        // 发起（含流式）——窗口优先、预取让路，同单图预取串行链哲学：慢盘
-        // 上预取流的随机读不与正在等待的窗口栏交错；source_ready 防半截
-        // 文件污染（raw 栏的 rawdec 队列本就单 worker 串行，不参与本闸门）
-        // ——让预取纹理在用户滑动前就绪，配合滑动就绪闸门实现零等待换屏
-        let window_busy = self.compare.as_ref().is_some_and(|s| {
-            s.panes
-                .iter()
-                .any(|p| matches!(p.kind, PaneKind::Image) && p.landed && self.img.is_pending(p.key))
-        });
-        if !window_busy {
-            let cands = self
-                .compare
-                .as_ref()
-                .map(|s| s.prefetch.clone())
-                .unwrap_or_default();
-            for (key, source, name, size) in cands {
-                if !self.img.has(key) && !self.img.is_pending(key) {
-                    let ready = match &source {
-                        ImageSource::File(_) => source_ready(&source, size),
-                        ImageSource::Stream(..) => true,
-                    };
-                    if ready {
-                        self.img.request(key, source, max_dim, &name);
-                    }
+        // 预取候选补发：Prefetch 类直发——调度器 admission 内建"解码在途
+        // 预取让路 + 预取单在途"规则，窗口优先不再需要手工 window_busy
+        // 闸门（被拒绝的候选进 ImageService deferred 队列，解码完成事件
+        // 驱动逐个放行）；source_ready 防半截文件污染（raw 栏的 rawdec
+        // 队列本就单 worker 串行，不参与）
+        let cands = self
+            .compare
+            .as_ref()
+            .map(|s| s.prefetch.clone())
+            .unwrap_or_default();
+        for (key, source, name, size) in cands {
+            if !self.img.has(key) && !self.img.is_pending(key) {
+                let ready = match &source {
+                    ImageSource::File(_) => source_ready(&source, size),
+                    ImageSource::Stream(..) => true,
+                };
+                if ready {
+                    self.img
+                        .request(key, source, max_dim, &name, IoClass::Prefetch);
                 }
             }
         }
@@ -762,9 +761,15 @@ impl App {
                     ImageSource::Stream(..) => {
                         if !self.img.is_pending(pane.key) {
                             // 预取网漏网（如刚切栏数后立即滑动）：当场发起
+                            // （用户翻页目标 = Decode 类，可见内容优先）
                             let max_dim = self.cfg.image.image_max_dim;
-                            self.img
-                                .request(pane.key, pane.source.clone(), max_dim, &pane.name);
+                            self.img.request(
+                                pane.key,
+                                pane.source.clone(),
+                                max_dim,
+                                &pane.name,
+                                IoClass::Decode,
+                            );
                         }
                         true
                     }
@@ -1005,6 +1010,9 @@ impl App {
     pub(super) fn exit_compare(&mut self) {
         let Some(s) = self.compare.take() else { return };
         self.img.clear_shown_multi();
+        // 对比会话的窗口栏/候选 deferred 是会话内意图：退出即清（回落播放
+        // 的目标条目由 play→play_image 重新发起）
+        self.img.clear_deferred();
         let idx = s
             .panes
             .get(s.master)

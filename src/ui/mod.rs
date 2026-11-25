@@ -20,9 +20,10 @@
 use crate::cache;
 use crate::config::Config;
 use crate::imgview::{
-    clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView, MAX_ZOOM,
-    MIN_ZOOM,
+    clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView,
+    MAX_ZOOM, MIN_ZOOM,
 };
+use crate::iosched::IoClass;
 use crate::player::mpv_ffi;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
@@ -185,12 +186,14 @@ enum RatingSyncMsg {
 /// 名单外格式（目录行等）一并传入，worker 内 rating_kind 过滤不读盘
 type RatingProbeBatch = Vec<(usize, PathBuf, String)>;
 
-/// 按需评级探测任务（目录模式，视口惰性）：常驻 worker 逐批读评级回传，
-/// 同时仅一个。换包清理 = drop 整个 job（tx 断连 worker 退出、旧 rx 随
-/// 句柄丢弃，迟到结果天然不串包）
+/// 按需评级探测任务（目录模式，视口惰性）：常驻 worker 单条命令单条回执
+/// （阻塞 recv 零轮询），派发节拍由 App 侧 rating_queue + poll_rating_probe
+/// 按调度器槽位驱动（优先级占槽模型，评级 = 最低优先级）。换包清理 =
+/// drop 整个 job（tx 断连 worker 退出、旧 rx 随句柄丢弃，迟到结果天然
+/// 不串包）
 struct RatingProbeJob {
-    tx: std::sync::mpsc::Sender<RatingProbeBatch>,
-    rx: std::sync::mpsc::Receiver<Vec<(usize, Option<u8>)>>,
+    tx: std::sync::mpsc::Sender<(usize, PathBuf, String)>,
+    rx: std::sync::mpsc::Receiver<(usize, Option<u8>)>,
 }
 
 /// 探测窗口 = 可见行数 × 此倍数（可见 ± 1 个视口行，总窗 ≈ 3×视口）。
@@ -465,6 +468,9 @@ pub struct App {
     compare: Option<CompareSession>,
     // raw 帧软解服务（对比栏专用：后台线程解码 → mpsc → UI 上传纹理）
     rawdec: RawFrameService,
+    // 统一 IO 发牌调度器（图片解码/raw 软解/直方图/预取发牌 + 评级让路
+    // 观察；Arc 共享给各服务与评级 worker。热重载走 reload_config）
+    io: std::sync::Arc<crate::iosched::IoScheduler>,
     // 直方图开关（Ctrl+H；覆盖层随当前条目绘制，状态见 panels::paint_histogram）
     histogram_on: bool,
     // raw 直方图软解服务（Ctrl+H 按需旁路：软解第 0 帧算直方图，不传纹理；
@@ -481,11 +487,16 @@ pub struct App {
     // 图片/raw 走 LUT
     contrast_map: ContrastMap,
     /// 目录模式按需评级探测（视口惰性，取代旧一次性全量扫描）：worker
-    /// 常驻线程收 `RatingProbeBatch` 命令逐项读分格式矩阵评级，每批处理完
-    /// 回传一条 Vec<(entry_idx, 星级)>（空批也发——inflight 计账需要）。
-    /// tx drop = worker 退出（换包清理点）。App 侧无可插入的 pending 队列：
-    /// 去重唯一状态是 rating_probed 位图（mark-at-enqueue，见 enqueue 注释）
+    /// 常驻线程**单条命令单条回执**（阻塞 recv 零轮询），读一个文件回一条
+    /// (entry_idx, 星级)。tx drop = worker 退出（换包清理点）。App 侧无可
+    /// 插入的 pending 队列：去重唯一状态是 rating_probed 位图
+    /// （mark-at-enqueue，见 enqueue 注释）
     rating_probe: Option<RatingProbeJob>,
+    /// 评级探测待派发队列（FIFO，App 侧持有）：入队压队列、
+    /// poll_rating_probe 尾部按调度器槽位逐条派发（优先级占槽模型，
+    /// 评级 = 最低优先级，deferred 有解码/预取排队时让位）。派发即记账
+    /// （issue + inflight++），回执回账（complete + inflight--）
+    rating_queue: std::collections::VecDeque<(usize, PathBuf, String)>,
     /// 已入队探测的 entry 下标位图：入队瞬间置位（false→true 才真正发送），
     /// 同一 idx 结构上不可能二次入队——无 pending 集、无查询去重。
     /// idx 是致密域（0..entries.len()），位图下标直寻 O(1) 零哈希，
@@ -565,6 +576,7 @@ impl App {
         let contrast_map: ContrastMap =
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let orig_budget = (cfg.image.image_orig_cache_mb.clamp(64, 4096) as usize) * 1024 * 1024;
+        let io = crate::iosched::IoScheduler::new(&cfg.io);
         Self {
             cfg,
             archive: None,
@@ -576,7 +588,13 @@ impl App {
             gl: cc.gl.clone(),
             egui_ctx: cc.egui_ctx.clone(),
             player: None,
-            img: ImageService::new(cc.egui_ctx.clone(), img_cap, contrast_map.clone(), orig_budget),
+            img: ImageService::new(
+                cc.egui_ctx.clone(),
+                img_cap,
+                contrast_map.clone(),
+                orig_budget,
+                io.clone(),
+            ),
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
@@ -625,12 +643,14 @@ impl App {
             encode_dialog: None,
             encode_job: None,
             compare: None,
-            rawdec: RawFrameService::new(cc.egui_ctx.clone()),
+            rawdec: RawFrameService::new(cc.egui_ctx.clone(), io.clone()),
             histogram_on: false,
-            hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone()),
+            hist_raw: crate::rawdec::HistService::new(cc.egui_ctx.clone(), io.clone()),
+            io,
             arrow_hold: None,
             contrast_map,
             rating_probe: None,
+            rating_queue: std::collections::VecDeque::new(),
             rating_probed: Vec::new(),
             rating_probe_window: None,
             rating_probe_intent: None,
@@ -653,6 +673,7 @@ impl App {
         let contrast_map: ContrastMap =
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let orig_budget = (cfg.image.image_orig_cache_mb.clamp(64, 4096) as usize) * 1024 * 1024;
+        let io = crate::iosched::IoScheduler::new(&cfg.io);
         Self {
             cfg,
             archive: None,
@@ -664,7 +685,7 @@ impl App {
             gl: None,
             egui_ctx: ctx.clone(),
             player: None,
-            img: ImageService::new(ctx.clone(), img_cap, contrast_map.clone(), orig_budget),
+            img: ImageService::new(ctx.clone(), img_cap, contrast_map.clone(), orig_budget, io.clone()),
             img_fallback: std::collections::HashSet::new(),
             img_view: ImgView::default(),
             img_viewport: egui::Rect::NOTHING,
@@ -713,12 +734,14 @@ impl App {
             encode_dialog: None,
             encode_job: None,
             compare: None,
-            rawdec: RawFrameService::new(ctx.clone()),
+            rawdec: RawFrameService::new(ctx.clone(), io.clone()),
             histogram_on: false,
-            hist_raw: crate::rawdec::HistService::new(ctx.clone()),
+            hist_raw: crate::rawdec::HistService::new(ctx.clone(), io.clone()),
+            io,
             arrow_hold: None,
             contrast_map,
             rating_probe: None,
+            rating_queue: std::collections::VecDeque::new(),
             rating_probed: Vec::new(),
             rating_probe_window: None,
             rating_probe_intent: None,

@@ -14,6 +14,8 @@ mod console;
 // encode 引擎（dump 序列→视频）+ CLI 壳：UI 壳尚未接入（多选/右键/确认窗）
 mod encode;
 mod imgview;
+// 统一 IO 发牌调度层：解码/预取/评级让路规则（doc/架构设计/17_IO调度层.md）
+mod iosched;
 // 日志管线：内存环形缓冲（F12 面板）+ 后台线程定时落盘 archview.log
 mod logsink;
 mod meta;
@@ -86,6 +88,24 @@ fn main() -> eframe::Result<()> {
         .and_then(|p| p.parent().map(|d| d.join("archview.log")))
         .unwrap_or_else(|| "archview.log".into());
     let sink = logsink::LogSink::start(log_path.clone());
+    // panic 钩子：windows 子系统下 panic 输出（stderr）不可见，进程死亡
+    // 无任何痕迹（实测：评级洪峰 + 点击播放场景静默退出，日志戛然而止）。
+    // 钩子把 panic 现场同步直写 archview.log + 环形缓冲（不等 5s 落盘
+    // 线程），下一帧可能就死，钩子自身不能再 panic
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let msg = info.payload().downcast_ref::<&str>().map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<非字符串 payload>".into());
+        let t = std::thread::current();
+        logsink::push_panic(&format!(
+            "PANIC thread={} at {loc}: {msg}",
+            t.name().unwrap_or("<unnamed>")
+        ));
+    }));
     let registry = tracing_subscriber::registry()
         .with(log_filter)
         .with(

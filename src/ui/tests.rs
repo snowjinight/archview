@@ -1694,8 +1694,9 @@ fn replay_current_exits_compare_and_noop_safe() {
 }
 
 /// 对比模式预取让路（窗口优先）：窗口变更瞬间窗口栏 pending 在途，预取候选
-/// （含流式）不得并发发起——慢盘上预取流的随机读会与正在等待的窗口栏交错
-/// （同单图预取串行链哲学）；窗口栏纹理全部就绪后 compare_tick 统一补发，
+/// （含流式）经 Prefetch 类发牌被调度器让路规则推迟（"解码在途预取一律
+/// 推迟"是 admission 规则，被拒候选进 ImageService deferred 队列）；
+/// 窗口栏纹理全部就绪后（完成事件回账）deferred 逐个放行补发，
 /// 滑动就绪闸门的零等待换屏前置条件保持
 #[test]
 fn compare_prefetch_deferred_until_window_ready() {
@@ -1708,25 +1709,32 @@ fn compare_prefetch_deferred_until_window_ready() {
     app.selected = [0, 1].into_iter().collect();
     app.try_enter_compare();
     assert!(app.compare.is_some(), "2 张合格静态图应放行进入对比");
-    // 窗口栏已发起解码
-    for i in 0..2 {
-        assert!(
-            app.img.is_pending((11, i)) || app.img.has((11, i)),
-            "窗口栏 {i} 应已发起解码"
-        );
-    }
-    // 预取候选未发起（旧实现流式在 after_change 立即并发，此处钉死让路语义）
+    // 窗口栏已发起解码：p0 占住 Decode 名额，p1 超预算进 deferred（FIFO）
+    assert!(
+        app.img.is_pending((11, 0)) || app.img.has((11, 0)),
+        "窗口栏 0 应立即发起解码"
+    );
+    assert!(
+        app.img.is_pending((11, 1))
+            || app.img.has((11, 1))
+            || app.img.is_deferred((11, 1)),
+        "窗口栏 1 应在途或排队（FIFO 不丢弃窗口栏）"
+    );
+    // 预取候选未发起（tick 才补发；此刻既不在途也不排队）
     assert!(
         !app.img.is_pending((11, 2)) && !app.img.has((11, 2)),
         "窗口未就绪时预取候选不得发起解码"
     );
-    // 窗口栏纹理就绪 → tick 补发预取候选
+    // 窗口栏纹理就绪 → tick 补发预取候选（Prefetch 类：若窗口栏仍有
+    // 解码在途则被 admission 拒绝排队，完成事件驱动放行）
     wait_texture(&mut app, (11, 0), "对比栏0");
     wait_texture(&mut app, (11, 1), "对比栏1");
     app.compare_tick();
     assert!(
-        app.img.is_pending((11, 2)) || app.img.has((11, 2)),
-        "窗口就绪后预取候选应被 tick 补发"
+        app.img.is_pending((11, 2))
+            || app.img.has((11, 2))
+            || app.img.is_deferred((11, 2)),
+        "窗口就绪后预取候选应被 tick 补发（在途或排队）"
     );
     wait_texture(&mut app, (11, 2), "对比预取候选");
     app.exit_compare();
@@ -2020,9 +2028,10 @@ fn compare_list_focus_and_master_rating() {
 
 /// 预取串行链（当前张 → +1 → -1，任一时刻最多 1 路预取在途）：巨图多路
 /// 并行解码抢 CPU/内存带宽会把当前张出图拖到秒级（8192 级实测 5s+）——
-/// 当前张解码中预取让路，就绪后 poll_img 补发 +1，+1 就绪再补发 -1。
-/// 三张 1200×900 png 走真实解码链（decode → Ready → poll 上传 → 事件
-/// 触发）钉死整链语义
+/// 候选全部 Prefetch 类 request，被 admission 拒绝的进 deferred 队列 FIFO，
+/// "当前张解码中预取让路"与"预取单在途"都是调度规则；解码完成事件驱动
+/// 逐个放行，串行链顺序涌现。三张 1200×900 png 走真实解码链（decode →
+/// Ready → poll 上传 → 事件触发）钉死整链语义
 #[test]
 fn prefetch_serial_chain_current_first_then_plus1_then_minus1() {
     let dir = make_png_dir("chain", &["p0.png", "p1.png", "p2.png"]);
@@ -2034,15 +2043,20 @@ fn prefetch_serial_chain_current_first_then_plus1_then_minus1() {
     let key = |app: &App, i: usize| (app.archive.as_ref().unwrap().id, i);
     let (k_cur, k_plus, k_minus) = (key(&app, 1), key(&app, 2), key(&app, 0));
 
-    // 1) 当前张解码中：预取让路（±1 都不得发起）。播中间张（±1 邻居齐全）
+    // 1) 当前张解码中：预取让路（±1 都不得发起，进 deferred 排队且按
+    //    +1 → -1 顺序）。播中间张（±1 邻居齐全）
     app.play(1);
     assert!(app.img.is_pending(k_cur), "当前张应立即发起解码");
     assert!(
         !app.img.is_pending(k_plus) && !app.img.is_pending(k_minus),
         "当前张解码中预取必须让路（3 路并行是巨图出图慢的根因）"
     );
+    assert!(
+        app.img.is_deferred(k_plus) && app.img.is_deferred(k_minus),
+        "被拒预取候选应进 deferred 队列（FIFO 保序，不丢弃）"
+    );
 
-    // 2) 当前张就绪 → poll_img 补发 +1（单在途，-1 不动）
+    // 2) 当前张就绪 → poll 完成事件驱动 deferred 放行 +1（单在途，-1 不动）
     wait_texture(&mut app, k_cur, "当前张");
     assert!(app.img.is_pending(k_plus), "当前张就绪后应补发 +1 预取");
     assert!(!app.img.is_pending(k_minus), "+1 在途时 -1 不得并发（单在途名额）");

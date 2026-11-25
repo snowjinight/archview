@@ -466,6 +466,9 @@ prefetch_upstream_mb = 512
 | `image.image_full_guided_strength` / `image_full_guided_radius` | 导向降噪结构容忍度 D（默认 10，内部换算 ε=D² 方差阈值：3~8 温和 / 15~30 重噪 / 30~60 激进）与窗口半径（默认 1 = 3×3，人像实测定版；重噪图可 2~4）；涂抹感重调小、噪点残留调大 |
 | `extract.prefetch_downstream_mb` | 下游预取上限（MB），0 = 关闭：solid 包（7z / solid RAR）解压时顺带预取下标更大的后续文件，一次顺序解压流解出一批，翻页直接命中 |
 | `extract.prefetch_upstream_mb` | 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目顺带写盘，随机跳看后回看直接命中缓存（旧键名 `prefetch_mb` / `prefetch_prev_mb` 仍可读取） |
+| `io.io_parallel_max_num` | IO 并行槽位数（钳 1~16，默认 1）：图片 base/full 解码、raw 帧软解、raw 直方图、评级探测共用同一槽位预算（三类优先级 解码 > 预取 > 评级）。`1` = 全链串行（机械盘 / NAS 最优：随机读不交错）；SSD 可调 4~6 恢复并发。超出上限的请求排队，完成事件驱动逐个放行。详见 [架构设计 17](doc/架构设计/17_IO调度层.md) |
+| `io.prefetch_yield` | 预取让路（默认 true）：有解码在途时预取一律推迟（用户可见内容优先占住 IO，预取在解码间隙渐进推进）；false = 预取与解码并行抢 IO |
+| `io.rating_yield` | 评级让路（默认 true）：评级探测为最低优先级——解码/预取排队时让位不派发，在途评级文件读完让出（文件粒度抢占）；槽位有空（total < `io_parallel_max_num`）时借空槽随行（SSD 并行档评级扫描不再饿死）；false = 后台扫（闸门旁路） |
 
 ## Encode：帧序列 dump → 视频
 

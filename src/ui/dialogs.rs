@@ -46,6 +46,11 @@ impl App {
             .open(&mut open)
             .collapsible(false)
             .fixed_rect(rect)
+            // Foreground 置顶：egui 交互时把被点面板 move_to_top（同 Middle
+            // 层内重排），点击列表/控制栏会把 Middle 层的日志窗口压到面板
+            // 之下——"先开 F12 再播放 → 窗口消失、播放中再开 → 正常"的根因
+            // （窗口新建时才 move_to_top，之后任何面板交互都会反超）
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(follow, "跟随底部");

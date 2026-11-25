@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn 节头提取_空与畸形与CRLF() {
+    fn 节头提取_空与畸形与_crlf() {
         assert_eq!(section_headers(""), Vec::<(String, usize)>::new());
         // 无 ']' / 空节名 / 非 ']' 结尾但含 ']' 的畸形行
         assert_eq!(
