@@ -909,10 +909,12 @@ impl RawFrameService {
             .map(|(k, _)| *k)
             .collect();
         for k in expired {
-            tracing::warn!("raw 帧解码超时放弃 [{:?} f{}]", k.0, k.1);
+            tracing::warn!("raw 帧解码超时剔除 [{:?} f{}]（可重试）", k.0, k.1);
             self.pending.remove(&k);
             self.sched.complete(IoClass::Decode);
-            self.errs.insert(k.0, "raw 帧解码超时".into());
+            // 不写 errs：超时≠解码失败（NAS 慢读 >10s 的大帧是常态），
+            // 剔除回账后 UI 重发即可重试（与 imgview 看门狗口径一致）；
+            // 迟到的成功 Frame 仍会按 fail-open 回账并落 frames 自愈
         }
         // deferred 队列放行（FIFO，队首不满足即停；与 request 同一 spawn 入口）
         loop {
@@ -975,6 +977,10 @@ impl RawFrameService {
         self.pending.retain(|(k, _, _), _| keys.contains(k));
         self.probes.retain(|k, _| keys.contains(k));
         self.resolved.retain(|k, _| keys.contains(k));
+        // deferred 同步过滤：死条目驻留会让 deferred_len() 持续 >0 压死
+        // 评级让位闸（rating_yield=true 永久饿死评级探测），放行时还会对
+        // 已关闭栏白做整帧软解
+        self.deferred.retain(|d| keys.contains(&d.key));
     }
 }
 
@@ -1051,7 +1057,9 @@ impl HistService {
             || self
                 .done
                 .get(&key)
-                .is_some_and(|e| e.contrast == contrast && e.res.is_ok())
+                // 同 contrast 的 Err 也是终态：损坏文件每帧重触发 24MP 软解
+                // 是死循环（失败≠可重试；换 contrast / retain 清理后可再来）
+                .is_some_and(|e| e.contrast == contrast)
         {
             return;
         }
@@ -1244,6 +1252,8 @@ impl HistService {
     pub(crate) fn retain(&mut self, keys: &[ImgKey]) {
         self.pending.retain(|k, _| keys.contains(k));
         self.done.retain(|k, _| keys.contains(k));
+        // deferred 同步过滤（死条目压死评级让位闸，同 RawFrameService）
+        self.deferred.retain(|d| keys.contains(&d.key));
     }
 }
 
@@ -1962,5 +1972,64 @@ mod tests {
             ..rl
         };
         assert!(raw_frame_info(&rl3, size).is_err());
+    }
+
+    fn test_sched() -> Arc<crate::iosched::IoScheduler> {
+        crate::iosched::IoScheduler::new(&crate::config::IoConfig::default())
+    }
+
+    /// retain 过滤 deferred：已关闭栏的死条目必须同步清掉——驻留会让
+    /// deferred_len() 持续 >0 压死评级让位闸（rating_yield=true 永久饿死
+    /// 评级探测），放行时还会对已关闭栏白做整帧软解
+    #[test]
+    fn retain_同步过滤deferred死条目() {
+        let mut svc = RawFrameService::new(egui::Context::default(), test_sched());
+        // 解码占槽（默认 max=1）→ request 挂 deferred
+        svc.sched.issue(IoClass::Decode);
+        let info = RawFrameInfo {
+            w: 64,
+            h: 64,
+            pixfmt: "rgba".into(),
+            fps: 0.0,
+            bit_shift: 0,
+            auto_bayer: false,
+            frame_bytes: 64 * 64 * 4,
+            frame_count: 1,
+        };
+        let src = ImageSource::File(std::path::PathBuf::from("nowhere.raw"));
+        svc.request((9, 0), &src, &info, 0, 0);
+        assert_eq!(svc.deferred_len(), 1, "槽位占满应挂 deferred");
+        // 窗口内保留：条目不动
+        svc.retain(&[(9, 0)]);
+        assert_eq!(svc.deferred_len(), 1);
+        // 栏关闭：deferred 死条目同步清掉（评级让位闸不再被压死）
+        svc.retain(&[]);
+        assert_eq!(svc.deferred_len(), 0, "死条目必须随 retain 清掉");
+    }
+
+    /// HistService Err 终态：同 contrast 的 Err 不再重试（损坏文件每帧
+    /// 重触发 24MP 软解是死循环）；retain 清理后允许再来
+    #[test]
+    fn hist_err终态_不重试() {
+        let mut svc = HistService::new(egui::Context::default(), test_sched());
+        let cfg = crate::config::Config::default();
+        let src = ImageSource::File(std::path::PathBuf::from("x.mp4"));
+        // 非 raw 文件：直接落 done Err（不发线程、不排队）
+        svc.request((9, 0), &src, "x.mp4", 1000, &cfg, 0);
+        assert!(
+            svc.done
+                .get(&(9, 0))
+                .is_some_and(|e| e.contrast == 0 && e.res.is_err()),
+            "非 raw 应落 Err 终态"
+        );
+        assert!(svc.pending.is_empty());
+        assert_eq!(svc.deferred_len(), 0);
+        // 同 contrast 二次请求：幂等返回（不重试）
+        svc.request((9, 0), &src, "x.mp4", 1000, &cfg, 0);
+        assert_eq!(svc.done.len(), 1);
+        assert!(svc.pending.is_empty());
+        // retain 清理（退出直方图覆盖层）→ 可重新探测
+        svc.retain(&[]);
+        assert!(!svc.done.contains_key(&(9, 0)));
     }
 }

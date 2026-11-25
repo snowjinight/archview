@@ -22,7 +22,7 @@
 //! - `Prefetch`：`total < max`，且 `prefetch_yield` 开启时须
 //!   `decode_out == 0`，`prefetch_out < 1`（单在途）；超出 deferred；
 //! - `Rating`（最低优先级）：`total < max` 且单在途；**派发顺序保证
-//!   优先级**——poll 先放行 deferred 再派评级（App 侧评级队列逐条派发），
+//!   优先级**——App 侧评级派发闸（deferred 非空让位）+ 跨帧派发顺序，
 //!   高优先级请求来了占槽排队，在途评级文件读完让出（文件粒度抢占）。
 //!   rating_yield=false 时派发闸门旁路（后台扫语义，槽位照占）
 //!
@@ -99,9 +99,10 @@ impl IoScheduler {
     /// 发牌判定（只读，不记账）：该类此刻是否允许开工。
     /// **优先级占槽模型**：三类共用 `io_parallel_max_num` 个槽位，槽位
     /// 算术统一为 `total < max`（total = 解码+预取+评级在途之和）；类间
-    /// 优先级不靠 admission 区分，靠**派发顺序**保证（poll 先放行 deferred
-    /// 再派评级；评级派发时若有槽位空出，deferred 必已被放行——admission
-    /// 是纯槽位算术，数学上排除优先级反转）
+    /// 优先级不靠 admission 区分，靠**派发顺序**保证（App 侧 poll 编排：
+    /// 评级派发先于解码/预取的 deferred 放行一帧——同帧让位、跨帧保持
+    /// 优先级；deferred 放行内部低优先级 Prefetch 可被 Decode/Full 越过）。
+    /// admission 是纯槽位算术，数学上排除优先级反转
     pub fn admission(&self, class: IoClass) -> bool {
         let b = self.budget.lock().unwrap();
         let total = self.decode_out.load(Ordering::Relaxed)
