@@ -760,7 +760,9 @@ impl PlayerService {
         }
     }
 
-    /// 相对 seek（秒，可为负），mpv 默认关键帧级（快）
+    /// 相对 seek（秒，可为负）。恒为关键帧级 `relative`（快，无追帧卡顿）；
+    /// 落点对齐到 ≥目标的下一关键帧（GOP ~4s 时 +5s 实际跳 8~9s，用户实测
+    /// 接受——曾试过 relative+exact 精确对齐，追帧解码卡顿不可接受已回退）
     pub fn seek_relative(&self, sec: f64) {
         if let Err(e) = mpv_ffi::command_string(self.ctx, &format!("no-osd seek {sec:+} relative"))
         {

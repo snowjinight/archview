@@ -34,9 +34,12 @@ impl App {
         // 全宽贴底停靠：fixed_rect 把窗口钉死在视口（同宽、下缘对齐、
         // 高约 38%），不可拖动/缩放，与底部控制栏同一坐标基准，视觉上
         // 像内嵌面板而不是浮动窗
-        let scr = ctx
-            .input(|i| i.raw.screen_rect)
-            .unwrap_or(egui::Rect::NOTHING);
+        // 屏幕矩形必须用 viewport_rect()（非 Option，raw 缺失时沿用上一帧）：
+        // eframe 部分帧不带 raw.screen_rect（None 语义=沿用上一帧），若自己
+        // unwrap_or(Rect::NOTHING) 会拿到 ±INFINITY 反向矩形 → 窗口宽度 NaN
+        // → debug 版 egui debug_assert panic 进程崩溃 / release 版窗口 rect
+        // 无效被剔除渲染（“F12 消失且打不开”）
+        let scr = ctx.input(|i| i.viewport_rect());
         let h = (scr.height() * 0.38).clamp(220.0, 560.0);
         let rect = egui::Rect::from_min_max(
             egui::pos2(scr.left(), scr.bottom() - h),

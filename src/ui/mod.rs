@@ -476,10 +476,13 @@ pub struct App {
     // raw 直方图软解服务（Ctrl+H 按需旁路：软解第 0 帧算直方图，不传纹理；
     // 标准图片的直方图由 imgview 解码 worker 顺手算，不经此服务）
     hist_raw: crate::rawdec::HistService,
-    // 方向键长按连发状态：Some((方向 -1/+1, 下次连发时刻))。暂停=连续逐帧、
-    // 播放=连续 ±5s seek，松开/失焦/模态清除（见 nav::arrow_hold_fire 与
-    // handle_shortcuts 头部清除逻辑）
-    arrow_hold: Option<(i32, std::time::Instant)>,
+    // 方向键 tap/hold 手势状态：(方向 -1/+1, 锚点时刻, tap 待决)。
+    // tap 待决=true：锚点=按下时刻，未发任何 seek——释放时按压 < 500ms
+    // 补发单次 ±5s（暂停=±1 帧）；=false：连发链进行中，锚点=下次连发
+    // 时刻（超阈值由 arrow_hold_fire 转换，第一发即起拍）。与 OS 键盘
+    // 重复设置解耦的应用层固定阈值判别。松开/失焦/模态清除（见
+    // nav::arrow_hold_fire 与 handle_shortcuts 头部清除逻辑）
+    arrow_hold: Option<(i32, std::time::Instant, bool)>,
     // per-file 显示对比度（W/S 快捷键）：key = (archive_id, entry_idx)，值 =
     // 步数 n（每步斜率 ×1.25，缺省 0 = 未调）。会话内记忆（切回自动恢复），
     // 不进 config（对比度是 per-file 显示偏好，全局默认无意义）。与

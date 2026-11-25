@@ -234,14 +234,13 @@ impl App {
         if ctx.memory(|m| m.focused()) == Some(search_box_id()) {
             return;
         }
-        let mut seek_rel = 0.0f64;
         let mut vol_delta = 0i64;
         let (mut do_pause, mut do_mute, mut step_entry) = (false, false, 0i32);
-        // 视频暂停时的方向键 = 逐帧步进（上一帧/下一帧）
-        let mut frame_dir = 0i32;
-        // 方向键长按连发：本次按下的方向（-1/+1，0=无新按下）
+        // 方向键 tap/hold 手势：本次按下的方向（-1/+1，0=无新按下）。
+        // 按下只登记；释放 < 阈值补发单次动作、≥ 阈值由 arrow_hold_fire
+        // 转连发链（见 ARROW_HOLD_DELAY 与 arrow_hold_fire）
         let mut hold_press = 0i32;
-        // 方向键释放（清除连发）
+        // 方向键释放（tap 补发 + 清除连发）
         let mut hold_release = false;
         // L=视频播放模式三态循环（定格→列表→循环）
         let mut loop_toggle = false;
@@ -273,8 +272,6 @@ impl App {
         let img_mode = self.tex_image_key().is_some();
         // 音量/静音仅视频模式生效（真视频；mpv 回退图虽走播放器但无声可调）
         let vid_mode = !self.playing_is_image();
-        // 视频暂停态（进 mpv 前读本地原子缓存，不阻塞）
-        let vid_paused = !img_mode && self.player.as_ref().is_some_and(|p| p.paused());
         let (mut zoom_in, mut zoom_out, mut zoom_100, mut zoom_fit) = (false, false, false, false);
         // 从事件流里直接消费按键（过滤按住重复触发）：
         // 移除后同帧内其它控件（如聚焦的按钮）不会再响应，避免双重触发
@@ -345,7 +342,7 @@ impl App {
                     }
                     return true;
                 }
-                // 方向键释放：清除长按连发（保留事件不消费，其它控件可读）
+                // 方向键释放：tap 补发 + 清除连发（保留事件不消费，其它控件可读）
                 if let egui::Event::Key {
                     key: egui::Key::ArrowLeft | egui::Key::ArrowRight,
                     pressed: false,
@@ -380,22 +377,16 @@ impl App {
                         false
                     }
                     egui::Key::ArrowLeft => {
-                        // 暂停时=上一帧（逐帧），播放中=快退 5s；两种都登记长按连发
+                        // 按下只登记方向不立即动作——tap/hold 手势判别
+                        // （ARROW_HOLD_DELAY 阈值）：释放时按压 < 阈值补发单次
+                        // ±5s seek（暂停=±1 帧），超阈值由 arrow_hold_fire 转
+                        // 连发链。按下即发会导致"稍久按压 = 单次+连发首条叠
+                        // 加"的 10s/15s 误跳（mpv 对 RELATIVE seek 排队累加）
                         hold_press = -1;
-                        if vid_paused {
-                            frame_dir = -1;
-                        } else {
-                            seek_rel = -5.0;
-                        }
                         false
                     }
                     egui::Key::ArrowRight => {
                         hold_press = 1;
-                        if vid_paused {
-                            frame_dir = 1;
-                        } else {
-                            seek_rel = 5.0;
-                        }
                         false
                     }
                     // 缩放键（图片模式）：+/=/− 步进，0=100%，Home=适应窗口。
@@ -553,12 +544,6 @@ impl App {
             }
         }
         if let Some(p) = &self.player {
-            if seek_rel != 0.0 {
-                p.seek_relative(seek_rel);
-            }
-            if frame_dir != 0 {
-                p.frame_step(frame_dir);
-            }
             if vol_delta != 0 {
                 let v = (self.cfg.player.volume + vol_delta).clamp(0, 100);
                 p.set_volume(v);
@@ -568,14 +553,27 @@ impl App {
                 self.cfg.player.muted = false;
             }
         }
-        // 方向键长按连发登记：释放=清除；按下=记录方向与首发节奏锚点
-        //（首拍已在上面 frame_dir/seek_rel 落地，连发从 HOLD_DELAY 后起拍）
-        if hold_release {
-            self.arrow_hold = None;
-        }
+        // 方向键 tap/hold 手势登记。**先登记按下、后处理释放**：同帧
+        // press+release（极速点按）也能正确补发。释放时按压 < ARROW_HOLD_DELAY
+        // 补发单次动作（播放=±5s seek、暂停=±1 帧步进），≥ 阈值由
+        // arrow_hold_fire 转连发链（tap 补发作废，持续快进不与任何已发
+        // seek 叠加）。头部清除（失焦/模态）会连带丢弃未决 tap——该场景
+        // key-up 收不到、状态不可信，宁可丢一次快进也不残留连发
         if hold_press != 0 {
-            let now = std::time::Instant::now();
-            self.arrow_hold = Some((hold_press, now + Self::ARROW_HOLD_DELAY));
+            self.arrow_hold = Some((hold_press, std::time::Instant::now(), true));
+        }
+        if hold_release {
+            if let Some((dir, _t0, pending)) = self.arrow_hold.take() {
+                if pending {
+                    if let Some(p) = &self.player {
+                        if p.paused() {
+                            p.frame_step(dir);
+                        } else {
+                            p.seek_relative(dir as f64 * 5.0);
+                        }
+                    }
+                }
+            }
         }
         if step_entry != 0 {
             self.play_adjacent(step_entry, step_entry > 0);
@@ -848,9 +846,12 @@ impl App {
         tracing::info!("评级 {ename}: {r} dirty={dirty}");
     }
 
-    // ---- 方向键长按连发 ----
-    // 首拍后的首发延迟（与 OS 键盘重复惯例一致）
-    const ARROW_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    // ---- 方向键 tap/hold 手势 ----
+    // 手势阈值：按压时长 < 该值 = 单次动作（释放时补发 ±5s seek / 暂停 ±1 帧）；
+    // ≥ 该值转长按连发。长按判定用应用层固定阈值而非 OS 键盘重复事件——
+    // OS 重复延迟随用户键盘设置可低至 ~250ms，快按即被误判连发（叠加成
+    // 10s/15s），与 OS 设置解耦后判别确定
+    const ARROW_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
     // 暂停态连续逐帧：完成驱动 + 30fps 节流。下一发必须等上一发步进 seek
     // 完成（step_ready，PLAYBACK_RESTART 事件唤醒），节奏自适应 mpv 逐帧消化
     // 速度、无丢命令错拍；33ms 为最快上限（≈30fps，逐帧快过 30fps 肉眼无益）
@@ -861,15 +862,30 @@ impl App {
     // 播放态连续 ±5s seek 间隔（≈33s/s；mpv 对 RELATIVE seek 入队累加合并）
     const ARROW_HOLD_SEEK: std::time::Duration = std::time::Duration::from_millis(150);
 
-    /// 方向键长按连发：暂停=连续逐帧步进，播放=连续 ±5s seek，松开即停。
-    /// 每帧由 handle_shortcuts 尾部驱动。切方向=重置节奏锚点，换挡（暂停↔播放）
-    /// 在每次 fire 时实时读 paused() 缓存自适应。按住失效场景（失焦/模态）
-    /// 由 handle_shortcuts 头部的清除逻辑兜底，无任意时限
+    /// 方向键 tap/hold 手势驱动：tap 待决（未超阈值）等待释放补发单次动作；
+    /// 超阈值转连发链——第一发即起拍（此刻起连续 ±5s / 连续逐帧），此后
+    /// 按住期间每帧检查到点即发并 request_repaint_after 排下一发。换挡
+    /// （暂停↔播放）在每次 fire 时实时读 paused() 缓存自适应。按住失效
+    /// 场景（失焦/模态）由 handle_shortcuts 头部的清除逻辑兜底，无任意时限
     fn arrow_hold_fire(&mut self, ctx: &egui::Context) {
-        let Some((dir, next_fire)) = self.arrow_hold else {
+        let Some((dir, anchor, pending)) = self.arrow_hold else {
             return;
         };
         let now = std::time::Instant::now();
+        if pending {
+            // tap 待决：阈值内等 release（补发由释放臂负责），定时重查阈值
+            let held = now.duration_since(anchor);
+            if held < Self::ARROW_HOLD_DELAY {
+                ctx.request_repaint_after(Self::ARROW_HOLD_DELAY - held);
+                return;
+            }
+            // 超阈值：转连发链，锚点改写为下次连发时刻（立即起拍第一发）。
+            // tap 补发作废——持续快进从 0 开始，不与任何已发 seek 叠加
+            self.arrow_hold = Some((dir, now, false));
+        }
+        let Some((dir, next_fire, _)) = self.arrow_hold else {
+            return;
+        };
         if now < next_fire {
             ctx.request_repaint_after(next_fire - now);
             return;
@@ -884,7 +900,7 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(25));
                 return;
             }
-            self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_STEP));
+            self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_STEP, false));
             // 正常由完成事件唤醒下一发；兜底排帧保证闸门永不失联
             ctx.request_repaint_after(Self::ARROW_HOLD_STEP);
             if let Some(p) = &self.player {
@@ -892,7 +908,7 @@ impl App {
             }
             return;
         }
-        self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_SEEK));
+        self.arrow_hold = Some((dir, now + Self::ARROW_HOLD_SEEK, false));
         // 播放态 vsync 帧率更密，request_repaint_after 与之取较早者，无害
         ctx.request_repaint_after(Self::ARROW_HOLD_SEEK);
         if let Some(p) = &self.player {
