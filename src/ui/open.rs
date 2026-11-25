@@ -547,7 +547,11 @@ impl App {
             // 则 rating_out 永久 ≥1，admission(Rating) 永假（评级静默失效）
             self.io.complete(IoClass::Rating);
             self.rating_inflight = self.rating_inflight.saturating_sub(1);
+            self.rating_inflight_since = None;
             tracing::warn!("评级派发失败（worker 断连），记账已回滚");
+        } else {
+            // 看门狗基准：worker 阻塞读卡死时超时回账的唯一依据
+            self.rating_inflight_since = Some(std::time::Instant::now());
         }
     }
 
@@ -565,6 +569,7 @@ impl App {
         self.rating_probe_window = None;
         self.rating_probe_intent = None;
         self.rating_inflight = 0;
+        self.rating_inflight_since = None;
         self.rating_image_idx = Vec::new();
     }
 
@@ -634,11 +639,35 @@ impl App {
                         self.io.complete(IoClass::Rating);
                     }
                     self.rating_inflight = 0;
+                    self.rating_inflight_since = None;
                     self.rating_probe = None;
                     tracing::warn!("评级探测 worker 已退出，在途记账已回补");
                     break;
                 }
             }
+        }
+        // 看门狗（评级侧唯一兜底）：worker 卡死在单个阻塞文件读上（NAS
+        // 断连/停滞）时回执永不到达——文件粒度抢占的前提是"读会结束"，
+        // 卡死的读没有边界可让，inflight/rating_out 永久占槽，max=1 下
+        // Decode/Prefetch admission 全拒（浏览冻结）。超时回账放行：
+        // fail-open 口径——迟到结果照常收回合并（inflight 饱和下溢吸收
+        // 双记），worker 不摘除，读最终返回后派发链自然恢复
+        if self.rating_inflight > 0 {
+            let over = match self.rating_inflight_since {
+                Some(t0) => t0.elapsed() > crate::imgview::PENDING_TIMEOUT,
+                None => true, // 防御：在途但无基准（理论不可达），按超时处理
+            };
+            if over {
+                tracing::error!(
+                    "评级探测超时（>{:?}无回执）回账放行——worker 卡死在单个文件读上（NAS 停滞?）",
+                    crate::imgview::PENDING_TIMEOUT
+                );
+                self.io.complete(IoClass::Rating);
+                self.rating_inflight = 0;
+                self.rating_inflight_since = None;
+            }
+        } else {
+            self.rating_inflight_since = None;
         }
         // 派发下一项：优先级闸门（deferred 空）+ 槽位算术（admission）
         self.rating_probe_dispatch();
@@ -989,5 +1018,40 @@ mod tests {
         assert_eq!(app.rating_inflight, 0, "send 失败应回滚记账");
         assert_eq!(app.io.rating_out(), 0);
         assert!(app.io.admission(IoClass::Rating), "回账后槽位应可用");
+    }
+
+    /// 评级看门狗：worker 卡死在单个阻塞文件读上（NAS 断连/停滞）超过
+    /// PENDING_TIMEOUT 无回执 → 回账放行。不回账则 rating_out 永久 ≥1，
+    /// max=1 下 Decode/Prefetch admission 全拒（浏览冻结）。迟到结果
+    /// 按 fail-open 收回（双记由饱和下溢吸收）
+    #[test]
+    fn rating_看门狗超时_回账放行() {
+        use crate::iosched::IoClass;
+        let mut app = super::App::new_for_test(crate::config::Config::default());
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let (res_tx, res_rx) = std::sync::mpsc::channel();
+        app.rating_probe = Some(RatingProbeJob {
+            tx: cmd_tx,
+            rx: res_rx,
+        });
+        app.rating_probed = vec![false; 1];
+        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
+        app.rating_probe_dispatch();
+        assert_eq!(app.rating_inflight, 1);
+        assert_eq!(app.io.rating_out(), 1);
+        // 未超时：不动作
+        app.poll_rating_probe();
+        assert_eq!(app.rating_inflight, 1, "未超时不得回账");
+        // 模拟卡死：派发时刻推到看门狗阈值之前
+        app.rating_inflight_since =
+            Some(std::time::Instant::now() - crate::imgview::PENDING_TIMEOUT);
+        app.poll_rating_probe();
+        assert_eq!(app.rating_inflight, 0, "超时必须回账，否则占槽永久化");
+        assert_eq!(app.io.rating_out(), 0);
+        assert!(app.io.admission(IoClass::Rating), "回账后槽位应可用");
+        // 迟到结果按 fail-open 收回：双记完成被饱和下溢吸收，计数不崩
+        res_tx.send((0usize, Some(3u8))).unwrap();
+        app.poll_rating_probe();
+        assert_eq!(app.io.rating_out(), 0, "迟到回执的双记应被下溢吸收");
     }
 }

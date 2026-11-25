@@ -974,7 +974,24 @@ impl RawFrameService {
     pub(crate) fn retain(&mut self, keys: &[ImgKey]) {
         self.frames.retain(|k, _| keys.contains(k));
         self.errs.retain(|k, _| keys.contains(k));
-        self.pending.retain(|(k, _, _), _| keys.contains(k));
+        // 在途条目随窗口剔除：即时回账——看门狗只扫 pending，剔除后卡死
+        // worker 既无迟到消息兜底也无看门狗跟踪（Decode 名额永久泄漏，
+        // max=1 下全类 admission 永拒）。迟到消息双记由饱和下溢吸收
+        let mut dropped = 0usize;
+        self.pending.retain(|(k, _, _), _| {
+            if keys.contains(k) {
+                true
+            } else {
+                dropped += 1;
+                false
+            }
+        });
+        if dropped > 0 {
+            tracing::warn!("raw 帧在途条目随窗口剔除 {dropped} 路，发牌名额即时回补");
+            for _ in 0..dropped {
+                self.sched.complete(IoClass::Decode);
+            }
+        }
         self.probes.retain(|k, _| keys.contains(k));
         self.resolved.retain(|k, _| keys.contains(k));
         // deferred 同步过滤：死条目驻留会让 deferred_len() 持续 >0 压死
@@ -1250,7 +1267,23 @@ impl HistService {
 
     /// 切条目后清理非当前 key（直方图按 key 即用即弃，不驻留）
     pub(crate) fn retain(&mut self, keys: &[ImgKey]) {
-        self.pending.retain(|k, _| keys.contains(k));
+        // 在途条目随清理剔除：即时回账（口径同 RawFrameService::retain——
+        // 看门狗只扫 pending，不回账则卡死 worker 永久占槽）
+        let mut dropped = 0usize;
+        self.pending.retain(|k, _| {
+            if keys.contains(k) {
+                true
+            } else {
+                dropped += 1;
+                false
+            }
+        });
+        if dropped > 0 {
+            tracing::warn!("raw 直方图在途条目随清理剔除 {dropped} 路，发牌名额即时回补");
+            for _ in 0..dropped {
+                self.sched.complete(IoClass::Decode);
+            }
+        }
         self.done.retain(|k, _| keys.contains(k));
         // deferred 同步过滤（死条目压死评级让位闸，同 RawFrameService）
         self.deferred.retain(|d| keys.contains(&d.key));
@@ -2005,6 +2038,35 @@ mod tests {
         // 栏关闭：deferred 死条目同步清掉（评级让位闸不再被压死）
         svc.retain(&[]);
         assert_eq!(svc.deferred_len(), 0, "死条目必须随 retain 清掉");
+    }
+
+    /// retain 剔除在途条目：发牌名额即时回账——看门狗只扫 pending，剔除后
+    /// 卡死 worker 既无迟到消息兜底也无看门狗跟踪（Decode 名额永久泄漏，
+    /// max=1 下全类 admission 永拒）。帧服务与直方图服务同口径
+    #[test]
+    fn retain_在途剔除即时回账() {
+        let mut svc = RawFrameService::new(egui::Context::default(), test_sched());
+        // 直塞 pending 模拟在途（worker 卡死场景：Frame 消息不会到来）
+        svc.pending.insert(((9, 0), 3, 0), Instant::now());
+        svc.sched.issue(IoClass::Decode);
+        assert_eq!(svc.sched.decode_out(), 1);
+        // 窗口内保留：条目与名额都不动
+        svc.retain(&[(9, 0)]);
+        assert_eq!(svc.sched.decode_out(), 1, "窗口内条目不得误回账");
+        // 栏关闭：剔除 + 回账
+        svc.retain(&[]);
+        assert_eq!(
+            svc.sched.decode_out(),
+            0,
+            "retain 移除 pending 必须即时回账，否则名额泄漏"
+        );
+        // 直方图服务同款
+        let mut hist = HistService::new(egui::Context::default(), test_sched());
+        hist.pending.insert((9, 1), Instant::now());
+        hist.sched.issue(IoClass::Decode);
+        assert_eq!(hist.sched.decode_out(), 1);
+        hist.retain(&[]);
+        assert_eq!(hist.sched.decode_out(), 0, "直方图在途剔除同款回账");
     }
 
     /// HistService Err 终态：同 contrast 的 Err 不再重试（损坏文件每帧

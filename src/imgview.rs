@@ -380,7 +380,13 @@ impl ImageService {
         if let Some(i) = self.pos(key) {
             self.cache.remove(i);
         }
-        self.pending.remove(&key);
+        self.pending.remove(&key).map(|(_, class, _)| {
+            // 在途条目随 invalidate 剔除：即时回账——看门狗只扫 pending，
+            // 不回账则卡死 worker 既无迟到消息兜底也无看门狗跟踪（发牌
+            // 名额永久泄漏）。迟到消息双记一次完成由饱和下溢吸收（fail-open）
+            self.sched.complete(class);
+            tracing::warn!("invalidate 剔除在途解码 {key:?}，发牌名额即时回补");
+        });
         // deferred 同 key 条目同步清掉：被 invalidate 的请求不再放行
         // （热重载重放/旋转写回后旧参数请求无意义）
         self.deferred.retain(|d| d.key != key);
@@ -4022,6 +4028,35 @@ mod tests {
     }
 
     // ---- 相机 RAW 预览（方案 §4.3）----
+
+    /// invalidate 剔除在途解码条目：发牌名额即时回账——看门狗只扫 pending，
+    /// 不回账则卡死 worker 既无迟到消息兜底也无看门狗跟踪（名额永久泄漏，
+    /// max=1 下全类 admission 永拒）。Decode/Prefetch 两类都要回
+    #[test]
+    fn invalidate_在途剔除即时回账() {
+        let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0, test_sched());
+        // 直塞 pending 模拟在途（worker 卡死场景：消息不会到来）
+        svc.pending.insert(
+            (1, 0),
+            (std::time::Instant::now(), IoClass::Decode, svc.base_gen + 1),
+        );
+        svc.sched.issue(IoClass::Decode);
+        assert_eq!(svc.sched.decode_out(), 1);
+        svc.invalidate((1, 0));
+        assert_eq!(
+            svc.sched.decode_out(),
+            0,
+            "invalidate 移除 pending 必须即时回账，否则名额泄漏"
+        );
+        // Prefetch 类同款
+        svc.pending.insert(
+            (1, 1),
+            (std::time::Instant::now(), IoClass::Prefetch, svc.base_gen + 1),
+        );
+        svc.sched.issue(IoClass::Prefetch);
+        svc.invalidate((1, 1));
+        assert_eq!(svc.sched.prefetch_out(), 0);
+    }
 
     #[test]
     fn is_raw_photo_ext_判定() {

@@ -518,6 +518,10 @@ pub struct App {
     /// 已入队未收回的探测条数：星级筛选门控（==0 才让筛选谓词生效）+
     /// 顶栏"评级扫描中… N%"标记的依据（panels.rs top_bar）
     rating_inflight: usize,
+    /// 在途评级派发时刻（看门狗基准）：worker 阻塞读卡死（NAS 断连）时
+    /// 回执永不到达，文件粒度抢占没有边界可让——超时回账放行（唯一兜底，
+    /// 见 poll_rating_probe 看门狗分支）
+    rating_inflight_since: Option<std::time::Instant>,
     /// 星级筛选（图片标签页筛选条）：None=全部；Some(0)=未评；
     /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）
     rating_filter: Option<u8>,
@@ -659,6 +663,7 @@ impl App {
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),
             rating_inflight: 0,
+            rating_inflight_since: None,
             rating_filter: None,
             delete_confirm: None,
             rating_dirty: std::collections::HashMap::new(),
@@ -750,6 +755,7 @@ impl App {
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),
             rating_inflight: 0,
+            rating_inflight_since: None,
             rating_filter: None,
             delete_confirm: None,
             rating_dirty: std::collections::HashMap::new(),
