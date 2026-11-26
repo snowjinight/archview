@@ -457,6 +457,30 @@ impl ImageService {
         }
     }
 
+    /// 摘除仍排队的预取任务并清其占位（切条目播放时调用，§19 取消语义
+    /// 扩展）：旧条目的邻居预取在 Prefetch FIFO 里排在队首，切条目后多已
+    /// 陈旧——不摘会在新邻居预取之前被读线程消费（插队一个读段）。逐条
+    /// `cancel_token` 摘除：返回 >0（仍在排队）连带清 pending 占位——迟到
+    /// buffer 因占位缺失被 gen 校验丢弃；返回 0（已出队在读，读无法中断）
+    /// 保留占位让 buffer 正常落地解码。Decode 类占位不受影响。
+    /// 返回摘除的排队任务数
+    pub fn cancel_queued_prefetch(&mut self) -> usize {
+        let tokens: Vec<(ImgKey, u64)> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.class == IoClass::Prefetch)
+            .map(|(k, p)| (*k, p.token))
+            .collect();
+        let mut n = 0;
+        for (k, token) in tokens {
+            if self.sched.cancel_token(IoClass::Prefetch, token) > 0 {
+                self.pending.remove(&k);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// 方向事实读取（R 键轮转基准）：无记录 = 1（未矫正）
     pub fn orientation(&self, key: ImgKey) -> u8 {
         self.orientations.get(&key).copied().unwrap_or(1)
@@ -3939,6 +3963,71 @@ mod tests {
         ready(&mut svc, (1, 3));
         // 卡死 bug 回归：修复前 cur 被逐出且 pending 已空，frame=None 永久占位
         assert!(svc.frame(cur).is_some(), "正在显示的图不应被预取洪水挤出");
+    }
+
+    /// 切条目摘除排队预取（§19 取消语义扩展）：排队任务摘队 + 清占位；
+    /// 已出队在读（token 先被摘）保留占位让 buffer 照常落地；Decode 类
+    /// 占位不受影响
+    #[test]
+    fn cancel_queued_prefetch_摘队清占位_在途保留() {
+        let sched = test_sched();
+        let mut svc =
+            ImageService::new(egui::Context::default(), 2, Default::default(), 0, sched.clone());
+        // 占住唯一读线程（max=1）：阻塞任务等信号，保证后续请求必在排队
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        sched.submit(crate::iosched::IoJob {
+            name: "gate".into(),
+            class: IoClass::Decode,
+            token: 0,
+            heavy: false,
+            work: Box::new(move || {
+                let _ = started_tx.send(());
+                let _ = go_rx.recv();
+                Ok(Vec::new())
+            }),
+            on_done: Box::new(|_| {}),
+        });
+        assert_eq!(
+            started_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(()),
+            "读线程应被 gate 任务占住"
+        );
+        // 两个 Prefetch 请求（读线程忙，必排队）+ 一个 Decode 请求（对照组）
+        svc.request(
+            (1, 0),
+            ImageSource::File("nope_a".into()),
+            512,
+            "a.png",
+            IoClass::Prefetch,
+        );
+        svc.request(
+            (1, 1),
+            ImageSource::File("nope_b".into()),
+            512,
+            "b.png",
+            IoClass::Prefetch,
+        );
+        svc.request(
+            (1, 2),
+            ImageSource::File("nope_c".into()),
+            512,
+            "c.png",
+            IoClass::Decode,
+        );
+        assert!(svc.is_pending((1, 0)) && svc.is_pending((1, 1)) && svc.is_pending((1, 2)));
+        assert_eq!(sched.queued(IoClass::Prefetch), 2);
+        // 模拟 (1,1) 已出队在读：手动摘掉其排队任务（此后服务侧摘不到）
+        let t1 = svc.pending[&(1, 1)].token;
+        assert_eq!(sched.cancel_token(IoClass::Prefetch, t1), 1);
+        // 摘除：只应摘到 (1,0)
+        assert_eq!(svc.cancel_queued_prefetch(), 1);
+        assert!(!svc.is_pending((1, 0)), "排队任务应连占位一起清");
+        assert!(svc.is_pending((1, 1)), "在途任务占位应保留（读毕照常落地）");
+        assert!(svc.is_pending((1, 2)), "Decode 类占位不受影响");
+        assert_eq!(sched.queued(IoClass::Prefetch), 0);
+        // 放行 gate 收尾（其余排队 Decode 任务随后自行动作，不影响断言）
+        let _ = go_tx.send(());
     }
 
     #[test]

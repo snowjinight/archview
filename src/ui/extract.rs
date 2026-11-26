@@ -70,6 +70,15 @@ impl App {
             });
             return;
         }
+        // 切条目即摘除仍排队的旧预取（§19 取消语义扩展）：旧邻居预取在
+        // Prefetch FIFO 队首，不摘会在新邻居预取前插队一个读段。在途读
+        // 不摘（读毕照常落地，翻回仍可用）；同条目重播不摘（预取仍有效）
+        if self.playing != Some(entry_idx) {
+            let dropped = self.img.cancel_queued_prefetch();
+            if dropped > 0 {
+                tracing::debug!("切条目摘除排队预取 {dropped} 项");
+            }
+        }
         // 图片路由：流式 zip 图片（静态图含全部 webp + gif 动图，13.4 第 4 步）
         // 走纹理直显（跳过 mpv，不解压）；7z/RAR 图片仍走解压会话（批次/预取
         // 机制复用），落地后在 load_extracted 分流为纹理解码
