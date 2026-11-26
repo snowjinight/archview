@@ -753,6 +753,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         session,
         ratings: std::collections::HashMap::new(),
         deleted: std::collections::HashSet::new(),
+        dir_mode: false,
     });
 
     // 会话当前窗口（下标升序）
@@ -1566,6 +1567,7 @@ fn png_archive(
         session,
         ratings: std::collections::HashMap::new(),
         deleted: std::collections::HashSet::new(),
+        dir_mode: true,
     });
     vfs
 }

@@ -78,6 +78,10 @@ struct ArchiveState {
     vfs: Arc<dyn ArchiveVFS>,
     /// true = 流式播放（zip 快路径）；false = 后台解压（7z/RAR 慢路径）
     stream: bool,
+    /// true = 目录模式（path.is_dir() 打开时一次性缓存）。file_list 每帧
+    /// 读此字段判定删除入口可达——**禁止每帧 stat**：目录在 NFS/网络盘上
+    /// 时 is_dir() 是一次网络往返（实测 R: 盘 ~68ms/次，帧探针暴露）
+    dir_mode: bool,
     /// 固实解码会话（UI ↔ 后台解码线程共享，生命周期与包一致；stream 包
     /// 不使用）。UI 组批时重写 targets/focus，解码线程动态消费——跳转只
     /// 更新目标集，不重启解码流（协议见 vfs::ArchiveVFS::extract_session）

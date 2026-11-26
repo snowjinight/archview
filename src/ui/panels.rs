@@ -738,8 +738,9 @@ impl App {
         let mut menu_all = false;
         let mut menu_clear = false;
         let mut menu_compare: Option<usize> = None;
-        // 删除选中（进回收站）：仅目录模式可达（压缩包内无磁盘路径）
-        let menu_delete_ok = self.archive.as_ref().is_some_and(|a| a.path.is_dir());
+        // 删除选中（进回收站）：仅目录模式可达（压缩包内无磁盘路径）。
+        // dir_mode 为打开时缓存——每帧 is_dir() 在 NFS 上是 ~70ms 网络往返
+        let menu_delete_ok = self.archive.as_ref().is_some_and(|a| a.dir_mode);
         let mut menu_delete = false;
         // 同步评级到文件：目录模式 + dirty 非空（有未落盘的评级改动）
         let menu_sync_ok = menu_delete_ok && !self.rating_dirty.is_empty();

@@ -335,6 +335,9 @@ impl App {
             })),
             ratings: std::collections::HashMap::new(),
             deleted: std::collections::HashSet::new(),
+            // 目录模式判定一次性缓存（每帧 stat 在网络盘上是 ~70ms 级往返，
+            // 见 ArchiveState.dir_mode 注释）
+            dir_mode: path.is_dir(),
         });
         // 新包旧选择无意义：清多选与范围锚点（entry 下标对新包是错位引用）
         self.selected.clear();
