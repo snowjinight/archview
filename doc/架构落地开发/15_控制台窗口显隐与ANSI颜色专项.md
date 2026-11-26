@@ -74,7 +74,8 @@
 - F12 在 `handle_shortcuts()` 最顶部切换 `log_open`（先于一切早退分支，
   覆盖所有模态）；
 - 窗口内容：`logsink::snapshot()` 拉环形缓冲，`ScrollArea::show_rows` +
-  `stick_to_bottom(follow)`（跟随底部默认开）；布局为**全宽贴底停靠**
+  `stick_to_bottom(follow)`（跟随底部默认开，手动开关语义 + 挤出补偿见
+  §5.3）；布局为**全宽贴底停靠**
   （`Window::fixed_rect`：与视口同宽、下缘对齐、高约 38%，不可拖动/缩放，
   视口尺寸取 `ctx.input(|i| i.raw.screen_rect)`）；工具行：跟随开关 /
   复制全部（`ctx.copy_text`）/ 用记事本打开 archview.log / 清屏
@@ -96,3 +97,59 @@
   兜底，exit 0 不崩；
 - GUI 内按 F12：日志窗口开合、跟随/复制/清屏可用；
 - config.toml 破坏后启动：弹窗报 TOML 错误后 panic（不再静默闪退）。
+
+## 5. 修复记录：跟随底部失效 + 上翻时正文"向下滚 N 行"（2026-11-26）
+
+### 5.1 现象
+
+1. 勾选「跟随底部」后手动上翻日志，新日志到达（如 3 行）时视图不跳到底部，
+   而是当前阅读位**向下滚 3 行**（正文整体上顶 3 行），滚动距离恒等于新日志行数；
+2. 取消勾选后现象与勾选时**一样**——复选框看起来完全不起作用。
+
+### 5.2 根因（两个症状同根）
+
+- **主因：满环挤出造成假滚动**。环形缓冲满 600 行后，每来 1 行就
+  `pop_front` 挤掉顶行（`push_bytes` / `push_panic` 两处），快照整体索引
+  前移；而 egui 的滚动 `State.offset` 是"距内容顶部的像素距离"，无人
+  补偿 → 同一段正文在视口中的位置整体上移 N 行，视觉上=向下滚 N 行。
+  该现象与 `stick_to_bottom` 勾选与否**无关**，故复选框看似无效；
+- **次因：egui stick 语义与预期不符**。`stick_to_bottom(true)` 只在
+  "贴着底部（`scroll_stuck_to_end=true`）"时才跟随（scroll_area.rs
+  `if stick_to_end[d] && state.scroll_stuck_to_end[d]`）——上翻后
+  stuck=false，新日志到达不会跳底。即 egui 语义是"贴底才跟随"，而 UI
+  语义应为"复选框是手动开关：勾选=始终跟随，不勾选=冻结阅读位"。
+
+### 5.3 修复
+
+- **logsink.rs**：`Inner` 增加 `evicted_total: u64` 累计挤出行数
+  （单调递增，`pop_front` 两处 +1），新增 `pub fn evicted_total()` 读数
+  （毒化恢复同 push_bytes）；
+- **dialogs.rs log_window**（`show_rows` 之后，重写持久化 State）：
+  - 勾选跟随：仅未贴底时把 `st.offset.y` 钉到 `available`（=
+    content_size − 视口高，恰为 max_offset）并 `State::store`——下一帧
+    直接渲染底部且 stuck 重算为 true，egui 原生 stick 接管；上翻后新
+    日志到达也回底部。**踩坑（2026-11-26 二次修复）**：首版每帧无条件
+    覆写 `offset = content_size.y`（超出 max_offset 一个视口高），而
+    egui 的 clamp 在 `end()` 里、发生在渲染**之后** → 下一帧渲染时
+    offset 仍超界，内容整体平移出裁剪区（整帧空白），再 clamp 回正常
+    又被覆写超界……逐帧交替 = 日志疯狂闪动后消失。教训：**覆写
+    ScrollArea offset 只能写 max_offset（content_size − inner_rect 尺寸），
+    且仅在未贴底时写**，渲染帧用的就是存进去的值，不能指望 end() 兜底；
+  - 不勾选：仅当本帧有挤出（帧差值）且不在底部（`offset < available`
+    - 0.5 容差）时补偿 `offset -= 挤出数 × 行距`（行距=行高+
+    item_spacing，与 show_rows 内部换算同款），阅读位纹丝不动；贴底时
+    无需补偿（视口本就罩住最新行）；
+  - 帧差值记录在 `App.log_evicted`（须在取 `log_follow` 可变借用**前**
+    计算——同属 self，否则借用冲突）。
+
+### 5.4 教训
+
+- egui `ScrollArea` 的滚动 offset 是"距内容顶的像素距离"，**内容顶部
+  变化（挤出/删除/收缩）必须自行补偿 offset**，否则视觉上内容会平移；
+- `stick_to_bottom` ≠ "始终跟随"，是"贴底才跟随"；要做手动开关语义
+  （勾选=无条件跳底），须每帧显式改写持久化 State（`show_rows` 返回值
+  `ScrollAreaOutput.state` + `State::store(ctx, id)` 是官方公开路径，
+  私有字段 stuck/offset_target 会随整个 State 原样带回，无信息丢失）；
+- 同一文件的并行 Edit 会静默丢失改动（构造器初始化漏一处 → E0063），
+  同文件多处修改必须逐条串行。
+

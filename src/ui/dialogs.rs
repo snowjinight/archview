@@ -8,7 +8,9 @@ use crate::encode::cli;
 impl App {
     /// 运行日志窗口（F12 开关，nav.rs 接线）：展示 logsink 内存环形缓冲
     /// （最近 600 行，无 ANSI 色）。完整历史落盘 archview.log（exe 同目录），
-    /// 「用记事本打开」直达。跟随底部滚动默认开，手动上翻即冻结自动跟随
+    /// 「用记事本打开」直达。「跟随底部」为手动开关：勾选=每帧钉到底部
+    /// （上翻后新日志到达也回底部）；不勾选=自由翻阅，满环挤出按行距
+    /// 补偿 offset，正文纹丝不动（冻结阅读位）
     pub(super) fn log_window(&mut self, ctx: &egui::Context) {
         if !self.log_open {
             return;
@@ -28,6 +30,10 @@ impl App {
         }
         let lines = crate::logsink::snapshot();
         let path = crate::logsink::file_path();
+        // 本帧新挤出行数（须在取 log_follow 可变借用前算完——同属 self）
+        let evicted_now = crate::logsink::evicted_total();
+        let evicted = evicted_now.saturating_sub(self.log_evicted);
+        self.log_evicted = evicted_now;
         let mut open = self.log_open;
         let follow = &mut self.log_follow;
         let collapsed = &mut self.log_collapsed;
@@ -77,7 +83,7 @@ impl App {
                 });
                 ui.separator();
                 let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-                egui::ScrollArea::vertical()
+                let out = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(*follow)
                     .show_rows(ui, row_h, lines.len(), |ui, range| {
@@ -87,6 +93,37 @@ impl App {
                             ));
                         }
                     });
+                // egui stick_to_bottom 只在"贴着底部（stuck）"时跟随：上翻后
+                // stuck=false，新日志到达不会跳底；而满环挤出使快照整体索引
+                // 前移，offset（距内容顶的像素距离）无人补偿，正文就"上顶"
+                // N 行——表现为"当前位置向下滚 N 行"，且与复选框无关。故：
+                // 勾选→每帧把 offset 钉到底部强制跟随；不勾选→按挤出量补偿
+                if *follow {
+                    // 钉到 max_offset（=content_size - 视口高，恰为贴底）：
+                    // 下一帧直接渲染底部且 stuck 重算为 true，egui 原生
+                    // stick 接管同值维护。仅未贴底时覆写——每帧无条件写
+                    // 会把 offset 顶过界（渲染发生在 end() clamp 之前，
+                    // 内容被平移出裁剪区 → 隔帧空白闪烁），且已贴底时
+                    // egui stick 自会维持
+                    let available = out.content_size.y - out.inner_rect.size().y;
+                    if out.state.offset.y < available - 0.5 {
+                        let mut st = out.state;
+                        st.offset.y = available;
+                        st.store(ui.ctx(), out.id);
+                    }
+                } else if evicted > 0 {
+                    // 仅非底部需要补偿：贴底时视口本就罩住最新行，挤出无视觉
+                    // 影响；非底部时同一正文在快照中的下标前移 N，把 offset
+                    // 回退 N 个行距，阅读位纹丝不动（真冻结）
+                    let available = out.content_size.y - out.inner_rect.size().y;
+                    if out.state.offset.y < available - 0.5 {
+                        // 行距 = 行高 + item_spacing（show_rows 的行距换算同款）
+                        let pitch = row_h + ui.spacing().item_spacing.y;
+                        let mut st = out.state;
+                        st.offset.y = (st.offset.y - evicted as f32 * pitch).max(0.0);
+                        st.store(ui.ctx(), out.id);
+                    }
+                }
             });
         self.log_open = open;
     }

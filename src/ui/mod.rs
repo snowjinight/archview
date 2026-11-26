@@ -448,8 +448,12 @@ pub struct App {
     log_open: bool,
     // 日志窗口收起态：只留右缘小标签（点击/F12 展开），不挡左侧文件列表
     log_collapsed: bool,
-    // 日志窗口跟随底部滚动（默认开；手动上翻即看历史）
+    // 日志窗口跟随底部滚动（默认开；手动开关：勾选=每帧钉到底部，新日志
+    // 到达无论当前是否上翻都跳到最新行；不勾选=自由翻阅冻结阅读位）
     log_follow: bool,
+    // 上帧已见的日志挤出总数（logsink evicted_total 快照）：满环每挤出一行，
+    // 快照索引整体前移，不按行距补偿滚动 offset 就会出现正文"上顶"假滚动
+    log_evicted: u64,
     // 启动参数传入的初始打开目标（SendTo「Archview player」/拖到 exe 上），首帧触发一次
     initial_open: Option<PathBuf>,
     // 单媒体文件入口（拖入/SendTo/命令行/「打开媒体文件」）的跳转目标文件名：
@@ -641,6 +645,7 @@ impl App {
             log_open: false,
             log_collapsed: false,
             log_follow: true,
+            log_evicted: 0,
             initial_open: initial,
             pending_focus: None,
             selected: Default::default(),
@@ -732,6 +737,7 @@ impl App {
             log_open: false,
             log_collapsed: false,
             log_follow: true,
+            log_evicted: 0,
             initial_open: None,
             pending_focus: None,
             selected: Default::default(),

@@ -35,6 +35,9 @@ struct Inner {
     pending: Vec<u8>,
     /// 跨多次 write 调用的未收尾行（tracing 一条事件可能分片写入）
     cur: Vec<u8>,
+    /// 累计挤出行数（单调递增）：满环 pop_front 的总次数。UI 面板据此按
+    /// 行距补偿滚动 offset——快照索引整体前移时正文才不会"上顶"（假滚动）
+    evicted_total: u64,
 }
 
 pub struct LogSink {
@@ -60,6 +63,7 @@ impl LogSink {
                 ring: VecDeque::with_capacity(RING_LINES),
                 pending: Vec::new(),
                 cur: Vec::new(),
+                evicted_total: 0,
             }),
             kick: Condvar::new(),
         });
@@ -151,6 +155,18 @@ pub fn snapshot() -> Vec<String> {
     SINK.get().map(|s| s.snapshot()).unwrap_or_default()
 }
 
+/// 环形缓冲累计挤出行数（单调递增；F12 面板按帧差值补偿滚动 offset 用）
+pub fn evicted_total() -> u64 {
+    SINK.get()
+        .map(|s| {
+            match s.inner.lock() {
+                Ok(g) => g.evicted_total,
+                Err(p) => p.into_inner().evicted_total, // 毒化恢复同 push_bytes
+            }
+        })
+        .unwrap_or(0)
+}
+
 /// 崩溃现场直接落盘（panic 钩子专用）：绕过 pending 批量管线，同步 append
 /// 写文件（进程即将终止，不等 5s 落盘线程）+ 环形缓冲（F12 面板可见）。
 /// 锁用毒化恢复——panic 钩子自身绝不能再 panic
@@ -163,6 +179,7 @@ pub fn push_panic(text: &str) {
         };
         if g.ring.len() == RING_LINES {
             g.ring.pop_front();
+            g.evicted_total += 1;
         }
         g.ring.push_back(text.to_string());
         g.pending.extend_from_slice(line.as_bytes());
