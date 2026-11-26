@@ -38,6 +38,10 @@ struct Inner {
     /// 累计挤出行数（单调递增）：满环 pop_front 的总次数。UI 面板据此按
     /// 行距补偿滚动 offset——快照索引整体前移时正文才不会"上顶"（假滚动）
     evicted_total: u64,
+    /// 落盘线程正在写一批增量（take 之后 write 之前置 true，写毕清零）：
+    /// 退出同步（flush_blocking）以此判定"字节已到达磁盘"，而非只看
+    /// pending 空（take 后写前有窗口，提前返回会丢最后一批）
+    draining: bool,
 }
 
 pub struct LogSink {
@@ -64,6 +68,7 @@ impl LogSink {
                 pending: Vec::new(),
                 cur: Vec::new(),
                 evicted_total: 0,
+                draining: false,
             }),
             kick: Condvar::new(),
         });
@@ -101,12 +106,20 @@ impl LogSink {
                         .unwrap_or_else(|p| p.into_inner());
                     g = guard;
                 }
-                std::mem::take(&mut g.pending)
+                let batch = std::mem::take(&mut g.pending);
+                g.draining = !batch.is_empty();
+                batch
             };
         if let Some(o) = out.as_mut() {
             if !batch.is_empty() {
                 let _ = o.write_all(&batch);
                 let _ = o.flush();
+                // 写毕清 draining 并唤醒退出同步等待者（毒化恢复同 push_bytes）
+                if let Ok(mut g) = self.inner.lock() {
+                    g.draining = false;
+                    drop(g);
+                    self.kick.notify_all();
+                }
             }
         }
         }
@@ -196,6 +209,30 @@ pub fn push_panic(text: &str) {
 /// 日志文件路径（UI「用记事本打开」用；未初始化 = None）
 pub fn file_path() -> Option<PathBuf> {
     PATH.get().cloned()
+}
+
+/// 退出强制同步落盘（窗口关闭 / App::drop 时调用）：唤醒落盘线程把未落盘
+/// 增量立即写盘，并等待"pending 排空且在途批写毕"再返回——修掉"进程退出
+/// 最多丢最近 5s 日志"的旧行为（退出自动保存的 INFO 记录此前从未落过盘，
+/// 排障时一度无法证明退出同步是否触发）。上限 2s 防落盘线程卡死拖住退出；
+/// panic 路径不走这里（push_panic 已直写文件）。未初始化 = 空操作
+pub fn flush_blocking() {
+    let Some(s) = SINK.get() else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let drained = match s.inner.lock() {
+            Ok(g) => g.pending.is_empty() && !g.draining,
+            Err(p) => {
+                let g = p.into_inner();
+                g.pending.is_empty() && !g.draining
+            }
+        };
+        if drained || std::time::Instant::now() >= deadline {
+            return;
+        }
+        s.kick.notify_all();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// 清空环形缓冲（F12 面板「清屏」）：仅清界面视图，落盘增量与文件不动

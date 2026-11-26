@@ -1882,6 +1882,56 @@ fn rating_sync_shortcut_works_in_compare_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 退出同步写失败拦截（2026-11-26）：exiting 同步遇写失败 → 不发 Close
+/// 放行退出，err 常驻失败清单。修复前该路径静默吞失败直接关窗（webp
+/// 简单格式事件实证：用户感知"退出不保存评级"，且 logsink 5s 落盘把
+/// exiting=true 记录一并吞掉，排障无凭据）。失败不回灌 dirty（确认后
+/// 再次点 X 即退出，与手动同步语义一致）
+#[test]
+fn exiting_sync_blocks_close_on_write_failure() {
+    let dir = make_png_dir("syncfail", &["p0.png"]);
+    // 坏 PNG：文件存在（过 exists 检查）但容器解析必败 → write_rating
+    // Err；Skipped 语义只覆盖"文件不存在"，不适用
+    let bad = dir.join("bad.png");
+    std::fs::write(&bad, b"not a png").unwrap();
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+    // 直接挂脏表并启动退出同步（不经 close_requested 拦截注入——拦截
+    // 门控依赖 winit 事件流，测试里不可达；拦截本身已有 CancelClose
+    // 状态机，此处聚焦 poll 收尾分支）
+    app.rating_dirty.insert(bad.clone(), 5);
+    app.start_rating_sync(true);
+    assert!(app.rating_sync.is_some(), "退出同步应已启动");
+
+    let ctx = egui::Context::default();
+    let mut close_sent = false;
+    for _ in 0..200 {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| app.poll_rating_sync());
+        if app.rating_sync.is_none() {
+            close_sent = out
+                .viewport_output
+                .values()
+                .any(|v| v.commands.contains(&egui::ViewportCommand::Close));
+        }
+        // 测试不做渲染端纹理上载，每次清 delta 防析构 panic
+        out.textures_delta.clear();
+        if app.rating_sync.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.rating_sync.is_none(), "同步 job 应收敛");
+    assert!(!close_sent, "写失败必须拦住退出（不得发 Close）");
+    let err = app.error.as_deref().expect("失败清单应常驻 err 位");
+    assert!(err.contains("写入失败"), "err 需指明失败: {err}");
+    assert!(
+        app.rating_dirty.is_empty(),
+        "失败不回灌 dirty（与手动同步语义一致）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 对比模式空格自动翻页（2026-11-24）：开关随会话记忆（CompareSession 内，
 /// 不泄漏回单图幻灯片）；tick 到期整组前滑 1（复用 compare_slide 就绪闸门
 /// ——流式 Incoming 未就绪挂起、就绪补滑），窗口换血重置锚点（手动滑动

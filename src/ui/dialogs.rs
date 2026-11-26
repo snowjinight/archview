@@ -788,9 +788,10 @@ impl App {
     }
 
     /// 评级同步任务轮询（update 每帧）：Item 计数；Done 收尾——exiting 时
-    /// dirty 又非空（同步期间又评了新项）→ 再启一轮收敛，否则放行退出
-    ///（ViewportCommand::Close）；手动同步 → notice/err 汇总。失败不回灌
-    /// dirty（用户可再次手动同步重试）
+    /// 有写失败 → 拦住不放行（err 汇总，本轮 CancelClose 已拦下系统关闭，
+    /// 用户确认后再次点 X 即直接退出）；dirty 又非空（同步期间又评了新项）
+    /// → 再启一轮收敛，否则放行退出（ViewportCommand::Close）；手动同步 →
+    /// notice/err 汇总。失败不回灌 dirty（用户可再次手动同步重试）
     pub(super) fn poll_rating_sync(&mut self) {
         let mut finished = false;
         if let Some(job) = self.rating_sync.as_mut() {
@@ -818,6 +819,18 @@ impl App {
         }
         let job = self.rating_sync.take().unwrap();
         if job.exiting {
+            if !job.failed.is_empty() {
+                // 写失败拦住退出：静默放行 = 评级无提示丢失（用户排查时连
+                // 日志都没有，webp 简单格式事件已实证）。错误清单常驻 err
+                // 位；星级显示仍来自会话内存，不丢。跳过（文件已消失）不算
+                // 失败——无可写对象，放行合理
+                self.set_err(format!(
+                    "退出保存未完成：{} 项评级写入失败（星级暂存于会话，可排查后再退出）：{}",
+                    job.failed.len(),
+                    job.failed.join("；")
+                ));
+                return;
+            }
             if self.rating_dirty.is_empty() {
                 self.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Close);

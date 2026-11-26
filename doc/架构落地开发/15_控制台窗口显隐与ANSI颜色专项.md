@@ -37,8 +37,13 @@
   fmt 层 `with_ansi(false)` 写入（缓冲与落盘都要纯文本）；跨 write 调用
   的未收尾行用 `cur: Vec<u8>` 累积、`\n` 时 `from_utf8_lossy` 收行；
 - **定时落盘**：后台线程 `wait_timeout(5s)` 或增量攒满 64KB 提前唤醒，
-  `BufWriter` append 追加 archview.log（exe 同目录）；进程退出最多丢
-  最近 5s 未落盘增量（诊断日志可接受）；
+  `BufWriter` append 追加 archview.log（exe 同目录）；
+- **退出强制同步落盘（2026-11-26）**：`flush_blocking()`——`App::drop`
+  末尾调用，notify 唤醒落盘线程后轮询等待 `pending` 排空**且在途批
+  写毕**（`Inner.draining` 标志区分"take 后写前"的窗口，只看 pending
+  空会丢最后一批），上限 2s 防线程卡死拖住退出。取代"进程退出最多丢
+  最近 5s"旧口径——退出自动保存的 INFO 记录此前从未落过盘，排障一度
+  无法证明退出同步是否触发；panic 路径不走这里（push_panic 直写文件）；
 - **轮转**：启动时文件 >4MB → 改名 `archview.log.old`（覆盖上一代）；
 - **MakeWriter**：孤儿规则不允许为 `Arc<LogSink>` 直接实现外部 trait，
   用本地 newtype `SinkWriter(pub Arc<LogSink>)` 包装；

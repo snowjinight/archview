@@ -11,9 +11,11 @@
 //!   手术（JPEG APP1 / PNG iTXt / WebP "XMP " 块）+ XMP 文本编辑：
 //!   已有包原位替换优先，无标记则在 `</rdf:RDF>` 前追加独立
 //!   rdf:Description（不做属性合并）；清除 = 剥离 Rating 保留其余内容。
-//!   WebP 简单格式（无 VP8X 块）无元数据容器，显式 Err 不静默兜底
-//!   （img-parts 内部 convert_into_infered_kind 其实能自动补 VP8X，
-//!   但只能经 set_icc_profile/set_exif 等副作用路径触发，不干净不用）
+//!   WebP 简单格式（无 VP8X 块）先升级为 VP8X 扩展格式再写（webpmux
+//!   -set 同款语义，2026-11-26 改：仅动容器不重编码；XMP 块在文件尾，
+//!   读链头尾双读；VP8X flags 的 XMP 位同步由本模块负责——img-parts
+//!   的 convert_into_infered_kind 只在 set_icc_profile/set_exif 副作用
+//!   路径触发，且 flags 重算不含 XMP 位，不干净不用）
 //! - tif/tiff + 相机 RAW（arw/nef/nrw/srf/sr2/arq）+ bmp + gif →
 //!   sidecar `.xmp`（Lightroom 命名约定，原文件字节零改动）
 //! - EXIF 18246/18249 评级读取已删除（Microsoft 非正式扩展位，主流
@@ -27,7 +29,7 @@ use img_parts::jpeg::{markers, Jpeg, JpegSegment};
 use img_parts::png::{Png, PngChunk};
 use img_parts::riff::{RiffChunk, RiffContent};
 use img_parts::vp8::VP8Kind;
-use img_parts::webp::{WebP, CHUNK_XMP};
+use img_parts::webp::{WebP, CHUNK_ALPH, CHUNK_VP8L, CHUNK_VP8X, CHUNK_XMP};
 use img_parts::ImageEXIF;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -118,12 +120,24 @@ pub fn sidecar_path(image_path: &Path) -> PathBuf {
 
 /// 读图片评级（后台扫描/同步用）。按矩阵分格式：
 /// Embedded = 头部 ≤512KB 文本搜索 xmp:Rating（XMP 包在 JPEG APP1 /
-/// PNG iTXt / WebP XMP 块，均位于文件头部）；Sidecar = 读 sidecar。
+/// PNG iTXt 位于头部；WebP XMP 块按规范在图像数据之后即文件尾，头读
+/// 未覆盖全文件时补读尾部 512KB）；Sidecar = 读 sidecar。
 /// 无标记/读取失败 = None（不报错，扫描线程容忍）
 pub fn read_rating(path: &Path, name: &str) -> Option<u8> {
     match rating_kind(name)? {
         RatingKind::Sidecar => read_sidecar_rating(&sidecar_path(path)),
-        RatingKind::Embedded => read_embedded_xmp(&read_head_bytes(path)?),
+        RatingKind::Embedded => {
+            let head = read_head_bytes(path)?;
+            let is_webp = head.len() > 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP";
+            let data = if is_webp {
+                let mut all = head;
+                all.extend(read_tail_bytes(path)?);
+                all
+            } else {
+                head
+            };
+            read_embedded_xmp(&data)
+        }
     }
 }
 
@@ -151,14 +165,30 @@ fn read_embedded_xmp(data: &[u8]) -> Option<u8> {
     parse_xmp_rating(&String::from_utf8_lossy(data))
 }
 
-/// 读文件头部（≤512KB；文件更小则到 EOF）。XMP 在 JPEG APP1 / PNG iTXt /
-/// WebP XMP 块均位于文件头部——单次读覆盖
+/// 读文件头部（≤512KB；文件更小则到 EOF）。JPEG APP1 / PNG iTXt 均在
+/// 文件头——单次读覆盖
 fn read_head_bytes(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut buf = vec![0u8; 512 * 1024];
     let n = f.read(&mut buf).ok()?;
     buf.truncate(n);
+    Some(buf)
+}
+
+/// 读文件尾部（≤512KB；仅 webp 评级读用——XMP 块规范位置在文件尾）。
+/// 文件 ≤512KB 时返回空（头部已覆盖全文，避免重复段）
+fn read_tail_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len <= 512 * 1024 {
+        return Some(Vec::new());
+    }
+    let start = len - 512 * 1024;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity(512 * 1024);
+    f.read_to_end(&mut buf).ok()?;
     Some(buf)
 }
 
@@ -495,14 +525,34 @@ fn png_set_xmp(path: &Path, r: u8) -> Result<(), String> {
     std::fs::write(path, out).map_err(|e| format!("写入文件失败: {e}"))
 }
 
-/// WebP：仅扩展格式（VP8X 块）有元数据容器；简单 VP8/VP8L 显式 Err
-///（评级留 dirty，不静默兜底）。XMP 块追加在尾部（规范位置：图像
-/// 数据之后）
+/// WebP 嵌入式 XMP（xmp:Rating）。XMP 块按 WebP 容器规范只能存在于扩展
+/// 格式（VP8X 头块）文件：简单 VP8/VP8L 先做容器升级再写入——升级为
+/// webpmux -set 同款语义（仅动容器不重编码：头部插入 VP8X，canvas 宽高
+/// 取自 VP8/VP8L 位流头，flags 按 ALPHA/XMP 置位）。XMP 块追加在图像
+/// 数据之后（规范位置，文件尾）——读链对 webp 头尾双读覆盖
 fn webp_set_xmp(path: &Path, r: u8) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| format!("读取文件失败: {e}"))?;
     let mut webp = WebP::from_bytes(data.into()).map_err(|e| format!("WebP 解析失败: {e}"))?;
     if webp.kind() != VP8Kind::VP8X {
-        return Err("WebP 简单格式（无 VP8X 块）不支持嵌入评级".to_string());
+        // 简单格式 → VP8X 扩展格式升级（webpmux -set 同款语义）。
+        // VP8X 数据块 10 字节：flags + 3 保留 + canvas 宽/高-1 各 24bit LE；
+        // flags 位图（libwebp muxi.h）：XMP=0x04 / EXIF=0x08 / ALPHA=0x10。
+        // ALPHA 位：ALPH 块存在，或 VP8L 位流头 alpha_is_used 位（byte4 & 0x10）
+        let (w, h) = webp
+            .dimensions()
+            .ok_or_else(|| "WebP 简单格式升级失败：无法从位流头解析宽高".to_string())?;
+        let alpha = webp.has_chunk(CHUNK_ALPH)
+            || webp
+                .chunk_by_id(CHUNK_VP8L)
+                .and_then(|c| c.content().data())
+                .is_some_and(|d| d.get(4).is_some_and(|b| b & 0x10 != 0));
+        let mut vp8x = vec![if alpha { 0x10 } else { 0x00 }, 0, 0, 0];
+        vp8x.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        vp8x.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        webp.chunks_mut().insert(
+            0,
+            RiffChunk::new(CHUNK_VP8X, RiffContent::Data(vp8x.into())),
+        );
     }
     let existing = webp
         .chunk_by_id(CHUNK_XMP)
@@ -514,11 +564,39 @@ fn webp_set_xmp(path: &Path, r: u8) -> Result<(), String> {
         let chunk = RiffChunk::new(CHUNK_XMP, RiffContent::Data(text.into_bytes().into()));
         webp.chunks_mut().push(chunk);
     }
+    webp_sync_xmp_flag(&mut webp, r > 0);
     let mut out = Vec::new();
     webp.encoder()
         .write_to(&mut out)
         .map_err(|e| format!("WebP 编码失败: {e}"))?;
     std::fs::write(path, out).map_err(|e| format!("写入文件失败: {e}"))
+}
+
+/// 同步 VP8X flags 的 XMP 位（0x04）与 XMP 块有无一致。规范读端（libwebp
+/// demux）以 flags 为准入声明，漏置位会读不到元数据；其余位（ICC/ALPHA/
+/// EXIF/ANIM）保持原值不重算。img-parts 未提供 flags 直改入口，此处替换
+/// VP8X 数据块（1 字节改动，宽度 ≥10 校验过）
+fn webp_sync_xmp_flag(webp: &mut WebP, has_xmp: bool) {
+    let Some(vp8x) = webp
+        .chunks_mut()
+        .iter_mut()
+        .find(|c| c.id() == CHUNK_VP8X)
+    else {
+        return;
+    };
+    let new_data = match vp8x.content().data() {
+        Some(d) if d.len() >= 10 => {
+            let mut v = d.to_vec();
+            if has_xmp {
+                v[0] |= 0x04;
+            } else {
+                v[0] &= !0x04;
+            }
+            v
+        }
+        _ => return, // 畸形 VP8X 原样保留（防御）
+    };
+    *vp8x.content_mut() = RiffContent::Data(new_data.into());
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,10 +1093,11 @@ mod tests {
             .expect("XMP 包存在")
     }
 
-    /// WebP 简单格式（image crate 产出，无 VP8X）显式失败：Err + 文件
-    /// 字节不变（不静默兜底、不部分写入）
+    /// WebP 简单格式（image crate 产出，无 VP8X）→ 容器升级后写入成功：
+    /// 评级往返 + 清除 + 升级后可解码、宽高不变、VP8X flags 的 XMP/ALPHA
+    /// 位与块一致（webpmux -set 同款语义）
     #[test]
-    fn webp_简单格式明确失败() {
+    fn webp_简单格式升级写入() {
         let dir =
             std::env::temp_dir().join(format!("archview_meta_test_wsf_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1026,12 +1105,25 @@ mod tests {
         image::DynamicImage::new_rgb8(4, 4)
             .write_to(&mut std::fs::File::create(&p).unwrap(), image::ImageFormat::WebP)
             .unwrap();
-        let before = std::fs::read(&p).unwrap();
-        let err = write_rating(&p, "t.webp", 5).unwrap_err();
-        assert!(err.contains("简单格式"), "错误文案需指明原因: {err}");
-        assert_eq!(std::fs::read(&p).unwrap(), before, "文件字节不得改动");
-        // 清除语义对简单格式同样失败（无容器可剥离）
-        assert!(write_rating(&p, "t.webp", 0).is_err());
+
+        write_rating(&p, "t.webp", 5).unwrap();
+        assert_eq!(read_rating(&p, "t.webp"), Some(5));
+        let img = image::open(&p).expect("升级后可解码");
+        assert_eq!((img.width(), img.height()), (4, 4), "宽高不变");
+        // flags：XMP 位（0x04）与块一致；image crate 产 VP8L 无 alpha → ALPHA 位 0
+        let webp = WebP::from_bytes(std::fs::read(&p).unwrap().into()).unwrap();
+        assert_eq!(webp.kind(), VP8Kind::VP8X);
+        let f = webp.chunk_by_id(CHUNK_VP8X).unwrap().content().data().unwrap()[0];
+        assert_eq!(f & 0x04, 0x04, "XMP flag 置位");
+        assert_eq!(f & 0x10, 0x00, "无 alpha 不置 ALPHA 位");
+
+        write_rating(&p, "t.webp", 0).unwrap();
+        assert_eq!(read_rating(&p, "t.webp"), None, "清除");
+        image::open(&p).unwrap();
+        let webp = WebP::from_bytes(std::fs::read(&p).unwrap().into()).unwrap();
+        let f = webp.chunk_by_id(CHUNK_VP8X).unwrap().content().data().unwrap()[0];
+        assert_eq!(f & 0x04, 0x00, "清除后 XMP flag 同步复位");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

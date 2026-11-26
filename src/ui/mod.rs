@@ -1091,5 +1091,8 @@ impl Drop for App {
             let freed = cache::clean_all(&cache::cache_dir(&self.cfg));
             tracing::info!("退出清理缓存: {:.1} MB", freed as f64 / 1048576.0);
         }
+        // 退出同步落盘：不等 5s 定时批量，本条日志与之前所有未落盘增量
+        // （含退出自动保存的记录）一起立即写盘，排障不再丢退出尾巴
+        crate::logsink::flush_blocking();
     }
 }
