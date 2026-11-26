@@ -86,11 +86,12 @@ pub(super) struct CompareSession {
     pub autoplay_anchor: f64,
     /// 锚点对应的窗口首栏条目（变化检测用）
     pub autoplay_idx: Option<usize>,
-    /// 动画 webp 嗅探（挪出 UI 线程，设计 §18.3.4）：key → None = 在途 /
-    /// Some(animated)。窗格构建对 webp 假定静态（PaneKind::Image），嗅探
-    /// 线程读段过读闸门（NAS 流式源不卡 UI；头部分块读，探针类同款豁免
-    /// 记账），结果经 channel 由 compare_tick 收回改判 Unsupported。有键
-    /// 即不重发（Some(false) = 静态终态）
+    /// 动画 webp 嗅探（挪出 UI 线程，设计 §18.3.4）：key → Some(false) =
+    /// 在途占位（假定静态，兜底语义：嗅探任务丢失/读失败时窗格按静态
+    /// 放行，不产生永久 None 卡死）/ Some(true) = 动画终态。窗格构建对
+    /// webp 假定静态（PaneKind::Image），嗅探走统一调度器读段（头部分
+    /// 块读，探针类同款），结果经 channel 由 compare_tick 收回改判
+    /// Unsupported。有键即不重发
     pub webp_sniff: std::collections::HashMap<ImgKey, Option<bool>>,
     /// 嗅探回执通道（会话创建时建对；worker 断连即嗅探线程静默退出）
     pub webp_tx: std::sync::mpsc::Sender<(ImgKey, bool)>,
@@ -681,10 +682,10 @@ impl App {
             .filter(|p| !s.webp_sniff.contains_key(&p.key))
             .map(|p| (p.key, p.source.clone(), p.name.clone()))
             .collect();
-        // 占位（None = 在途）防重发：收集后统一插入（filter/map 闭包借用
-        // 与 insert 互斥借用，不能合并）
+        // 占位（Some(false) = 在途假定静态，兜底防任务丢失卡死）防重发：
+        // 收集后统一插入（filter/map 闭包借用与 insert 互斥借用，不能合并）
         for (key, _, _) in &jobs {
-            s.webp_sniff.entry(*key).or_insert(None);
+            s.webp_sniff.entry(*key).or_insert(Some(false));
         }
         let tx = s.webp_tx.clone();
         let ctx = self.egui_ctx.clone();
@@ -701,7 +702,7 @@ impl App {
                 // 读失败按静态处理（放行解码，解码侧自会报错）；bool 解码 =
                 // buf 首字节
                 if let Err(e) = &r {
-                    tracing::warn!("webp 嗅探失败按静态处理 [{label}]: {e}");
+                    tracing::error!("webp 嗅探读失败按静态处理 [{label}]: {e}");
                 }
                 let animated = r.ok().and_then(|b| b.first().copied()).unwrap_or(0) == 1;
                 let _ = tx.send((key, animated));
@@ -710,6 +711,8 @@ impl App {
             self.io.submit(IoJob {
                 name: format!("webp嗅探 {name}"),
                 class: IoClass::Decode,
+                token: 0,
+                heavy: false,
                 work,
                 on_done,
             });
@@ -717,8 +720,8 @@ impl App {
     }
 
     /// 嗅探结果收回：动画命中改判栏 kind = Unsupported + 撤销该栏已发的
-    /// 解码（invalidate 按 io_done 分流回账）；结果落缓存，滑动把该条目
-    /// 带回窗口时直接命中改判，不再嗅探
+    /// 解码（invalidate 只清占位，迟到解码产物按占位校验丢弃——新调度器
+    /// 无记账）；结果落缓存，滑动把该条目带回窗口时直接命中改判，不再嗅探
     fn compare_webp_sniff_poll(&mut self) {
         let Some(s) = &mut self.compare else {
             return;

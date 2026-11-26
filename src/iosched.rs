@@ -77,6 +77,14 @@ pub struct IoJob {
     /// 日志观测（文件名）
     pub name: String,
     pub class: IoClass,
+    /// 服务侧提交令牌（服务自增序号，0 = 无令牌）：服务看门狗剔除后用
+    /// [`IoScheduler::cancel_token`] 按令牌摘除**仍在排队**的旧任务，防
+    /// 重发堆积（在读任务不摘——读毕由服务按 gen 代次校验丢弃）
+    pub token: u64,
+    /// 大字节读标记（raw 整帧 24~48MB 级）：看门狗宽限 3×READ_STALL——
+    /// NAS 慢盘上大读 >10s 是常态，不宽限会被误判卡死反复派救援
+    /// （fail-open 两读并行违背 max=1 串行不变量）
+    pub heavy: bool,
     /// 读段：一次 IO 拿全源字节（纯读，无解码）
     pub work: Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>,
     /// 读毕回执（成功/失败都调）：投 Buffer/ReadFailed 消息回服务通道
@@ -103,6 +111,8 @@ pub struct IoScheduler {
     last_read_finished: Mutex<Instant>,
     /// 最近一次救援 spawn 时刻（看门狗基准二：防卡死期每帧重复救援）
     last_rescue: Mutex<Instant>,
+    /// 在读的大字节任务数（heavy 标记）：看门狗按此分级宽限
+    heavy_in_flight: AtomicUsize,
 }
 
 impl IoScheduler {
@@ -122,6 +132,7 @@ impl IoScheduler {
             readers_active: AtomicUsize::new(0),
             last_read_finished: Mutex::new(Instant::now()),
             last_rescue: Mutex::new(Instant::now()),
+            heavy_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -149,6 +160,20 @@ impl IoScheduler {
         let n = g.q[class.prio()].len();
         g.q[class.prio()].clear();
         n
+    }
+
+    /// 按提交令牌摘除指定类队列中的任务（服务看门狗剔除重发前调用）：
+    /// 只摘**仍在排队**的旧任务防重发堆积；在读任务不摘（读毕由服务按
+    /// gen 代次校验丢弃）。返回摘除条数
+    pub fn cancel_token(&self, class: IoClass, token: u64) -> usize {
+        if token == 0 {
+            return 0;
+        }
+        let mut g = self.queues.lock().unwrap();
+        let q = &mut g.q[class.prio()];
+        let n = q.len();
+        q.retain(|j| j.token != token);
+        n - q.len()
     }
 
     /// 指定类队列长度（观测：星级筛选"扫描未完成"判定、预取排队汇总）
@@ -200,18 +225,37 @@ impl IoScheduler {
     /// 读线程主循环：等任务 → 按优先级取一个 → 读 → 回执。每轮取任务前
     /// 核对目标数，超编自行退出（动态伸缩，不打断在途读）
     fn reader_loop(self: Arc<Self>) {
+        self.reader_loop_from(None, false)
+    }
+
+    /// 读线程主循环本体（`first` = 救援线程直带的队首任务）。`rescue=true`
+    /// 时本线程即救援线程：自带一名超编名额，退出判定线放宽 target+1，
+    /// 跑完救援任务后**留编为常规读者**——若按旧实现"毕活即 fetch_sub
+    /// 退出"，会与"原读者按超编自行退出"叠加成零读者饿死队列（只能等
+    /// 10s 后看门狗再救一次）
+    fn reader_loop_from(self: Arc<Self>, first: Option<IoJob>, rescue: bool) {
+        let mut first = first;
         loop {
-            let job = {
-                let mut g = self.queues.lock().unwrap();
-                loop {
-                    // 超编退出（reload 缩编/救援线程完成回归）
-                    if self.readers_active.load(Ordering::Relaxed) > self.target() {
-                        self.readers_active.fetch_sub(1, Ordering::Relaxed);
-                        return;
-                    }
-                    match Self::take_job(&mut g) {
-                        Some(job) => break job,
-                        None => g = self.cond.wait(g).unwrap(),
+            let job = match first.take() {
+                Some(job) => job,
+                None => {
+                    let mut g = self.queues.lock().unwrap();
+                    loop {
+                        // 先取任务（超编读者有活照干，不留活饿死）；队列空
+                        // 才核对超编退出。判定线每轮实时计算（target 可被
+                        // reload 缩编）——入口/wait 前捕获旧值会让旧读者拿
+                        // 旧 target 比对，缩编后永不退出（动态伸缩测试钉住）
+                        match Self::take_job(&mut g) {
+                            Some(job) => break job,
+                            None => {
+                                let limit = self.target() + if rescue { 1 } else { 0 };
+                                if self.readers_active.load(Ordering::Relaxed) > limit {
+                                    self.readers_active.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+                                g = self.cond.wait(g).unwrap();
+                            }
+                        }
                     }
                 }
             };
@@ -231,8 +275,18 @@ impl IoScheduler {
         let t0 = Instant::now();
         // 开工（debug）
         tracing::debug!("IO 开工 {:?} {}", job.class, job.name);
+        if job.heavy {
+            self.heavy_in_flight.fetch_add(1, Ordering::Relaxed);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.work))
-            .unwrap_or_else(|_| Err("IO 读线程 panic".into()));
+            .unwrap_or_else(|_| {
+                // 读段 panic：转 Err 回执（error 级——畸形源分支确认点）
+                tracing::error!("IO 读段 panic {:?} {}", job.class, job.name);
+                Err("IO 读线程 panic".into())
+            });
+        if job.heavy {
+            self.heavy_in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
         // 读毕（debug，耗时）
         tracing::debug!(
             "IO 读毕 {:?} {}（{}ms）",
@@ -240,24 +294,40 @@ impl IoScheduler {
             job.name,
             t0.elapsed().as_millis()
         );
-        (job.on_done)(result);
+        // 回执 panic 兜底：on_done 投消息 + repaint，正常不可能 panic；
+        // 一旦 panic（如互斥中毒）会杀读线程且 readers_active 不回收
+        // （计数虚高 → ensure_readers 永不补员），捕获记 error 防静默死亡
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (job.on_done)(result);
+        }))
+        .map_err(|_| {
+            tracing::error!("IO 回执 on_done panic {:?} {}", job.class, job.name);
+        });
         *self.last_read_finished.lock().unwrap() = Instant::now();
     }
 
-    /// 看门狗（UI poll 每帧调）：队列非空且超 READ_STALL 无读毕（且自上次
-    /// 救援后仍无读毕）→ spawn 一次性救援读线程执行队首任务。救援线程
-    /// 算一名超编读者，完成后按动态伸缩规则自行退出
+    /// 看门狗（UI poll 每帧调）：队列非空且超阈值无读毕（且自上次救援后
+    /// 仍无读毕）→ spawn 一次性救援读线程执行队首任务。阈值分级：在读
+    /// 大字节任务（heavy，raw 整帧 24~48MB）宽限 3×READ_STALL——NAS 慢盘
+    /// 大读 >10s 是常态，不分级会误判卡死反复 fail-open 破坏串行不变量。
+    /// 救援线程自带一名超编名额（退出判定线 target+1），跑完队首任务后
+    /// 留编为常规读者（原超编读者在队列排空时对账退出）
     pub fn watchdog(self: &Arc<Self>) {
         let queued = self.queued_all();
         if queued == 0 {
             return;
         }
+        let stall = if self.heavy_in_flight.load(Ordering::Relaxed) > 0 {
+            READ_STALL * 3
+        } else {
+            READ_STALL
+        };
         let base = {
             let last = *self.last_read_finished.lock().unwrap();
             let rescued = *self.last_rescue.lock().unwrap();
             last.max(rescued)
         };
-        if base.elapsed() <= READ_STALL {
+        if base.elapsed() <= stall {
             return;
         }
         let job = {
@@ -268,19 +338,31 @@ impl IoScheduler {
         *self.last_rescue.lock().unwrap() = Instant::now();
         self.readers_active.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
-            "IO 读线程疑似卡死（>{READ_STALL:?}无读毕，队列 {queued} 项）——spawn 救援读线程执行队首 {} {:?}，退化为两读并行",
+            "IO 读线程疑似卡死（>{stall:?}无读毕，队列 {queued} 项）——spawn 救援读线程执行队首 {} {:?}，退化为两读并行",
             job.name,
             job.class
         );
+        // 任务入槽位传递：救援线程取走执行；spawn 失败（极端）则从槽位
+        // 取回归还队首防蒸发（否则服务侧 pending 只能等 10s 超时兜底）
+        let job_slot = Arc::new(Mutex::new(Some(job)));
         let this = Arc::clone(self);
+        let slot = Arc::clone(&job_slot);
         let r = std::thread::Builder::new()
             .name("iorescue".into())
             .spawn(move || {
-                this.run_job(job);
-                this.readers_active.fetch_sub(1, Ordering::Relaxed);
+                if let Some(j) = slot.lock().unwrap().take() {
+                    this.reader_loop_from(Some(j), true);
+                }
             });
         if r.is_err() {
-            self.readers_active.fetch_sub(1, Ordering::Relaxed);
+            let mut s = job_slot.lock().unwrap();
+            if let Some(job) = s.take() {
+                // error 级确认分支
+                tracing::error!("救援读线程创建失败，任务归还队列: {}", job.name);
+                self.readers_active.fetch_sub(1, Ordering::Relaxed);
+                let mut g = self.queues.lock().unwrap();
+                g.q[job.class.prio()].push_front(job);
+            }
         }
     }
 
@@ -307,6 +389,8 @@ mod tests {
         IoJob {
             name: name.to_owned(),
             class,
+            token: 0,
+            heavy: false,
             work: Box::new(|| Ok(Vec::new())),
             on_done: Box::new(|_| {}),
         }
@@ -324,6 +408,8 @@ mod tests {
         s.submit(IoJob {
             name: "prefetch-1".into(),
             class: IoClass::Prefetch,
+            token: 0,
+            heavy: false,
             work: Box::new(move || {
                 let _ = started_tx.send(());
                 std::thread::sleep(Duration::from_millis(150));
@@ -339,6 +425,8 @@ mod tests {
         s.submit(IoJob {
             name: "decode-1".into(),
             class: IoClass::Decode,
+            token: 0,
+            heavy: false,
             work: Box::new(|| Ok(Vec::new())),
             on_done: Box::new(move |_| {
                 let _ = tx2.send("decode-1");
@@ -347,6 +435,8 @@ mod tests {
         s.submit(IoJob {
             name: "prefetch-2".into(),
             class: IoClass::Prefetch,
+            token: 0,
+            heavy: false,
             work: Box::new(|| Ok(Vec::new())),
             on_done: Box::new(move |_| {
                 let _ = tx.send("prefetch-2");
@@ -373,6 +463,8 @@ mod tests {
             s.submit(IoJob {
                 name: format!("j{i}"),
                 class: IoClass::Decode,
+                token: 0,
+                heavy: false,
                 work: Box::new(move || {
                     let n = ov.fetch_add(1, Ordering::SeqCst) + 1;
                     mx.fetch_max(n, Ordering::SeqCst);
@@ -402,6 +494,8 @@ mod tests {
             s.submit(IoJob {
                 name: "p".into(),
                 class: IoClass::Decode,
+                token: 0,
+                heavy: false,
                 work: Box::new(move || {
                     let _ = st.send(());
                     std::thread::sleep(Duration::from_millis(150));
@@ -439,6 +533,8 @@ mod tests {
         s.submit(IoJob {
             name: "busy".into(),
             class: IoClass::Decode,
+            token: 0,
+            heavy: false,
             work: Box::new(|| {
                 std::thread::sleep(Duration::from_millis(200));
                 Ok(Vec::new())
@@ -468,6 +564,8 @@ mod tests {
             s.submit(IoJob {
                 name: "hold".into(),
                 class: IoClass::Prefetch,
+                token: 0,
+                heavy: false,
                 work: Box::new(|| {
                     std::thread::sleep(Duration::from_millis(500));
                     Ok(Vec::new())
@@ -494,8 +592,8 @@ mod tests {
         assert_eq!(s.queued(IoClass::Prefetch), 0, "全部读毕队列应清空");
     }
 
-    /// 看门狗：伪造"很久无读毕 + 队列非空"→ 救援线程执行队首任务；
-    /// 时间戳新鲜时不触发
+    /// 看门狗：伪造"很久无读毕 + 队列非空"→ 救援线程执行队首任务并留编
+    /// 消化剩余队列；时间戳新鲜时不触发
     #[test]
     fn watchdog_救援队首() {
         let s = IoScheduler::new(&cfg(1));
@@ -505,6 +603,8 @@ mod tests {
         s.submit(IoJob {
             name: "stuck".into(),
             class: IoClass::Decode,
+            token: 0,
+            heavy: false,
             work: Box::new(|| {
                 std::thread::sleep(Duration::from_millis(700));
                 Ok(Vec::new())
@@ -520,6 +620,8 @@ mod tests {
             s.submit(IoJob {
                 name: name.into(),
                 class: IoClass::Prefetch,
+                token: 0,
+                heavy: false,
                 work: Box::new(|| Ok(Vec::new())),
                 on_done: Box::new(move |_| {
                     let _ = t.send(name);
@@ -533,14 +635,61 @@ mod tests {
         *s.last_read_finished.lock().unwrap() = Instant::now() - READ_STALL;
         *s.last_rescue.lock().unwrap() = Instant::now() - READ_STALL;
         s.watchdog();
-        // 救援取走队首 rescued-a（优先级序）；rescued-b 留队
+        // 救援取走队首 rescued-a（优先级序）执行
         let got = rrx
             .recv_timeout(Duration::from_secs(2))
             .expect("救援线程应执行队首任务");
         assert_eq!(got, "rescued-a");
-        assert_eq!(s.queued(IoClass::Prefetch), 1);
+        // 救援线程留编为常规读者，继续消化 rescued-b（不再毕活即退出）
+        let got2 = rrx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("救援读者应继续消化队列");
+        assert_eq!(got2, "rescued-b");
+        // 队列排空后超编名额对账退出：在编读者回落到目标数（防零读者饿死）
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while s.readers_active() > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.readers_active() <= 1, "超编名额应在队列排空后对账退出");
         let _ = rx.recv_timeout(Duration::from_secs(2));
-        let _ = rrx.recv_timeout(Duration::from_secs(2));
+    }
+
+    /// cancel_token：按提交令牌摘除仍在排队的旧任务（防看门狗重发堆积）；
+    /// 在读任务不受影响，无令牌（0）恒零动作
+    #[test]
+    fn cancel_token_摘队() {
+        let s = IoScheduler::new(&cfg(1));
+        // 占住唯一读线程（长任务）
+        let (tx, rx) = mpsc::channel::<()>();
+        let txc = tx.clone();
+        s.submit(IoJob {
+            name: "busy".into(),
+            class: IoClass::Decode,
+            token: 1,
+            heavy: false,
+            work: Box::new(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(Vec::new())
+            }),
+            on_done: Box::new(move |_| {
+                let _ = txc.send(());
+            }),
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        s.submit(job(IoClass::Decode, "q-7"));
+        s.submit(job(IoClass::Decode, "q-8"));
+        assert_eq!(s.cancel_token(IoClass::Decode, 7), 0, "无令牌任务不摘");
+        assert_eq!(s.cancel_token(IoClass::Decode, 0), 0, "令牌 0 恒零动作");
+        // 给排队任务标记令牌 7 再摘（重造：cancel 7 应摘掉恰一条）
+        {
+            let mut g = s.queues.lock().unwrap();
+            g.q[IoClass::Decode.prio()][0].token = 7;
+        }
+        assert_eq!(s.queued(IoClass::Decode), 2);
+        assert_eq!(s.cancel_token(IoClass::Decode, 7), 1, "按令牌摘队首");
+        assert_eq!(s.queued(IoClass::Decode), 1, "在读与异令牌任务不受影响");
+        assert_eq!(s.cancel_token(IoClass::Decode, 7), 0, "重复摘除幂等");
+        let _ = rx.recv_timeout(Duration::from_secs(2));
     }
 
     /// reload 钳制域：0 → 1（串行不并行）、超界收敛不 panic
@@ -557,6 +706,8 @@ mod tests {
             s.submit(IoJob {
                 name: format!("j{i}"),
                 class: IoClass::Decode,
+                token: 0,
+                heavy: false,
                 work: Box::new(move || {
                     let n = ov.fetch_add(1, Ordering::SeqCst) + 1;
                     mx.fetch_max(n, Ordering::SeqCst);
@@ -590,6 +741,8 @@ mod tests {
         s.submit(IoJob {
             name: "boom".into(),
             class: IoClass::Decode,
+            token: 0,
+            heavy: false,
             work: Box::new(|| panic!("坏源")),
             on_done: Box::new(move |r| {
                 let _ = tx1.send(r);
@@ -598,6 +751,8 @@ mod tests {
         s.submit(IoJob {
             name: "after".into(),
             class: IoClass::Decode,
+            token: 0,
+            heavy: false,
             work: Box::new(|| Ok(b"ok".to_vec())),
             on_done: Box::new(move |r| {
                 let _ = tx.send(r);

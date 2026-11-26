@@ -503,6 +503,12 @@ pub struct App {
     /// idx 是致密域（0..entries.len()），位图下标直寻 O(1) 零哈希，
     /// 比 HashSet 少一次哈希且缓存友好（1 字节/条目）
     rating_probed: Vec<bool>,
+    /// 评级探测提交/完成计数（星级集齐判定的事实源）：提交侧自增（每条
+    /// IoJob 一计），poll 消费回执一计——计数差 >0 = 仍有在途（含已出队
+    /// 正在读的，queued(Rating) 漏算这一段）；计数归等 = 全部结果已回投。
+    /// 比队列深度准：读毕出队后结果还在路上时 queued 已归零
+    rating_submitted: usize,
+    rating_done: usize,
     /// 上次入队的列表窗口（视图行区间）：每帧一次比较，窗口没移动零开销；
     /// 移动才把意图窗口交给 debounce 判定入队
     rating_probe_window: Option<(usize, usize)>,
@@ -650,6 +656,8 @@ impl App {
             contrast_map,
             rating_probe: None,
             rating_probed: Vec::new(),
+            rating_submitted: 0,
+            rating_done: 0,
             rating_probe_window: None,
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),
@@ -739,6 +747,8 @@ impl App {
             contrast_map,
             rating_probe: None,
             rating_probed: Vec::new(),
+            rating_submitted: 0,
+            rating_done: 0,
             rating_probe_window: None,
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),

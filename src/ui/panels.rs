@@ -335,20 +335,12 @@ impl App {
                     format!("后台解压中…（剩余 {left} 项）"),
                 );
             }
-            // 评级按需探测扫描中（调度器 Rating 队列非空）：顶栏短标记 +
-            // 百分比。已完成 = 已入队（位图标记数）- 排队待读（队列深度），
-            // 基数 = 打开时登记的图片条目总数；归零即消失。仅扫描期每帧
-            // O(图片数) 计数（读毕回传驱动重绘，10k 条目布尔读开销可忽略），
-            // 平时零开销
-            if self.io.queued(IoClass::Rating) > 0 && !self.rating_image_idx.is_empty()
+            // 评级按需探测扫描中（提交/完成计数差 >0，含在途读——队列深度
+            // 漏算已出队在读的段）：顶栏短标记 + 百分比。基数 = 提交计数；
+            // 归零即消失。仅扫描期每帧 O(1) 计数比较，平时零开销
+            if self.rating_submitted > self.rating_done
             {
-                let marked = self
-                    .rating_image_idx
-                    .iter()
-                    .filter(|&i| self.rating_probed[*i])
-                    .count();
-                let done = marked.saturating_sub(self.io.queued(IoClass::Rating));
-                let pct = done * 100 / self.rating_image_idx.len();
+                let pct = self.rating_done * 100 / self.rating_submitted;
                 ui.colored_label(
                     ui.visuals().weak_text_color(),
                     format!("评级扫描中… {pct}%"),

@@ -200,10 +200,16 @@ impl App {
                 ImgEvent::Ready(key) => tracing::debug!("图片纹理就绪: {key:?}"),
                 ImgEvent::Failed(key, e) => {
                     if self.tex_image_key() == Some(*key) {
-                        tracing::warn!("图片解码失败，回退 mpv 播放: {e}");
+                        tracing::error!("图片解码失败，回退 mpv 播放: {e}");
                         self.img_fallback_mpv(key.1);
                     } else {
-                        tracing::warn!("图片预取解码失败: {e}");
+                        // 预取失败：解码错误多为确定性（坏图/格式不支持），
+                        // 重试无益——记 img_fallback 负缓存防预取/自愈无限
+                        // 重发；翻到该图时直接走 mpv 兜底
+                        tracing::error!("图片预取解码失败，记回退负缓存: {e}");
+                        if self.archive.as_ref().is_some_and(|a| a.id == key.0) {
+                            self.img_fallback.insert(*key);
+                        }
                     }
                 }
             }
@@ -308,10 +314,10 @@ impl App {
     /// 等待（LRU 上限自然淘汰）。7z/RAR 仅对已完整落盘的条目发起——未落盘的
     /// 归 extract 会话管（半截文件也解不出图）。
     ///
-    /// 串行链（当前张 → +1 → -1）由调度器涌现：候选全部以 Prefetch 类 request，
-    /// admission 拒绝进 ImageService deferred 队列 FIFO——"当前张解码在途 →
-    /// 预取让路"与"预取单在途"都是调度规则，解码完成事件驱动逐个放行
-    /// （触发时机 = poll 每收到解码完成事件，见 poll_img）
+    /// 串行链（当前张 → +1 → -1）由调度器涌现：候选全部以 Prefetch 类
+    /// request 入调度器队列——"当前张解码优先 → 预取让路"是 Decode >
+    /// Prefetch 队列序的天然结果，读线程池按序消费，无需此处手工名额。
+    /// 预取触发时机 = poll 每收到解码完成事件（见 poll_img）
     fn prefetch_images(&mut self) {
         if self.compare.is_some() {
             return;

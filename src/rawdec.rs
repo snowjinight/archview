@@ -567,6 +567,9 @@ struct RawFrameDone {
     key: ImgKey,
     idx: usize,
     contrast: i32,
+    /// 提交代次（= 提交序号）：poll 落终态前校验——旧 worker 迟到失败不得
+    /// 吃掉重发请求的占位/污染 errs（errs 无代次键，误写会永久封死重试）
+    gen: u64,
     res: Result<(egui::ColorImage, [u32; 2], Histogram), String>,
 }
 
@@ -610,6 +613,8 @@ enum RawMsg {
         key: ImgKey,
         idx: usize,
         contrast: i32,
+        /// 提交代次（= 提交序号）：poll 校验占位归属，迟到/被剔请求丢弃
+        gen: u64,
         data: Vec<u8>,
         info: RawFrameInfo,
         resolved: Option<String>,
@@ -619,17 +624,31 @@ enum RawMsg {
     Probe(RawProbeDone),
 }
 
+/// raw 帧链路 pending 条目（设计 §19 D6：pending 语义 = "已提交等产物"）
+#[derive(Clone)]
+struct RawPend {
+    /// 发起时刻（读段计时起点；Buffer 投回后转入解码段计时）
+    at: Instant,
+    /// 解码段计时起点（None = 仍在排队/读段）
+    decode_at: Option<Instant>,
+    /// 提交代次（= 提交序号）：回执校验占位归属
+    gen: u64,
+    /// 调度器提交令牌（读段超时剔除时 cancel_token 摘队）
+    token: u64,
+}
+
 /// raw 帧解码服务（与 ImageService 并列，同一数据源不同消费者）
 pub(crate) struct RawFrameService {
     /// 统一 IO 发牌调度器（帧软解走 Decode 类；探针豁免不碰调度器）
     sched: Arc<IoScheduler>,
     tx: Sender<RawMsg>,
     rx: Receiver<RawMsg>,
-    /// (key, 帧号, contrast) → 发起时刻（防重复 spawn；contrast 入键——调
+    /// (key, 帧号, contrast) → 在途条目（防重复 spawn；contrast 入键——调
     /// 对比度后同帧按新 contrast 重发，旧请求在途不阻塞新请求）。
-    /// 看门狗超时判定用；剔除不回账（新调度器无记账，迟到回执按在途
-    /// 占位校验丢弃，设计 §19 D6）
-    pending: HashMap<(ImgKey, usize, i32), Instant>,
+    /// 看门狗分段计时；剔除 cancel_token 摘队，迟到回执按代次校验丢弃
+    pending: HashMap<(ImgKey, usize, i32), RawPend>,
+    /// 提交序号发生器（gen 与 token 同源，0 = 无令牌哨兵，从 1 起发）
+    sub_seq: u64,
     /// 每栏已就绪帧（保留上一帧直到新帧就绪，切换无闪烁）
     frames: HashMap<ImgKey, RawFrameTex>,
     /// 确定性失败（格式不支持/数据坏）：不再重试
@@ -661,6 +680,7 @@ impl RawFrameService {
             tx,
             rx,
             pending: HashMap::new(),
+            sub_seq: 1,
             frames: HashMap::new(),
             errs: HashMap::new(),
             probes: HashMap::new(),
@@ -693,7 +713,17 @@ impl RawFrameService {
         {
             return;
         }
-        self.pending.insert((key, fi, contrast), Instant::now());
+        let seq = self.sub_seq;
+        self.sub_seq += 1;
+        self.pending.insert(
+            (key, fi, contrast),
+            RawPend {
+                at: Instant::now(),
+                decode_at: None,
+                gen: seq,
+                token: seq,
+            },
+        );
         let work_source = source.clone();
         let mut work_info = info.clone();
         // 排列缓存命中：pixfmt 落定 + auto_bayer 清位，worker 直接按已解
@@ -704,6 +734,7 @@ impl RawFrameService {
         }
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let gen = seq;
         let work = Box::new(move || {
             let mut info = work_info;
             match read_frame_bytes(&work_source, &mut info, fi) {
@@ -712,6 +743,7 @@ impl RawFrameService {
                         key,
                         idx: fi,
                         contrast,
+                        gen,
                         data,
                         info,
                         resolved,
@@ -724,11 +756,13 @@ impl RawFrameService {
         let tx_done = self.tx.clone();
         let on_done = Box::new(move |r: Result<Vec<u8>, String>| {
             if let Err(e) = r {
-                // 读段失败（含读线程 panic 转 Err）：直投解码失败收尾
+                // 读段失败（含读线程 panic 转 Err）：直投解码失败收尾（代次
+                // 随行，poll 校验占位归属）
                 let _ = tx_done.send(RawMsg::Frame(RawFrameDone {
                     key,
                     idx: fi,
                     contrast,
+                    gen,
                     res: Err(e),
                 }));
             }
@@ -737,6 +771,10 @@ impl RawFrameService {
         self.sched.submit(IoJob {
             name: format!("raw帧 {key:?} f{fi}"),
             class: IoClass::Decode,
+            // 整帧 24~48MB 级：heavy 标记——调度器看门狗宽限 3×READ_STALL
+            //（NAS 慢盘大读 >10s 是常态，不分级会被误判卡死破坏串行）
+            token: seq,
+            heavy: true,
             work,
             on_done,
         });
@@ -813,17 +851,25 @@ impl RawFrameService {
         let mut repaint = false;
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                RawMsg::FrameBuffer { key, idx, contrast, data, info, resolved } => {
-                    // 在途占位校验：已剔除（看门狗/retain）的请求迟到回执丢弃
-                    //（取消语义，设计 §19 D3）
-                    if !self.pending.contains_key(&(key, idx, contrast)) {
-                        tracing::debug!("迟到 FrameBuffer 丢弃（已剔除）{key:?} f{idx}");
-                        continue;
-                    }
-                    // 首请求的排列解析结果入缓存（帧解码失败排列仍有效——
-                    // 探测成功即数据可辨，失败多半是别的原因）
+                RawMsg::FrameBuffer { key, idx, contrast, gen, data, info, resolved } => {
+                    // 排列解析结果入缓存（无论占位是否在途——解析值是 per-file
+                    // 事实，迟到/被剔请求的探测结果同样有效，丢弃即丢掉整帧
+                    // 探测成本）
                     if let Some(name) = resolved {
                         self.resolved.insert(key, name);
+                    }
+                    // 在途占位校验（代次）：已剔除（看门狗/retain）或已被重发
+                    // 覆盖（旧代次）的请求迟到回执丢弃（取消语义，设计 §19 D3）；
+                    // 命中即切换看门狗到解码段计时
+                    if let Some(p) = self.pending.get_mut(&(key, idx, contrast)) {
+                        if p.gen != gen {
+                            tracing::debug!("迟到 FrameBuffer 丢弃（代次不符）{key:?} f{idx}");
+                            continue;
+                        }
+                        p.decode_at = Some(Instant::now());
+                    } else {
+                        tracing::debug!("迟到 FrameBuffer 丢弃（已剔除）{key:?} f{idx}");
+                        continue;
                     }
                     // 解码段纯 CPU worker spawn（设计 §19 D3）：bit_shift +
                     // 色彩转换 + contrast LUT + 直方图（O(像素)）
@@ -841,16 +887,34 @@ impl RawFrameService {
                                 key,
                                 idx,
                                 contrast,
+                                gen,
                                 res,
                             }));
                             ctx2.request_repaint();
                         });
                     if r.is_err() {
+                        // error 级确认分支：线程起不来（极端）落 errs 终态
+                        tracing::error!("raw 解码线程创建失败，落 errs 终态: {key:?} f{idx}");
                         self.pending.remove(&(key, idx, contrast));
                         self.errs.insert(key, "raw 解码线程创建失败".into());
                     }
                 }
                 RawMsg::Frame(m) => {
+                    // 代次校验（先验再 remove）：旧 worker 迟到产物不得吃掉
+                    // 重发请求的占位、不得污染 errs（errs 仅按 key 键控，
+                    // 陈旧失败误写会永久封死重试）
+                    let gen_ok = self
+                        .pending
+                        .get(&(m.key, m.idx, m.contrast))
+                        .is_some_and(|p| p.gen == m.gen);
+                    if !gen_ok {
+                        tracing::debug!(
+                            "迟到 Frame 丢弃（代次不符）{:?} f{}",
+                            m.key,
+                            m.idx
+                        );
+                        continue;
+                    }
                     self.pending.remove(&(m.key, m.idx, m.contrast));
                     match m.res {
                         Ok((img, _native, hist)) => {
@@ -870,7 +934,8 @@ impl RawFrameService {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);
+                            // error 级确认失败分支（当代次真实失败 → errs 终态）
+                            tracing::error!("raw 帧解码失败 [{:?} f{}]: {e}", m.key, m.idx);
                             self.errs.insert(m.key, e);
                         }
                     }
@@ -889,23 +954,30 @@ impl RawFrameService {
             }
             repaint = true;
         }
-        // 看门狗（与 imgview 同款）：worker 卡死/消息丢失时剔除 pending 放行
-        // 重发——新调度器无记账，剔除只清占位，迟到回执按占位校验丢弃
+        // 看门狗（与 imgview 同款分段计时）：读段超时（排队+读，raw 整帧
+        // 大，放宽 FULL_READ_TIMEOUT）= cancel_token 摘队 + 剔除可重试；
+        // 解码段超时 = 剔除可重试。不写 errs：超时≠解码失败，剔除后 UI
+        // 重发即可重试（与 imgview 看门狗口径一致）
+        let now = Instant::now();
         let expired: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, t0)| t0.elapsed() > crate::imgview::PENDING_TIMEOUT)
+            .filter(|(_, p)| match p.decode_at {
+                Some(t0) => now.duration_since(t0) > crate::imgview::PENDING_TIMEOUT,
+                None => now.duration_since(p.at) > crate::imgview::FULL_READ_TIMEOUT,
+            })
             .map(|(k, _)| *k)
             .collect();
         for k in expired {
-            self.pending.remove(&k);
-            tracing::warn!(
-                "raw 帧解码超时剔除 [{:?} f{}]（可重试）",
-                k.0,
-                k.1
-            );
-            // 不写 errs：超时≠解码失败（NAS 慢读 >10s 的大帧是常态），
-            // 剔除后 UI 重发即可重试（与 imgview 看门狗口径一致）
+            if let Some(p) = self.pending.remove(&k) {
+                let dropped = self.sched.cancel_token(IoClass::Decode, p.token);
+                // error 级确认超时剔除分支
+                tracing::error!(
+                    "raw 帧解码超时剔除 [{:?} f{}]（可重试，摘队 {dropped}）",
+                    k.0,
+                    k.1
+                );
+            }
         }
         if repaint {
             self.ctx.request_repaint();
@@ -947,6 +1019,8 @@ impl RawFrameService {
 struct HistDone {
     key: ImgKey,
     contrast: i32,
+    /// 提交代次（= 提交序号）：poll 落终态前校验占位归属
+    gen: u64,
     res: Result<Histogram, String>,
 }
 
@@ -962,10 +1036,27 @@ enum HistMsg {
     Buffer {
         key: ImgKey,
         contrast: i32,
+        /// 提交代次（= 提交序号）：poll 校验占位归属
+        gen: u64,
         data: Vec<u8>,
         info: RawFrameInfo,
+        /// 预解析排列名（回传供缓存，帧链路同款）
+        resolved: Option<String>,
     },
     Done(HistDone),
+}
+
+/// 直方图链路 pending 条目（设计 §19 D6：pending 语义 = "已提交等产物"）
+#[derive(Clone)]
+struct HistPend {
+    /// 发起时刻（读段计时起点；Buffer 投回后转入解码段计时）
+    at: Instant,
+    /// 解码段计时起点（None = 仍在排队/读段）
+    decode_at: Option<Instant>,
+    /// 提交代次（= 提交序号）
+    gen: u64,
+    /// 调度器提交令牌（读段超时剔除时 cancel_token 摘队）
+    token: u64,
 }
 
 /// raw 直方图软解服务（Ctrl+H 单图直方图的 raw 侧入口）：单图显示走
@@ -978,8 +1069,14 @@ pub(crate) struct HistService {
     sched: Arc<IoScheduler>,
     tx: Sender<HistMsg>,
     rx: Receiver<HistMsg>,
-    /// key → 发起时刻：看门狗超时判定用；剔除不回账（新调度器无记账）
-    pending: HashMap<ImgKey, Instant>,
+    /// key → 在途条目：看门狗分段计时；剔除 cancel_token 摘队，迟到回执
+    /// 按代次校验丢弃（设计 §19 D6）
+    pending: HashMap<ImgKey, HistPend>,
+    /// 提交序号发生器（gen 与 token 同源，0 = 无令牌哨兵，从 1 起发）
+    sub_seq: u64,
+    /// 已解析的 bayer 排列（key → 落定 pixfmt）：与帧链路 resolved 缓存同
+    /// 语义的自有副本——命中免 auto_bayer 整帧统计重跑（24~48MB 全图探测）
+    resolved: HashMap<ImgKey, String>,
     /// 已就绪结果（Ok=直方图 / Err=确定性失败文案，不重试）
     done: HashMap<ImgKey, HistEntry>,
     ctx: egui::Context,
@@ -993,6 +1090,8 @@ impl HistService {
             tx,
             rx,
             pending: HashMap::new(),
+            sub_seq: 1,
+            resolved: HashMap::new(),
             done: HashMap::new(),
             ctx,
         }
@@ -1043,7 +1142,9 @@ impl HistService {
                 return;
             }
         };
-        let info = match raw_frame_info(&rl, size) {
+        // 已解析排列命中（帧链路探测过）：预置 pixfmt 免 auto_bayer 整帧
+        // 统计重跑（24~48MB 全图探测），直方图与显示同排列逐位一致
+        let mut info = match raw_frame_info(&rl, size) {
             Ok(i) => i,
             Err(e) => {
                 self.done.insert(
@@ -1056,18 +1157,40 @@ impl HistService {
                 return;
             }
         };
+        if let Some(n) = self.resolved.get(&key) {
+            info.pixfmt = n.clone();
+            info.auto_bayer = false;
+        }
         // 读段 = Decode 类代理读（软解整帧读，设计 §19）：IoJob 入调度器
-        // 队列，读毕直投 HistMsg::Buffer，poll 收到 spawn 纯 CPU 直方图 worker
-        self.pending.insert(key, Instant::now());
+        // 队列，读毕直投 HistMsg::Buffer，poll 收到 spawn 纯 CPU 直方图 worker。
+        // gen 与 token 同源自增（重发前看门狗按 token 摘队、迟到回执按 gen 丢弃）
+        let seq = self.sub_seq;
+        self.sub_seq += 1;
+        let now = Instant::now();
+        self.pending.insert(
+            key,
+            HistPend {
+                at: now,
+                decode_at: None,
+                gen: seq,
+                token: seq,
+            },
+        );
         let work_source = source.clone();
         let work_name = name.to_owned();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let work = Box::new(move || {
-            let mut info = info;
             match read_frame_bytes(&work_source, &mut info, 0) {
-                Ok((data, _resolved)) => {
-                    let _ = tx.send(HistMsg::Buffer { key, contrast, data, info });
+                Ok((data, resolved)) => {
+                    let _ = tx.send(HistMsg::Buffer {
+                        key,
+                        contrast,
+                        gen: seq,
+                        data,
+                        info,
+                        resolved,
+                    });
                     Ok(Vec::new())
                 }
                 Err(e) => Err(e),
@@ -1077,9 +1200,11 @@ impl HistService {
         let on_done = Box::new(move |r: Result<Vec<u8>, String>| {
             if let Err(e) = r {
                 // 读段失败（含读线程 panic 转 Err）：直投失败收尾
+                tracing::error!("raw 直方图读段失败 [{key:?}] gen{seq}: {e}");
                 let _ = tx_done.send(HistMsg::Done(HistDone {
                     key,
                     contrast,
+                    gen: seq,
                     res: Err(e),
                 }));
             }
@@ -1088,6 +1213,8 @@ impl HistService {
         self.sched.submit(IoJob {
             name: format!("直方图 {work_name}"),
             class: IoClass::Decode,
+            token: seq,
+            heavy: true,
             work,
             on_done,
         });
@@ -1098,12 +1225,26 @@ impl HistService {
         let mut repaint = false;
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                HistMsg::Buffer { key, contrast, data, info } => {
-                    // 在途占位校验：已剔除（看门狗/retain）的请求迟到回执丢弃
-                    //（取消语义，设计 §19 D3）
-                    if !self.pending.contains_key(&key) {
-                        tracing::debug!("迟到 HistBuffer 丢弃（已剔除）{key:?}");
+                HistMsg::Buffer { key, contrast, gen, data, info, resolved } => {
+                    // 在途占位校验（代次归属）：已剔除（看门狗/retain）或旧
+                    // 代次的迟到回执丢弃（取消语义，设计 §19 D3/D6）
+                    let hit = self
+                        .pending
+                        .get_mut(&key)
+                        .filter(|p| p.gen == gen)
+                        .is_some();
+                    if !hit {
+                        tracing::debug!("迟到 HistBuffer 丢弃 {key:?} gen{gen}（已剔除/旧代次）");
                         continue;
+                    }
+                    // 预解析排列回填缓存（帧链路同款）：auto_bayer 整帧统计
+                    // 探测结果跨 contrast 复用，免重复 24~48MB 全图扫描
+                    if let Some(name) = resolved {
+                        self.resolved.insert(key, name);
+                    }
+                    // 转入解码段计时（Buffer 投回即读段成功）
+                    if let Some(p) = self.pending.get_mut(&key) {
+                        p.decode_at = Some(Instant::now());
                     }
                     // 解码段纯 CPU worker spawn（设计 §19 D3）：bit_shift +
                     // 色彩转换 + contrast LUT + 直方图（LUT 先落显示像素再
@@ -1118,10 +1259,11 @@ impl HistService {
                             }))
                             .map_err(|_| "raw 直方图线程 panic".to_string())
                             .and_then(|r| r);
-                            let _ = tx.send(HistMsg::Done(HistDone { key, contrast, res }));
+                            let _ = tx.send(HistMsg::Done(HistDone { key, contrast, gen, res }));
                             ctx2.request_repaint();
                         });
                     if r.is_err() {
+                        tracing::error!("raw 直方图解码 worker spawn 失败 [{key:?}] gen{gen}");
                         self.pending.remove(&key);
                         self.done.insert(
                             key,
@@ -1133,29 +1275,66 @@ impl HistService {
                     }
                 }
                 HistMsg::Done(m) => {
-                    self.pending.remove(&m.key);
-                    self.done.insert(
-                        m.key,
-                        HistEntry {
-                            contrast: m.contrast,
-                            res: m.res,
-                        },
-                    );
+                    // 代次校验：旧 worker 的迟到失败不得吃掉当代次的占位
+                    //（已被看门狗剔除重发的请求，旧失败落地会把新在途顶掉）
+                    let hit = self
+                        .pending
+                        .get(&m.key)
+                        .is_some_and(|p| p.gen == m.gen);
+                    if hit {
+                        self.pending.remove(&m.key);
+                        self.done.insert(
+                            m.key,
+                            HistEntry {
+                                contrast: m.contrast,
+                                res: m.res,
+                            },
+                        );
+                    } else {
+                        tracing::debug!(
+                            "迟到 HistDone 丢弃 {key:?} gen{gen}（已剔除/旧代次）",
+                            key = m.key,
+                            gen = m.gen
+                        );
+                    }
                 }
             }
             repaint = true;
         }
-        // 看门狗（与 imgview 同款）：worker 卡死/消息丢失时剔除 pending 放行
-        // 重发——新调度器无记账，剔除只清占位
-        let expired: Vec<_> = self
+        // 看门狗分段计时（imgview full 同款）：读段（排队+源读）超
+        // FULL_READ_TIMEOUT = 慢盘大读未归，剔除占位并按 token 摘掉仍在
+        // 排队的旧任务防重发堆积（可重试，不落终态）；解码段（纯 CPU
+        // worker）超 PENDING_TIMEOUT = worker 卡死/消息丢失，落 Err 终态
+        // 放行重发（与 imgview 直方图语义一致）
+        let now = Instant::now();
+        let expired_read: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, t0)| t0.elapsed() > crate::imgview::PENDING_TIMEOUT)
+            .filter(|(_, p)| {
+                p.decode_at.is_none() && now.duration_since(p.at) > crate::imgview::FULL_READ_TIMEOUT
+            })
+            .map(|(k, p)| (*k, p.token))
+            .collect();
+        for (k, token) in expired_read {
+            let n = self.sched.cancel_token(IoClass::Decode, token);
+            self.pending.remove(&k);
+            tracing::error!(
+                "raw 直方图读段超时 [{k:?}]（>{:?} 未读毕），剔除占位可重试（摘队 {n}）",
+                crate::imgview::FULL_READ_TIMEOUT
+            );
+        }
+        let expired_decode: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| {
+                p.decode_at
+                    .is_some_and(|t0| now.duration_since(t0) > crate::imgview::PENDING_TIMEOUT)
+            })
             .map(|(k, _)| *k)
             .collect();
-        for k in expired {
+        for k in expired_decode {
             self.pending.remove(&k);
-            tracing::warn!("raw 直方图解码超时放弃 [{k:?}]（可重试）");
+            tracing::error!("raw 直方图解码段超时放弃 [{k:?}]（落终态，可重试）");
             self.done.insert(
                 k,
                 HistEntry {
@@ -1185,6 +1364,8 @@ impl HistService {
             tracing::warn!("raw 直方图在途条目随清理剔除 {dropped} 路（可重试）");
         }
         self.done.retain(|k, _| keys.contains(k));
+        // resolved 缓存同键域收敛（key 即用即弃，探测结果不留孤儿）
+        self.resolved.retain(|k, _| keys.contains(k));
     }
 }
 
@@ -1949,7 +2130,11 @@ mod tests {
     fn retain_剔除在途占位() {
         let mut svc = RawFrameService::new(egui::Context::default(), test_sched());
         // 直塞 pending 模拟在途（worker 卡死读段场景：回执不会到来）
-        svc.pending.insert(((9, 0), 3, 0), Instant::now());
+        let now = Instant::now();
+        svc.pending.insert(
+            ((9, 0), 3, 0),
+            RawPend { at: now, decode_at: None, gen: 1, token: 1 },
+        );
         // 窗口内保留：条目不动
         svc.retain(&[(9, 0)]);
         assert!(svc.pending.contains_key(&((9, 0), 3, 0)), "窗口内条目不得误剔除");
@@ -1958,7 +2143,11 @@ mod tests {
         assert!(!svc.pending.contains_key(&((9, 0), 3, 0)), "在途占位必须随 retain 清掉");
         // 直方图服务同款
         let mut hist = HistService::new(egui::Context::default(), test_sched());
-        hist.pending.insert((9, 1), Instant::now());
+        let now = Instant::now();
+        hist.pending.insert(
+            (9, 1),
+            HistPend { at: now, decode_at: None, gen: 1, token: 1 },
+        );
         hist.retain(&[]);
         assert!(!hist.pending.contains_key(&(9, 1)), "直方图在途剔除同款");
     }

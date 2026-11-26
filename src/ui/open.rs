@@ -509,9 +509,13 @@ impl App {
         self.io.submit(IoJob {
             name: format!("评级 {name}"),
             class: IoClass::Rating,
+            token: 0,
+            heavy: false,
             work,
             on_done,
         });
+        // 集齐判定计数：提交一计（poll 消费回执一计，计数归等 = 全部回投）
+        self.rating_submitted += 1;
     }
 
     /// 评级探测会话重置（换包唯一入口）：全部探测状态清零 + 调度器
@@ -524,6 +528,8 @@ impl App {
         self.rating_probe_window = None;
         self.rating_probe_intent = None;
         self.rating_image_idx = Vec::new();
+        self.rating_submitted = 0;
+        self.rating_done = 0;
     }
 
     /// 视口窗口入队便捷层：entry 下标切片 → (idx, 路径, 文件名) 探测项。
@@ -566,6 +572,9 @@ impl App {
             match job.rx.try_recv() {
                 Ok((idx, r)) => {
                     got = true;
+                    // 集齐判定计数：回执消费一计（失败回执同样计——读失败
+                    // 也回投消息，计数必然归等收敛）
+                    self.rating_done += 1;
                     let Some(a) = self.archive.as_mut() else {
                         break;
                     };
@@ -577,10 +586,11 @@ impl App {
             }
         }
         // 批级转折（info）：整批探测完成（F12 可见的评级日志就这一条 +
-        // 入队一条，中间过程 debug）。排队归零 = 全部结果已回投或随
-        // 换包 cancel 丢弃，事实集齐，筛选可安全生效
+        // 入队一条，中间过程 debug）。提交/完成计数归等 = 全部结果已回投
+        // 或随换包 cancel 清账，事实集齐，筛选可安全生效（比 queued(Rating)
+        // 归零准：读毕出队后结果还在路上时队列深度已漏算这一段）
         if got
-            && self.io.queued(IoClass::Rating) == 0
+            && self.rating_done == self.rating_submitted
             && self.rating_filter.is_some()
         {
             tracing::info!("评级探测完成（本轮队列已清空）");
@@ -611,11 +621,11 @@ impl App {
         // 要过 3 遍 is_video_ext，万级条目 × raw 预设回溯时开销放大 3 倍
         let query = crate::search::parse_query(&self.search);
         // 星级筛选谓词（仅图片条目；与文本搜索 AND）：Some(0)=未评、
-        // Some(n)=≥n 星。探测队列未清空（queued(Rating)>0）时暂不生效
-        // （poll_rating_probe 归零后重建视图）——防列表中途反复闪变。
-        // 已删除条目（trash 删除后的会话标记）无条件剔除
-        let filter_active =
-            self.io.queued(IoClass::Rating) == 0 && self.rating_filter.is_some();
+        // Some(n)=≥n 星。探测计数未归等（rating_submitted > rating_done，
+        // 含在途读）时暂不生效（poll_rating_probe 归等后重建视图）——
+        // 防列表中途反复闪变。已删除条目（trash 删除后的会话标记）无条件剔除
+        let filter_active = self.rating_submitted == self.rating_done
+            && self.rating_filter.is_some();
         let rating_filter = self.rating_filter;
         let mut classified: Vec<(usize, bool)> = a
             .entries
