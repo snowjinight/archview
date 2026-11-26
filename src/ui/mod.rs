@@ -23,7 +23,7 @@ use crate::imgview::{
     clamp_pan, fit_scale, zoom_pan, ImageService, ImageSource, ImgEvent, ImgKey, ImgView,
     MAX_ZOOM, MIN_ZOOM,
 };
-use crate::iosched::IoClass;
+use crate::iosched::{IoClass, IoJob};
 use crate::player::mpv_ffi;
 use crate::player::stream_cb;
 use crate::player::PlayerService;
@@ -186,13 +186,12 @@ enum RatingSyncMsg {
 /// 名单外格式（目录行等）一并传入，worker 内 rating_kind 过滤不读盘
 type RatingProbeBatch = Vec<(usize, PathBuf, String)>;
 
-/// 按需评级探测任务（目录模式，视口惰性）：常驻 worker 单条命令单条回执
-/// （阻塞 recv 零轮询），派发节拍由 App 侧 rating_queue + poll_rating_probe
-/// 按调度器槽位驱动（优先级占槽模型，评级 = 最低优先级）。换包清理 =
-/// drop 整个 job（tx 断连 worker 退出、旧 rx 随句柄丢弃，迟到结果天然
-/// 不串包）
+/// 按需评级探测任务（目录模式，视口惰性）：探测以 IoJob 直接提交调度器
+/// Rating 类队列（读线程读毕 on_done 回投结果），job 只持结果通道。
+/// 换包清理 = drop job（rx 随句柄丢弃，迟到结果不串包）+ 调度器
+/// cancel(Rating) 清排队任务（设计 §19 D8）
 struct RatingProbeJob {
-    tx: std::sync::mpsc::Sender<(usize, PathBuf, String)>,
+    tx: std::sync::mpsc::Sender<(usize, Option<u8>)>,
     rx: std::sync::mpsc::Receiver<(usize, Option<u8>)>,
 }
 
@@ -489,17 +488,12 @@ pub struct App {
     // ImageService 共享 Rc<RefCell> 单源真值：视频走 mpv contrast 属性、
     // 图片/raw 走 LUT
     contrast_map: ContrastMap,
-    /// 目录模式按需评级探测（视口惰性，取代旧一次性全量扫描）：worker
-    /// 常驻线程**单条命令单条回执**（阻塞 recv 零轮询），读一个文件回一条
-    /// (entry_idx, 星级)。tx drop = worker 退出（换包清理点）。App 侧无可
-    /// 插入的 pending 队列：去重唯一状态是 rating_probed 位图
-    /// （mark-at-enqueue，见 enqueue 注释）
+    /// 目录模式按需评级探测（视口惰性，取代旧一次性全量扫描）：探测以
+    /// IoJob 直接提交调度器 Rating 类队列（读毕 on_done 回投一条
+    /// (entry_idx, 星级)，job 只持结果通道）。App 侧无可插入的 pending
+    /// 队列：去重唯一状态是 rating_probed 位图（mark-at-enqueue，见
+    /// enqueue 注释）
     rating_probe: Option<RatingProbeJob>,
-    /// 评级探测待派发队列（FIFO，App 侧持有）：入队压队列、
-    /// poll_rating_probe 尾部按调度器槽位逐条派发（优先级占槽模型，
-    /// 评级 = 最低优先级，deferred 有解码/预取排队时让位）。派发即记账
-    /// （issue + inflight++），回执回账（complete + inflight--）
-    rating_queue: std::collections::VecDeque<(usize, PathBuf, String)>,
     /// 已入队探测的 entry 下标位图：入队瞬间置位（false→true 才真正发送），
     /// 同一 idx 结构上不可能二次入队——无 pending 集、无查询去重。
     /// idx 是致密域（0..entries.len()），位图下标直寻 O(1) 零哈希，
@@ -515,15 +509,9 @@ pub struct App {
     /// 打开时图片条目 idx 快照（筛选取样全集）：星级筛选激活时遍历补扫
     /// 剩余未探测项（insert-noop 天然只入新项）；压缩包模式为空
     rating_image_idx: Vec<usize>,
-    /// 已入队未收回的探测条数：星级筛选门控（==0 才让筛选谓词生效）+
-    /// 顶栏"评级扫描中… N%"标记的依据（panels.rs top_bar）
-    rating_inflight: usize,
-    /// 在途评级派发时刻（看门狗基准）：worker 阻塞读卡死（NAS 断连）时
-    /// 回执永不到达，文件粒度抢占没有边界可让——超时回账放行（唯一兜底，
-    /// 见 poll_rating_probe 看门狗分支）
-    rating_inflight_since: Option<std::time::Instant>,
     /// 星级筛选（图片标签页筛选条）：None=全部；Some(0)=未评；
-    /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）
+    /// Some(1..5)=≥n 星。进入 rebuild_view 谓词（与文本搜索 AND）；
+    /// 生效门控 = 调度器 Rating 队列排空（扫描中灰色，见 rebuild_view）
     rating_filter: Option<u8>,
     /// 「删除筛选结果」确认窗（星级删除入口；仅目录模式可达）
     delete_confirm: Option<DeleteConfirm>,
@@ -657,13 +645,10 @@ impl App {
             arrow_hold: None,
             contrast_map,
             rating_probe: None,
-            rating_queue: std::collections::VecDeque::new(),
             rating_probed: Vec::new(),
             rating_probe_window: None,
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),
-            rating_inflight: 0,
-            rating_inflight_since: None,
             rating_filter: None,
             delete_confirm: None,
             rating_dirty: std::collections::HashMap::new(),
@@ -749,13 +734,10 @@ impl App {
             arrow_hold: None,
             contrast_map,
             rating_probe: None,
-            rating_queue: std::collections::VecDeque::new(),
             rating_probed: Vec::new(),
             rating_probe_window: None,
             rating_probe_intent: None,
             rating_image_idx: Vec::new(),
-            rating_inflight: 0,
-            rating_inflight_since: None,
             rating_filter: None,
             delete_confirm: None,
             rating_dirty: std::collections::HashMap::new(),
@@ -972,6 +954,10 @@ impl eframe::App for App {
         // 后台打开任务轮询（大包/网络盘）
         self.poll_open();
         probe!("poll_open");
+        // 调度器读卡死看门狗（设计 §19 D5）：队列非空且 >10s 无读毕/救援 →
+        // 救援线程 takeover 队首
+        self.io.watchdog();
+        probe!("watchdog");
         // 目录模式评级扫描轮询（EXIF Rating → 列表亮星/筛选条）
         self.poll_rating_probe();
         probe!("poll_rating_probe");

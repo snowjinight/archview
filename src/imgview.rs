@@ -27,7 +27,7 @@
 //! 缩放/平移的纯几何函数（[`fit_scale`]/[`zoom_pan`]/[`clamp_pan`]）也放在这里，
 //! 便于单测与 UI 层复用。
 
-use crate::iosched::{IoClass, IoScheduler};
+use crate::iosched::{IoClass, IoJob, IoScheduler};
 use crate::vfs::{ArchiveVFS, VirtualEntry};
 use egui::TextureOptions;
 use image::{AnimationDecoder, GenericImageView};
@@ -185,9 +185,6 @@ enum ImgMsg {
         /// 本次解码实际应用的 EXIF 方向值（静态图；动图恒 1）——
         /// 进 ImageService.orientations 方向事实表
         orient: u8,
-        /// 发牌类（调度器记账回执）：pending 可能在消息前被看门狗/invalidate
-        /// 移除，类随消息走保证 complete 恒可记账
-        class: IoClass,
         /// 发起时的 base 解码代次：poll 验证 pending 内代次相符才落缓存
         /// ——invalidate/看门狗剔除后重发的请求，旧 worker 迟到产物（旧
         /// 配置纹理）按代次丢弃（与 FullReady.epoch 同口径）
@@ -196,28 +193,42 @@ enum ImgMsg {
     Failed {
         key: ImgKey,
         error: String,
-        /// 发牌类（同 Ready.class）
-        class: IoClass,
         /// 发起时的 base 解码代次（同 Ready.gen）：poll 验证代次相符才
-        /// remove pending——旧 worker 迟到失败不吃掉新代次请求的占位
+        /// remove pending——旧请求迟到失败不吃掉新代次请求的占位
         gen: u64,
     },
+    /// 代理读 buffer（设计 §19 D3）：读线程读毕投回，poll 收到后 spawn
+    /// 纯 CPU 解码 worker。gen = 提交时 base 解码代次（读毕投递时代次
+    /// 不符直接丢弃——取消语义）；name = 提交时快照（解码 worker 消息/
+    /// 日志沿用）
+    Buffer {
+        key: ImgKey,
+        gen: u64,
+        buf: Vec<u8>,
+        name: String,
+    },
+    /// full 档代理读 buffer（真源读的 full 才有；原图缓存命中的 full 是
+    /// 纯 CPU 零 IO 直 spawn，不经此消息。name/sharpen = 提交时快照，
+    /// 解码 worker 取用）
+    FullBuffer {
+        key: ImgKey,
+        epoch: u64,
+        buf: Vec<u8>,
+        name: String,
+        sharpen: SharpenCfg,
+    },
     /// full 槽纹理就绪（原图 ×ppp×3，见 request_full）。epoch = 发起时的
-    /// full 请求代次：被 invalidate 丢弃的旧 worker 迟到产物按代次丢弃。
-    /// io = 本次是否做了源读（原图缓存命中 = 纯 CPU 重采样零 IO，发牌方
-    /// 未占槽，回账按此标志对齐）
+    /// full 请求代次：被 invalidate 丢弃的旧 worker 迟到产物按代次丢弃
     FullReady {
         key: ImgKey,
         img: egui::ColorImage,
         name: String,
         epoch: u64,
-        io: bool,
     },
-    /// 原图解码失败/放弃：UI 保持降采样纹理（io 同 FullReady）
+    /// 原图解码失败/放弃：UI 保持降采样纹理
     FullFailed {
         key: ImgKey,
         epoch: u64,
-        io: bool,
     },
 }
 
@@ -235,40 +246,44 @@ struct Cached {
     hist: Option<Histogram>,
 }
 
-/// deferred 请求种类：base 档按类发牌；full 高清档恒 Decode 类
+/// base 档 pending 条目（设计 §19 D6：pending 语义 = "已提交等 buffer"，
+/// 无记账无 io_done）：提交时捕获的解码参数随条目存放，Buffer 投回后
+/// spawn 纯 CPU 解码 worker 时取用
 #[derive(Clone)]
-enum DeferredKind {
-    Base { max_dim: u32, class: IoClass },
-    Full { sharpen: SharpenCfg },
+struct PendingBase {
+    /// 发起时刻（看门狗超时判定）
+    at: Instant,
+    /// base 解码代次：Buffer/Ready/Failed 回传比对，代次不符 = 本请求
+    /// 已被 invalidate/看门狗剔除，迟到产物丢弃（取消语义）
+    gen: u64,
+    /// 基础档最大边（cfg.image.image_max_dim）
+    max_dim: u32,
+    /// 基础档预放大倍率 = 发起时屏幕 DPI（跨屏迁移后已缓存纹理不回炉）
+    factor: f64,
+    /// orig-lru 单张准入（预算/2）
+    native_limit: u64,
+    /// 会话内方向覆盖（R 键旋转不可写格式路径）
+    orient_override: Option<u8>,
 }
 
-/// deferred 队列条目：admission 拒绝的请求原样排队（FIFO 保序 = 单图
-/// 串行链"当前张 → +1 → −1"顺序涌现），poll 完成事件驱动逐个放行
-#[derive(Clone)]
-struct DeferredReq {
-    key: ImgKey,
-    source: ImageSource,
-    name: String,
-    kind: DeferredKind,
-    /// 入队时刻（放行日志打等待时长）
-    at: Instant,
+/// full worker 输入：原图缓存复用（零 IO 直 spawn）或代理读 buffer
+enum FullInput {
+    Cached(image::DynamicImage),
+    Bytes(Vec<u8>),
 }
 
 pub struct ImageService {
-    /// 统一 IO 发牌调度器（App 构造共享；发牌/回执只在 UI 线程）
+    /// 统一 IO 代理读调度器（App 构造共享；提交/查询只在 UI 线程）
     sched: Arc<IoScheduler>,
     tx: Sender<ImgMsg>,
     rx: Receiver<ImgMsg>,
     ctx: egui::Context,
-    /// 解码中集合：发起时刻 + 发牌类 + 代次 → 看门狗超时判定与完成记账。
-    /// 防重复 spawn 同一条目（请求 → 线程 → Ready/Failed 才移除）。代次
-    /// 供 poll Ready 验证：被 invalidate/看门狗剔除后按新代次重发的请求，
-    /// 旧 worker 迟到产物按代次丢弃（与 full_epoch 同口径）
-    pending: HashMap<ImgKey, (Instant, IoClass, u64)>,
-    /// base 解码请求代次（单调递增）：spawn_base 捕获、Ready 回传比对
+    /// 解码中集合：已提交等 buffer（含调度器排队/在读/解码 worker 在跑）。
+    /// 防重复提交同一条目（请求 → Buffer → Ready/Failed 才移除）。
+    /// 看门狗超时剔除允许重新发起；代次供 poll 验证迟到产物
+    pending: HashMap<ImgKey, PendingBase>,
+    /// base 解码请求代次（单调递增）：提交时捕获、Ready 回传比对
     base_gen: u64,
-    /// admission 拒绝的请求队列（FIFO）：完成事件驱动逐个放行
-    deferred: VecDeque<DeferredReq>,
     /// **per-file 显示对比度**（W/S 快捷键，值 = ×1.25 步数 n）：App 共享
     /// 同一 Rc<RefCell>（单源真值，视频属性/图片 LUT/对比 raw 重放都读
     /// 这里）。poll 上传期应用 LUT——解码发起在先、调对比度在后也恒拿到
@@ -294,10 +309,10 @@ pub struct ImageService {
     /// 最长边 + 100MP 预算，峰值 ~400MB），只随当前显示条目存续
     /// （frame() 切条目即弃）
     full: Option<(ImgKey, egui::TextureHandle)>,
-    /// 原图解码中（key + 发起时刻，后者供看门狗超时判定）
-    /// full 单槽在途：(key, 发起时刻, 是否做源读)。第三项 = 记账对齐
-    /// （原图缓存命中的 full 是纯 CPU 零 IO，不占槽不回账）
-    full_pending: Option<(ImgKey, Instant, bool)>,
+    /// full 槽在途条目（key + 发起时刻，后者供看门狗超时判定）：原图缓存
+    /// 命中的 full 是纯 CPU 直 spawn，真源读的 full 等调度器投回 FullBuffer
+    /// ——两者都占单槽到 FullReady/FullFailed（解码参数随消息走）
+    full_pending: Option<(ImgKey, Instant)>,
     /// full 请求代次：invalidate 丢弃在途 full worker 时递增——迟到消息按
     /// 代次判旧（旧 worker 产物是旧解码/增强配置，不能顶掉新参数请求）
     full_epoch: u64,
@@ -344,7 +359,6 @@ impl ImageService {
             contrast_map,
             pending: HashMap::new(),
             base_gen: 0,
-            deferred: VecDeque::new(),
             cache: VecDeque::new(),
             cap: cap.max(1),
             shown: None,
@@ -380,23 +394,16 @@ impl ImageService {
         if let Some(i) = self.pos(key) {
             self.cache.remove(i);
         }
-        self.pending.remove(&key).map(|(_, class, _)| {
-            // 在途条目随 invalidate 剔除：即时回账——看门狗只扫 pending，
-            // 不回账则卡死 worker 既无迟到消息兜底也无看门狗跟踪（发牌
-            // 名额永久泄漏）。迟到消息双记一次完成由饱和下溢吸收（fail-open）
-            self.sched.complete(class);
-            tracing::warn!("invalidate 剔除在途解码 {key:?}，发牌名额即时回补");
-        });
-        // deferred 同 key 条目同步清掉：被 invalidate 的请求不再放行
-        // （热重载重放/旋转写回后旧参数请求无意义）
-        self.deferred.retain(|d| d.key != key);
-        // 在途 full worker 同 key：清 pending 并递增代次——迟到的 FullReady/
-        // FullFailed 按代次丢弃（其产物是旧配置参数，不能顶掉 invalidate 后
-        // 的新参数请求）
+        // 在途条目随 invalidate 剔除：读毕投回的 buffer/迟到产物按 gen
+        // 代次校验丢弃（无记账可回，剔除只清 pending——设计 §19 D6）
+        self.pending.remove(&key);
+        // 在途 full worker 同 key：清 pending 并递增代次——迟到的 FullBuffer/
+        // FullReady/FullFailed 按代次丢弃（其产物是旧配置参数，不能顶掉
+        // invalidate 后的新参数请求）
         if self.full.as_ref().is_some_and(|(k, _)| *k == key) {
             self.full = None;
         }
-        if self.full_pending.as_ref().is_some_and(|(k, _, _)| *k == key) {
+        if self.full_pending.as_ref().is_some_and(|(k, _)| *k == key) {
             self.full_pending = None;
             self.full_epoch += 1;
         }
@@ -449,11 +456,11 @@ impl ImageService {
         self.shown_multi.clear();
     }
 
-    /// 请求解码（幂等：已缓存/解码中直接返回）。
+    /// 请求解码（幂等：已缓存/已提交直接返回）。
     /// 调用方负责构造 source；max_dim 来自 cfg.image.image_max_dim；
     /// name 仅用于日志（定位"发起了没/何时发起"）；
-    /// class = 发牌类（当前显示 Decode / 后台预取 Prefetch）。
-    /// admission 通过即 spawn；拒绝挂 deferred 队列，完成事件驱动放行
+    /// class = 调度类（当前显示 Decode / 后台预取 Prefetch）——排队/串行/
+    /// 优先级全部由调度器队列序涌现（设计 §19）
     pub fn request(
         &mut self,
         key: ImgKey,
@@ -465,30 +472,13 @@ impl ImageService {
         if self.pending.contains_key(&key) || self.pos(key).is_some() {
             return;
         }
-        if self.sched.admission(class) {
-            self.spawn_base(key, source, max_dim, name, class);
-        } else {
-            // IO 等待关键转折（info）：谁在排队、为什么（各类在途计数）
-            tracing::info!(
-                "IO 排队 {class:?} {name}（decode={} prefetch={} rating={}，队列 {}）",
-                self.sched.decode_out(),
-                self.sched.prefetch_out(),
-                self.sched.rating_out(),
-                self.deferred.len() + 1
-            );
-            self.deferred.push_back(DeferredReq {
-                key,
-                source,
-                name: name.to_owned(),
-                kind: DeferredKind::Base { max_dim, class },
-                at: Instant::now(),
-            });
-        }
+        self.submit_base(key, source, max_dim, name, class);
     }
 
-    /// 发牌开工：记账 + 插 pending + spawn 解码线程（request/deferred 放行
-    /// 共用；spawn 失败即时回账，不会等到看门狗）
-    fn spawn_base(
+    /// 提交代理读任务（D3）：pending 占位（解码参数随条目存）→ IoJob 入
+    /// 调度器队列。读毕 on_done 投 Buffer/Failed 回执；poll 收到 Buffer 后
+    /// spawn 纯 CPU 解码 worker（spawn_decode_worker）
+    fn submit_base(
         &mut self,
         key: ImgKey,
         source: ImageSource,
@@ -506,43 +496,74 @@ impl ImageService {
         // 会话内方向覆盖（R 键旋转不可写格式路径）：request 时快照下发，
         // worker 覆盖文件 EXIF 方向
         let orient_override = self.rotoverride.get(&key).copied();
+        self.base_gen += 1;
+        let gen = self.base_gen;
+        self.pending.insert(
+            key,
+            PendingBase {
+                at: Instant::now(),
+                gen,
+                max_dim,
+                factor,
+                native_limit,
+                orient_override,
+            },
+        );
+        // 读段闭包：纯 IO（读毕由调度器投 Buffer 回执，解码在 poll 侧 spawn）
+        let work_source = source;
+        let work = Box::new(move || read_source_bytes(&work_source));
+        let tx = self.tx.clone();
+        let name = name.to_owned();
+        let job_name = name.clone();
+        let on_done = Box::new(move |r: Result<Vec<u8>, String>| match r {
+            Ok(buf) => {
+                let _ = tx.send(ImgMsg::Buffer { key, gen, buf, name });
+            }
+            Err(e) => {
+                let _ = tx.send(ImgMsg::Failed { key, error: e, gen });
+            }
+        });
+        self.sched.submit(IoJob {
+            name: job_name,
+            class,
+            work,
+            on_done,
+        });
+    }
+
+    /// 纯 CPU 解码 worker（Buffer 投回后 spawn，设计 §19 D3）：无读段无
+    /// 记账——源字节已在内存。解码对畸形文件可能 panic：捕获转 Failed，
+    /// 否则线程静默死亡（无 send、无 repaint），UI 永久占位死局
+    fn spawn_decode_worker(
+        &mut self,
+        key: ImgKey,
+        buf: Vec<u8>,
+        name: &str,
+        p: PendingBase,
+    ) {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let name = name.to_owned();
-        self.base_gen += 1;
-        let gen = self.base_gen;
-        self.pending.insert(key, (Instant::now(), class, gen));
-        self.sched.issue(class);
-        // 开工细节（debug）：直接发牌与放行共用此入口，info 级转折在
-        // 「IO 排队 / IO 放行」两处
-        tracing::debug!(
-            "IO 开工 {class:?} {name}（decode={} prefetch={}）",
-            self.sched.decode_out(),
-            self.sched.prefetch_out()
-        );
+        let (tx_err, ctx_err) = (tx.clone(), ctx.clone());
         let r = std::thread::Builder::new()
             .name("imgdec".into())
             .spawn(move || {
-                // 解码对畸形文件可能 panic（坏图触发 codec 内部越界等）：
-                // 捕获转 Failed。否则线程静默死亡（无 send、无 repaint），
-                // pending 永久泄漏 → 该图被幂等检查拦截 → 永久占位死局
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode_image_orient(
-                        &source,
-                        max_dim,
-                        false,
-                        factor,
+                    decode_image_bytes(
+                        buf,
                         &name,
+                        p.max_dim,
+                        false,
+                        p.factor,
                         &SharpenCfg::OFF,
-                        native_limit,
-                        orient_override,
+                        p.native_limit,
+                        p.orient_override,
                     )
                 }));
                 match r {
                     Ok(Ok((decoded, native, orient))) => {
                         // 直方图在解码线程顺手算（O(像素)，被解码耗时掩盖）：
-                        // 静态图全图；动图取首帧（逐帧统计显存外的 CPU 成本
-                        // 随帧数线性涨，且直方图语义是"这张图长什么样"）
+                        // 静态图全图；动图取首帧
                         let hist = match &decoded {
                             Decoded::Static(img) => Some(Histogram::compute(img)),
                             Decoded::Anim(a) => a.first().map(|(f, _)| Histogram::compute(f)),
@@ -554,30 +575,31 @@ impl ImageService {
                             name,
                             native,
                             orient,
-                            class,
-                            gen,
+                            gen: p.gen,
                         });
                     }
                     Ok(Err(e)) => {
-                        let _ = tx.send(ImgMsg::Failed { key, error: e, class, gen });
+                        let _ = tx.send(ImgMsg::Failed { key, error: e, gen: p.gen });
                     }
                     Err(_) => {
                         let _ = tx.send(ImgMsg::Failed {
                             key,
                             error: "解码线程 panic".into(),
-                            class,
-                            gen,
+                            gen: p.gen,
                         });
                     }
                 }
-                // 唤醒 UI 立即 poll：否则要等下一次重绘（空闲时可迟 100ms+，
-                // 实测 LOG 解码完成→上帧间隔 50~130ms 全是这个）
+                // 唤醒 UI 立即 poll：否则要等下一次重绘（空闲时可迟 100ms+）
                 ctx.request_repaint();
             });
         if r.is_err() {
-            // 线程起不来（极端）：移除 pending + 回账，让后续请求可重试
-            self.pending.remove(&key);
-            self.sched.complete(class);
+            // 线程起不来（极端）：投 Failed 让 UI 回退重试
+            let _ = tx_err.send(ImgMsg::Failed {
+                key,
+                error: "解码线程创建失败".into(),
+                gen: p.gen,
+            });
+            ctx_err.request_repaint();
         }
     }
 
@@ -586,28 +608,25 @@ impl ImageService {
     /// 缩放屏 ×4.5，badge 300% 处 1:1 采样）——绝不在基础纹理（已 ×ppp）
     /// 上级联再放大（两级重采样抹锐边）。倍率内部按屏幕 DPI 取值，调用方
     /// 无需传参。
-    /// full 高清档派发（request_full / deferred 放行共用）：**先查原图
-    /// 缓存再决定发牌**——natives 命中 = 纯 CPU 重采样（fast_image_resize
-    /// + 锐化），零 IO 不占槽直接开工（full 升级大多数情况走此路径，用
-    /// 户洞察：占着 IO 槽排队纯属错门）；未命中 = 真源读，按 Decode 发牌。
-    /// 返回 false = 槽位忙需排队（request 入 deferred；放行 loop 保持
-    /// 队头）。已就绪/在途/已放弃返回 true（无事可做）
+    /// full 高清档派发：**先查原图缓存再决定读段**——natives 命中 = 纯
+    /// CPU 重采样（fast_image_resize + 锐化），零 IO 直接 spawn worker
+    /// （full 升级大多数情况走此路径）；未命中 = 真源读，提交调度器
+    /// Decode 类任务（设计 §19）。已就绪/在途/已放弃无事可做；full 单槽
+    /// 忙时不抢槽——触发方每帧重触发，槽腾出后自然开工
     fn dispatch_full(
         &mut self,
         key: ImgKey,
         source: ImageSource,
         name: &str,
         sharpen: SharpenCfg,
-    ) -> bool {
+    ) {
         if self.has_full(key) || self.is_full_pending(key) || self.is_full_failed(key) {
-            return true;
+            return;
         }
-        // full 单槽互斥：其它条目的 full 在途时不抢槽（返回 true = 调用方
-        // 认为已受理；max≥2 时槽位算术放得行，双 worker 并发的旧产物会被
-        // epoch/key 检查丢弃白费一路 IO，且覆盖 full_pending 单槽记账）。
-        // 触发方每帧重触发/deferred 保持等待，槽腾出后自然开工
+        // full 单槽互斥：其它条目的 full 在途时不抢槽（双 worker 并发的旧
+        // 产物会被 epoch/key 检查丢弃白费一路 IO，且覆盖 full_pending 单槽）
         if self.full_pending.is_some() {
-            return true;
+            return;
         }
         // 原图缓存命中即复用（clone 一份：natives 同时服务像素探针不能
         // take；缓冲拷贝 ~10ms 后台线程无感）；未命中走二次解码（真 IO）
@@ -616,16 +635,16 @@ impl ImageService {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, n)| n.clone());
-        if cached.is_none() && !self.sched.admission(IoClass::Decode) {
-            return false;
+        self.full_pending = Some((key, Instant::now()));
+        match cached {
+            Some(img) => self.spawn_full_worker(key, FullInput::Cached(img), name, sharpen),
+            None => self.submit_full_read(key, source, name, sharpen),
         }
-        self.spawn_full(key, source, name, sharpen, cached);
-        true
     }
 
     /// 原图源：base worker 留存的原图缓存命中即复用（免二次解码，2K 图省
-    /// ~300ms，**且零 IO——不占 IO 槽**）；未命中（切图回跳/缓存被换）从源
-    /// 重新解码（真 IO，按 Decode 发牌，槽忙挂 deferred 完成事件驱动放行）。
+    /// ~300ms，**且零 IO——不占读线程**）；未命中（切图回跳/缓存被换）从源
+    /// 重新解码（真 IO，提交调度器 Decode 类任务）。
     /// 升级资格由触发方保证：仅 native ≤ image_max_dim 的图（即基础
     /// 纹理走了预放大）值得升级；超大图原尺寸直进 LRU、深放大交给 GPU
     /// 双线性（二次解码秒级 + 300MB 级显存，增益 <×1.4 不值当）。
@@ -643,39 +662,58 @@ impl ImageService {
         name: &str,
         sharpen: SharpenCfg,
     ) {
-        if !self.dispatch_full(key, source.clone(), name, sharpen) {
-            // IO 等待关键转折（info）：真源读的 full 在排队（缓存命中的
-            // 纯 CPU full 不会到这里）
-            tracing::info!(
-                "IO 排队 Decode(full) {name}（decode={} prefetch={} rating={}，队列 {}）",
-                self.sched.decode_out(),
-                self.sched.prefetch_out(),
-                self.sched.rating_out(),
-                self.deferred.len() + 1
-            );
-            self.deferred.push_back(DeferredReq {
-                key,
-                source,
-                name: name.to_owned(),
-                kind: DeferredKind::Full { sharpen },
-                at: Instant::now(),
-            });
-        }
+        self.dispatch_full(key, source, name, sharpen);
     }
 
-    /// 发牌开工（full 高清档）：单槽占位 + spawn（dispatch_full / deferred
-    /// 放行共用；spawn 失败即时回账）。cached = 原图缓存命中（调用方查好
-    /// 传入）：命中 = 纯 CPU 重采样零 IO，**不占槽不发牌**；未命中 = 真源
-    /// 读，issue 记账（FullReady/FullFailed/看门狗按 io 标志回账）
-    fn spawn_full(
+    /// 提交 full 档代理读任务：单槽占位已由 dispatch_full 完成，IoJob 入
+    /// 调度器队列。读毕 on_done 投 FullBuffer（解码参数随消息走）/读失败
+    /// 直投 FullFailed
+    fn submit_full_read(
         &mut self,
         key: ImgKey,
         source: ImageSource,
         name: &str,
         sharpen: SharpenCfg,
-        cached: Option<image::DynamicImage>,
     ) {
-        tracing::debug!("发起高清解码 {name}（{}）", if cached.is_some() { "原图缓存复用" } else { "源读" });
+        tracing::debug!("发起高清解码 {name}（源读）");
+        let epoch = self.full_epoch;
+        let work_source = source;
+        let work = Box::new(move || read_source_bytes(&work_source));
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let name = name.to_owned();
+        let job_name = format!("full {name}");
+        let on_done = Box::new(move |r: Result<Vec<u8>, String>| {
+            let msg = match r {
+                Ok(buf) => ImgMsg::FullBuffer { key, epoch, buf, name, sharpen },
+                // 读失败：FullFailed 不携带错误文本（UI 保持降采样纹理即可）
+                Err(_) => ImgMsg::FullFailed { key, epoch },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.sched.submit(IoJob {
+            name: job_name,
+            class: IoClass::Decode,
+            work,
+            on_done,
+        });
+    }
+
+    /// 纯 CPU full worker（原图缓存命中直 spawn / FullBuffer 投回后 spawn，
+    /// 设计 §19 D3）：无读段无记账。畸形文件可能 panic：捕获转 FullFailed
+    /// 防死局
+    fn spawn_full_worker(
+        &mut self,
+        key: ImgKey,
+        input: FullInput,
+        name: &str,
+        sharpen: SharpenCfg,
+    ) {
+        tracing::debug!(
+            "发起高清解码 {name}（{}）",
+            if matches!(input, FullInput::Cached(_)) { "原图缓存复用" } else { "源读" }
+        );
         // 高清档倍率 = ppp×3：badge（zoom×ppp）300% 处 full 纹素与物理像素
         // 1:1，300%~400% 主用区间锐度完整；200%~300% 为 0.67~1× 轻微缩采样
         // （静止图无感）。默认阈值 2.0（badge 200% 滚轮档）起接管
@@ -683,30 +721,32 @@ impl ImageService {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let name = name.to_owned();
+        let (tx_err, ctx_err) = (tx.clone(), ctx.clone());
         let epoch = self.full_epoch;
-        let did_io = cached.is_none();
-        self.full_pending = Some((key, Instant::now(), did_io));
-        if did_io {
-            self.sched.issue(IoClass::Decode);
-        }
         // 方向事实快照：full 档从源重解码时必须与 base 档同朝向（R 键
         // 写回路径已同步此表，见 record_orientation）
         let orient = self.orientation(key);
         let r = std::thread::Builder::new()
             .name("imgfull".into())
             .spawn(move || {
-                // 同 request：畸形文件可能 panic，捕获转 FullFailed 防死局
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match cached {
-                    Some(img) => {
+                // 同 base 解码：畸形文件可能 panic，捕获转 FullFailed 防死局
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match input {
+                    FullInput::Cached(img) => {
                         tracing::debug!("高清解码复用原图缓存{} {name}", sharpen.tag());
                         Ok(build_full(img, factor, &sharpen))
                     }
-                    None => {
+                    FullInput::Bytes(buf) => {
                         // full 档：原图即输入不保留 native（native_limit 传 0）。
                         // 方向走方向事实表快照（base 解码已记录/写回路径已同步）
-                        let orient = orient;
-                        match decode_image_orient(
-                            &source, FULL_MAX_DIM, true, factor, &name, &sharpen, 0, Some(orient),
+                        match decode_image_bytes(
+                            buf,
+                            &name,
+                            FULL_MAX_DIM,
+                            true,
+                            factor,
+                            &sharpen,
+                            0,
+                            Some(orient),
                         ) {
                             Ok((Decoded::Static(img), _, _)) => Ok(img),
                             // 单帧动图取唯一帧当静态原图
@@ -718,55 +758,63 @@ impl ImageService {
                     }
                 }));
                 let msg = match r {
-                    Ok(Ok(img)) => ImgMsg::FullReady { key, img, name, epoch, io: did_io },
-                    Ok(Err(())) | Err(_) => ImgMsg::FullFailed { key, epoch, io: did_io },
+                    Ok(Ok(img)) => ImgMsg::FullReady { key, img, name, epoch },
+                    Ok(Err(())) | Err(_) => ImgMsg::FullFailed { key, epoch },
                 };
                 let _ = tx.send(msg);
                 ctx.request_repaint();
             });
         if r.is_err() {
-            self.full_pending = None;
-            if did_io {
-                self.sched.complete(IoClass::Decode);
-            }
+            // 线程起不来（极端）：投 FullFailed 放弃（UI 保持降采样纹理）
+            let _ = tx_err.send(ImgMsg::FullFailed { key, epoch });
+            ctx_err.request_repaint();
         }
     }
 
-    /// 每帧排空回传通道：上传纹理进 LRU，收集事件
+    /// 每帧排空回传通道：收 Buffer spawn 解码 worker，上传纹理进 LRU，收集事件
     pub fn poll(&mut self) -> Vec<ImgEvent> {
-        // 看门狗：pending 超时（线程卡死/消息丢失的兜底）——剔除允许
-        // 下次 play/预取重新发起，否则该图永久占位
+        // 看门狗：pending 超时（读卡死/消息丢失的兜底）——剔除允许
+        // 下次 play/预取重新发起，否则该图永久占位。代理读模型无记账可回：
+        // 剔除只清 pending，迟到 buffer/产物按 gen 代次校验丢弃（设计 §19 D6）
         let now = Instant::now();
-        let expired: Vec<(ImgKey, IoClass)> = self
+        let expired: Vec<ImgKey> = self
             .pending
             .iter()
-            .filter(|(_, (t, ..))| now.duration_since(*t) > PENDING_TIMEOUT)
-            .map(|(k, (_, c, _))| (*k, *c))
+            .filter(|(_, p)| now.duration_since(p.at) > PENDING_TIMEOUT)
+            .map(|(k, _)| *k)
             .collect();
-        for (k, c) in expired {
+        for k in expired {
             self.pending.remove(&k);
-            // 回账：卡死线程占住的发牌名额立即释放（其 worker 若还活着，
-            // 迟到消息的 complete 会双记一次——饱和下溢 fail-open，
-            // 见 iosched.rs 记账口径）
-            self.sched.complete(c);
             tracing::warn!("解码超时（>{PENDING_TIMEOUT:?}）剔除，可重试: {k:?}");
         }
         // 原图看门狗：超时判死并标记放弃（区别于基础解码的可重试——重触发
         // 条件 zoom≥0.95 在显示期间恒成立，可重试会无限重解卡死图）
-        if let Some((k, t0, io)) = self.full_pending {
+        if let Some((k, t0)) = self.full_pending.clone() {
             if now.duration_since(t0) > PENDING_TIMEOUT {
                 tracing::warn!("原图解码超时（>{PENDING_TIMEOUT:?}）放弃: {k:?}");
                 self.full_pending = None;
                 self.full_failed = Some(k);
-                // 回账（口径同上：迟到消息双记 fail-open；纯 CPU full 未占槽不回账）
-                if io {
-                    self.sched.complete(IoClass::Decode);
-                }
             }
         }
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
+                ImgMsg::Buffer { key, gen, buf, name } => {
+                    // 代次验证（不 remove：pending 占位要保留到 Ready 产物
+                    // 落地——在读+解码全程 is_pending 恒真，heal 不重复补发；
+                    // Ready 臂负责移除）：代次不符 = 本请求已被 invalidate/
+                    // 看门狗剔除——迟到 buffer 丢弃（取消语义，设计 §19 D3）
+                    let Some(p) = self
+                        .pending
+                        .get(&key)
+                        .filter(|p| p.gen == gen)
+                        .cloned()
+                    else {
+                        tracing::debug!("迟到 Buffer 丢弃（代次不符）{key:?}");
+                        continue;
+                    };
+                    self.spawn_decode_worker(key, buf, &name, p);
+                }
                 ImgMsg::Ready {
                     key,
                     decoded,
@@ -774,17 +822,18 @@ impl ImageService {
                     name,
                     native,
                     orient,
-                    class,
                     gen,
                 } => {
                     // 代次验证（先验再 remove：pending 里的条目可能是按新
                     // 代次重发的请求，误 remove 会吃掉新请求的占位，新 worker
                     // 结果反而无处落地）：代次不符 = 本 worker 已被
                     // invalidate/看门狗剔除——迟到产物（旧解码/增强配置的
-                    // 纹理）丢弃，但回账照常（fail-open：pending 可能被提前
-                    // 剔除双记一次——饱和下溢不卡死）
-                    let gen_ok = self.pending.get(&key).is_some_and(|(_, _, g)| *g == gen);
-                    self.sched.complete(class);
+                    // 纹理）丢弃。记账已前移至 worker 读毕（消息不再回账，
+                    // 见 iosched.rs 槽位语义）
+                    let gen_ok = self
+                        .pending
+                        .get(&key)
+                        .is_some_and(|p| p.gen == gen);
                     if !gen_ok {
                         tracing::debug!("迟到 Ready 丢弃（代次不符）[{name}]");
                         continue;
@@ -890,27 +939,30 @@ impl ImageService {
                     );
                     out.push(ImgEvent::Ready(key));
                 }
-                ImgMsg::Failed { key, error, class, gen } => {
+                ImgMsg::Failed { key, error, gen } => {
                     // 代次先验再 remove（同 Ready：旧 worker 迟到失败不吃掉
-                    // 新代次请求的 pending 占位）；回账照常 fail-open
-                    if self.pending.get(&key).is_some_and(|(_, _, g)| *g == gen) {
+                    // 新代次请求的 pending 占位）。记账已前移至 worker 读毕
+                    //（含读失败路径；panic 于读段时由看门狗回账兜底）
+                    if self
+                        .pending
+                        .get(&key)
+                        .is_some_and(|p| p.gen == gen)
+                    {
                         self.pending.remove(&key);
                         out.push(ImgEvent::Failed(key, error));
                     }
-                    self.sched.complete(class);
                 }
-                ImgMsg::FullReady { key, mut img, name, epoch, io } => {
-                    // 调度器回账（真源读的 full 占槽；fail-open：无论 pending/
-                    // 代次匹配与否都回，双记饱和下溢无害）
-                    if io {
-                        self.sched.complete(IoClass::Decode);
-                    }
+                ImgMsg::FullReady { key, mut img, name, epoch } => {
+                    // 记账已前移至 worker 读毕。
                     // 只认当前 pending 的 key + 当前代次：槽已换条目/被
                     // invalidate 的旧 worker 迟到消息丢弃（其产物是旧配置
                     // 参数，不能顶掉 invalidate 后按新配置发起的请求）。
                     // 代次先验再 take——误 take 会吃掉新请求的 pending，
                     // 新 worker 的结果反而无处落地
-                    if self.full_pending.as_ref().is_some_and(|(k, _, _)| *k == key)
+                    if self
+                        .full_pending
+                        .as_ref()
+                        .is_some_and(|(k, _)| *k == key)
                         && epoch == self.full_epoch
                     {
                         self.full_pending = None;
@@ -932,12 +984,12 @@ impl ImageService {
                         // 仍需原图取样，不再随 full 就绪释放）
                     }
                 }
-                ImgMsg::FullFailed { key, epoch, io } => {
-                    // 调度器回账（同 FullReady：真源读占槽，纯 CPU 不占）
-                    if io {
-                        self.sched.complete(IoClass::Decode);
-                    }
-                    if self.full_pending.as_ref().is_some_and(|(k, _, _)| *k == key)
+                ImgMsg::FullFailed { key, epoch } => {
+                    // 记账已前移至 worker 读毕。
+                    if self
+                        .full_pending
+                        .as_ref()
+                        .is_some_and(|(k, _)| *k == key)
                         && epoch == self.full_epoch
                     {
                         self.full_pending = None;
@@ -945,81 +997,21 @@ impl ImageService {
                         self.full_failed = Some(key);
                     }
                 }
-            }
-        }
-        // deferred 队列放行（两遍扫描，优先级涌现）：
-        // 第一遍只放 Decode/Full（用户可见请求，同类严格 FIFO）——admission
-        // 是全局槽位算术，被阻塞的同类必同样阻塞后面同类，跳过不改变顺序；
-        // 第二遍只从队首放 Prefetch（低优先级垫底）——否则解码完成瞬间
-        // 队首的陈旧预取会先于用户点击的图放行（NAS 上秒级可感），且让路
-        // 期被阻塞的预取不能 HOL 卡住后面的用户请求。放行走与 request 同
-        // 一 spawn 入口（发牌记账 + pending 占位 + spawn）
-        // 第一遍：Decode / Full
-        let mut i = 0;
-        while i < self.deferred.len() {
-            let d = self.deferred[i].clone();
-            match &d.kind {
-                // 预取留给第二遍（低优先级不参与本轮竞争）：空分支落到底部
-                // 统一 i += 1——此处再自增会双重递增，跳过紧随其后的
-                // Decode/Full 条目（优先级反转复发，回归测试抓过）
-                DeferredKind::Base { class: IoClass::Prefetch, .. } => {}
-                DeferredKind::Base { class, .. } => {
-                    // 幂等去重（任意位置可弃）
-                    if self.pos(d.key).is_some() || self.pending.contains_key(&d.key) {
-                        self.deferred.remove(i);
-                        continue;
-                    }
-                    if self.sched.admission(*class) {
-                        self.deferred.remove(i);
-                        tracing::info!(
-                            "IO 放行 {}（排队 {}ms）",
-                            d.name,
-                            d.at.elapsed().as_millis()
-                        );
-                        let DeferredKind::Base { max_dim, class } = d.kind else {
-                            unreachable!("Base 分支")
-                        };
-                        self.spawn_base(d.key, d.source, max_dim, &d.name, class);
-                        continue;
-                    }
-                }
-                DeferredKind::Full { sharpen } => {
-                    // 已满足/已放弃的条目丢弃；full 单槽在途保持队内等待
-                    // （触发方每帧重触发不会重复入队——dispatch_full 幂等）
-                    if self.has_full(d.key) || self.is_full_failed(d.key) {
-                        self.deferred.remove(i);
-                        continue;
-                    }
-                    if self.full_pending.is_none()
-                        && self.dispatch_full(d.key, d.source.clone(), &d.name, *sharpen)
+                ImgMsg::FullBuffer { key, epoch, buf, name, sharpen } => {
+                    // 读毕投递（设计 §19 D3）：代次 + 单槽 key 双验证，不符
+                    // 丢弃（取消语义）；命中即 spawn 纯 CPU full worker
+                    if self
+                        .full_pending
+                        .as_ref()
+                        .is_some_and(|(k, _)| *k == key)
+                        && epoch == self.full_epoch
                     {
-                        self.deferred.remove(i);
-                        tracing::info!(
-                            "IO 放行 {}（排队 {}ms）",
-                            d.name,
-                            d.at.elapsed().as_millis()
-                        );
-                        continue;
+                        self.spawn_full_worker(key, FullInput::Bytes(buf), &name, sharpen);
+                    } else {
+                        tracing::debug!("迟到 FullBuffer 丢弃（代次不符）{key:?}");
                     }
                 }
             }
-            i += 1;
-        }
-        // 第二遍：Prefetch（严格队首 FIFO，被阻塞即停——同类保序）
-        while let Some(d) = self.deferred.front().cloned() {
-            let DeferredKind::Base { class: IoClass::Prefetch, max_dim, .. } = d.kind else {
-                break;
-            };
-            if self.pos(d.key).is_some() || self.pending.contains_key(&d.key) {
-                self.deferred.pop_front();
-                continue;
-            }
-            if !self.sched.admission(IoClass::Prefetch) {
-                break;
-            }
-            self.deferred.pop_front();
-            tracing::info!("IO 放行 {}（排队 {}ms）", d.name, d.at.elapsed().as_millis());
-            self.spawn_base(d.key, d.source, max_dim, &d.name, IoClass::Prefetch);
         }
         out
     }
@@ -1191,21 +1183,12 @@ impl ImageService {
         self.pending.contains_key(&key)
     }
 
-    /// 清空 deferred 队列（换压缩包/进出对比时调用）：队列条目持有旧源
-    /// Arc<VFS>，条目键对新会话已无意义；队首若滞留旧请求还会挡住新请求
-    /// 放行（FIFO 不插队）
-    pub fn clear_deferred(&mut self) {
-        self.deferred.clear();
-    }
-
-    /// deferred 队列长度（评级派发优先级闸门用：非空 = 有解码/预取在排队）
-    pub fn deferred_len(&self) -> usize {
-        self.deferred.len()
-    }
-
-    /// 指定条目是否在 deferred 队列中（调度观测：排队汇总/测试断言用）
-    pub fn is_deferred(&self, key: ImgKey) -> bool {
-        self.deferred.iter().any(|d| d.key == key)
+    /// 清空调度器排队任务（换压缩包/进出对比时调用）：在途读允许跑完，
+    /// 迟到 buffer 按代次校验自然丢弃（取消语义，设计 §19 D3）
+    pub fn clear_queued(&mut self) {
+        self.sched.cancel(IoClass::Decode);
+        self.sched.cancel(IoClass::Prefetch);
+        self.pending.clear();
     }
 
     /// 静态图判定（动图不做原图升级：全帧原图显存不可控）
@@ -1222,7 +1205,7 @@ impl ImageService {
 
     /// 原图解码中判定
     pub fn is_full_pending(&self, key: ImgKey) -> bool {
-        self.full_pending.is_some_and(|(k, _, _)| k == key)
+        self.full_pending.as_ref().is_some_and(|(k, _)| *k == key)
     }
 
     /// 原图已放弃判定（失败/超时/动图）：不再重试
@@ -1345,10 +1328,65 @@ fn decode_image(
         .map(|(d, n, _)| (d, n))
 }
 
-/// 方向参数化版本：orient_override = Some(u8 1-8) 时覆盖文件 EXIF 方向
-///（R 键旋转、不可写格式的会话内记忆路径），None = 读文件元数据。
-/// 返回值第三项 = 实际应用的 EXIF 方向值（静态图；动图恒 1），
-/// 供 ImageService 记录方向事实（R 键在此值上轮转）。
+/// 源读（读段，I1）：闸门持有方调用——**一次 IO 拿全源字节**（设计 §18 C7：
+/// File 分支现状是"EXIF 头开一次 + 解码流式开一次"两次 NAS round trip，
+/// 拆分后合一；Stream 分支 read_to_end 原样）
+fn read_source_bytes(source: &ImageSource) -> Result<Vec<u8>, String> {
+    match source {
+        ImageSource::File(path) => {
+            std::fs::read(path).map_err(|e| format!("读取图片失败: {e}"))
+        }
+        ImageSource::Stream(vfs, entry) => {
+            let mut vf = vfs
+                .open_entry(entry)
+                .map_err(|e| format!("打开压缩包条目失败: {e}"))?;
+            // 条目大小已知：按声明容量预分配（防恶意声明封顶 1 GiB）
+            let mut buf = Vec::with_capacity(entry.size.clamp(0, 1024 * 1024 * 1024) as usize);
+            vf.read_to_end(&mut buf)
+                .map_err(|e| format!("读取压缩包条目失败: {e}"))?;
+            Ok(buf)
+        }
+    }
+}
+
+/// 解码段（纯 CPU，源字节已在内存）：RAW 拦截 → EXIF 方向（内存解析，
+/// 零额外 IO）→ ImageReader::from_bytes 解码。
+/// 返回 (结果, 原图保留, 实际应用的 EXIF 方向)：原图仅基础档静态且满足
+/// orig-lru 准入时带回（native_limit_bytes），full 档传 0 不保留
+fn decode_image_bytes(
+    buf: Vec<u8>,
+    name: &str,
+    max_dim: u32,
+    full: bool,
+    factor: f64,
+    sharpen: &SharpenCfg,
+    native_limit_bytes: u64,
+    orient_override: Option<u8>,
+) -> Result<(Decoded, Option<image::DynamicImage>, u8), String> {
+    // 相机 RAW 拦截：with_guessed_format 对 ARW/NEF 探不出格式（返回 None），
+    // 须按扩展名先行拦截（方案 §4.3）。失败 fall through 原路径——改名伪
+    // raw 由 ImageReader 报错 → mpv 回退
+    if is_raw_photo_ext(name) {
+        if let Ok((img, o)) = decode_raw_preview(&buf, orient_override) {
+            tracing::debug!("RAW 预览 [{name}] {}x{} orient={o}", img.width(), img.height());
+            return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)
+                .map(|(d, n)| (d, n, o));
+        }
+    }
+    // EXIF 方向（R 旋转覆盖优先；buf 已在内存走 read_meta_bytes，畸形文件
+    // 静默回 1——方向缺失不影响解码主链路）
+    let orient = orient_override.unwrap_or_else(|| {
+        crate::meta::read_meta_bytes(&buf).map(|m| m.orientation).unwrap_or(1)
+    });
+    let reader = image::ImageReader::new(std::io::Cursor::new(buf))
+        .with_guessed_format()
+        .map_err(|e| format!("识别图片格式失败: {e}"))?;
+    decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes, orient)
+}
+
+/// 读段 + 解码段串接（测试包装用；生产 worker 走两段分离——读毕回账后
+/// 解码不占槽，见 spawn_base/spawn_full）
+#[cfg(test)]
 fn decode_image_orient(
     source: &ImageSource,
     max_dim: u32,
@@ -1359,55 +1397,8 @@ fn decode_image_orient(
     native_limit_bytes: u64,
     orient_override: Option<u8>,
 ) -> Result<(Decoded, Option<image::DynamicImage>, u8), String> {
-    match source {
-        ImageSource::File(path) => {
-            // 相机 RAW 拦截：with_guessed_format 对 ARW/NEF 探不出格式
-            //（返回 None），须按扩展名先行拦截（方案 §4.3）。失败 fall
-            // through 原路径——改名伪 raw 由 ImageReader 报错 → mpv 回退
-            if is_raw_photo_ext(name) {
-                if let Ok((img, o)) = decode_raw_preview_path(path, orient_override) {
-                    tracing::debug!("RAW 预览 [{name}] {}x{} orient={o}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)
-                        .map(|(d, n)| (d, n, o));
-                }
-            }
-            // EXIF 方向（R 旋转覆盖优先；kamadak-exif 读文件头，畸形文件
-            // 静默回 1——方向缺失不影响解码主链路）
-            let orient = orient_override.unwrap_or_else(|| {
-                crate::meta::read_meta_path(path).map(|m| m.orientation).unwrap_or(1)
-            });
-            let reader = image::ImageReader::open(path)
-                .map_err(|e| format!("打开图片失败: {e}"))?
-                .with_guessed_format()
-                .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes, orient)
-        }
-        ImageSource::Stream(vfs, entry) => {
-            let mut vf = vfs
-                .open_entry(entry)
-                .map_err(|e| format!("打开压缩包条目失败: {e}"))?;
-            // 条目大小已知：按声明容量预分配（防恶意声明封顶 1 GiB）
-            let mut buf = Vec::with_capacity(entry.size.clamp(0, 1024 * 1024 * 1024) as usize);
-            vf.read_to_end(&mut buf)
-                .map_err(|e| format!("读取压缩包条目失败: {e}"))?;
-            // 同 File 分支：RAW 拦截（buf 已全量读入，from_bytes 直接解析）
-            if is_raw_photo_ext(name) {
-                if let Ok((img, o)) = decode_raw_preview(&buf, orient_override) {
-                    tracing::debug!("RAW 预览 [{name}] {}x{} orient={o}", img.width(), img.height());
-                    return finish_static(img, max_dim, full, factor, sharpen, native_limit_bytes)
-                        .map(|(d, n)| (d, n, o));
-                }
-            }
-            // EXIF 方向：buf 已在内存，Cursor 头部解析零额外 IO
-            let orient = orient_override.unwrap_or_else(|| {
-                crate::meta::read_meta_bytes(&buf).map(|m| m.orientation).unwrap_or(1)
-            });
-            let reader = image::ImageReader::new(std::io::Cursor::new(buf))
-                .with_guessed_format()
-                .map_err(|e| format!("识别图片格式失败: {e}"))?;
-            decode_any(reader, max_dim, full, factor, name, sharpen, native_limit_bytes, orient)
-        }
-    }
+    let buf = read_source_bytes(source)?;
+    decode_image_bytes(buf, name, max_dim, full, factor, sharpen, native_limit_bytes, orient_override)
 }
 
 /// 按格式分流：gif 与动画 webp 走逐帧解码（单帧归静态）；静态 webp 与其余
@@ -1596,22 +1587,6 @@ fn decode_raw_preview(
     orient_override: Option<u8>,
 ) -> Result<(image::DynamicImage, u8), String> {
     let mut f = raw_files::RawFile::from_bytes(bytes).map_err(|e| format!("RAW 识别失败: {e}"))?;
-    let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
-    let jpeg = f
-        .read_preview(&pv)
-        .map_err(|e| format!("读预览失败: {e}"))?;
-    let img = image::load_from_memory(&jpeg).map_err(|e| format!("预览解码失败: {e}"))?;
-    let o = orient_override.unwrap_or_else(|| raw_orient_u8(pv.orientation()));
-    Ok((crate::meta::apply_orientation(img, o), o))
-}
-
-/// 同 [`decode_raw_preview`]，文件源（7z/RAR 落盘缓存）：`RawFile::open`
-/// 的块缓存只读文件结构与预览所在块，优于全量读盘
-fn decode_raw_preview_path(
-    path: &std::path::Path,
-    orient_override: Option<u8>,
-) -> Result<(image::DynamicImage, u8), String> {
-    let mut f = raw_files::RawFile::open(path).map_err(|e| format!("RAW 识别失败: {e}"))?;
     let pv = f.largest_preview().ok_or("RAW 无内嵌预览")?;
     let jpeg = f
         .read_preview(&pv)
@@ -3789,12 +3764,21 @@ mod tests {
         // 测试直喂：代次机制要求 Ready 与 pending 占位匹配——pending 无该
         // key（未走真实 request）时补一个占位，有则沿用真实代次
         let gen = match svc.pending.get(&key) {
-            Some((_, _, g)) => *g,
+            Some(p) => p.gen,
             None => {
                 svc.base_gen += 1;
                 let g = svc.base_gen;
-                svc.pending
-                    .insert(key, (std::time::Instant::now(), IoClass::Decode, g));
+                svc.pending.insert(
+                    key,
+                    PendingBase {
+                        at: std::time::Instant::now(),
+                        gen: g,
+                        max_dim: 0,
+                        factor: 1.0,
+                        native_limit: 0,
+                        orient_override: None,
+                    },
+                );
                 g
             }
         };
@@ -3805,7 +3789,6 @@ mod tests {
             native: None,
             name: name.to_owned(),
             orient: 1,
-            class: IoClass::Decode,
             gen,
         });
         svc.poll();
@@ -3945,7 +3928,7 @@ mod tests {
             ImgEvent::Ready(_) => panic!("缺失文件不应解码成功"),
         }
         assert!(svc.pending.is_empty());
-        assert!(svc.deferred.is_empty(), "在途期重复请求不入队，失败后无遗留");
+        assert_eq!(svc.sched.queued(IoClass::Decode), 0, "失败后调度器无遗留任务");
         // pending 清除后可重新请求（重试语义）
         svc.request(
             (9, 9),
@@ -3957,12 +3940,11 @@ mod tests {
         assert_eq!(svc.pending.len(), 1);
     }
 
-    /// full 零 IO 门控（优先级占槽模型的记账对齐）：原图缓存未命中 = 真源
-    /// 读，按 Decode 发牌占槽（FullFailed 回账）；**命中 = 纯 CPU 重采样
-    /// （fast_image_resize + 锐化）零 IO，不占槽直接开工**——占着 IO 槽
-    /// 排队纯属错门（full 升级大多数情况走缓存命中路径）
+    /// full 读段路径门控：原图缓存未命中 = 真源读提交调度器（Decode 类
+    /// 任务）；**命中 = 纯 CPU 重采样（fast_image_resize + 锐化）零 IO，
+    /// 不经调度器直接 spawn worker**——full 升级大多数情况走缓存命中路径
     #[test]
-    fn full_原图缓存命中不占槽() {
+    fn full_原图缓存命中不经调度器() {
         // orig_budget 给足（16MB）：natives 准入按预算逐出，0 会让测试原图
         // 推入即逐出、命中路径测不到
         let mut svc = ImageService::new(
@@ -3973,26 +3955,33 @@ mod tests {
             test_sched(),
         );
         let missing = || ImageSource::File(std::path::PathBuf::from("definitely_missing.png"));
-        // ① 未命中：真源读占槽
+        // ① 未命中：真源读提交调度器——缺失文件读秒败（FullFailed），自旋
+        // 等待收尾（毫秒级）
         svc.request_full((9, 9), missing(), "t.png", SharpenCfg::OFF);
         assert!(svc.is_full_pending((9, 9)));
-        assert_eq!(svc.sched.decode_out(), 1, "源读 full 应占 Decode 槽");
-        // FullFailed{io:true} 回账归零
-        let _ = svc.tx.send(ImgMsg::FullFailed {
-            key: (9, 9),
-            epoch: svc.full_epoch,
-            io: true,
-        });
-        svc.poll();
-        assert_eq!(svc.sched.decode_out(), 0, "回账后应归零");
+        loop {
+            svc.poll();
+            if svc.full_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(svc.sched.queued(IoClass::Decode), 0, "读毕后调度器应清空");
         // ② 命中：原图已入 natives（base worker 产出的常见状态），full
-        // 直接开工且零占槽
+        // 直接 spawn worker 且不经调度器
         // 测试直喂（代次匹配）：补 pending 占位 + 捕获代次
         svc.base_gen += 1;
         let g2 = svc.base_gen;
         svc.pending.insert(
             (9, 8),
-            (std::time::Instant::now(), IoClass::Decode, g2),
+            PendingBase {
+                at: std::time::Instant::now(),
+                gen: g2,
+                max_dim: 0,
+                factor: 1.0,
+                native_limit: 0,
+                orient_override: None,
+            },
         );
         let _ = svc.tx.send(ImgMsg::Ready {
             key: (9, 8),
@@ -4004,58 +3993,60 @@ mod tests {
             native: Some(image::DynamicImage::new_rgba8(8, 8)),
             name: "t2.png".into(),
             orient: 1,
-            class: IoClass::Decode,
             gen: g2,
         });
         svc.poll();
         svc.request_full((9, 8), missing(), "t2.png", SharpenCfg::OFF);
         assert!(svc.is_full_pending((9, 8)), "命中 full 应直接开工");
         assert_eq!(
-            svc.sched.decode_out(),
+            svc.sched.queued(IoClass::Decode),
             0,
-            "原图缓存命中的纯 CPU full 不得占 IO 槽"
+            "原图缓存命中的纯 CPU full 不经调度器"
         );
-        // ③ 迟到收尾：FullReady{io:false} 不回账（计数保持 0，不饱和下溢）
+        // ③ 迟到收尾：FullReady 落纹理（不参与调度记账——新模型无记账）
         let _ = svc.tx.send(ImgMsg::FullReady {
             key: (9, 8),
             img: egui::ColorImage::new([4, 4], vec![egui::Color32::WHITE; 16]),
             name: "t2.png".into(),
             epoch: svc.full_epoch,
-            io: false,
         });
         svc.poll();
-        assert_eq!(svc.sched.decode_out(), 0);
+        assert!(svc.has_full((9, 8)), "FullReady 应落纹理");
     }
 
     // ---- 相机 RAW 预览（方案 §4.3）----
 
-    /// invalidate 剔除在途解码条目：发牌名额即时回账——看门狗只扫 pending，
-    /// 不回账则卡死 worker 既无迟到消息兜底也无看门狗跟踪（名额永久泄漏，
-    /// max=1 下全类 admission 永拒）。Decode/Prefetch 两类都要回
+    /// invalidate 剔除在途解码条目：新模型无记账（记账已随旧调度器拆除），
+    /// 剔除只清 pending 占位；旧 worker 迟到 buffer/产物按代次校验丢弃
+    /// （取消语义，设计 §19 D3/D6）
     #[test]
-    fn invalidate_在途剔除即时回账() {
+    fn invalidate_剔除在途_迟到消息代次丢弃() {
         let mut svc = ImageService::new(egui::Context::default(), 2, Default::default(), 0, test_sched());
-        // 直塞 pending 模拟在途（worker 卡死场景：消息不会到来）
+        // 直塞 pending 模拟在途（worker 卡死读段场景：消息不会到来）
+        svc.base_gen = 1;
         svc.pending.insert(
             (1, 0),
-            (std::time::Instant::now(), IoClass::Decode, svc.base_gen + 1),
+            PendingBase {
+                at: std::time::Instant::now(),
+                gen: 1,
+                max_dim: 0,
+                factor: 1.0,
+                native_limit: 0,
+                orient_override: None,
+            },
         );
-        svc.sched.issue(IoClass::Decode);
-        assert_eq!(svc.sched.decode_out(), 1);
         svc.invalidate((1, 0));
-        assert_eq!(
-            svc.sched.decode_out(),
-            0,
-            "invalidate 移除 pending 必须即时回账，否则名额泄漏"
-        );
-        // Prefetch 类同款
-        svc.pending.insert(
-            (1, 1),
-            (std::time::Instant::now(), IoClass::Prefetch, svc.base_gen + 1),
-        );
-        svc.sched.issue(IoClass::Prefetch);
-        svc.invalidate((1, 1));
-        assert_eq!(svc.sched.prefetch_out(), 0);
+        assert!(!svc.pending.contains_key(&(1, 0)), "invalidate 必须清占位");
+        // 迟到 Buffer（旧 gen）：丢弃，不 spawn 解码 worker
+        let _ = svc.tx.send(ImgMsg::Buffer {
+            key: (1, 0),
+            gen: 1,
+            buf: vec![1, 2, 3],
+            name: "t.png".into(),
+        });
+        svc.poll();
+        assert!(!svc.pending.contains_key(&(1, 0)), "迟到 Buffer 不得重建占位");
+        assert!(svc.pos((1, 0)).is_none(), "迟到 Buffer 不得产生缓存");
     }
 
     #[test]
@@ -4165,12 +4156,21 @@ mod tests {
         };
         // 测试直喂（代次匹配）：pending 无该 key 时补占位，有则沿用真实代次
         let gen = match svc.pending.get(&key) {
-            Some((_, _, g)) => *g,
+            Some(p) => p.gen,
             None => {
                 svc.base_gen += 1;
                 let g = svc.base_gen;
-                svc.pending
-                    .insert(key, (std::time::Instant::now(), IoClass::Decode, g));
+                svc.pending.insert(
+                    key,
+                    PendingBase {
+                        at: std::time::Instant::now(),
+                        gen: g,
+                        max_dim: 0,
+                        factor: 1.0,
+                        native_limit: 0,
+                        orient_override: None,
+                    },
+                );
                 g
             }
         };
@@ -4181,7 +4181,6 @@ mod tests {
             native,
             name: name.to_owned(),
             orient: 1,
-            class: IoClass::Decode,
             gen,
         });
         svc.poll();
@@ -4294,37 +4293,6 @@ mod tests {
         assert!(svc.frame(key).is_none(), "旧纹理条目应被清掉防陈旧显示");
     }
 
-    /// deferred 两遍放行：队首陈旧预取不 HOL 卡住后面的用户解码请求
-    /// （第一遍只放 Decode/Full，第二遍才从队首放 Prefetch 垫底）
-    #[test]
-    fn deferred_两遍放行_预取让位用户请求() {
-        let mut svc =
-            ImageService::new(egui::Context::default(), 2, Default::default(), 0, test_sched());
-        // 解码占槽（默认 max=1）：后续请求全部挂 deferred
-        svc.sched.issue(IoClass::Decode);
-        let src = ImageSource::File(std::path::PathBuf::from("nowhere.bin"));
-        // 先排预取（队首），再排用户解码请求（队尾）——陈旧预取在前
-        svc.request((9, 0), src.clone(), 0, "p.png", IoClass::Prefetch);
-        svc.request((9, 1), src, 0, "u.png", IoClass::Decode);
-        assert_eq!(svc.deferred.len(), 2, "槽位占满应挂 deferred");
-        // 槽位释放 → poll 放行：第一遍越过队首 Prefetch 放行 Decode，
-        // 第二遍 Prefetch admission 失败（解码在途）留在队首
-        svc.sched.complete(IoClass::Decode);
-        svc.poll();
-        assert!(
-            svc.pending.contains_key(&(9, 1)),
-            "用户解码请求应先放行开工"
-        );
-        assert_eq!(svc.sched.decode_out(), 1);
-        assert_eq!(svc.deferred.len(), 1, "陈旧预取不应先于用户请求放行");
-        // 解码回账 → 再 poll：队首 Prefetch 放行
-        svc.sched.complete(IoClass::Decode);
-        svc.poll();
-        assert!(svc.deferred.is_empty());
-        assert!(svc.pending.contains_key(&(9, 0)), "预取放行开工");
-        assert_eq!(svc.sched.prefetch_out(), 1);
-    }
-
     /// 迟到 Ready 代次丢弃：invalidate 剔除旧代次占位后，旧 worker 迟到
     /// 产物按代次丢弃（不落缓存不吃掉新请求）；新代次产物正常落缓存
     #[test]
@@ -4340,12 +4308,21 @@ mod tests {
         };
         // 旧代次 gen=1 占位 → invalidate 剔除（真实场景：热重载重放/旋转写回）
         svc.base_gen = 1;
-        svc.pending
-            .insert(key, (std::time::Instant::now(), IoClass::Decode, 1));
+        svc.pending.insert(
+            key,
+            PendingBase {
+                at: std::time::Instant::now(),
+                gen: 1,
+                max_dim: 0,
+                factor: 1.0,
+                native_limit: 0,
+                orient_override: None,
+            },
+        );
         svc.invalidate(key);
         assert!(!svc.pending.contains_key(&key));
-        // 旧 worker 迟到 Ready（gen=1）：complete 照常回账（类随消息走），
-        // 但产物按代次丢弃
+        // 旧 worker 迟到 Ready（gen=1）：记账已随旧调度器拆除（消息不回账），
+        // 产物按代次丢弃
         let _ = svc.tx.send(ImgMsg::Ready {
             key,
             decoded: img(),
@@ -4353,15 +4330,23 @@ mod tests {
             native: None,
             name: "t.png".into(),
             orient: 1,
-            class: IoClass::Decode,
             gen: 1,
         });
         svc.poll();
         assert!(svc.pos(key).is_none(), "代次不符的迟到产物必须丢弃");
         // 新代次请求占位 + 对应 Ready 正常落缓存
         svc.base_gen = 2;
-        svc.pending
-            .insert(key, (std::time::Instant::now(), IoClass::Decode, 2));
+        svc.pending.insert(
+            key,
+            PendingBase {
+                at: std::time::Instant::now(),
+                gen: 2,
+                max_dim: 0,
+                factor: 1.0,
+                native_limit: 0,
+                orient_override: None,
+            },
+        );
         let _ = svc.tx.send(ImgMsg::Ready {
             key,
             decoded: img(),
@@ -4369,7 +4354,6 @@ mod tests {
             native: None,
             name: "t.png".into(),
             orient: 1,
-            class: IoClass::Decode,
             gen: 2,
         });
         svc.poll();
@@ -4377,22 +4361,21 @@ mod tests {
     }
 
     /// dispatch_full 单槽互斥：其它条目的 full 在途时不得抢槽/覆盖
-    /// full_pending 记账（返回 true = 受理，槽腾出后触发方重触发自然开工）
+    /// full_pending 单槽（无事可做直接返回，槽腾出后触发方重触发自然开工）
     #[test]
     fn dispatch_full_单槽互斥_不覆盖在途() {
         let mut svc =
             ImageService::new(egui::Context::default(), 2, Default::default(), 0, test_sched());
         let busy_key = (9, 0);
-        svc.full_pending = Some((busy_key, std::time::Instant::now(), true));
+        svc.full_pending = Some((busy_key, std::time::Instant::now()));
         let src = ImageSource::File(std::path::PathBuf::from("nowhere.bin"));
-        let r = svc.dispatch_full((9, 1), src, "u.png", SharpenCfg::OFF);
-        assert!(r, "槽位忙应返回 true（调用方认为已受理）");
+        svc.dispatch_full((9, 1), src, "u.png", SharpenCfg::OFF);
         assert!(
             svc.full_pending
                 .as_ref()
-                .is_some_and(|(k, _, _)| *k == busy_key),
+                .is_some_and(|(k, _)| *k == busy_key),
             "在途槽不得被覆盖"
         );
-        assert_eq!(svc.sched.decode_out(), 0, "不得为第二个 full 发牌");
+        assert_eq!(svc.sched.queued(IoClass::Decode), 0, "不得为第二个 full 入队");
     }
 }

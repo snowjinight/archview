@@ -43,7 +43,6 @@ pub(super) struct ComparePane {
     pub landed: bool,
 }
 
-#[derive(Default)]
 pub(super) struct CompareSession {
     /// 滑动域快照：进入对比时按入口谓词过滤后的 view 索引序列（搜索/切
     /// 标签改变 view 时快照不重建，滑动在快照内进行）
@@ -87,6 +86,40 @@ pub(super) struct CompareSession {
     pub autoplay_anchor: f64,
     /// 锚点对应的窗口首栏条目（变化检测用）
     pub autoplay_idx: Option<usize>,
+    /// 动画 webp 嗅探（挪出 UI 线程，设计 §18.3.4）：key → None = 在途 /
+    /// Some(animated)。窗格构建对 webp 假定静态（PaneKind::Image），嗅探
+    /// 线程读段过读闸门（NAS 流式源不卡 UI；头部分块读，探针类同款豁免
+    /// 记账），结果经 channel 由 compare_tick 收回改判 Unsupported。有键
+    /// 即不重发（Some(false) = 静态终态）
+    pub webp_sniff: std::collections::HashMap<ImgKey, Option<bool>>,
+    /// 嗅探回执通道（会话创建时建对；worker 断连即嗅探线程静默退出）
+    pub webp_tx: std::sync::mpsc::Sender<(ImgKey, bool)>,
+    pub webp_rx: std::sync::mpsc::Receiver<(ImgKey, bool)>,
+}
+
+/// 手写 Default：channel 套件无 Default（测试用 `..Default::default()`
+/// 构造会话依赖此实现；webp_tx/webp_rx 同 channel 建对）
+impl Default for CompareSession {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            domain: Vec::new(),
+            panes: Vec::new(),
+            zoom: None,
+            center: egui::vec2(0.5, 0.5),
+            cursor: 0,
+            master: 0,
+            pending_slide: None,
+            prefetch: Vec::new(),
+            master_fit: None,
+            autoplay: false,
+            autoplay_anchor: 0.0,
+            autoplay_idx: None,
+            webp_sniff: std::collections::HashMap::new(),
+            webp_tx: tx,
+            webp_rx: rx,
+        }
+    }
 }
 
 impl CompareSession {
@@ -406,10 +439,17 @@ impl App {
         let kind = match self.raw_demux_opts(&e.name, Some(e.size)) {
             Err(msg) => PaneKind::RawErr(msg),
             Ok(None) => {
-                // webp 静态/动画按名不可分：动画嗅探命中 → 占位文案，
-                // 不发起解码（滑动窗口把动画 webp 带进窗格时同样命中）
-                if e.name.to_ascii_lowercase().ends_with(".webp") && webp_animated(&source) {
-                    tracing::debug!("对比窗格排除动画 webp [{}]", e.name);
+                // webp 静态/动画按名不可分：嗅探已挪出 UI 线程（设计
+                // §18.3.4）——已知动画结果直接改判；未知/在途假定静态放行，
+                // compare_after_change 派发嗅探、compare_tick 收回改判
+                let known = self
+                    .compare
+                    .as_ref()
+                    .and_then(|s| s.webp_sniff.get(&key))
+                    .copied()
+                    .flatten();
+                if known == Some(true) {
+                    tracing::debug!("对比窗格排除动画 webp [{}]（嗅探缓存）", e.name);
                     PaneKind::Unsupported("动画 webp 不参与对比".into())
                 } else {
                     PaneKind::Image
@@ -444,10 +484,11 @@ impl App {
         self.error = None;
         self.notice = None;
         self.probe = None; // 探针锚定单图模式内容，进对比即失效
-        // 单图模式的 deferred 队列（含预取候选）对对比会话是陈旧意图：
-        // 换模态清空，窗口栏/候选由 compare_after_change 重发
-        self.img.clear_deferred();
+        // 单图模式的在途/排队读请求（含预取候选）对对比会话是陈旧意图：
+        // 换模态取消清空，窗口栏/候选由 compare_after_change 重发
+        self.img.clear_queued();
         tracing::info!("进入对比视图: {} 栏", panes.len());
+        let (webp_tx, webp_rx) = std::sync::mpsc::channel();
         self.compare = Some(CompareSession {
             domain,
             panes,
@@ -461,6 +502,9 @@ impl App {
             autoplay: false,
             autoplay_anchor: 0.0,
             autoplay_idx: None,
+            webp_sniff: std::collections::HashMap::new(),
+            webp_tx,
+            webp_rx,
         });
         self.compare_after_change();
     }
@@ -468,6 +512,9 @@ impl App {
     /// 窗口变更（进入/滑动/增减栏）后的公共收尾：发起解码 + shown 集合 +
     /// 双向预取（"就绪再滑动"体验的前置条件）
     fn compare_after_change(&mut self) {
+        // webp 栏嗅探派发（挪出 UI 线程，§18.3.4）：新进窗口的 webp Image 栏
+        // 无嗅探记录的逐栏 spawn，结果异步改判
+        self.compare_webp_sniff_dispatch();
         let (keys, wants, cands) = {
             let Some(s) = &self.compare else { return };
             let keys = s.shown_keys();
@@ -549,8 +596,8 @@ impl App {
                 .request(key, source, max_dim, &name, IoClass::Decode);
         }
         // 预取候选不在此处发起：由 compare_tick 统一补发（Prefetch 类，
-        // 调度器 admission 内建"解码在途预取让路"规则，窗口优先由让路
-        // 规则涌现；快盘下窗口毫秒级就绪、预取紧跟无损失）
+        // 窗口优先 = 就绪闸门 + Decode > Prefetch 队列序涌现；快盘下窗口
+        // 毫秒级就绪、预取紧跟无损失）
         // raw 帧对齐游标（进入/滑动后游标已重置/保持，按需补发）
         self.compare_request_raw_frames();
     }
@@ -619,6 +666,79 @@ impl App {
         }
     }
 
+    /// webp 嗅探派发（挪出 UI 线程，§18.3.4）：Image 栏 webp 无嗅探记录的
+    /// 逐栏提交调度器 Decode 小读任务——读段统一进调度器读线程（NAS 流式
+    /// 源不再卡 UI；头部分块读几个 round trip）。已在途/已决的 key 不重发
+    fn compare_webp_sniff_dispatch(&mut self) {
+        let Some(s) = &mut self.compare else {
+            return;
+        };
+        let jobs: Vec<(ImgKey, ImageSource, String)> = s
+            .panes
+            .iter()
+            .filter(|p| matches!(p.kind, PaneKind::Image))
+            .filter(|p| p.name.to_ascii_lowercase().ends_with(".webp"))
+            .filter(|p| !s.webp_sniff.contains_key(&p.key))
+            .map(|p| (p.key, p.source.clone(), p.name.clone()))
+            .collect();
+        // 占位（None = 在途）防重发：收集后统一插入（filter/map 闭包借用
+        // 与 insert 互斥借用，不能合并）
+        for (key, _, _) in &jobs {
+            s.webp_sniff.entry(*key).or_insert(None);
+        }
+        let tx = s.webp_tx.clone();
+        let ctx = self.egui_ctx.clone();
+        for (key, source, name) in jobs {
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let label = name.clone();
+            let work = Box::new(move || {
+                // 读段（调度器串行）：嗅探 = 头部 chunk 读，结果编码进返回值
+                let animated = webp_animated(&source);
+                Ok::<Vec<u8>, String>(vec![animated as u8])
+            });
+            let on_done = Box::new(move |r: Result<Vec<u8>, String>| {
+                // 读失败按静态处理（放行解码，解码侧自会报错）；bool 解码 =
+                // buf 首字节
+                if let Err(e) = &r {
+                    tracing::warn!("webp 嗅探失败按静态处理 [{label}]: {e}");
+                }
+                let animated = r.ok().and_then(|b| b.first().copied()).unwrap_or(0) == 1;
+                let _ = tx.send((key, animated));
+                ctx.request_repaint();
+            });
+            self.io.submit(IoJob {
+                name: format!("webp嗅探 {name}"),
+                class: IoClass::Decode,
+                work,
+                on_done,
+            });
+        }
+    }
+
+    /// 嗅探结果收回：动画命中改判栏 kind = Unsupported + 撤销该栏已发的
+    /// 解码（invalidate 按 io_done 分流回账）；结果落缓存，滑动把该条目
+    /// 带回窗口时直接命中改判，不再嗅探
+    fn compare_webp_sniff_poll(&mut self) {
+        let Some(s) = &mut self.compare else {
+            return;
+        };
+        let mut results = Vec::new();
+        while let Ok((key, animated)) = s.webp_rx.try_recv() {
+            results.push((key, animated));
+        }
+        for (key, animated) in results {
+            s.webp_sniff.insert(key, Some(animated));
+            if animated {
+                if let Some(p) = s.panes.iter_mut().find(|p| p.key == key) {
+                    tracing::debug!("对比窗格排除动画 webp [{}]（异步嗅探改判）", p.name);
+                    p.kind = PaneKind::Unsupported("动画 webp 不参与对比".into());
+                    self.img.invalidate(key);
+                }
+            }
+        }
+    }
+
     /// 每帧 tick（ui() 轮询）：raw 结果排空、raw 帧对齐、image 栏自愈、
     /// 非流式落地检查 + 解压会话触发
     pub(super) fn compare_tick(&mut self) {
@@ -626,6 +746,7 @@ impl App {
             return;
         }
         self.rawdec.poll();
+        self.compare_webp_sniff_poll();
         self.compare_request_raw_frames();
         // image 栏自愈（被挤出/在途丢失一帧内补发，同 heal_current_image）；
         // 源未落地（landed=false）不请求——防 img_fallback 确定性污染
@@ -654,11 +775,11 @@ impl App {
             self.img
                 .request(key, source, max_dim, &name, IoClass::Decode);
         }
-        // 预取候选补发：Prefetch 类直发——调度器 admission 内建"解码在途
-        // 预取让路 + 预取单在途"规则，窗口优先不再需要手工 window_busy
-        // 闸门（被拒绝的候选进 ImageService deferred 队列，解码完成事件
-        // 驱动逐个放行）；source_ready 防半截文件污染（raw 栏的 rawdec
-        // 队列本就单 worker 串行，不参与）
+        // 预取候选补发：Prefetch 类直发——调度器读线程串行 + 优先级队列
+        // 内建"Decode > Prefetch"次序，窗口优先不再需要手工 window_busy
+        // 闸门（被解码占住的读让预取自然排队，读毕即消费）；
+        // source_ready 防半截文件污染（raw 栏的 rawdec 队列本就单 worker
+        // 串行，不参与）
         let cands = self
             .compare
             .as_ref()
@@ -1010,9 +1131,9 @@ impl App {
     pub(super) fn exit_compare(&mut self) {
         let Some(s) = self.compare.take() else { return };
         self.img.clear_shown_multi();
-        // 对比会话的窗口栏/候选 deferred 是会话内意图：退出即清（回落播放
-        // 的目标条目由 play→play_image 重新发起）
-        self.img.clear_deferred();
+        // 对比会话的窗口栏/候选读请求是会话内意图：退出即取消清空（回落播放
+        // 模态后由单图链路按需重发）
+        self.img.clear_queued();
         let idx = s
             .panes
             .get(s.master)

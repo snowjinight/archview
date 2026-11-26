@@ -250,6 +250,8 @@ impl App {
         let Some(key) = self.tex_image_key() else {
             return;
         };
+        // is_pending 在提交瞬间即落占位（调度器排队+在读统一观测，设计
+        // §19 D6），排队未开工的请求不会误判"无在途"重复补发
         if self.img.has(key) || self.img.is_pending(key) {
             return;
         }
@@ -350,28 +352,24 @@ impl App {
             v
         };
         // 阶段二（可变借用）：曾回退 mpv 的条目跳过（mpv 链路显示，不再
-        // 纹理解码）；已缓存/在途的候选幂等跳过（request/deferred 内部
-        // 同键去重兜底）；其余全部按序 Prefetch 类发起（单在途与让路
-        // 规则由调度器执行，无需此处手工名额）
+        // 纹理解码）；已缓存/在途的候选幂等跳过（request 提交瞬间落占位，
+        // 同键去重兜底）；其余全部按序 Prefetch 类发起（读线程串行 +
+        // Decode > Prefetch 队列序由调度器执行，无需此处手工名额）
         let max_dim = self.cfg.image.image_max_dim;
-        let mut queued = 0usize;
         for (key, src, name) in cands {
             if self.img_fallback.contains(&key) {
                 continue;
             }
-            if self.img.has(key) {
+            if self.img.has(key) || self.img.is_pending(key) {
                 continue;
             }
             self.img
                 .request(key, src, max_dim, &name, IoClass::Prefetch);
-            // is_deferred：本轮候选中被调度器排队等待的数量（debug 汇总，
-            // 逐项转折日志在 ImageService 排队/放行处）
-            if self.img.is_deferred(key) {
-                queued += 1;
-            }
         }
+        let queued = self.io.queued(IoClass::Prefetch);
         if queued > 0 {
-            tracing::debug!("预取 {queued} 项排队等待（让路/单在途），完成事件驱动放行");
+            // debug 汇总（调度器队列观测点）：排队数量含让路等待的候选
+            tracing::debug!("预取 {queued} 项排队等待（让路/读线程忙碌），读毕即消费");
         }
     }
 

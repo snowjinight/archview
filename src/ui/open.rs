@@ -348,14 +348,14 @@ impl App {
         // 打开时只登记图片条目下标快照 + 常驻 worker，探测批次由列表视口
         // 钩子按需入队（panels.rs debounce 后调 rating_probe_enqueue，首帧
         // 空集立即入队头部窗口）。压缩包模式无磁盘路径不探测（会话内评级）。
-        // 评级按分格式真相矩阵读取（meta.rs 头注）；换包 = drop job：
-        // worker 随 tx 断连退出、旧 rx 随句柄丢弃（迟到结果不串包）
-        // 换包 = 评级探测会话重置（worker 断连退出、迟到结果不串包；
-        // 在途记账就地回补——见 rating_probe_session_reset）
+        // 评级按分格式真相矩阵读取（meta.rs 头注）；换包 = drop job + 调度器
+        // cancel(Rating)：旧 rx 随句柄丢弃（迟到结果不串包）
+        // 换包 = 评级探测会话重置（job drop + 调度器 cancel(Rating) 清排队
+        // 任务，迟到结果不串包——见 rating_probe_session_reset）
         self.rating_probe_session_reset();
-        // 换包清 deferred：旧包的排队请求对新集合是陈旧意图（key 含
+        // 换包清排队请求：旧包的排队任务对新集合是陈旧意图（key 含
         // archive_id 不会误发，但占队列无意义）
-        self.img.clear_deferred();
+        self.img.clear_queued();
         if path.is_dir() {
             // 位图按 entries.len() 分配（idx 致密域：下标直寻去重）
             self.rating_probed = vec![false; self.archive.as_ref().unwrap().entries.len()];
@@ -371,27 +371,11 @@ impl App {
                 .filter(|(_, e)| !e.is_dir && self.cfg.is_image_ext(&e.name))
                 .map(|(i, _)| i)
                 .collect();
-            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<(usize, PathBuf, String)>();
+            // 探测 = IoJob 直接提交调度器 Rating 类队列（读线程读毕
+            // on_done 回投结果，设计 §19 D8），无 worker 线程；job 只持
+            // 结果通道（tx 供 enqueue 闭包回投，rx 由 poll 排空）
             let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<u8>)>();
-            let egui_ctx = self.egui_ctx.clone();
-            std::thread::Builder::new()
-                .name("ratingprobe".into())
-                .spawn(move || {
-                    // 常驻：cmd_rx 断连（UI 端换包 drop job）即退出。
-                    // **单条命令单条回执**（阻塞 recv 零轮询零睡眠）——
-                    // 派发节拍由 UI 线程 poll_rating_probe 按调度器槽位
-                    // 驱动（优先级占槽模型，评级 = 最低优先级）。读一个
-                    // 文件回一条结果并唤醒 UI（结果驱动下一项派发，空闲
-                    // 全事件驱动）；在途评级占一个槽位，高优先级请求在
-                    // 文件边界自然抢占（读完当前文件让出）
-                    for (idx, p, name) in cmd_rx {
-                        let r = crate::meta::read_rating(&p, &name);
-                        let _ = tx.send((idx, r));
-                        egui_ctx.request_repaint();
-                    }
-                })
-                .ok();
-            self.rating_probe = Some(RatingProbeJob { tx: cmd_tx, rx });
+            self.rating_probe = Some(RatingProbeJob { tx, rx });
         }
         // 单媒体文件入口：目标文件所在目录打开完成（仅目录模式消费——
         // 压缩包路径不吃焦点，防"焦点未消费又被压缩包打开覆盖"的竞态串播）。
@@ -470,11 +454,11 @@ impl App {
     }
 
     /// 按需评级探测入队（panels.rs 视口钩子与筛选补扫共用）：**mark-at-enqueue**
-    /// ——入队瞬间 `rating_probed[idx]` 置位（false→true 才真正发送），同一
+    /// ——入队瞬间 `rating_probed[idx]` 置位（false→true 才真正提交），同一
     /// idx 在生命周期内结构上不可能二次入队；无独立 pending 集，入队调用方
     /// 只在窗口变化/筛选激活等离散事件发生，不逐帧去重。单条去重成本 =
-    /// 一次位图下标读写（零哈希零扫描，与已标记量无关）。入队只压 App 侧
-    /// 队列（记账在派发时累加），实际派发节拍由 poll_rating_probe 驱动。
+    /// 一次位图下标读写（零哈希零扫描，与已标记量无关）。提交 = IoJob 直接
+    /// 进调度器 Rating 队列（优先级最低，读线程按队列序消费，设计 §19 D8）。
     /// job 缺位（压缩包模式）零动作
     pub(super) fn rating_probe_enqueue(&mut self, items: RatingProbeBatch) {
         if self.rating_probe.is_none() {
@@ -484,92 +468,58 @@ impl App {
         for (idx, p, name) in items {
             if idx < self.rating_probed.len() && !self.rating_probed[idx] {
                 self.rating_probed[idx] = true;
-                self.rating_queue.push_back((idx, p, name));
+                self.submit_rating_probe(idx, p, name);
                 pushed += 1;
             }
         }
         if pushed > 0 {
-            // debug 探针（config log_level=debug 可见）：排查计账闭环/
-            // 窗口覆盖的观测点（idx 非连续属正常，视图行映射的是图片条目
-            // 下标，目录行/视频条目穿插其间）
-            tracing::debug!(
-                "评级探测入队 {} 项（队列 {}，在途 {}）",
+            // info 批级转折（队列深度 = 调度器 Rating 队列观测点；idx 非连续
+            // 属正常，视图行映射的是图片条目下标，目录行/视频条目穿插其间）
+            tracing::info!(
+                "评级探测入队 {} 项（队列 {}）",
                 pushed,
-                self.rating_queue.len(),
-                self.rating_inflight,
+                self.io.queued(IoClass::Rating),
             );
         }
     }
 
-    /// 评级派发（poll_rating_probe 尾部，测试直调）：**最低优先级**。
-    /// 两道闸门：
-    /// 1. 优先级闸门——`rating_yield` 开启时，img/rawdec/hist 任一 deferred
-    ///    非空 = 有解码/预取在排队，评级让位（本轮 poll 放行完成后下一帧
-    ///    再试）；`rating_yield=false` = 后台扫，闸门旁路（槽位照占，不抢
-    ///    高优先级已占的槽）；
-    /// 2. 槽位算术——`admission(Rating)`（total < max 且单在途）。
-    /// 单条派发：worker 一次读一个文件；派发即记账（issue + inflight++）。
-    /// 高优先级请求在评级文件边界自然抢占（在途文件读完让出，下一项被
-    /// 闸门压住）
-    fn rating_probe_dispatch(&mut self) {
-        if self.cfg.io.rating_yield
-            && (self.img.deferred_len() > 0
-                || self.rawdec.deferred_len() > 0
-                || self.hist_raw.deferred_len() > 0)
-        {
-            return;
-        }
-        if self.rating_probe.is_none() {
-            return;
-        }
-        let Some((idx, p, name)) = self.rating_queue.front().cloned() else {
-            return;
+    /// 单条评级探测提交：读段 = meta::read_rating（评级头读，NAS 上毫秒级），
+    /// IoJob 入调度器 Rating 队列，读毕 on_done 回投 (idx, 星级) 并唤醒 UI。
+    /// 无记账无看门狗——读卡死由调度器侧看门狗救援（设计 §19 D5/D6）
+    fn submit_rating_probe(&mut self, idx: usize, p: PathBuf, name: String) {
+        let job = self.rating_probe.as_ref().expect("enqueue 已判 job 在位");
+        let tx = job.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let work = {
+            let p = p.clone();
+            let name = name.clone();
+            Box::new(move || {
+                Ok::<Vec<u8>, String>(
+                    crate::meta::read_rating(&p, &name).map(|v| vec![v]).unwrap_or_default(),
+                )
+            })
         };
-        if !self.io.admission(IoClass::Rating) {
-            return;
-        }
-        self.rating_queue.pop_front();
-        self.io.issue(IoClass::Rating);
-        self.rating_inflight += 1;
-        // 每文件一条，trace 级（千文件目录 = 千条，debug 也刷屏——批级转折
-        // 看入队/完成两条 info）
-        tracing::trace!(
-            "评级派发 {name}（队列 {}，在途 {}）",
-            self.rating_queue.len(),
-            self.rating_inflight
-        );
-        let sent = self
-            .rating_probe
-            .as_ref()
-            .is_some_and(|job| job.tx.send((idx, p, name)).is_ok());
-        if !sent {
-            // worker 已死（spawn 失败/断连）：send 失败即回滚记账——不回滚
-            // 则 rating_out 永久 ≥1，admission(Rating) 永假（评级静默失效）
-            self.io.complete(IoClass::Rating);
-            self.rating_inflight = self.rating_inflight.saturating_sub(1);
-            self.rating_inflight_since = None;
-            tracing::warn!("评级派发失败（worker 断连），记账已回滚");
-        } else {
-            // 看门狗基准：worker 阻塞读卡死时超时回账的唯一依据
-            self.rating_inflight_since = Some(std::time::Instant::now());
-        }
+        let on_done = Box::new(move |r: Result<Vec<u8>, String>| {
+            let _ = tx.send((idx, r.ok().and_then(|b| b.first().copied())));
+            ctx.request_repaint();
+        });
+        self.io.submit(IoJob {
+            name: format!("评级 {name}"),
+            class: IoClass::Rating,
+            work,
+            on_done,
+        });
     }
 
-    /// 评级探测会话重置（换包唯一入口）：在途记账就地回补 + 全部探测
-    /// 状态清零。worker 随 tx drop 断连退出（迟到结果不串包）；不回补
-    /// 在途账则 rating_out 永久 ≥1，新会话 admission(Rating) 永假
-    /// （评级静默失效）
+    /// 评级探测会话重置（换包唯一入口）：全部探测状态清零 + 调度器
+    /// cancel(Rating) 清排队任务（取消语义，设计 §19 D8）；job drop 后
+    /// 旧 rx 随句柄丢弃，在途读毕的迟到结果不串包
     fn rating_probe_session_reset(&mut self) {
-        if self.rating_inflight > 0 {
-            self.io.complete(IoClass::Rating);
-        }
+        self.io.cancel(IoClass::Rating);
         self.rating_probe = None;
-        self.rating_queue.clear();
         self.rating_probed = Vec::new();
         self.rating_probe_window = None;
         self.rating_probe_intent = None;
-        self.rating_inflight = 0;
-        self.rating_inflight_since = None;
         self.rating_image_idx = Vec::new();
     }
 
@@ -599,30 +549,20 @@ impl App {
         self.rating_probe_enqueue_rows(&idxs);
     }
 
-    /// 按需评级探测轮询：收当帧全部单条结果，合并进 a.ratings（**会话值
-    /// 优先**——用户探测期间手动评的星不被覆盖），逐条扣 inflight 并回账
-    /// 调度器（类随消息走：结果 = Rating 类完成）；**尾部派发下一项**
-    /// （结果 + 完成事件共同驱动派发链，零轮询）；inflight 归零且队列清空
-    /// 且星级筛选已选时重建视图（筛选谓词等全量事实就绪才生效，防列表
-    /// 中途反复闪变）
+    /// 按需评级探测轮询：收当帧全部结果，合并进 a.ratings（**会话值
+    /// 优先**——用户探测期间手动评的星不被覆盖）。探测任务全部由
+    /// submit_rating_probe 提交调度器（读线程读毕 on_done 回投），本函数
+    /// 只消费结果通道；调度器 queued(Rating) 归零且星级筛选已选时重建
+    /// 视图（筛选谓词等全量事实就绪才生效，防列表中途反复闪变）
     pub(super) fn poll_rating_probe(&mut self) {
         let mut got = false;
         loop {
-            let res = self
-                .rating_probe
-                .as_ref()
-                .map(|job| job.rx.try_recv());
-            let Some(res) = res else {
-                return;
+            let Some(job) = self.rating_probe.as_ref() else {
+                break;
             };
-            match res {
+            match job.rx.try_recv() {
                 Ok((idx, r)) => {
                     got = true;
-                    self.rating_inflight = self.rating_inflight.saturating_sub(1);
-                    // 评级回账（fail-open 口径与解码侧一致）
-                    self.io.complete(IoClass::Rating);
-                    // 每文件一条，trace 级（同派发）
-                    tracing::trace!("评级探测收回（在途 {}）", self.rating_inflight);
                     let Some(a) = self.archive.as_mut() else {
                         break;
                     };
@@ -630,57 +570,18 @@ impl App {
                         a.ratings.entry(idx).or_insert(r);
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // worker 已死（spawn 失败/panic）且消息已收尽：在途项永远
-                    // 不会回执——补回账防 rating_out 卡 1（评级永久失效），
-                    // 并摘除 job 防 dispatch 每帧对死通道 issue/回滚空转
-                    if self.rating_inflight > 0 {
-                        self.io.complete(IoClass::Rating);
-                    }
-                    self.rating_inflight = 0;
-                    self.rating_inflight_since = None;
-                    self.rating_probe = None;
-                    tracing::warn!("评级探测 worker 已退出，在途记账已回补");
-                    break;
-                }
+                Err(_) => break, // Empty：收尽；Disconnected：rx 随 job 摘除即终
             }
         }
-        // 看门狗（评级侧唯一兜底）：worker 卡死在单个阻塞文件读上（NAS
-        // 断连/停滞）时回执永不到达——文件粒度抢占的前提是"读会结束"，
-        // 卡死的读没有边界可让，inflight/rating_out 永久占槽，max=1 下
-        // Decode/Prefetch admission 全拒（浏览冻结）。超时回账放行：
-        // fail-open 口径——迟到结果照常收回合并（inflight 饱和下溢吸收
-        // 双记），worker 不摘除，读最终返回后派发链自然恢复
-        if self.rating_inflight > 0 {
-            let over = match self.rating_inflight_since {
-                Some(t0) => t0.elapsed() > crate::imgview::PENDING_TIMEOUT,
-                None => true, // 防御：在途但无基准（理论不可达），按超时处理
-            };
-            if over {
-                tracing::error!(
-                    "评级探测超时（>{:?}无回执）回账放行——worker 卡死在单个文件读上（NAS 停滞?）",
-                    crate::imgview::PENDING_TIMEOUT
-                );
-                self.io.complete(IoClass::Rating);
-                self.rating_inflight = 0;
-                self.rating_inflight_since = None;
-            }
-        } else {
-            self.rating_inflight_since = None;
-        }
-        // 派发下一项：优先级闸门（deferred 空）+ 槽位算术（admission）
-        self.rating_probe_dispatch();
+        // 批级转折（info）：整批探测完成（F12 可见的评级日志就这一条 +
+        // 入队一条，中间过程 debug）。排队归零 = 全部结果已回投或随
+        // 换包 cancel 丢弃，事实集齐，筛选可安全生效
         if got
-            && self.rating_inflight == 0
-            && self.rating_queue.is_empty()
+            && self.io.queued(IoClass::Rating) == 0
+            && self.rating_filter.is_some()
         {
-            // 批级转折（info）：整批探测完成（F12 可见的评级日志就这一条 +
-            // 入队一条，中间过程 trace）
             tracing::info!("评级探测完成（本轮队列已清空）");
-            if self.rating_filter.is_some() {
-                self.rebuild_view();
-            }
+            self.rebuild_view();
         }
     }
 
@@ -707,11 +608,11 @@ impl App {
         // 要过 3 遍 is_video_ext，万级条目 × raw 预设回溯时开销放大 3 倍
         let query = crate::search::parse_query(&self.search);
         // 星级筛选谓词（仅图片条目；与文本搜索 AND）：Some(0)=未评、
-        // Some(n)=≥n 星。探测未收齐（inflight>0）时暂不生效（poll_rating_probe
-        // 归零后重建视图）——防列表中途反复闪变。已删除条目（trash 删除
-        // 后的会话标记）无条件剔除
+        // Some(n)=≥n 星。探测队列未清空（queued(Rating)>0）时暂不生效
+        // （poll_rating_probe 归零后重建视图）——防列表中途反复闪变。
+        // 已删除条目（trash 删除后的会话标记）无条件剔除
         let filter_active =
-            self.rating_inflight == 0 && self.rating_queue.is_empty() && self.rating_filter.is_some();
+            self.io.queued(IoClass::Rating) == 0 && self.rating_filter.is_some();
         let rating_filter = self.rating_filter;
         let mut classified: Vec<(usize, bool)> = a
             .entries
@@ -864,194 +765,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 评级派发（优先级占槽模型）：解码占槽（max=1）不派发，槽位空出才派
-    /// 发；派发即记账（issue + inflight++），回执回账（complete + inflight--）
+    /// 评级探测闭环（调度器直提直读，设计 §19 D8）：enqueue 提交 IoJob 入
+    /// Rating 队列 → 调度器读线程读毕 on_done 回投 → poll 合并；
+    /// mark-at-enqueue 去重：同一 idx 二次入队不重复提交（结果只回一条）
     #[test]
-    fn rating_派发_解码占槽等待与记账闭环() {
-        use crate::iosched::IoClass;
+    fn rating_probe_闭环_提交读毕合并与去重() {
         let mut app = super::App::new_for_test(crate::config::Config::default());
-        let dir = std::env::temp_dir().join(format!("archview_probe_yield_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("archview_probe_new_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("a.jpg"),
             b"\xff\xd8\xff\xe0<rdf:Description xmp:Rating=\"4\"/>",
         )
         .unwrap();
-        // 测试直连通道：job.tx 供 dispatch 发命令（cmd_rx 模拟 worker 收），
-        // res_tx 模拟 worker 回执（job.rx 供 poll 收）
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rating_probe = Some(RatingProbeJob { tx, rx });
         app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, dir.join("a.jpg"), "a.jpg".to_string())]);
-        assert_eq!(app.rating_queue.len(), 1);
-        // 解码占槽（默认 max=1）：admission 拒，不派发
-        app.io.issue(IoClass::Decode);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_queue.len(), 1, "解码占槽时评级不得派发");
-        assert_eq!(app.rating_inflight, 0);
-        // 解码完成回账 → 槽位空出 → 派发 + 记账
-        app.io.complete(IoClass::Decode);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_queue.len(), 0, "槽位空出后派发");
-        assert_eq!(app.rating_inflight, 1);
-        // worker 侧模拟：收命令 → 读 → 回执
-        let (idx, p, name) = cmd_rx.recv().unwrap();
-        assert_eq!(idx, 0);
-        let r = crate::meta::read_rating(&p, &name);
-        assert_eq!(r, Some(4));
-        res_tx.send((idx, r)).unwrap();
+        let item = (0usize, dir.join("a.jpg"), "a.jpg".to_string());
+        app.rating_probe_enqueue(vec![item.clone()]);
+        assert!(app.rating_probed[0], "mark-at-enqueue 置位");
+        app.rating_probe_enqueue(vec![item]);
+        // 调度器读线程真实读毕回投：只有一条结果（二次入队被去重）
+        let got = app
+            .rating_probe
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("探测结果未回投");
+        assert_eq!(got, (0, Some(4)));
+        assert!(
+            app.rating_probe
+                .as_ref()
+                .unwrap()
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "去重后不应有第二条结果"
+        );
+        // poll 合并：archive 缺位走 break 分支不崩（合并逻辑 or_insert 本身
+        // 由 ratings 表结构保证会话值优先）；筛选在位时 queued 归零走
+        // rebuild_view 分支（archive None → 清行缓存，安全）
+        app.rating_filter = Some(4);
         app.poll_rating_probe();
-        assert_eq!(app.rating_inflight, 0, "回执后计账归零");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 评级派发优先级闸门：deferred 有排队的高优先级请求时评级让位
-    /// （放行完成后下一帧再派发）；队列 FIFO 保序
+    /// 换包会话重置（新取消语义，设计 §19 D8）：cancel(Rating) 清排队任务
+    /// + 探测状态清零 + job 摘除；在途读毕迟到结果落空通道（rx 随 job 丢弃，
+    /// send 失败静默）不串包。优先级/取消/看门狗归调度器侧单测（iosched.rs）
     #[test]
-    fn rating_派发_deferred排队让位() {
+    fn rating_probe_换包会话重置_取消与清零() {
         use crate::iosched::IoClass;
         let mut app = super::App::new_for_test(crate::config::Config::default());
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (_res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
+        let dir = std::env::temp_dir().join(format!("archview_probe_reset_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.jpg"),
+            b"\xff\xd8\xff\xe0<rdf:Description xmp:Rating=\"4\"/>",
+        )
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.rating_probe = Some(RatingProbeJob { tx, rx: _rx });
         app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
-        // 解码占槽（max=1）→ img.request 进 deferred → 闸门挡评级派发
-        app.io.issue(IoClass::Decode);
-        let key: crate::imgview::ImgKey = (0, 0);
-        app.img.request(
-            key,
-            crate::imgview::ImageSource::File(std::path::PathBuf::from("nowhere.bin")),
-            0,
-            "nowhere.bin",
-            IoClass::Decode,
-        );
-        assert!(app.img.deferred_len() > 0, "槽位占满请求应挂 deferred");
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_queue.len(), 1, "deferred 排队时评级让位");
-        // 放行链：解码完成 → deferred 放行（占槽）→ 评级仍不派发；
-        // deferred 清空且槽位空闲才派发
-        app.io.complete(IoClass::Decode);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_queue.len(), 1, "deferred 在途请求仍占派发位");
-        app.img.clear_deferred();
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_queue.len(), 0, "deferred 清空后派发");
-    }
-
-    /// 换包会话重置：在途记账就地回补——不回补则 rating_out 永久 ≥1，
-    /// 新会话 admission(Rating) 永假（评级静默失效）
-    #[test]
-    fn rating_换包会话重置_在途回账() {
-        use crate::iosched::IoClass;
-        let mut app = super::App::new_for_test(crate::config::Config::default());
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (_res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
-        app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_inflight, 1, "派发成功即在途");
-        assert_eq!(app.io.rating_out(), 1);
-        // 换包：回补在途账 + 全部探测状态清零
+        app.rating_probe_enqueue(vec![(0usize, dir.join("a.jpg"), "a.jpg".to_string())]);
         app.rating_probe_session_reset();
-        assert_eq!(app.rating_inflight, 0);
-        assert_eq!(app.io.rating_out(), 0, "在途账必须回补，否则新会话评级永假");
-        assert!(app.rating_probe.is_none());
-        assert!(app.rating_queue.is_empty());
+        assert!(app.rating_probe.is_none(), "job 应随换包摘除");
         assert!(app.rating_probed.is_empty());
         assert!(app.rating_probe_window.is_none());
         assert!(app.rating_probe_intent.is_none());
         assert!(app.rating_image_idx.is_empty());
-        // 回补后新会话可立即派发（admission 不再被旧账卡死）
-        assert!(app.io.admission(IoClass::Rating));
-    }
-
-    /// worker 死亡（spawn 失败/panic 断连）且消息收尽：poll Disconnected
-    /// 分支补回在途账并摘除 job——防 dispatch 每帧对死通道空转
-    #[test]
-    fn rating_worker死亡_poll补账() {
-        let mut app = super::App::new_for_test(crate::config::Config::default());
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
-        app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_inflight, 1);
-        drop(res_tx); // worker 死亡：回执通道断连
-        app.poll_rating_probe();
-        assert_eq!(app.rating_inflight, 0, "断连分支应补回在途账");
-        assert_eq!(app.io.rating_out(), 0);
-        assert!(app.rating_probe.is_none(), "死 job 应摘除");
-    }
-
-    /// send 失败（worker 已死）回滚：派发瞬间 send 报错即回账——否则
-    /// rating_out 永久 ≥1，admission(Rating) 永假
-    #[test]
-    fn rating_send失败_回滚记账() {
-        use crate::iosched::IoClass;
-        let mut app = super::App::new_for_test(crate::config::Config::default());
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (_res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
-        app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
-        drop(cmd_rx); // worker 侧收命令通道已死：send 必败
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_inflight, 0, "send 失败应回滚记账");
-        assert_eq!(app.io.rating_out(), 0);
-        assert!(app.io.admission(IoClass::Rating), "回账后槽位应可用");
-    }
-
-    /// 评级看门狗：worker 卡死在单个阻塞文件读上（NAS 断连/停滞）超过
-    /// PENDING_TIMEOUT 无回执 → 回账放行。不回账则 rating_out 永久 ≥1，
-    /// max=1 下 Decode/Prefetch admission 全拒（浏览冻结）。迟到结果
-    /// 按 fail-open 收回（双记由饱和下溢吸收）
-    #[test]
-    fn rating_看门狗超时_回账放行() {
-        use crate::iosched::IoClass;
-        let mut app = super::App::new_for_test(crate::config::Config::default());
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-        let (res_tx, res_rx) = std::sync::mpsc::channel();
-        app.rating_probe = Some(RatingProbeJob {
-            tx: cmd_tx,
-            rx: res_rx,
-        });
-        app.rating_probed = vec![false; 1];
-        app.rating_probe_enqueue(vec![(0usize, "x.png".into(), "x.png".to_string())]);
-        app.rating_probe_dispatch();
-        assert_eq!(app.rating_inflight, 1);
-        assert_eq!(app.io.rating_out(), 1);
-        // 未超时：不动作
-        app.poll_rating_probe();
-        assert_eq!(app.rating_inflight, 1, "未超时不得回账");
-        // 模拟卡死：派发时刻推到看门狗阈值之前
-        app.rating_inflight_since =
-            Some(std::time::Instant::now() - crate::imgview::PENDING_TIMEOUT);
-        app.poll_rating_probe();
-        assert_eq!(app.rating_inflight, 0, "超时必须回账，否则占槽永久化");
-        assert_eq!(app.io.rating_out(), 0);
-        assert!(app.io.admission(IoClass::Rating), "回账后槽位应可用");
-        // 迟到结果按 fail-open 收回：双记完成被饱和下溢吸收，计数不崩
-        res_tx.send((0usize, Some(3u8))).unwrap();
-        app.poll_rating_probe();
-        assert_eq!(app.io.rating_out(), 0, "迟到回执的双记应被下溢吸收");
+        assert_eq!(
+            app.io.queued(IoClass::Rating),
+            0,
+            "排队任务应被 cancel 清空（在途任务不在队列计数，读毕落空通道）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

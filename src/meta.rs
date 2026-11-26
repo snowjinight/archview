@@ -59,7 +59,9 @@ pub fn read_meta_bytes(buf: &[u8]) -> Option<ExifMeta> {
     Some(parse_exif(&exif))
 }
 
-/// 从文件读 EXIF（目录模式：解码链 File 源）
+/// 从文件读 EXIF。生产解码链已全量预读走 [`read_meta_bytes`]（一次 IO 拿全，
+/// 不再单独开文件读头）；本函数现仅测试使用（临时文件读回验证）
+#[cfg(test)]
 pub fn read_meta_path(path: &Path) -> Option<ExifMeta> {
     let file = std::fs::File::open(path).ok()?;
     let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()?;
