@@ -109,6 +109,11 @@ pub struct IoScheduler {
     readers_active: AtomicUsize,
     /// 最近一次读毕时刻（看门狗基准一）
     last_read_finished: Mutex<Instant>,
+    /// 队列持续非空起始时刻（看门狗基准三）：量"任务排队多久没读毕"而非
+    /// "多久没读毕"——后者把空闲期算进卡死时长，空闲 >10s 后首批任务入队
+    /// 瞬间即误报（raw 对比入队 17ms 实测）。首见非空起表、排空清 None；
+    /// 后续入队**不重置**——读者真卡死时评级探测持续入队不得无限推迟救援
+    queue_wait_since: Mutex<Option<Instant>>,
     /// 最近一次救援 spawn 时刻（看门狗基准二：防卡死期每帧重复救援）
     last_rescue: Mutex<Instant>,
     /// 在读的大字节任务数（heavy 标记）：看门狗按此分级宽限
@@ -131,6 +136,7 @@ impl IoScheduler {
             ),
             readers_active: AtomicUsize::new(0),
             last_read_finished: Mutex::new(Instant::now()),
+            queue_wait_since: Mutex::new(None),
             last_rescue: Mutex::new(Instant::now()),
             heavy_in_flight: AtomicUsize::new(0),
         }
@@ -306,17 +312,27 @@ impl IoScheduler {
         *self.last_read_finished.lock().unwrap() = Instant::now();
     }
 
-    /// 看门狗（UI poll 每帧调）：队列非空且超阈值无读毕（且自上次救援后
-    /// 仍无读毕）→ spawn 一次性救援读线程执行队首任务。阈值分级：在读
-    /// 大字节任务（heavy，raw 整帧 24~48MB）宽限 3×READ_STALL——NAS 慢盘
-    /// 大读 >10s 是常态，不分级会误判卡死反复 fail-open 破坏串行不变量。
+    /// 看门狗（UI poll 每帧调）：队列持续非空且超阈值无读毕（且自上次
+    /// 救援后仍无读毕）→ spawn 一次性救援读线程执行队首任务。基准三选
+    /// max：读毕 / 队列非空起始 / 上次救援——队列非空基准防"空闲期后首批
+    /// 任务入队瞬间误判卡死"（空闲时长 ≠ 卡死时长），救援基准防卡死期
+    /// 每帧重复救援。阈值分级：在读大字节任务（heavy，raw 整帧 24~48MB）
+    /// 宽限 3×READ_STALL——NAS 慢盘大读 >10s 是常态，不分级会误判卡死
+    /// 反复 fail-open 破坏串行不变量。
     /// 救援线程自带一名超编名额（退出判定线 target+1），跑完队首任务后
     /// 留编为常规读者（原超编读者在队列排空时对账退出）
     pub fn watchdog(self: &Arc<Self>) {
         let queued = self.queued_all();
-        if queued == 0 {
-            return;
-        }
+        // 基准三：队列持续非空起始时刻。本帧首次见非空 → 起表并让过本帧
+        // （排空清零）；空闲时长不计入，任务排队时长才是卡死嫌疑
+        let wait_since = {
+            let mut w = self.queue_wait_since.lock().unwrap();
+            if queued == 0 {
+                *w = None;
+                return;
+            }
+            *w.get_or_insert_with(Instant::now)
+        };
         let stall = if self.heavy_in_flight.load(Ordering::Relaxed) > 0 {
             READ_STALL * 3
         } else {
@@ -325,7 +341,7 @@ impl IoScheduler {
         let base = {
             let last = *self.last_read_finished.lock().unwrap();
             let rescued = *self.last_rescue.lock().unwrap();
-            last.max(rescued)
+            last.max(wait_since).max(rescued)
         };
         if base.elapsed() <= stall {
             return;
@@ -631,9 +647,10 @@ mod tests {
         // 队列非空但时间戳新鲜：不触发
         s.watchdog();
         assert_eq!(s.queued(IoClass::Prefetch), 2, "看门狗不应误触发");
-        // 伪造时间戳：很久无读毕且无救援
+        // 伪造时间戳：很久无读毕、无救援、队列已持续非空超阈值
         *s.last_read_finished.lock().unwrap() = Instant::now() - READ_STALL;
         *s.last_rescue.lock().unwrap() = Instant::now() - READ_STALL;
+        *s.queue_wait_since.lock().unwrap() = Some(Instant::now() - READ_STALL);
         s.watchdog();
         // 救援取走队首 rescued-a（优先级序）执行
         let got = rrx
@@ -652,6 +669,43 @@ mod tests {
         }
         assert!(s.readers_active() <= 1, "超编名额应在队列排空后对账退出");
         let _ = rx.recv_timeout(Duration::from_secs(2));
+    }
+
+    /// 看门狗误报回归：空闲期（>stall 无读毕）后首批任务入队不得触发救援
+    /// ——入队基准重置，空闲时长 ≠ 卡死时长（raw 对比入队 17ms 即误报实测）
+    #[test]
+    fn watchdog_空闲后首批入队不误判() {
+        let s = IoScheduler::new(&cfg(1));
+        // 占住唯一读线程的重活（模拟 raw 整帧在读，heavy → 3× 宽限）
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        s.submit(IoJob {
+            name: "heavy-in-flight".into(),
+            class: IoClass::Decode,
+            token: 0,
+            heavy: true,
+            work: Box::new(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(Vec::new())
+            }),
+            on_done: Box::new(move |_| {
+                let _ = done_tx.send(());
+            }),
+        });
+        started_rx.recv().unwrap();
+        // 伪造空闲期：上次读毕与上次救援都停在很久前（在读任务不刷新基准）
+        let stale = Instant::now() - READ_STALL * 4;
+        *s.last_read_finished.lock().unwrap() = stale;
+        *s.last_rescue.lock().unwrap() = stale;
+        // 空闲期后首批任务入队：队列非空基准从本帧起表 → 看门狗不得误判
+        s.submit(job(IoClass::Decode, "first-after-idle"));
+        s.watchdog();
+        assert_eq!(s.queued(IoClass::Decode), 1, "新任务应仍在队列待读");
+        assert_eq!(s.readers_active(), 1, "不得派救援线程");
+        release_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
     }
 
     /// cancel_token：按提交令牌摘除仍在排队的旧任务（防看门狗重发堆积）；
