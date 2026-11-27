@@ -15,14 +15,20 @@
 //! AUMID 归属：winit 不设置 AppUserModelID（任务栏按钮按 exe 路径启发式
 //! 分组），带显式 AUMID 的最近项无法归入——进程级
 //! SetCurrentProcessExplicitAppUserModelID 须在建窗前调用认领同一标识。
+//! **显式 AUMID 必须有对应的已安装快捷方式**（PKEY_AppUserModel_ID 属性），
+//! Shell 才能把任务栏按钮解析为可固定应用：实测无快捷方式时拖文件到任务
+//! 栏图标直接红色拒绝（v1 无 AUMID 时是正常的"固定到"提示）——
+//! ensure_start_menu_shortcut 在启动时补齐用户级快捷方式。
 //! UI 线程 COM 由 winit 初始化（CoInitializeEx APARTMENTTHREADED），
 //! add 只能在 UI 线程调用（打开链路的 apply_open_done 满足）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows_sys::core::{GUID, PCWSTR};
 use windows_sys::Win32::Foundation::PROPERTYKEY;
-use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows_sys::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows_sys::Win32::System::Variant::VT_LPWSTR;
 use windows_sys::Win32::UI::Shell::{
@@ -38,8 +44,7 @@ const APP_ID: &str = "snowjinight.archview\0";
 const CLSID_SHELL_LINK: GUID = guid(0x00021401, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
 const IID_ISHELL_LINK_W: GUID = guid(0x000214F9, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
 const IID_IPROPERTY_STORE: GUID = guid(0x886D8EEB, 0x8CF2, 0x4446, [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99]);
-/// IPersistFile（回环测试存/读 .lnk 用）
-#[cfg(test)]
+/// IPersistFile（存 .lnk：开始菜单快捷方式 + 回环测试）
 const IID_IPERSIST_FILE: GUID = guid(0x0000010B, 0x0000, 0x0000, [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
 /// System.Title 的 fmtid（文档属性集 FMTID_DocumentSummaryInformation），
 /// pid 2 = Title
@@ -47,18 +52,87 @@ const KEY_TITLE: PROPERTYKEY = PROPERTYKEY {
     fmtid: guid(0xF29F85E0, 0x4FF9, 0x1068, [0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27, 0xB3, 0xD9]),
     pid: 2,
 };
+/// System.AppUserModel.ID（pid 5）：开始菜单快捷方式带此属性后，Shell
+/// 才能把显式 AUMID 解析为已安装应用（GUID 核自 windows-0.62.2 生成码）
+const KEY_APP_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: guid(0x9F4C2855, 0x9F79, 0x4B39, [0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3]),
+    pid: 5,
+};
 
 const fn guid(d1: u32, d2: u16, d3: u16, b: [u8; 8]) -> GUID {
     GUID { data1: d1, data2: d2, data3: d3, data4: b }
 }
 
 /// 进程级认领 AUMID：须在窗口创建前调用。重复设置返回失败——忽略
-/// （每进程只调一次，此处不构成问题）
+/// （每进程只调一次，此处不构成问题）。顺带补齐开始菜单快捷方式
+/// （显式 AUMID 的解析前提，见模块文档）
 pub fn init_app_id() {
     let id: Vec<u16> = APP_ID.encode_utf16().collect();
     unsafe {
         let _ = SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+        ensure_start_menu_shortcut();
     }
+}
+
+/// 确保用户级开始菜单存在带本应用 AUMID 的快捷方式（exe 基名.lnk）。
+/// 已存在则不重写（不刷新时间戳/不覆盖用户自定义）；失败静默
+unsafe fn ensure_start_menu_shortcut() {
+    // 建窗前 winit 尚未初始化 COM，这里自初始化（进程生命周期内不卸载；
+    // 已初始化返回 S_FALSE/RPC_E_CHANGED_MODE 均无害）
+    if CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(name) = exe.file_stem().and_then(|n| n.to_str()) else { return };
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let lnk = PathBuf::from(appdata)
+        .join(r"Microsoft\Windows\Start Menu\Programs")
+        .join(format!("{name}.lnk"));
+    if lnk.exists() {
+        return;
+    }
+    let exe_w: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
+    let lnk_w: Vec<u16> = lnk.to_string_lossy().encode_utf16().chain([0]).collect();
+    let app_id_w: Vec<u16> = APP_ID.encode_utf16().collect();
+
+    let mut link: *mut core::ffi::c_void = std::ptr::null_mut();
+    if CoCreateInstance(&CLSID_SHELL_LINK, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_ISHELL_LINK_W, &mut link) != 0
+        || link.is_null()
+    {
+        return;
+    }
+    type HrPcwFn = unsafe extern "system" fn(*mut core::ffi::c_void, PCWSTR) -> i32;
+    let set_path: HrPcwFn = vtable_slot(link, 20);
+    let set_icon: unsafe extern "system" fn(*mut core::ffi::c_void, PCWSTR, i32) -> i32 =
+        vtable_slot(link, 17);
+    let _ = set_path(link, exe_w.as_ptr());
+    let _ = set_icon(link, exe_w.as_ptr(), 0);
+
+    // 快捷方式带 PKEY_AppUserModel_ID = APP_ID：Shell 据此把 AUMID 解析回
+    // 本 exe（任务栏按钮固定/拖入/jump list 归属的前提）
+    let qi: unsafe extern "system" fn(*mut core::ffi::c_void, *const GUID, *mut *mut core::ffi::c_void) -> i32 =
+        vtable_slot(link, 0);
+    let mut store: *mut core::ffi::c_void = std::ptr::null_mut();
+    if qi(link, &IID_IPROPERTY_STORE, &mut store) == 0 && !store.is_null() {
+        let mut pv = PROPVARIANT::default();
+        pv.Anonymous.Anonymous.vt = VT_LPWSTR;
+        pv.Anonymous.Anonymous.Anonymous.pwszVal = app_id_w.as_ptr() as *mut u16;
+        let set_value: unsafe extern "system" fn(*mut core::ffi::c_void, *const PROPERTYKEY, *const PROPVARIANT) -> i32 =
+            vtable_slot(store, 6);
+        let commit: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32 = vtable_slot(store, 7);
+        let _ = set_value(store, &KEY_APP_ID, &pv);
+        let _ = commit(store);
+        release(store);
+    }
+
+    let mut persist: *mut core::ffi::c_void = std::ptr::null_mut();
+    if qi(link, &IID_IPERSIST_FILE, &mut persist) == 0 && !persist.is_null() {
+        let save: unsafe extern "system" fn(*mut core::ffi::c_void, PCWSTR, i32) -> i32 =
+            vtable_slot(persist, 6);
+        let _ = save(persist, lnk_w.as_ptr(), 0);
+        release(persist);
+    }
+    release(link);
 }
 
 /// 打开成功后登记进任务栏「最近」（仅 UI 线程调用）。失败静默：增强
