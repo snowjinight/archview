@@ -8,7 +8,7 @@
 
 pub mod classify;
 
-use crate::vfs::{ArchiveVFS, VfsError, VirtualEntry};
+use crate::vfs::{ArchiveVFS, ExtractPhase, VfsError, VirtualEntry};
 use classify::{classify_file_name, ClassifyResult};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -412,7 +412,7 @@ fn execute_plan(
     let promoted = std::cell::Cell::new(0usize);
     let cancel = std::sync::atomic::AtomicBool::new(false);
 
-    let progress = |done: u64, stage: &str| {
+    let progress = |phase: ExtractPhase, done: u64, _total: u64| {
         {
             let mut last = last_print.borrow_mut();
             if last.elapsed() < PROGRESS_THROTTLE {
@@ -420,13 +420,12 @@ fn execute_plan(
             }
             *last = Instant::now();
         }
+        // VarTidy 的目标是批内全部条目，无前置跳过/预取段——只关心写入段
+        if phase != ExtractPhase::Target {
+            return;
+        }
         let mb = done / 1024 / 1024;
-        let msg = if stage.is_empty() {
-            format!("[{display}] 解压中… {mb} MB")
-        } else {
-            format!("[{display}] {stage} · {mb} MB")
-        };
-        (out_cell.borrow_mut())(&msg);
+        (out_cell.borrow_mut())(&format!("[{display}] 解压中… {mb} MB"));
     };
 
     let file_done = |i: usize| {

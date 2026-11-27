@@ -1268,7 +1268,7 @@ mod tests {
             &entries[0],
             &extracted,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
         )
         .unwrap();
         assert_eq!(

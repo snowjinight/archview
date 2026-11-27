@@ -2,7 +2,9 @@
 //! sevenz-rust 只支持顺序解压（固态块内 seek 需从块头重解），因此 open_entry 不支持，
 //! 播放走后台解压到缓存目录 → 播放本地文件。
 
-use super::{AccessMode, ArchiveVFS, SharedSession, VfsError, VirtualEntry, VirtualFile};
+use super::{
+    AccessMode, ArchiveVFS, ExtractPhase, SharedSession, VfsError, VirtualEntry, VirtualFile,
+};
 use sevenz_rust::{Password, SevenZReader};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -145,7 +147,7 @@ impl ArchiveVFS for SevenzVFS {
         entry: &VirtualEntry,
         dest: &Path,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
     ) -> Result<(), VfsError> {
         self.extract_batch(&[(entry, dest)], cancel, progress, &|_| {})
     }
@@ -163,7 +165,7 @@ impl ArchiveVFS for SevenzVFS {
         &self,
         targets: &[(&VirtualEntry, &Path)],
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize),
     ) -> Result<(), VfsError> {
         use std::collections::{BTreeSet, HashMap};
@@ -230,7 +232,9 @@ impl ArchiveVFS for SevenzVFS {
                 if let Some(&ti) = remaining.get(e.name.as_str()) {
                     let dest = targets[ti].1;
                     left_in_folder -= 1;
-                    write_entry_data(data, e.size, dest, progress)?;
+                    // 静态批不知道批内目标的物理次序（UI 传入顺序 = 点击项
+                    // 优先），一律按目标写入段上报
+                    write_entry_data(data, e.size, dest, ExtractPhase::Target, 0, e.size, progress)?;
                     remaining.remove(e.name.as_str());
                     file_done(ti);
                     // 本 folder 目标全部解出：停止迭代（后续 folder 由外层循环处理）
@@ -240,13 +244,16 @@ impl ArchiveVFS for SevenzVFS {
                     // 相接，crate 的 BoundedReader 不带 drop-skip，不消费数据
                     // 会导致后续 entry 读取整体错位、CRC 校验失败
                     // （solid_7z_extract_later_entry 回归测试覆盖此路径）。
-                    // 按条目数 + 字节数上报进度（字节可见"在动"，不像卡死）
-                    // 读侧错误保留 io 形态（坏密码路径同上）
-                    std::io::copy(data, &mut std::io::sink()).map_err(sevenz_rust::Error::io)?;
+                    // 计数 sink 就地丢弃 + 按 4MB 粒度上报跳过段进度
+                    // （字节可见"在动"，不像卡死）；读侧错误保留 io 形态
+                    // （坏密码路径同上）。静态批无 list 下标，跳过段无法算
+                    // 定比总量（total=0 = 无分母，UI 显示活动指示）
+                    let mut sink = PhaseSink::new(ExtractPhase::SkipUp, 0, 0, progress);
+                    std::io::copy(data, &mut sink).map_err(sevenz_rust::Error::io)?;
                     skipped += 1;
-                    skipped_bytes += e.size;
+                    skipped_bytes += sink.n;
                     if skipped.is_multiple_of(64) {
-                        progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                        progress(ExtractPhase::SkipUp, skipped_bytes, 0);
                     }
                     Ok(true)
                 }
@@ -296,7 +303,7 @@ impl ArchiveVFS for SevenzVFS {
         &self,
         session: &SharedSession,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize, &Path),
     ) -> Result<(), VfsError> {
         use std::collections::BTreeSet;
@@ -309,10 +316,18 @@ impl ArchiveVFS for SevenzVFS {
             .clone()
             .unwrap_or_else(Password::empty)
             .to_vec();
+        // 条目名 → 下标：非目标条目按其下标与 focus 的相对位置分入
+        // SkipUp（focus 之前）/ Downstream（focus 之后）段
+        let idx_of: std::collections::HashMap<&str, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.as_str(), i))
+            .collect();
 
         loop {
             // ---- 规划：持锁快照目标集 → folder 分组 + focus 优先 ----
-            let (folders, focus_folder, zero_streams, round_gen) = {
+            let (folders, focus_folder, zero_streams, round_gen, focus_idx, tgt_idx) = {
                 // 判空/取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
                 let mut st = session.lock().unwrap();
                 if cancel.load(Ordering::Relaxed) {
@@ -346,8 +361,75 @@ impl ArchiveVFS for SevenzVFS {
                             .is_some_and(|e| st.targets.contains_key(&e.name))
                     })
                     .and_then(|fi| self.folder_of.get(fi).copied().flatten());
-                (folders, focus_folder, zero, round_gen)
+                // 分段锚点：focus 指针（无 focus = 最小目标下标）；目标下标集合
+                // （含 0 字节无流条目，totals 只按有流部分累计）
+                let focus_idx = st.focus.unwrap_or_else(|| {
+                    st.targets.values().map(|(i, _)| *i).min().unwrap_or(0)
+                });
+                let tgt_idx: std::collections::HashSet<usize> =
+                    st.targets.values().map(|(i, _)| *i).collect();
+                (folders, focus_folder, zero, round_gen, focus_idx, tgt_idx)
             };
+            // 锁外统计本轮各段定比总量（entries/folder_of 为 open 缓存，无 IO）。
+            // 只计"本轮解码 folder 内 [folder 首条目, 该 folder 最后一个目标]"的
+            // 条目——folder 解码到目标解净即停，其后的条目不会流经，计入会
+            // 令分母虚大、bar 永远到不了 100%。focus 之前的目标计入 Upstream
+            // （预取落地）、非目标计入 SkipUp（穿过丢弃）；focus 本体 Target；
+            // focus 之后到批末整段流计入 Downstream（目标落地与段内非目标
+            // 跳过都算——搜索过滤/标签页隐藏/缓存命中条目会夹在批内目标之间）
+            let mut totals = [(0u64, 0u64); ExtractPhase::COUNT];
+            if let Some(&last) = tgt_idx.iter().max() {
+                // folder → 该 folder 内最后一个目标下标（解码的实际停止点）
+                let mut stop: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for &i in &tgt_idx {
+                    if let Some(Some(f)) = self.folder_of.get(i) {
+                        stop.entry(*f)
+                            .and_modify(|s| *s = (*s).max(i))
+                            .or_insert(i);
+                    }
+                }
+                for i in 0..=last {
+                    if let Some(Some(f)) = self.folder_of.get(i).copied() {
+                        if !folders.contains(&f) {
+                            continue;
+                        }
+                        let Some(&s) = stop.get(&f) else {
+                            continue;
+                        };
+                        if i > s {
+                            continue;
+                        }
+                        let size = self.entries[i].size;
+                        let ph = if i == focus_idx {
+                            ExtractPhase::Target
+                        } else if i < focus_idx {
+                            if tgt_idx.contains(&i) {
+                                ExtractPhase::Upstream
+                            } else {
+                                ExtractPhase::SkipUp
+                            }
+                        } else {
+                            ExtractPhase::Downstream
+                        };
+                        totals[ph as usize].1 += size;
+                    }
+                }
+            }
+            // 开工协议：发 Locate(0,0)（总量 0 → UI 显示定位 spinner）+
+            // 各非零段 (0, total)（UI 画空 bar 骨架）
+            progress(ExtractPhase::Locate, 0, 0);
+            for ph in [
+                ExtractPhase::SkipUp,
+                ExtractPhase::Upstream,
+                ExtractPhase::Target,
+                ExtractPhase::Downstream,
+            ] {
+                let t = totals[ph as usize].1;
+                if t > 0 {
+                    progress(ph, 0, t);
+                }
+            }
             let mut landed: usize = 0; // 本轮落地数（无进展保险的判据）
                                        // 无 folder 条目：锁外写空文件 → 锁内 remove 成功才算落地
             for (name, idx, dest) in zero_streams {
@@ -371,6 +453,12 @@ impl ArchiveVFS for SevenzVFS {
                     order.insert(0, ff);
                 }
             }
+
+            // 轮级段游标（跨 folder 累计，条目相对 focus 分段，与解码序无关）
+            let (mut skip_cur, mut up_cur, mut down_cur) = (0u64, 0u64, 0u64);
+            let skip_total = totals[ExtractPhase::SkipUp as usize].1;
+            let up_total = totals[ExtractPhase::Upstream as usize].1;
+            let down_total = totals[ExtractPhase::Downstream as usize].1;
 
             let mut interrupted = false;
             for &fi in &order {
@@ -398,8 +486,7 @@ impl ArchiveVFS for SevenzVFS {
                     }
                 };
                 let dec = sevenz_rust::BlockDecoder::new(fi, archive, &pw, &mut src);
-                let mut skipped: usize = 0;
-                let mut skipped_bytes: u64 = 0;
+                let mut seg_since_report: usize = 0; // 距上次段进度节流上报的条目数
                 let r = dec.for_each_entries(&mut |e, data| {
                     if cancel.load(Ordering::Relaxed) {
                         return Err(sevenz_rust::Error::other("cancelled"));
@@ -426,7 +513,28 @@ impl ArchiveVFS for SevenzVFS {
                         return Ok(false); // 中断本 folder，外层重排抢道 focus
                     }
                     if let Some((idx, dest)) = tgt {
-                        write_entry_data(data, e.size, &dest, progress)?;
+                        // 目标按其下标与 focus 的相对位置分入 Target/Upstream/
+                        // Downstream 段：写前 (base, seg_total) 起点上报、写中
+                        // 4MB 粒度、写完落地后推进段游标再报一次
+                        let (phase, base, seg_total) = if idx == focus_idx {
+                            (ExtractPhase::Target, 0u64, e.size)
+                        } else if idx < focus_idx {
+                            (ExtractPhase::Upstream, up_cur, up_total)
+                        } else {
+                            (ExtractPhase::Downstream, down_cur, down_total)
+                        };
+                        write_entry_data(data, e.size, &dest, phase, base, seg_total, progress)?;
+                        match phase {
+                            ExtractPhase::Upstream => {
+                                up_cur += e.size;
+                                progress(phase, up_cur, up_total);
+                            }
+                            ExtractPhase::Downstream => {
+                                down_cur += e.size;
+                                progress(phase, down_cur, down_total);
+                            }
+                            _ => {} // Target 由 write_entry_data 报满
+                        }
                         let hit = session
                             .lock()
                             .unwrap()
@@ -443,13 +551,37 @@ impl ArchiveVFS for SevenzVFS {
                         if folder_clear {
                             return Ok(false);
                         }
-                        // 非目标条目顺序消费丢弃（solid 流不可跳，同 extract_batch）
-                        std::io::copy(data, &mut std::io::sink())
-                            .map_err(sevenz_rust::Error::io)?;
-                        skipped += 1;
-                        skipped_bytes += e.size;
-                        if skipped.is_multiple_of(64) {
-                            progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                        // 非目标条目顺序消费丢弃（solid 流不可跳，同 extract_batch），
+                        // 按条目下标与 focus 相对位置分入 SkipUp/Downstream 段
+                        let is_down = idx_of
+                            .get(e.name.as_str())
+                            .is_some_and(|&i| i >= focus_idx);
+                        if is_down {
+                            let mut sink = PhaseSink::new(
+                                ExtractPhase::Downstream,
+                                down_cur,
+                                down_total,
+                                progress,
+                            );
+                            std::io::copy(data, &mut sink).map_err(sevenz_rust::Error::io)?;
+                            down_cur += sink.n;
+                        } else {
+                            let mut sink = PhaseSink::new(
+                                ExtractPhase::SkipUp,
+                                skip_cur,
+                                skip_total,
+                                progress,
+                            );
+                            std::io::copy(data, &mut sink).map_err(sevenz_rust::Error::io)?;
+                            skip_cur += sink.n;
+                        }
+                        seg_since_report += 1;
+                        if seg_since_report.is_multiple_of(64) {
+                            if is_down {
+                                progress(ExtractPhase::Downstream, down_cur, down_total);
+                            } else {
+                                progress(ExtractPhase::SkipUp, skip_cur, skip_total);
+                            }
                         }
                         Ok(true)
                     }
@@ -581,28 +713,89 @@ pub(crate) fn copy_with_progress(
     Ok(done)
 }
 
+/// 计数丢弃 sink：solid 流内非目标条目的数据必须顺序消费（不可跳），
+/// 但内容无用——就地统计字节数并按 4MB 粒度上报所属段（SkipUp/
+/// Downstream）的进度。base = 段内已累计游标（跨 folder 连续），total =
+/// 段定比总量（0 = 无分母，UI 走活动指示）
+struct PhaseSink<'a> {
+    phase: ExtractPhase,
+    base: u64,
+    total: u64,
+    n: u64,
+    last_report: u64,
+    progress: &'a dyn Fn(ExtractPhase, u64, u64),
+}
+
+impl<'a> PhaseSink<'a> {
+    fn new(
+        phase: ExtractPhase,
+        base: u64,
+        total: u64,
+        progress: &'a dyn Fn(ExtractPhase, u64, u64),
+    ) -> Self {
+        Self {
+            phase,
+            base,
+            total,
+            n: 0,
+            last_report: 0,
+            progress,
+        }
+    }
+}
+
+impl Write for PhaseSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.n += buf.len() as u64;
+        if self.n - self.last_report >= 4 * 1024 * 1024 {
+            let cur = if self.total > 0 {
+                (self.base + self.n).min(self.total)
+            } else {
+                self.base + self.n
+            };
+            (self.progress)(self.phase, cur, self.total);
+            self.last_report = self.n;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// 单条目落地：临时文件 + 进度拷贝 + flush + 原子改名，失败清理半截临时文件
 /// （并发解压同一 dest 时互不覆盖写坏缓存）。读侧错误（解码/CRC 失败）保留
 /// io 形态——可能是坏密码，sevenz-rust 在 maybe_bad_password 里把 io 错误
 /// 转成 MaybeBadPassword → VfsError::Password（UI 弹密码框重试的关键路径）。
-/// extract_batch 与 extract_session 共用
+/// 进度按 (phase, base+已写字节, total) 上报：total=0 无分母走活动指示，
+/// base = 该条目在本段内的起始游标（Target 段传 0/条目自身尺寸）
 fn write_entry_data(
     data: &mut dyn Read,
     size: u64,
     dest: &Path,
-    progress: &dyn Fn(u64, &str),
+    phase: ExtractPhase,
+    base: u64,
+    total: u64,
+    progress: &dyn Fn(ExtractPhase, u64, u64),
 ) -> Result<(), sevenz_rust::Error> {
     let tmp = super::tmp_path(dest);
     let res = (|| -> Result<(), sevenz_rust::Error> {
         let mut out = std::fs::File::create(&tmp).map_err(|err| {
             sevenz_rust::Error::other(format!("创建临时文件失败 [{}]: {err}", tmp.display()))
         })?;
-        copy_with_progress(data, &mut out, size, &|done| progress(done, "")).map_err(|err| {
-            match err {
-                CopyErr::Read(e) => sevenz_rust::Error::io(e),
-                CopyErr::Write(e) => {
-                    sevenz_rust::Error::other(format!("写入临时文件失败 [{}]: {e}", tmp.display()))
-                }
+        copy_with_progress(data, &mut out, size, &|done| {
+            let cur = if total > 0 {
+                (base + done).min(total)
+            } else {
+                base + done
+            };
+            progress(phase, cur, total)
+        })
+        .map_err(|err| match err {
+            CopyErr::Read(e) => sevenz_rust::Error::io(e),
+            CopyErr::Write(e) => {
+                sevenz_rust::Error::other(format!("写入临时文件失败 [{}]: {e}", tmp.display()))
             }
         })?;
         out.flush()
@@ -663,7 +856,7 @@ mod tests {
             &a,
             &dest,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {
+            &|_, _, _| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
         )
@@ -737,7 +930,7 @@ mod tests {
                 e,
                 &dest,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {},
+                &|_, _, _| {},
             )
             .unwrap_or_else(|e| panic!("solid 包第 {} 个条目 [{}] 解压失败: {e}", i + 1, name));
             let mut data = Vec::new();
@@ -806,7 +999,7 @@ mod tests {
             &listed[2],
             &dest_c,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
         )
         .unwrap();
         let mut data = Vec::new();
@@ -823,7 +1016,7 @@ mod tests {
         vfs.extract_batch(
             &[(&listed[0], &dest_a), (&listed[2], &dest_c2)],
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|_| {
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -888,7 +1081,7 @@ mod tests {
         vfs.extract_batch(
             &[(&listed[0], &d1), (&listed[2], &d3)],
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|_| {
                 done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -1028,7 +1221,7 @@ mod tests {
             &listed[1],
             &dest,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
         )
         .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), srcs[1].1);
@@ -1100,7 +1293,7 @@ mod tests {
                 &entries[0],
                 &dest,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {}
+                &|_, _, _| {}
             ),
             Err(VfsError::Password)
         ));
@@ -1111,7 +1304,7 @@ mod tests {
                 &entries[0],
                 &dest,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {}
+                &|_, _, _| {}
             ),
             Err(VfsError::Password)
         ));
@@ -1122,7 +1315,7 @@ mod tests {
                 &entries[0],
                 &dest,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {},
+                &|_, _, _| {},
             )
             .unwrap();
         let data = std::fs::read(&dest).unwrap();
@@ -1199,7 +1392,7 @@ mod tests {
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|idx, path| {
                 done_idx.store(idx as u64, std::sync::atomic::Ordering::Relaxed);
                 assert_eq!(path, d3.as_path(), "落地路径应为 f3 的目标路径");
@@ -1222,7 +1415,7 @@ mod tests {
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|_, _| {
                 panic!("空目标会话不应回调 file_done");
             },
@@ -1241,7 +1434,7 @@ mod tests {
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|idx, _| order.lock().unwrap().push(idx),
         )
         .unwrap();
@@ -1265,7 +1458,7 @@ mod tests {
             vfs.extract_session(
                 &s2,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {},
+                &|_, _, _| {},
                 &|_, _| { panic!("不存在的目标不应落地") }
             ),
             Err(VfsError::Archive(_))
@@ -1330,14 +1523,15 @@ mod tests {
             st.focus = Some(64);
             st.alive = true;
         }
-        // progress 回调里模拟 UI 重定向（一次性）：跳过计数满 64（即
-        // n63 消费完、n64 未到）时整体换目标——与 UI 重定向锁块同协议
+        // progress 回调里模拟 UI 重定向（一次性）：跳过段字节数非零（即
+        // n63 消费完、n64 未到——初始 (0, total) 骨架上报被 cur>0 过滤掉）
+        // 时整体换目标——与 UI 重定向锁块同协议
         let redirected = std::sync::atomic::AtomicBool::new(false);
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, stage| {
-                if !stage.starts_with("跳过前置文件") {
+            &|phase, cur, _total| {
+                if phase != ExtractPhase::SkipUp || cur == 0 {
                     return;
                 }
                 if redirected.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -1397,7 +1591,7 @@ mod tests {
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|idx, _| {
                 done.lock().unwrap().push(idx);
                 // 落地即追加下一个目标（模拟 UI 组批）
@@ -1505,7 +1699,7 @@ mod tests {
         vfs.extract_session(
             &s,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|idx, _| {
                 order.lock().unwrap().push(idx);
                 if idx == g1 {

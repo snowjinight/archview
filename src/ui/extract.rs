@@ -553,7 +553,7 @@ impl App {
         }
         // 只读规划段：借 archive 组批并产出 owned 数据。后续预检/重定向/
         // spawn 都要可变借用 self（方法调用借整个 self），须先结束 arch 借用
-        let (cached, was_pending, session, vfs, dir, dest, name, total, targets, batch_bytes) = {
+        let (cached, was_pending, session, vfs, dir, dest, name, targets, batch_bytes) = {
             let Some(arch) = &self.archive else { return };
             let entry = &arch.entries[entry_idx];
             let dir = cache::cache_dir(&self.cfg);
@@ -604,7 +604,6 @@ impl App {
                 dir,
                 dest,
                 entry.name.clone(),
-                entry.size,
                 targets,
                 batch_bytes,
             )
@@ -641,9 +640,7 @@ impl App {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                j.total = total;
-                j.done = 0;
-                j.stage = String::new();
+                j.phases = [(0, 0); ExtractPhase::COUNT];
             }
             tracing::debug!(
                 "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项，窗口 {win}",
@@ -667,9 +664,7 @@ impl App {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                j.total = total;
-                j.done = 0;
-                j.stage = String::new();
+                j.phases = [(0, 0); ExtractPhase::COUNT];
             }
             tracing::debug!(
                 "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
@@ -756,9 +751,7 @@ impl App {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                j.total = total;
-                j.done = 0;
-                j.stage = String::new();
+                j.phases = [(0, 0); ExtractPhase::COUNT];
                 j.pending = pending;
                 j.batch_len = batch_len;
                 // started 仅批外新目标重置：批内切换/缓存命中沿用（覆盖层
@@ -815,8 +808,8 @@ impl App {
                 let r = vfs.extract_session(
                     &session_for_thread,
                     &cancel_for_thread,
-                    &|done, stage| {
-                        let _ = tx.send(ExtMsg::Progress(done, stage.to_string()));
+                    &|phase, done, total| {
+                        let _ = tx.send(ExtMsg::Progress(phase, done, total));
                         egui_ctx.request_repaint();
                     },
                     &|idx, _path| {
@@ -855,9 +848,7 @@ impl App {
             entry_idx,
             dest,
             entry_name: name,
-            total,
-            done: 0,
-            stage: String::new(),
+            phases: [(0, 0); ExtractPhase::COUNT],
             pending,
             batch_len,
             started: std::time::Instant::now(),
@@ -885,19 +876,14 @@ impl App {
                 job.entry_name.clone(),
             );
             match msg {
-                ExtMsg::Progress(done, stage) => {
-                    if let Some(j) = &mut self.extract {
-                        // 写文件阶段（stage 空）的字节数按目标尺寸封顶：批内
-                        // 前置预取文件先于目标落地，其写入进度若直接进目标
-                        // 进度条会出现"300MB / 60MB"的怪相（跳过阶段 stage
-                        // 非空、按字节文本展示，不受影响）
-                        j.done = if stage.is_empty() {
-                            done.min(j.total)
-                        } else {
-                            done
-                        };
-                        j.stage = stage;
-                    }
+                ExtMsg::Progress(phase, done, total) => {
+                if let Some(j) = &mut self.extract {
+                    // 按段直写 (当前, 总量)：总量>0 时字节封顶（上报侧
+                    // min 已保证，双保险）；总量=0 的段走活动指示不写比值
+                    let slot = &mut j.phases[phase as usize];
+                    slot.0 = if total > 0 { done.min(total) } else { done };
+                    slot.1 = total;
+                }
                     // 继续排空而非 return：Progress 若每帧只消费一条（10fps
                     // ≈ 10条/秒），高速率落地时通道积压分钟级——线程退出后
                     // 浮层仍转圈（用户误判会话活着，实际 alive 已 false）、

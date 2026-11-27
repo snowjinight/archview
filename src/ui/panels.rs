@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::rawdec;
+use crate::vfs::ExtractPhase;
 use egui::AtomExt;
 
 /// 进度条/播放头主题色
@@ -334,6 +335,17 @@ impl App {
                     ui.visuals().weak_text_color(),
                     format!("后台解压中…（剩余 {left} 项）"),
                 );
+                // Downstream 段 mini bar：固定槽位 140×6、无内嵌文字——宽度
+                // 与高度恒定，不会随内容变化挤压相邻元素或撑高顶栏跳行。
+                // 目标落地后覆盖层消失，这是下游预取进度唯一可见处
+                let (dc, dt) = j.phases[ExtractPhase::Downstream as usize];
+                if dt > 0 {
+                    ui.add(
+                        egui::ProgressBar::new((dc as f32 / dt as f32).clamp(0.0, 1.0))
+                            .desired_width(140.0)
+                            .desired_height(6.0),
+                    );
+                }
             }
             // 评级按需探测扫描中（提交/完成计数差 >0，含在途读——队列深度
             // 漏算已出队在读的段）：顶栏短标记 + 百分比。基数 = 提交计数；
@@ -1080,24 +1092,50 @@ impl App {
                     .as_ref()
                     .map(|a| a.entries[f].name.clone())
                     .unwrap_or_default();
+                // 感知序号：与顶栏 [n/total] 同源（当前标签页 list_rows 位置+1），
+                // 不用 entries 内部下标（sort_files/跨标签页时两者不同）；
+                // 目标不在当前标签页（如正播视频、列表停在图片页）回退只显文件名
+                let pos = self
+                    .list_rows
+                    .iter()
+                    .position(|r| r.idx == f)
+                    .map(|p| format!("[{}/{}] ", p + 1, self.list_rows.len()));
+                let target = match pos {
+                    Some(p) => format!("{p}{entry_name}"),
+                    None => entry_name.clone(),
+                };
                 let area = sa.inner_rect;
                 let strip = egui::Rect::from_min_max(
                     egui::pos2(area.left(), area.bottom() - 48.0),
                     egui::pos2(area.right(), area.bottom() - 4.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                    // 背景全透明：不遮列表内容（叠加层视觉纯文字按钮）
+                    // 半透明琥珀底 + 琥珀字：隐约可见按钮存在又不遮列表内容
+                    //（与顶栏当前文件名同色相，dark 亮琥珀 / light 深琥珀）
+                    let amber = if ui.visuals().dark_mode {
+                        AMBER_DARK
+                    } else {
+                        AMBER_LIGHT
+                    };
+                    let fill = egui::Color32::from_rgba_unmultiplied(
+                        amber.r(),
+                        amber.g(),
+                        amber.b(),
+                        36,
+                    );
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         if ui
                             .add(
-                                egui::Button::new("跳至解压处")
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .corner_radius(6)
-                                    .min_size(egui::vec2(0.0, 40.0)),
+                                egui::Button::new(
+                                    egui::RichText::new("跳至解压处").color(amber),
+                                )
+                                .fill(fill)
+                                .corner_radius(6)
+                                .min_size(egui::vec2(0.0, 40.0)),
                             )
                             .on_hover_text(format!(
-                                "跳至解压处：{entry_name}（快捷键 B）。已落地则秒开，\
-                                 未落地则跳回等待、落地自动播放"
+                                "跳至解压处：{target} 若当前项解压完成则自动播放，\
+                                 未完成则跳回等待"
                             ))
                             .clicked()
                         {
@@ -1261,11 +1299,12 @@ impl App {
             if let Some(j) = &self.extract {
                 // 解压覆盖层：媒体区居中多行显示。顶栏一行放不下长文件名
                 // （曾被截断、进度条看不见），这里空间充足：完整文件名换行 +
-                // 阶段进度（solid 包跳过前置文件阶段无法算百分比 → 转圈 +
-                // 已解压字节数，让用户看到"在动"）+ 写文件阶段字节进度条
+                // 总进度条 + 三条分段并行小bar（跳过前置 / 上游预取落地 /
+                // 目标写入；Downstream 段画在顶栏 mini bar，见顶栏绘制）。
+                // 全段总量为 0（定位期/静态批无分母）→ spinner 活动指示
                 let rect = egui::Rect::from_center_size(
                     video.center(),
-                    egui::vec2(video.width().min(760.0), 170.0),
+                    egui::vec2(video.width().min(760.0), 250.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.vertical_centered(|ui| {
@@ -1287,21 +1326,51 @@ impl App {
                                 format!("{:.0} MB", b as f64 / 1024.0 / 1024.0)
                             }
                         };
-                        if !j.stage.is_empty() {
+                        let (skip, up, tgt, down) = (
+                            j.phases[ExtractPhase::SkipUp as usize],
+                            j.phases[ExtractPhase::Upstream as usize],
+                            j.phases[ExtractPhase::Target as usize],
+                            j.phases[ExtractPhase::Downstream as usize],
+                        );
+                        let sum_total = skip.1 + up.1 + tgt.1 + down.1;
+                        if sum_total == 0 {
                             ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new());
-                                ui.label(format!("{}（{}）", j.stage, human(j.done)));
+                                ui.label("正在定位目标…");
                             });
-                        } else if j.total > 0 {
+                        } else {
+                            let sum_done = skip.0 + up.0 + tgt.0 + down.0;
                             ui.add(
                                 egui::ProgressBar::new(
-                                    (j.done as f32 / j.total as f32).clamp(0.0, 1.0),
+                                    (sum_done as f32 / sum_total as f32).clamp(0.0, 1.0),
                                 )
-                                .text(format!("{} / {}", human(j.done), human(j.total)))
+                                .text(format!("{} / {}", human(sum_done), human(sum_total)))
                                 .desired_width(420.0),
                             );
-                        } else {
-                            ui.add(egui::Spinner::new());
+                            // 分段行：总量 0 的段不画（无分母，未开工或无该段）
+                            let row = |ui: &mut egui::Ui, label: &str, seg: (u64, u64)| {
+                                if seg.1 == 0 {
+                                    return;
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                    ui.add(
+                                        egui::ProgressBar::new(
+                                            (seg.0 as f32 / seg.1 as f32).clamp(0.0, 1.0),
+                                        )
+                                        .text(human(seg.0))
+                                        .desired_width(300.0),
+                                    );
+                                });
+                            };
+                            row(ui, "跳过前置文件", skip);
+                            row(ui, "上游预取落地", up);
+                            row(ui, "目标写入", tgt);
+                            let _ = down; // Downstream 在顶栏 mini bar 展示
                         }
                         if j.batch_len > 1 {
                             ui.add_space(6.0);

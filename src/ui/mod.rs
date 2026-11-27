@@ -30,7 +30,7 @@ use crate::player::PlayerService;
 use crate::vfs::dir_vfs::DirVFS;
 use crate::vfs::{
     archives_in_dir, next_archive_in_dir, open_with_password_probe, AccessMode, ArchiveVFS,
-    SessionState, SharedSession, VfsError, VirtualEntry,
+    ExtractPhase, SessionState, SharedSession, VfsError, VirtualEntry,
 };
 use egui::Widget;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,8 @@ mod extract;
 mod nav;
 mod open;
 mod panels;
+#[cfg(windows)]
+mod taskbar_drop;
 #[cfg(test)]
 mod tests;
 
@@ -223,11 +225,10 @@ struct ExtractJob {
     entry_idx: usize,
     dest: PathBuf,
     entry_name: String,
-    total: u64,
-    done: u64,
-    /// 当前阶段文字（空 = 正在写目标文件；非空 = solid 包跳过前置文件阶段，
-    /// 此时 done = 已顺序解压的字节数）
-    stage: String,
+    /// 各解压段的 (当前字节, 总量)（按 phase as usize 直寻）。总量 0 =
+    /// 该段无定比分母（UI 走活动指示）；SkipUp/Upstream/Target 为覆盖层
+    /// 三段，Downstream 为顶栏 mini bar（详见 ExtractPhase 语义）
+    phases: [(u64, u64); ExtractPhase::COUNT],
     /// 批内尚未解出的条目 → 目标路径（目标 + 预取）。条目落地（FileDone）
     /// 时移除；用户在批内切换目标时查此表决定"不取消只改期望"
     pending: std::collections::HashMap<usize, PathBuf>,
@@ -246,8 +247,8 @@ struct ExtractJob {
 }
 
 enum ExtMsg {
-    /// (字节数, 阶段文字)
-    Progress(u64, String),
+    /// (解压段, 该段当前字节, 该段总量)：总量 0 = 无定比分母（活动指示）
+    Progress(ExtractPhase, u64, u64),
     /// 批内某条目解压落地（临时文件改名完成）：参数 = 条目下标
     FileDone(usize),
     Done,
@@ -586,7 +587,7 @@ impl App {
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let orig_budget = (cfg.image.image_orig_cache_mb.clamp(64, 4096) as usize) * 1024 * 1024;
         let io = crate::iosched::IoScheduler::new(&cfg.io);
-        Self {
+        let app = Self {
             cfg,
             archive: None,
             search: String::new(),
@@ -670,7 +671,12 @@ impl App {
             delete_confirm: None,
             rating_dirty: std::collections::HashMap::new(),
             rating_sync: None,
-        }
+        };
+        // 任务栏驻留图标拖入通道（WM_DROPFILES 子类化，见 taskbar_drop）：
+        // 启动一次即可，失败静默（增强特性）
+        #[cfg(windows)]
+        taskbar_drop::install(cc);
+        app
     }
 
     /// 测试专用构造：绕开 eframe::CreationContext（单测无 egui 上下文，
@@ -971,6 +977,14 @@ impl eframe::App for App {
         // 拖放：压缩包文件拖入窗口即打开
         self.handle_dropped_files(&ctx);
         probe!("dropped");
+        // 任务栏驻留图标拖入（WM_DROPFILES 通道）：与窗口拖入同一条分流，
+        // 取第一条（多文件拖入忽略其余，同 handle_dropped_files 规则）
+        #[cfg(windows)]
+        if let Some(path) = taskbar_drop::drain().into_iter().next() {
+            self.open_path(path);
+        }
+        #[cfg(windows)]
+        probe!("taskbar_dropped");
         // 后台打开任务轮询（大包/网络盘）
         self.poll_open();
         probe!("poll_open");

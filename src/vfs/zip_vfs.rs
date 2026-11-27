@@ -4,7 +4,7 @@
 //! deflate 等压缩条目的 seek 由本模块实现：下游 seek（向文件尾）= 继续解压丢弃输出；
 //! 上游 seek（向文件头）= 重开 entry 从头解压丢弃到目标偏移（O(target)，架构文档"解码块 LRU"的未加缓存版本）。
 
-use super::{AccessMode, ArchiveVFS, VfsError, VirtualEntry, VirtualFile};
+use super::{AccessMode, ArchiveVFS, ExtractPhase, VfsError, VirtualEntry, VirtualFile};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -343,7 +343,7 @@ impl ArchiveVFS for ZipVFS {
         entry: &VirtualEntry,
         dest: &std::path::Path,
         _cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
     ) -> Result<(), VfsError> {
         let mut src = self.open_entry(entry)?;
         // 写临时文件 + 改名（与 7z/RAR 一致）：并发解压同一 dest 时不互相覆盖写坏缓存
@@ -355,9 +355,9 @@ impl ArchiveVFS for ZipVFS {
                 entry.name
             ))
         })?;
-        // zip 非固态：无跳过阶段，进度直接映射（阶段恒为空 = 写目标文件）
+        // zip 非固态：无跳过阶段，进度直接映射目标写入段
         super::sevenz_vfs::copy_with_progress(&mut src, &mut out, entry.size, &|done| {
-            progress(done, "")
+            progress(ExtractPhase::Target, done, entry.size)
         })
         .map_err(|e| {
             std::fs::remove_file(&tmp).ok(); // 清掉半截临时文件

@@ -144,6 +144,36 @@ impl From<std::io::Error> for VfsError {
     }
 }
 
+/// solid 慢路径解压流的分段进度阶段：解压回调以 `(阶段, 已推进字节, 阶段总量)`
+/// 上报，UI 据此并行绘制多条进度条（跳过段/上游段两条并行 + 目标条 + 总进度 +
+/// 目标落地后下游段转顶栏 mini bar）。各段以会话抢道锚点 focus（当前 UI 期望
+/// 的条目下标）为界：
+/// - [`ExtractPhase::SkipUp`]：解码区起点到 focus 之间的**非目标**条目——
+///   solid 流不可 seek，顺序解码后丢弃（RAR 整个前缀 / 7z focus folder 内
+///   目标之前的数据）
+/// - [`ExtractPhase::Upstream`]：同区间内的目标条目（上游预取，定位时顺带
+///   落地，零解码增量）
+/// - [`ExtractPhase::Target`]：focus 条目本体写入（用户正在等待的文件）
+/// - [`ExtractPhase::Downstream`]：focus 之后到批末目标的整段解码流——目标
+///   落地与段内非目标跳过**都计入推进**（段内可能夹搜索过滤条目/隐藏标签页
+///   的条目/缓存命中条目，只计落地字节会在这些夹缝处停滞）；常见情形
+///   （批内目标连续、无缓存命中）等价为纯落地进度
+/// - [`ExtractPhase::Locate`]：解码流打开/folder 直达定位（极短，总量 0，
+///   UI 显示 spinner）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractPhase {
+    Locate,
+    SkipUp,
+    Upstream,
+    Target,
+    Downstream,
+}
+
+impl ExtractPhase {
+    /// 阶段总数（UI 侧按 `phase as usize` 直寻的数组长度）
+    pub const COUNT: usize = 5;
+}
+
 /// 固实包解码会话的共享状态（UI ↔ 后台解码线程，见 `ArchiveVFS::extract_session`）。
 /// 相比 `extract_batch` 的静态批，目标集在解码过程中可被 UI 动态增删——
 /// 跳转不再取消解码流：同 folder 向下游跳零成本续解，跨 folder 只 seek。
@@ -200,9 +230,8 @@ pub trait ArchiveVFS: Send + Sync {
     /// - `cancel`：置位后实现应尽快返回 `VfsError::Cancelled`（用户切换了目标条目，
     ///   旧任务不再需要——solid 包跳过前置文件的阶段耗时可达分钟级，不取消会
     ///   与新任务并行抢占网络盘带宽）
-    /// - `progress`：(字节数, 阶段文字)。阶段为空串 = 正在写目标文件（字节数
-    ///   = 已写出）；非空 = 定位/跳过前置文件阶段（字节数 = 已顺序解压的字节数，
-    ///   此阶段可能占总耗时 99%，必须上报让人看到进展，否则像卡死）。
+    /// - `progress`：(阶段, 已推进字节, 阶段总量)，分段语义见 [`ExtractPhase`]。
+    ///   阶段总量 0 = 无定比分母的阶段（如 Locate），UI 显示活动指示器
     ///
     /// 默认不支持；ZipVFS/SevenzVFS/RarVFS 各自实现。
     fn extract_entry(
@@ -210,7 +239,7 @@ pub trait ArchiveVFS: Send + Sync {
         entry: &VirtualEntry,
         dest: &Path,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
     ) -> Result<(), VfsError> {
         let _ = (entry, dest, cancel, progress);
         Err(VfsError::Unsupported("此格式不支持解压".into()))
@@ -230,7 +259,7 @@ pub trait ArchiveVFS: Send + Sync {
         &self,
         targets: &[(&VirtualEntry, &Path)],
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize),
     ) -> Result<(), VfsError> {
         for (i, (entry, dest)) in targets.iter().enumerate() {
@@ -263,7 +292,7 @@ pub trait ArchiveVFS: Send + Sync {
         &self,
         session: &SharedSession,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize, &Path),
     ) -> Result<(), VfsError> {
         loop {
@@ -585,7 +614,7 @@ mod tests {
                     &entries[0],
                     &cache::dest_path(&cdir, 0, 0, &entries[0].name),
                     &std::sync::atomic::AtomicBool::new(false),
-                    &|_, _| {}
+                    &|_, _, _| {}
                 ),
                 Err(VfsError::Password)
             ),
@@ -606,7 +635,7 @@ mod tests {
                 &entries2[0],
                 &dest_a,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {},
+                &|_, _, _| {},
             )
             .unwrap();
         assert_eq!(
@@ -645,7 +674,7 @@ mod tests {
                 &entries3[0],
                 &dest_a,
                 &std::sync::atomic::AtomicBool::new(false),
-                &|_, _| {}
+                &|_, _, _| {}
             ),
             Err(VfsError::Password)
         ));

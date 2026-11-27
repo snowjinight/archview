@@ -2,7 +2,9 @@
 //! solid 包（`rar a -s`，主头 ROADF_SOLID）走后台解压会话 + 滑窗预取；
 //! 非 solid 包（rar 默认）逐文件独立压缩，随机访问只解点击项（单文件按需）。
 
-use super::{AccessMode, ArchiveVFS, SharedSession, VfsError, VirtualEntry, VirtualFile};
+use super::{
+    AccessMode, ArchiveVFS, ExtractPhase, SharedSession, VfsError, VirtualEntry, VirtualFile,
+};
 use std::path::{Path, PathBuf};
 use unrar::Archive;
 
@@ -92,14 +94,16 @@ impl RarVFS {
     }
 
     /// 单个密码候选的批量解压：一次 processing 遍历顺带解出全部目标
-    /// （solid RAR 定位目标需逐条 skip，一次遍历解一批摊薄固定成本）；
-    /// 目标之间的条目 skip 并按条目数 + 字节数上报进度
+    /// （solid RAR 定位目标需逐条 skip，一次遍历解一批摊薄固定成本）。
+    /// 无 list 下标可用（静态批不知道批内目标在包内的物理次序），
+    /// 分段退化：非目标 skip 报 SkipUp（无定比总量，UI 走活动指示）、
+    /// 目标解压报 Target（unrar 无逐字节回调，写前 0、完成后全量）
     fn try_batch(
         &self,
         pw: Option<&[u8]>,
         targets: &[(&VirtualEntry, &Path)],
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize),
     ) -> Result<(), VfsError> {
         use std::collections::HashMap;
@@ -154,7 +158,7 @@ impl RarVFS {
                         // 临时文件名带序号防并发踩踏。
                         // unrar 的 extract_to 无逐字节回调：写文件前发 0、完成后发
                         // 全量，UI 能区分"跳过阶段 → 写文件阶段"（字节数不串台）
-                        progress(0, "");
+                        progress(ExtractPhase::Target, 0, size);
                         let tmp = super::tmp_path(dest);
                         open = head.extract_to(&tmp).map_err(|e| {
                             std::fs::remove_file(&tmp).ok();
@@ -178,7 +182,7 @@ impl RarVFS {
                             ))
                         })?;
                         remaining.remove(&name);
-                        progress(size, "");
+                        progress(ExtractPhase::Target, size, size);
                         file_done(ti);
                         if remaining.is_empty() {
                             return Ok(());
@@ -193,7 +197,9 @@ impl RarVFS {
                         skipped += 1;
                         skipped_bytes += size;
                         if skipped.is_multiple_of(64) {
-                            progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                            // 静态批无 list 下标，跳过段无法算定比总量（total=0
+                            // = 无分母，UI 显示活动指示）
+                            progress(ExtractPhase::SkipUp, skipped_bytes, 0);
                         }
                     }
                 }
@@ -222,8 +228,9 @@ impl RarVFS {
         pw: Option<&[u8]>,
         session: &SharedSession,
         name_idx: &std::collections::HashMap<String, usize>,
+        list: &[VirtualEntry],
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize, &Path),
     ) -> Result<(PassFlow, usize), VfsError> {
         let arch = match pw {
@@ -233,9 +240,57 @@ impl RarVFS {
         let mut open = arch.open_for_processing().map_err(|e| {
             VfsError::Archive(format!("打开 RAR 失败 [{}]: {e}", self.path.display()))
         })?;
+        // 分段总量（pass 开工前一次算好）：RAR 顺序解码必然消费 [0, 最后目标]
+        // 的整段流——以 focus（抢道锚点）为界，目标 → Upstream/Target/Downstream，
+        // 非目标 → SkipUp/Downstream（段内夹的过滤条目/缓存命中条目计入总量，
+        // 才能让 bar 一直有分母可走）。开工即发各段 (0, total)，条立即出现不空窗
+        let (focus_idx, phase_totals) = {
+            let st = session.lock().unwrap();
+            let focus = st
+                .focus
+                .unwrap_or_else(|| st.targets.values().map(|(i, _)| *i).min().unwrap_or(0));
+            let tgt_idx: std::collections::HashSet<usize> =
+                st.targets.values().map(|(i, _)| *i).collect();
+            let last = tgt_idx.iter().copied().max().unwrap_or(0);
+            let mut t = [(0u64, 0u64); ExtractPhase::COUNT];
+            for (i, e) in list.iter().enumerate().take(last + 1) {
+                if tgt_idx.contains(&i) {
+                    match i.cmp(&focus) {
+                        std::cmp::Ordering::Less => t[ExtractPhase::Upstream as usize].1 += e.size,
+                        std::cmp::Ordering::Equal => t[ExtractPhase::Target as usize] = (0, e.size),
+                        std::cmp::Ordering::Greater => {
+                            t[ExtractPhase::Downstream as usize].1 += e.size
+                        }
+                    }
+                } else {
+                    match i.cmp(&focus) {
+                        std::cmp::Ordering::Less => t[ExtractPhase::SkipUp as usize].1 += e.size,
+                        std::cmp::Ordering::Greater => {
+                            t[ExtractPhase::Downstream as usize].1 += e.size
+                        }
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+            }
+            (focus, t)
+        };
+        progress(ExtractPhase::Locate, 0, 0);
+        for p in [
+            ExtractPhase::SkipUp,
+            ExtractPhase::Upstream,
+            ExtractPhase::Target,
+            ExtractPhase::Downstream,
+        ] {
+            let (c, t) = phase_totals[p as usize];
+            if t > 0 {
+                progress(p, c, t);
+            }
+        }
         let mut landed = 0; // 本遍落地数
         let mut skipped: usize = 0;
-        let mut skipped_bytes: u64 = 0;
+        let mut skip_cur: u64 = 0;
+        let mut up_cur: u64 = 0;
+        let mut down_cur: u64 = 0;
         loop {
             // 逐条目定位期间检查取消（大包 / NAS 上定位耗时分钟级）
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -266,24 +321,53 @@ impl RarVFS {
                 return Ok((PassFlow::Restart, landed)); // 回退重启定位 focus
             }
             let Some((ti, dest)) = tgt else {
+                // 非目标条目：focus 之前 = 跳过段（解码丢弃），之后 = 下游段
+                // （整段流进度的一部分，计入推进防止夹缝处 bar 停滞）
+                let is_up = cur_idx.is_some_and(|c| c < focus_idx);
                 open = head.skip().map_err(|e| {
                     VfsError::Archive(format!("RAR 跳过条目 [{}] 失败（正在定位目标）: {e}", name))
                 })?;
                 skipped += 1;
-                skipped_bytes += size;
-                if skipped.is_multiple_of(64) {
-                    progress(skipped_bytes, &format!("跳过前置文件 {skipped}"));
+                if is_up {
+                    skip_cur += size;
+                    if skipped.is_multiple_of(64) {
+                        let (_, t) = phase_totals[ExtractPhase::SkipUp as usize];
+                        progress(ExtractPhase::SkipUp, skip_cur.min(t), t);
+                    }
+                } else {
+                    down_cur += size;
+                    if skipped.is_multiple_of(64) {
+                        let (_, t) = phase_totals[ExtractPhase::Downstream as usize];
+                        progress(ExtractPhase::Downstream, down_cur.min(t), t);
+                    }
                 }
                 continue;
             };
             if encrypted && pw.is_none() {
                 return Err(VfsError::Password);
             }
-            // 缓存已存在且尺寸一致：幂等跳过（候选重试/会话重启后已解出的不重做）
+            // 缓存已存在且尺寸一致：幂等跳过（候选重试/会话重启后已解出的不重做）。
+            // 该条目本应解压：全量计入其所属段的推进（否则缓存命中的夹缝让 bar 停滞）
             if std::fs::metadata(&dest)
                 .map(|m| m.len() == size)
                 .unwrap_or(false)
             {
+                match ti.cmp(&focus_idx) {
+                    std::cmp::Ordering::Less => {
+                        up_cur += size;
+                        let (_, t) = phase_totals[ExtractPhase::Upstream as usize];
+                        progress(ExtractPhase::Upstream, up_cur.min(t), t);
+                    }
+                    std::cmp::Ordering::Greater => {
+                        down_cur += size;
+                        let (_, t) = phase_totals[ExtractPhase::Downstream as usize];
+                        progress(ExtractPhase::Downstream, down_cur.min(t), t);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let t = size;
+                        progress(ExtractPhase::Target, t, t);
+                    }
+                }
                 if session.lock().unwrap().targets.remove(&name).is_some() {
                     file_done(ti, &dest); // 锁已释放
                     landed += 1;
@@ -293,9 +377,26 @@ impl RarVFS {
                     .map_err(|e| VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name)))?;
                 continue;
             }
-            // 解压到临时文件再改名（同 try_batch）；unrar 无逐字节回调：
-            // 写文件前发 0、完成后发全量，UI 能区分"跳过 → 写文件"两阶段
-            progress(0, "");
+            // 分段归属：目标下标 vs focus（unrar 无逐字节回调，各段只能
+            // 写前发基线、完成后发全量）
+            let phase = match ti.cmp(&focus_idx) {
+                std::cmp::Ordering::Equal => ExtractPhase::Target,
+                std::cmp::Ordering::Less => ExtractPhase::Upstream,
+                std::cmp::Ordering::Greater => ExtractPhase::Downstream,
+            };
+            let (base, seg_total) = match phase {
+                ExtractPhase::Target => (0, size),
+                ExtractPhase::Upstream => (
+                    up_cur,
+                    phase_totals[ExtractPhase::Upstream as usize].1,
+                ),
+                ExtractPhase::Downstream => (
+                    down_cur,
+                    phase_totals[ExtractPhase::Downstream as usize].1,
+                ),
+                _ => (0, 0),
+            };
+            progress(phase, base.min(seg_total), seg_total);
             let tmp = super::tmp_path(&dest);
             open = head.extract_to(&tmp).map_err(|e| {
                 std::fs::remove_file(&tmp).ok();
@@ -322,7 +423,21 @@ impl RarVFS {
                 file_done(ti, &dest); // 锁已释放
                 landed += 1;
             }
-            progress(size, "");
+            // 完成后该段推进全量（unrar 无逐字节回调，条目级粒度）
+            match phase {
+                ExtractPhase::Target => progress(ExtractPhase::Target, size, size),
+                ExtractPhase::Upstream => {
+                    up_cur += size;
+                    let (_, t) = phase_totals[ExtractPhase::Upstream as usize];
+                    progress(ExtractPhase::Upstream, up_cur.min(t), t);
+                }
+                ExtractPhase::Downstream => {
+                    down_cur += size;
+                    let (_, t) = phase_totals[ExtractPhase::Downstream as usize];
+                    progress(ExtractPhase::Downstream, down_cur.min(t), t);
+                }
+                _ => {}
+            }
             if session.lock().unwrap().targets.is_empty() {
                 return Ok((PassFlow::Done, landed)); // 全部落地，提前收工
             }
@@ -399,7 +514,7 @@ impl ArchiveVFS for RarVFS {
         entry: &VirtualEntry,
         dest: &Path,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
     ) -> Result<(), VfsError> {
         self.extract_batch(&[(entry, dest)], cancel, progress, &|_| {})
     }
@@ -408,7 +523,7 @@ impl ArchiveVFS for RarVFS {
         &self,
         targets: &[(&VirtualEntry, &Path)],
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize),
     ) -> Result<(), VfsError> {
         // 尝试序列：有密码 → 各编码候选，最后兜底无密码（条目实际未加密时直接成功）；
@@ -449,7 +564,7 @@ impl ArchiveVFS for RarVFS {
         &self,
         session: &SharedSession,
         cancel: &std::sync::atomic::AtomicBool,
-        progress: &dyn Fn(u64, &str),
+        progress: &dyn Fn(ExtractPhase, u64, u64),
         file_done: &dyn Fn(usize, &Path),
     ) -> Result<(), VfsError> {
         // 尝试序列：有密码 → 各编码候选 + 无密码兜底；无密码 → 仅无密码（同 extract_batch）
@@ -462,12 +577,13 @@ impl ArchiveVFS for RarVFS {
             }
             attempts.push(None);
         }
-        // 名字 → list 下标（upstream 判定用；包内容不变，主循环外构建一次）
-        let name_idx: std::collections::HashMap<String, usize> = self
-            .list()
-            .into_iter()
+        // list 下标与条目尺寸表：name_idx 供 upstream 判定，list 供分段总量
+        // 统计（包内容不变，主循环外构建一次）
+        let list = self.list();
+        let name_idx: std::collections::HashMap<String, usize> = list
+            .iter()
             .enumerate()
-            .map(|(i, e)| (e.name, i))
+            .map(|(i, e)| (e.name.clone(), i))
             .collect();
         let mut stagnant = 0; // 连续零落地轮数（无进展保险）
         loop {
@@ -500,6 +616,7 @@ impl ArchiveVFS for RarVFS {
                         pw.as_deref(),
                         session,
                         &name_idx,
+                        &list,
                         cancel,
                         progress,
                         file_done,
@@ -690,7 +807,7 @@ mod tests {
             &entries[0],
             &dest,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
         )
         .unwrap();
         let data = std::fs::read(&dest).unwrap();
@@ -725,7 +842,7 @@ mod tests {
             &entries[1], // 中间的 f1.bin：非固态随机访问应直达
             &dest,
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
         )
         .unwrap();
         let data = std::fs::read(&dest).unwrap();
@@ -756,7 +873,7 @@ mod tests {
         vfs.extract_batch(
             &[(&entries[0], &d0), (&entries[2], &d2)],
             &std::sync::atomic::AtomicBool::new(false),
-            &|_, _| {},
+            &|_, _, _| {},
             &|_| {},
         )
         .unwrap();
