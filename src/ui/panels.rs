@@ -112,6 +112,11 @@ impl App {
             }
             if clean_cache {
                 let freed = cache::clean_all(&cache::cache_dir(&self.cfg));
+                // 缓存文件已全部删除：当前包命中位图同步清零，防命中判定
+                // 指向已删文件（其余包的位图随各自 ArchiveState 存活）
+                if let Some(a) = self.archive.as_mut() {
+                    a.cached.fill(false);
+                }
                 self.set_notice(format!("已清理缓存 {:.1} MB", freed as f64 / 1048576.0));
                 tracing::info!("手动清理缓存: {:.1} MB", freed as f64 / 1048576.0);
             }
@@ -771,6 +776,8 @@ impl App {
         let cfg = &self.cfg;
         // hover 气泡要完整包内路径（含目录段），与 rows 一样预取引用进闭包
         let entries = self.archive.as_ref().map(|a| &a.entries);
+        // 缓存命中位图（行前缀 C 判定）：与 entries 同为不可变预收集
+        let cached_list = self.archive.as_ref().map(|a| &a.cached);
         let playing = focus;
         let has_archive = self.archive.is_some();
         let item_spacing_y = ui.spacing().item_spacing.y;
@@ -843,8 +850,8 @@ impl App {
                         // 必须截断——selectable_label 默认换行会把长名行撑成 2 行高，
                         // 行高不均匀破坏虚拟化的等高前提：首行实测高被钉在 2 行值上，
                         // 渲染范围按虚高 step 缩水 → 底部空隙 + 翻页时 step 双稳态翻转
-                        // 多选指示（§15.5）终版：大写 S 前缀 + 主题感知琥珀
-                        // 着色（同 hover 气泡目录段 AMBER，视觉语言一致）。
+                        // 多选指示（§15.5）：大写 S 前缀 + 主题感知琥珀着色
+                        //（同 hover 气泡目录段 AMBER，视觉语言一致）。
                         // 底色方案两试皆废——egui Button 显式 fill 受
                         // `state != Inactive || frame_when_inactive` 守卫
                         //（widgets/button.rs）：非播放行 selectable 选中态
@@ -855,12 +862,16 @@ impl App {
                         // frame_when_inactive(true) 则全员常驻按钮底色。
                         // 文字显式色则无条件优先（widget_text.rs
                         // `text_color.unwrap_or_else(...)`），不受该守卫影响。
-                        // 元组 atoms（IntoAtoms）拼 S 段+文件名段：不放大 S
-                        // 字号（AtomLayout 行高取各段 max，放大破坏等高前
-                        // 提）、无真加粗可选（默认字体无 bold variant，
-                        // strong() 只是提亮色标志且被显式色覆盖）——大写+
-                        // 琥珀已够醒目。playing 行仍由 selectable 选中态着
-                        // 主题蓝（S 保持琥珀，暖冷对比清晰）
+                        // 缓存命中指示（对勾 ✓ 前缀，弱化灰）：条目已解压
+                        // 落地、点击秒开。"已缓存"三字太宽（挤压文件名/可能
+                        // 撑行破坏虚拟化等高前提），单字母 C 语义不明 → 沿用
+                        // S 的前缀写法改用对勾 ✓（微软雅黑注入 Proportional
+                        // 族，U+2713 在字库内渲染无忧）。
+                        // S/★/✓ 三个条件前缀用 Atoms::push_right 动态拼装
+                        // 替代旧二元 match（组合数 8，match 不可维护）。
+                        // 不放大前缀字号（AtomLayout 行高取各段 max，放大破
+                        // 坏等高前提）；playing 行仍由 selectable 选中态着主
+                        // 题蓝，前缀色不变
                         // ⚠ atom_shrink 必须钉在文件名段：egui 的 wrap_mode
                         //（truncate）只作用于 shrink 原子，多原子未显式指定时
                         // egui 自动选中**第一个**文本原子（= "S " 前缀），文件
@@ -868,10 +879,6 @@ impl App {
                         // 度=完整文件名宽 → 溢出内容撑宽左面板的 PanelState
                         //（resizable 面板宽=上一帧内容矩形），表现为"一选中
                         // 列表就被文件名撑开"。完整文件名在悬停气泡查看。
-                        // 星级前缀（★n）：评级来自 EXIF 后台扫描/会话评星（r.idx
-                        // 即 entries 下标）。原子拼接同 S 前缀结构——atom_shrink
-                        // 仍钉在文件名段（有显式 shrink 原子时 egui 不再自动选
-                        // 第一个文本原子，见下方 ⚠ 注释）
                         let star = self
                             .archive
                             .as_ref()
@@ -884,31 +891,26 @@ impl App {
                         } else {
                             AMBER_LIGHT
                         };
-                        let btn = match (sel.contains(&r.idx), star_txt) {
-                            (true, Some(st)) => egui::Button::selectable(
-                                playing == Some(r.idx),
-                                (
-                                    egui::RichText::new("S ").color(sel_c),
-                                    egui::RichText::new(st),
-                                    label,
-                                ),
-                            )
-                            .truncate(),
-                            (true, None) => egui::Button::selectable(
-                                playing == Some(r.idx),
-                                (egui::RichText::new("S ").color(sel_c), label),
-                            )
-                            .truncate(),
-                            (false, Some(st)) => egui::Button::selectable(
-                                playing == Some(r.idx),
-                                (egui::RichText::new(st), label),
-                            )
-                            .truncate(),
-                            (false, None) => {
-                                egui::Button::selectable(playing == Some(r.idx), r.label.as_str())
-                                    .truncate()
-                            }
-                        };
+                        let mut atoms = egui::Atoms::default();
+                        if sel.contains(&r.idx) {
+                            atoms.push_right(egui::RichText::new("S ").color(sel_c));
+                        }
+                        if let Some(st) = star_txt {
+                            atoms.push_right(egui::RichText::new(st));
+                        }
+                        // 弱化灰：缓存命中是"背景事实"，不与琥珀（多选）争注意力
+                        if cached_list
+                            .and_then(|c| c.get(r.idx))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            atoms.push_right(
+                                egui::RichText::new("✓ ").color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        atoms.push_right(label);
+                        let btn =
+                            egui::Button::selectable(playing == Some(r.idx), atoms).truncate();
                         // 行全宽热区：Button 默认收缩到文本宽，短文件名必须点中文字
                         // 才有效。min_size 抬宽下限到整行（高度 0 保持内容行高，
                         // 不破坏虚拟化等高前提）。宽度 = 内容区 available_width，

@@ -2,6 +2,7 @@
 //! 目录来自 config.toml（"auto" = 系统临时目录），代码零硬编码路径。
 
 use crate::config::Config;
+use crate::vfs::VirtualEntry;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -51,10 +52,12 @@ pub fn dir_usage(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// 计划写入 incoming_bytes 前，确保总量在上限内：超出则按 mtime 从旧到新删除
-pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
+/// 计划写入 incoming_bytes 前，确保总量在上限内：超出则按 mtime 从旧到新删除。
+/// 返回被删除文件的 (archive_id, entry_idx)（文件名解析不出 idx 的跳过上报），
+/// 调用方据此清缓存命中位图（见 scan_cached）
+pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) -> Vec<(u64, usize)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     let mut files: Vec<(PathBuf, u64, SystemTime)> = rd
         .filter_map(|e| e.ok())
@@ -73,8 +76,9 @@ pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
     let mut over = total
         .saturating_add(incoming_bytes)
         .saturating_sub(max_bytes);
+    let mut evicted = Vec::new();
     if over == 0 {
-        return;
+        return evicted;
     }
     for (path, size, _) in files {
         if over == 0 {
@@ -83,8 +87,63 @@ pub fn evict_if_needed(dir: &Path, max_bytes: u64, incoming_bytes: u64) {
         tracing::debug!("驱逐缓存: {}", path.display());
         if std::fs::remove_file(&path).is_ok() {
             over = over.saturating_sub(size);
+            if let Some(k) = parse_cache_name(&path) {
+                evicted.push(k);
+            }
         }
     }
+    evicted
+}
+
+/// 从缓存文件名解析 (archive_id, entry_idx)：{aid}_{idx}_{basename}。
+/// 解析失败（非缓存命名/手放文件）返回 None
+fn parse_cache_name(path: &Path) -> Option<(u64, usize)> {
+    let name = path.file_name()?.to_str()?;
+    let (aid, rest) = name.split_once('_')?;
+    let (idx, _) = rest.split_once('_')?;
+    Some((aid.parse().ok()?, idx.parse().ok()?))
+}
+
+/// 扫描缓存目录，构建指定包的"条目已落地"位图（下标 = entry idx）。
+/// 打开包时调用一次，此后批扫描/命中判定查位图——万级条目批扫描从
+/// N 次 per-file metadata 系统调用降到 0 次；read_dir 附带的
+/// DirEntry::metadata 零额外打开（NTFS/网络盘都远快于逐文件 metadata）。
+/// 尺寸与条目一致才置位（防半截/残留错位文件）；.part* 临时文件排除
+pub fn scan_cached(dir: &Path, archive_id: u64, entries: &[VirtualEntry]) -> Vec<bool> {
+    let prefix = format!("{archive_id}_");
+    let mut out = vec![false; entries.len()];
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        // .part 半截临时文件（cleanup_partial 的清理对象）不算缓存
+        if e.path()
+            .extension()
+            .is_some_and(|x| x.to_string_lossy().starts_with("part"))
+        {
+            continue;
+        }
+        let fname = e.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((idx_str, _base)) = rest.split_once('_') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        let Some(entry) = entries.get(idx) else {
+            continue;
+        };
+        if e.metadata().map(|m| m.len() == entry.size).unwrap_or(false) {
+            out[idx] = true;
+        }
+    }
+    out
 }
 
 /// 目标缓存文件名：{archive_id}_{entry_idx}_{basename}（防不同目录同名冲突）

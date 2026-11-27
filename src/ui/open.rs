@@ -316,6 +316,9 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // 缓存命中位图建图：一次 readdir 替代此后批扫描的全部逐条目 metadata
+        // （本包上次会话遗留的落地文件，按 {id}_{idx}_ 前缀解析 + 尺寸校验）
+        let cached = cache::scan_cached(&cache::cache_dir(&self.cfg), id, &entries);
         self.archive = Some(ArchiveState {
             id,
             name,
@@ -335,6 +338,7 @@ impl App {
             })),
             ratings: std::collections::HashMap::new(),
             deleted: std::collections::HashSet::new(),
+            cached,
             // 目录模式判定一次性缓存（每帧 stat 在网络盘上是 ~70ms 级往返，
             // 见 ArchiveState.dir_mode 注释）
             dir_mode: path.is_dir(),

@@ -739,6 +739,8 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         alive: false,
         gen: 0,
     }));
+    // 独立缓存目录尚无落地文件：位图全空（真实流程由 FileDone 逐个置位）
+    let cached = vec![false; entries.len()];
     app.archive = Some(super::ArchiveState {
         id: 7,
         name: "slide.7z".into(),
@@ -751,6 +753,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         session,
         ratings: std::collections::HashMap::new(),
         deleted: std::collections::HashSet::new(),
+        cached,
         dir_mode: false,
     });
 
@@ -994,8 +997,12 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     // 锚点不被污染 ----
     // 删掉 5 的落地文件模拟"未落地的下游"，再点已缓存的 3：目标秒开 +
     // 预取重定向补解 5。缓存命中不算解压推进 → last_focus 保持 2，
-    // "回到锚点"仍指向真正的解压位置
+    // "回到锚点"仍指向真正的解压位置。
+    // 真实流程里 5 变缺失只有 LRU 逐出/手动清缓存两条路，二者都会同步
+    // 清命中位图（evict_if_needed 返回值/clean_all 后 fill(false)）——
+    // 这里等价模拟逐出效果：删文件 + 清位
     std::fs::remove_file(&dest5).unwrap();
+    app.archive.as_mut().unwrap().cached[5] = false;
     app.start_extract(3);
     assert_eq!(app.playing, Some(3), "已缓存目标应立即播放");
     assert_eq!(window(&app), vec![5], "缺失的下游 5 应进预取窗口");
@@ -1565,6 +1572,7 @@ fn png_archive(
         session,
         ratings: std::collections::HashMap::new(),
         deleted: std::collections::HashSet::new(),
+        cached: vec![false; n], // 目录模式直读文件，缓存位图不参与
         dir_mode: true,
     });
     vfs

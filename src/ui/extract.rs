@@ -398,16 +398,10 @@ impl App {
         &self,
         arch: &ArchiveState,
         entry_idx: usize,
-        dir: &Path,
     ) -> (Vec<usize>, u64) {
-        // 判缓存：尺寸一致视为已落地
-        let on_disk = |i: usize| -> bool {
-            let e = &arch.entries[i];
-            let d = cache::dest_path(dir, arch.id, i, &e.name);
-            std::fs::metadata(&d)
-                .map(|m| m.len() == e.size)
-                .unwrap_or(false)
-        };
+        // 判缓存：查命中位图（open 时 scan_cached 建图，FileDone 落地置位、
+        // LRU 逐出/清空缓存清位）——不再逐条目 metadata 系统调用
+        let on_disk = |i: usize| arch.cached.get(i).copied().unwrap_or(false);
         let cap = self
             .cfg
             .extract
@@ -420,14 +414,17 @@ impl App {
             batch.push(entry_idx);
             batch_bytes = arch.entries[entry_idx].size;
         }
-        // 目标不在当前 view（被过滤）：单独成批，不扫后续
-        let start = arch
-            .view
-            .iter()
-            .position(|&i| i == entry_idx)
-            .unwrap_or(usize::MAX);
-        if start != usize::MAX && cap > 0 {
-            for &i in arch.view[start + 1..].iter() {
+        // 下游预取坚持物理序 + **全量落地**（entry_idx+1 起顺包内条目收，
+        // 不看 view）：solid 流不可跳，批内条目物理连续 = 每个解码字节都
+        // 落缓存，浪费归零。不做 view 可见过滤的理由：夹缝条目（搜索过滤/
+        // 标签页隐藏/非媒体文件）解码本来就要穿过，可见过滤只省磁盘——
+        // 而磁盘成本由 LRU 上限兜底、预取 size 用户自控，过滤纯属多余。
+        // 排序开启也不禁用：自然序 ≈ 物理序（7-Zip 打包本就字典序），命中
+        // 即赚一次免解码；不命中的最坏情况（点未落盘项 → 会话废弃重启）
+        // 与不预取完全等价，无额外代价——空间换时间，seek 代价大的 solid
+        // 包上期望收益为正
+        if cap > 0 {
+            for i in entry_idx + 1..arch.entries.len() {
                 if batch_bytes >= cap {
                     break;
                 }
@@ -444,9 +441,8 @@ impl App {
         // （locate_start 起点由格式决定——7z 目标所在 folder 起点、不跨 folder；
         // RAR 整个前缀），顺带写盘零解码增量。预算 prefetch_upstream_mb
         // 独立封顶，实取可能小于预算（folder 前缀不足时全取，不越界补齐）。
-        // 注意与下游预取去重：sort_files 开启时 view 序 ≠ 物理序，
-        // 下游批已收入的条目可能落在免费区内，重复入批会导致 file_done
-        // 下标错位（7z/RAR 的 remaining 表按名去重，但 batch 下标对不齐）
+        // 同下游：全量落地不看 view。与下游批天然不重叠（下游从
+        // entry_idx+1 起物理序、上游止于 entry_idx），无需去重
         let upstream_cap = self
             .cfg
             .extract
@@ -454,19 +450,13 @@ impl App {
             .saturating_mul(1024 * 1024);
         if upstream_cap > 0 {
             if let Some(s) = arch.vfs.locate_start(entry_idx) {
-                let view_set: std::collections::HashSet<usize> =
-                    arch.view.iter().copied().collect();
                 let mut upstream_bytes: u64 = 0;
                 for i in s..entry_idx {
                     if upstream_bytes >= upstream_cap {
                         break;
                     }
                     let e = &arch.entries[i];
-                    // 仅预取当前列表可见的条目（目录/搜索过滤外的文件用户点不到）
-                    if e.is_dir || !view_set.contains(&i) || batch.contains(&i) {
-                        continue;
-                    }
-                    if on_disk(i) {
+                    if e.is_dir || on_disk(i) {
                         continue;
                     }
                     upstream_bytes += e.size;
@@ -558,10 +548,8 @@ impl App {
             let entry = &arch.entries[entry_idx];
             let dir = cache::cache_dir(&self.cfg);
             let dest = cache::dest_path(&dir, arch.id, entry_idx, &entry.name);
-            // 缓存命中：尺寸一致直接播（窗口照常重算，见函数 doc）
-            let cached = std::fs::metadata(&dest)
-                .map(|m| m.len() == entry.size)
-                .unwrap_or(false);
+            // 缓存命中：查位图（open 时扫描 + FileDone 置位，尺寸已校验）
+            let cached = arch.cached.get(entry_idx).copied().unwrap_or(false);
             // 批内切换：新目标在当前批未完成清单里（覆盖层宽限期不清零的依据）
             let was_pending = self
                 .extract
@@ -582,7 +570,7 @@ impl App {
                     entry.size,
                 )
             } else {
-                let (batch, batch_bytes) = self.compute_batch(arch, entry_idx, &dir);
+                let (batch, batch_bytes) = self.compute_batch(arch, entry_idx);
                 let targets: Vec<(String, usize, PathBuf)> = batch
                     .iter()
                     .map(|&i| {
@@ -696,7 +684,16 @@ impl App {
             return;
         }
 
-        cache::evict_if_needed(&dir, self.cfg.cache.max_size_mb * 1024 * 1024, batch_bytes);
+        let evicted =
+            cache::evict_if_needed(&dir, self.cfg.cache.max_size_mb * 1024 * 1024, batch_bytes);
+        // 逐出可能删掉本包已落地条目：清位图，防命中判定指向已删文件
+        if let Some(a) = self.archive.as_mut() {
+            for (aid, idx) in evicted {
+                if aid == a.id && idx < a.cached.len() {
+                    a.cached[idx] = false;
+                }
+            }
+        }
 
         // 会话重定向（三分支共用）：清空旧目标写入新窗口 + focus。批内切换/
         // 缓存命中时新窗口 ≈ 旧窗口平移（已落地头部出窗、尾部补新），批外
@@ -894,6 +891,13 @@ impl App {
                     // 批内条目落地：是当前期望目标则立即播放（预取的留在缓存里
                     // 供后续翻页命中），否则只记账。对比模式不自动播放——
                     // compare_tick 的落地检查按栏拾取（播放会劫持对比会话）
+                    // 落地即置缓存命中位图（无论是否当前期望目标）：rename
+                    // 成功才会发 FileDone，位图可信；后续批扫描/命中判定零 IO
+                    if let Some(a) = self.archive.as_mut() {
+                        if i < a.cached.len() {
+                            a.cached[i] = true;
+                        }
+                    }
                     let mut play: Option<(PathBuf, usize)> = None;
                     if let Some(j) = &mut self.extract {
                         if let Some(d) = j.pending.remove(&i) {

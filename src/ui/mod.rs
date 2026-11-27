@@ -97,6 +97,11 @@ struct ArchiveState {
     /// 物理移除会让后续下标整体位移、缓存纹理错位指向错误文件），只在
     /// rebuild_view 谓词中剔除。压缩包模式删除入口不可达（仅目录模式）
     deleted: std::collections::HashSet<usize>,
+    /// 缓存命中位图（下标 = entry idx，true = 该条目已解压落地在缓存目录，
+    /// 尺寸校验过）：打开包时 scan_cached 建图，FileDone 落地置位，
+    /// LRU 逐出/清空缓存清位——批扫描与命中判定查此表，替代逐条目
+    /// metadata 系统调用（万级条目 × 网络盘上代价显著）
+    cached: Vec<bool>,
 }
 
 /// 密码输入弹窗：加密头（打开阶段）或内容加密（播放阶段）触发
