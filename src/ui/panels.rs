@@ -335,21 +335,51 @@ impl App {
             // 缓存、等待新文件等所有场景下后台剩余量都可见；与媒体区覆盖层
             // 信息重复无妨，视频正被观看绝不能遮挡
             if let Some(j) = &self.extract {
-                let left = j.pending.len();
-                ui.colored_label(
-                    ui.visuals().weak_text_color(),
-                    format!("后台解压中…（剩余 {left} 项）"),
-                );
-                // Downstream 段 mini bar：固定槽位 140×6、无内嵌文字——宽度
-                // 与高度恒定，不会随内容变化挤压相邻元素或撑高顶栏跳行。
-                // 目标落地后覆盖层消失，这是下游预取进度唯一可见处
-                let (dc, dt) = j.phases[ExtractPhase::Downstream as usize];
-                if dt > 0 {
-                    ui.add(
-                        egui::ProgressBar::new((dc as f32 / dt as f32).clamp(0.0, 1.0))
-                            .desired_width(140.0)
-                            .desired_height(6.0),
+                // 批完成驻留（idle）：会话活着但没有在解的批——不显示"进行
+                // 中"标记，否则批解完后顶栏永远挂着"剩余 0 项"
+                if j.idle {
+                    // 驻留提示：保留一行弱标记说明会话在（顺序翻页零成本续解）
+                    ui.colored_label(ui.visuals().weak_text_color(), "解压会话驻留中");
+                } else {
+                    let left = j.pending.len();
+                    ui.colored_label(
+                        ui.visuals().weak_text_color(),
+                        format!("后台解压中…（剩余 {left} 项）"),
                     );
+                    // 当前活动段 mini bar：固定槽位 140×6 + 2 字段名前缀。
+                    // 解压五段顺序推进（跳前置→上游预取→目标→下游），只画
+                    // Downstream 会在跳前置/上游预取阶段长时间停 0——用户误以
+                    // 为卡死。倒序找第一个 cur>0 且 t>0 的段（后段开工说明前段
+                    // 完成）；全零（定位期/骨架期）不画条，文字标记已够。hover
+                    // 显精确字节进度
+                    const PHASE_LABELS: [&str; ExtractPhase::COUNT] =
+                        ["定位", "跳过", "上游", "目标", "下游"];
+                    let mut active = None;
+                    for p in (0..ExtractPhase::COUNT).rev() {
+                        if j.phases[p].0 > 0 && j.phases[p].1 > 0 {
+                            active = Some(p);
+                            break;
+                        }
+                    }
+                    if let Some(p) = active {
+                        let (c, t) = j.phases[p];
+                        ui.monospace(
+                            egui::RichText::new(PHASE_LABELS[p])
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        let bar = ui.add(
+                            egui::ProgressBar::new((c as f32 / t as f32).clamp(0.0, 1.0))
+                                .desired_width(140.0)
+                                .desired_height(6.0),
+                        );
+                        bar.on_hover_text(format!(
+                            "{}阶段：{:.1} / {:.1} MB",
+                            PHASE_LABELS[p],
+                            c as f64 / 1048576.0,
+                            t as f64 / 1048576.0
+                        ));
+                    }
                 }
             }
             // 评级按需探测扫描中（提交/完成计数差 >0，含在途读——队列深度
@@ -363,21 +393,43 @@ impl App {
                     format!("评级扫描中… {pct}%"),
                 );
             }
-            // 锚点落地即可点（无需等整批解完）：秒开锚点，预取批继续后台跑
-            if self.extract_ready {
-                if let Some(f) = self.last_focus {
-                    if self.playing != Some(f) {
-                        let name = self
-                            .archive
-                            .as_ref()
-                            .map(|a| a.entries[f].name.clone())
-                            .unwrap_or_default();
-                        let btn = ui.button(format!("解压完成：{name}｜点击观看"));
-                        if btn.clicked() {
-                            self.play(f);
-                        }
-                        btn.on_hover_text("点击观看刚解压完成的文件（快捷键 B）");
+            // 跳至解压锚点的唯一入口（原列表底部/媒体区左下角悬浮按钮合并
+            // 至此——两处悬浮跟随滚动或遮画面，顶栏槽位恒定可见且与解压
+            // 进度标记同位，动线自然）：锚点落地即可点（无需等整批解完），
+            // 提醒已消费/回看期间仍可随时跳回。文案按提醒挂起与否分流，
+            // 快捷键 B
+            if let Some(f) = self.last_focus {
+                if self.playing != Some(f) {
+                    let name = self
+                        .archive
+                        .as_ref()
+                        .map(|a| a.entries[f].name.clone())
+                        .unwrap_or_default();
+                    // 按钮只显感知序号（当前标签页 list_rows 位置+1，与顶栏
+                    // [n/total] 同源）——万级条目长名会挤爆顶栏；完整文件名
+                    // 在 hover 提示。目标不在当前标签页（被过滤/切页）时不带
+                    // 序号。统一带"跳至解压处"字样保证可辨识
+                    let pos = self
+                        .list_rows
+                        .iter()
+                        .position(|r| r.idx == f)
+                        .map(|p| p + 1);
+                    let label = match pos {
+                        Some(n) => format!("跳至解压处 [{n}]"),
+                        None => "跳至解压处".to_owned(),
+                    };
+                    let hover = if self.extract_ready {
+                        format!("{name}｜当前锚点已解压完成，点击观看（快捷键 B）")
+                    } else {
+                        format!(
+                            "{name}｜已解压则立即播放，未完成则跳回等待（快捷键 B）"
+                        )
+                    };
+                    let btn = ui.button(label);
+                    if btn.clicked() {
+                        self.play(f);
                     }
+                    btn.on_hover_text(hover);
                 }
             }
         });
@@ -782,7 +834,8 @@ impl App {
         let has_archive = self.archive.is_some();
         let item_spacing_y = ui.spacing().item_spacing.y;
         // auto_shrink=false：滚动区域宽度固定占满面板，滚动条钉在右边界（不随文件名长度缩进）
-        let sa = egui::ScrollArea::vertical()
+        // （原列表底部悬浮按钮用 sa.inner_rect 定位；按钮迁媒体区后仅留返回值占位）
+        let _sa = egui::ScrollArea::vertical()
             .auto_shrink(egui::Vec2b::new(false, false))
             .show_viewport(ui, |ui, viewport| {
                 let total = rows.len();
@@ -1084,69 +1137,8 @@ impl App {
                 }
             }
         }
-        // 回到上次位置：盖在列表底部中央的悬浮按钮（约两行高、半透明、不占满
-        // 整行——按钮四周的列表项仍可点击）。目标 = last_focus（最后一次
-        // 实际解压的锚点，会话退出后保留）；正播在该位置时隐藏。快捷键 B
-        if let Some(f) = self.last_focus {
-            if self.playing != Some(f) {
-                let entry_name = self
-                    .archive
-                    .as_ref()
-                    .map(|a| a.entries[f].name.clone())
-                    .unwrap_or_default();
-                // 感知序号：与顶栏 [n/total] 同源（当前标签页 list_rows 位置+1），
-                // 不用 entries 内部下标（sort_files/跨标签页时两者不同）；
-                // 目标不在当前标签页（如正播视频、列表停在图片页）回退只显文件名
-                let pos = self
-                    .list_rows
-                    .iter()
-                    .position(|r| r.idx == f)
-                    .map(|p| format!("[{}/{}] ", p + 1, self.list_rows.len()));
-                let target = match pos {
-                    Some(p) => format!("{p}{entry_name}"),
-                    None => entry_name.clone(),
-                };
-                let area = sa.inner_rect;
-                let strip = egui::Rect::from_min_max(
-                    egui::pos2(area.left(), area.bottom() - 48.0),
-                    egui::pos2(area.right(), area.bottom() - 4.0),
-                );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                    // 半透明琥珀底 + 琥珀字：隐约可见按钮存在又不遮列表内容
-                    //（与顶栏当前文件名同色相，dark 亮琥珀 / light 深琥珀）
-                    let amber = if ui.visuals().dark_mode {
-                        AMBER_DARK
-                    } else {
-                        AMBER_LIGHT
-                    };
-                    let fill = egui::Color32::from_rgba_unmultiplied(
-                        amber.r(),
-                        amber.g(),
-                        amber.b(),
-                        36,
-                    );
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("跳至解压处").color(amber),
-                                )
-                                .fill(fill)
-                                .corner_radius(6)
-                                .min_size(egui::vec2(0.0, 40.0)),
-                            )
-                            .on_hover_text(format!(
-                                "跳至解压处：{target} 若当前项解压完成则自动播放，\
-                                 未完成则跳回等待"
-                            ))
-                            .clicked()
-                        {
-                            self.play(f);
-                        }
-                    });
-                });
-            }
-        }
+        // 跳至解压处入口已合并进顶栏槽位（顶栏"解压完成/跳至解压处"按钮，
+        // 不在播锚点即显示）：列表/媒体区不再放置悬浮按钮
         // 行高自校正：与估计值偏差超阈值时更新（DPI/主题变化后首帧即可收敛）
         if let Some(h) = measured {
             if self.row_h.is_none() || (self.row_h.unwrap() - h).abs() > 0.01 {
@@ -1292,12 +1284,19 @@ impl App {
         //   · 正在播 A 等 B：超过宽限期（ui.extract_overlay_delay_ms）
         //     才停绘视频帧显示覆盖层——快速解压全程不打扰 A，避免闪烁
         let extract_wait = self.extract.as_ref().is_some_and(|j| {
-            self.playing != Some(j.entry_idx)
+            !j.idle
+                && self.playing != Some(j.entry_idx)
                 && (self.playing.is_none()
                     || j.started.elapsed()
                         >= std::time::Duration::from_millis(self.cfg.ui.extract_overlay_delay_ms))
         });
-        if extract_wait || self.playing.is_none() {
+        // 批完成驻留（idle）：无在解的批，覆盖层不画（playing 也为 None 时
+        // 会走 else 分支显示无画面占位，不能被驻留任务的陈旧 phases 拦住）
+        let overlay_job = self
+            .extract
+            .as_ref()
+            .is_some_and(|j| !j.idle && (extract_wait || self.playing.is_none()));
+        if overlay_job {
             if let Some(j) = &self.extract {
                 // 解压覆盖层：媒体区居中多行显示。顶栏一行放不下长文件名
                 // （曾被截断、进度条看不见），这里空间充足：完整文件名换行 +
@@ -1616,6 +1615,8 @@ impl App {
         // 直方图覆盖层（Ctrl+H）：跨图片/视频两分支绘制——render API 单平面下
         // 本函数内的 shape 在 PaintCallback 之后提交，天然盖在画面上
         self.paint_histogram(ui, video);
+        // 跳至解压处入口已合并进顶栏槽位（"解压完成/跳至解压处"按钮，不在播
+        // 锚点即显示）——列表底部与媒体区左下角的悬浮按钮均已迁走
     }
 
     /// 直方图覆盖层（Ctrl+H 开关）：按当前条目分流取直方图。

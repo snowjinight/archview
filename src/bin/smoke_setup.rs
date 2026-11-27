@@ -194,6 +194,8 @@ fn find_mpv_dll() -> Option<PathBuf> {
 }
 
 /// WinRAR rar.exe 定位：ARCHVIEW_TEST_RAR → Program Files 标准位置
+/// → 注册表卸载信息 InstallLocation（非标准盘符安装，如 D:\software\winrar）。
+/// 注册表查询用 reg.exe 子进程（零依赖，reg 输出格式跨语言稳定）
 fn find_rar_exe() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ARCHVIEW_TEST_RAR") {
         let pb = PathBuf::from(p);
@@ -209,7 +211,41 @@ fn find_rar_exe() -> Option<PathBuf> {
             }
         }
     }
+    // 枚举 HKLM 卸载项，找 DisplayName 含 WinRAR 的 InstallLocation
+    const UNINST: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    const UNINST_WOW: &str = r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+    for key in [UNINST, UNINST_WOW] {
+        let Ok(out) = Command::new("reg").args(["query", key, "/s"]).output() else {
+            continue;
+        };
+        let mut display_hit = false;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            if line.starts_with("HKEY_") {
+                display_hit = false; // 新子键块复位
+            } else if let Some((name, data)) = parse_reg_sz(line) {
+                match name {
+                    "DisplayName" => display_hit = data.contains("WinRAR"),
+                    "InstallLocation" if display_hit => {
+                        let p = PathBuf::from(&data).join("rar.exe");
+                        if p.exists() {
+                            return Some(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     None
+}
+
+/// 解析 `reg query` 单行 `名    REG_SZ    数据`（数据可含空格，取 REG_SZ 之后原文）
+fn parse_reg_sz(line: &str) -> Option<(&str, String)> {
+    let idx = line.find("REG_SZ")?;
+    let name = line[..idx].trim();
+    let data = line[idx + "REG_SZ".len()..].trim();
+    (!name.is_empty() && !data.is_empty()).then_some((name, data.to_owned()))
 }
 
 /// TOML literal string（单引号，反斜杠不转义，Windows 路径友好）

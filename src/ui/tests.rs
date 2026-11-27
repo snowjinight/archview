@@ -42,7 +42,8 @@ fn done_fallback_yields_to_extract_ready() {
         pending: std::collections::HashMap::new(),
         batch_len: 1,
         started: std::time::Instant::now(),
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        idle: false,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rx,
     };
     let mut cfg = crate::config::Config::default();
@@ -900,13 +901,15 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     assert_eq!(window(&app), w4);
     assert_eq!(app.next_gen, 3);
 
-    // ---- 步骤 5：等整窗解净（会话空闲退出）----
+    // ---- 步骤 5：等整批解净（批完成驻留：真暂停后线程不退出）----
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         app.poll_extract();
         let drained = {
             let st = app.archive.as_ref().unwrap().session.lock().unwrap();
-            app.extract.is_none() && !st.alive && st.targets.is_empty()
+            app.extract.as_ref().is_some_and(|j| j.idle)
+                && st.alive
+                && st.targets.is_empty()
         };
         if drained {
             break;
@@ -918,7 +921,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     // keep 后 j.entry_idx 停在 0 且 playing==Some(0)：FileDone 不切画面、
-    // Done 兜底补播（playing != Some(entry_idx)）也不触发——keep 的安全性
+    // 批完成兜底补播（playing != Some(entry_idx)）也不触发——keep 的安全性
     assert_eq!(app.playing, Some(0), "解净后画面应停在回看项 p00");
     // 锚点 2 落地时用户在回看（自动播放被吞）→ 应置"解压完成待消费"提醒
     assert!(
@@ -926,57 +929,57 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         "回看中锚点落地应置解压完成提醒（顶栏提醒的依据）"
     );
 
-    // ---- 步骤 5b：会话退出后按 last_focus 跳回锚点（"回到锚点"的
-    // 可测等价路径）----
-    // 空闲退出只清 targets/alive，focus 与 last_focus 保留——用户回看
-    // 缓存后一键跳回解压推进点（2）。锚点已落地 → 立即播放；下游 5
-    // 尚未落地 → 重算预取窗口 [5] 并重 spawn 会话顺带补齐（秒开锚点
-    // + 预取两不误）
+    // ---- 步骤 5b：批完成驻留后按 last_focus 跳回锚点（会话复用重定向）----
+    // 驻留会话 alive=true：跳回锚点不再重 spawn，走重定向复用（新语义下
+    // 这正是"顺序/跳转零成本续解"的核心）。锚点 2 已落地 → 立即播放；
+    // 下游 5 尚未落地 → 重算预取窗口 [5]，解码线程从真暂停边界顺流补齐
     assert_eq!(
         app.last_focus,
         Some(2),
-        "会话退出后 last_focus 应保留（回到锚点的依据）"
+        "批完成后 last_focus 应保留（回到锚点的依据）"
     );
     assert_eq!(
         app.archive.as_ref().unwrap().session.lock().unwrap().focus,
         Some(2),
-        "会话空闲退出后 focus 锚点应保留"
+        "批完成后 focus 锚点应保留"
     );
     app.start_extract(2);
     let cancel2 = app
         .extract
         .as_ref()
-        .expect("5b 应重 spawn 预取任务")
+        .expect("5b 应保有驻留任务（重定向复用）")
         .cancel
         .clone();
     assert!(
-        !Arc::ptr_eq(&cancel2, &cancel1),
-        "会话空闲退出后回锚点应重起线程（新 cancel）"
+        Arc::ptr_eq(&cancel2, &cancel1),
+        "驻留会话回锚点应复用解码线程（cancel 句柄不变）"
     );
     assert_eq!(app.playing, Some(2), "锚点已落地应立即播放");
     assert!(!app.extract_ready, "跳回锚点播放后提醒应清除");
     assert_eq!(window(&app), vec![5], "锚点下游未落地项应进预取窗口");
-    assert_eq!(app.next_gen, 4, "重 spawn 会话自增 gen");
+    assert_eq!(app.next_gen, 4, "重定向自增 gen");
     {
         let st = app.archive.as_ref().unwrap().session.lock().unwrap();
         assert_eq!(st.focus, Some(2), "回到锚点不改锚点");
-        assert!(st.alive, "预取会话应重新拉起");
+        assert!(st.alive, "驻留会话应继续在跑");
     }
     assert_eq!(app.last_focus, Some(2), "回到锚点后 last_focus 保持");
-    // 等预取会话（补解 5）收尾，还原"会话已退出"前提给步骤 6
+    // 等预取批（补解 5）收尾，还原"批完成驻留"前提给步骤 5c
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         app.poll_extract();
         let drained = {
             let st = app.archive.as_ref().unwrap().session.lock().unwrap();
-            app.extract.is_none() && !st.alive && st.targets.is_empty()
+            app.extract.as_ref().is_some_and(|j| j.idle)
+                && st.alive
+                && st.targets.is_empty()
         };
         if drained {
             break;
         }
         assert!(
             std::time::Instant::now() <= deadline,
-            "等待预取会话收尾超时"
+            "等待预取批收尾超时"
         );
         if let Some(e) = &app.error {
             panic!("预取收尾阶段出错: {e}");
@@ -993,11 +996,11 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     );
     assert_eq!(app.playing, Some(2), "预取完成画面应停在锚点");
 
-    // ---- 步骤 5c：死后翻看已缓存项（"缓存命中预取会话启动"分支）——
-    // 锚点不被污染 ----
+    // ---- 步骤 5c：翻看已缓存项（缓存命中重定向，锚点不被污染）----
     // 删掉 5 的落地文件模拟"未落地的下游"，再点已缓存的 3：目标秒开 +
     // 预取重定向补解 5。缓存命中不算解压推进 → last_focus 保持 2，
-    // "回到锚点"仍指向真正的解压位置。
+    // "回到锚点"仍指向真正的解压位置。（驻留语义下走的是 alive 复用
+    // 重定向分支，不再 spawn 新线程）
     // 真实流程里 5 变缺失只有 LRU 逐出/手动清缓存两条路，二者都会同步
     // 清命中位图（evict_if_needed 返回值/clean_all 后 fill(false)）——
     // 这里等价模拟逐出效果：删文件 + 清位
@@ -1013,13 +1016,15 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         "缓存命中不应推进 last_focus（回看不污染锚点）"
     );
     assert!(!app.extract_ready, "缓存命中不应置位提醒");
-    // 等预取会话（补解 5）收尾，还原全落地前提给步骤 7
+    // 等预取批（补解 5）收尾，还原全落地前提给步骤 7
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         app.poll_extract();
         let drained = {
             let st = app.archive.as_ref().unwrap().session.lock().unwrap();
-            app.extract.is_none() && !st.alive && st.targets.is_empty()
+            app.extract.as_ref().is_some_and(|j| j.idle)
+                && st.alive
+                && st.targets.is_empty()
         };
         if drained {
             break;
@@ -1039,7 +1044,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         "整窗已落地不应重定向（空 targets 会误杀解码线程）"
     );
 
-    // ---- 终态：全部落地 + 内容无误 + 会话干净退出 ----
+    // ---- 终态：全部落地 + 内容无误 + 批完成驻留（会话活着待命）----
     for (i, (name, expect)) in srcs.iter().enumerate() {
         let dest = crate::cache::dest_path(&dir.join("cache"), 7, i, name);
         let data = std::fs::read(&dest).unwrap_or_else(|e| panic!("条目 {name} 应落地: {e}"));
@@ -1047,9 +1052,13 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     }
     {
         let st = app.archive.as_ref().unwrap().session.lock().unwrap();
-        assert!(!st.alive, "终态会话应已退出");
+        assert!(st.alive, "终态会话应驻留（真暂停语义下不退出）");
         assert!(st.targets.is_empty(), "终态 targets 应为空");
     }
+    assert!(
+        app.extract.as_ref().is_some_and(|j| j.idle),
+        "终态任务应标记批完成驻留"
+    );
     assert!(app.error.is_none(), "全程不应有错误");
     let _ = std::fs::remove_dir_all(&dir);
 }

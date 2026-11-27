@@ -104,6 +104,39 @@ impl SevenzVFS {
         let pw = self.password.clone().unwrap_or_else(Password::empty);
         SevenZReader::open(&self.path, pw).map_err(map_7z_err)
     }
+
+    /// 批边界真暂停：整会话目标解净时在条目边界阻塞（BlockDecoder 活着、
+    /// 解码位置停在当前条目，这是顺序浏览"零前缀续解"的关键），直至 UI
+    /// 重定向写入新目标或 cancel。返回 Ok(true) = 新目标全在本 folder，
+    /// 调用方顺流续解（流过即落地）；Ok(false) = 新目标在别的 folder，
+    /// 调用方中断本 folder 回外层重排（focus folder 提前，跨 folder 直达）；
+    /// Err = cancel。睡眠分片检查，不持锁睡眠，唤醒延迟 ≤ 一个分片
+    fn pause_at_batch_boundary(
+        &self,
+        session: &SharedSession,
+        cancel: &std::sync::atomic::AtomicBool,
+        folder: usize,
+    ) -> Result<bool, sevenz_rust::Error> {
+        use std::sync::atomic::Ordering;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(sevenz_rust::Error::other("cancelled"));
+            }
+            let (has_tgt, other_folder) = {
+                let st = session.lock().unwrap();
+                (
+                    !st.targets.is_empty(),
+                    st.targets.values().any(|(idx, _)| {
+                        self.folder_of.get(*idx).copied().flatten() != Some(folder)
+                    }),
+                )
+            };
+            if has_tgt {
+                return Ok(!other_folder);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }
 
 impl ArchiveVFS for SevenzVFS {
@@ -292,13 +325,18 @@ impl ArchiveVFS for SevenzVFS {
     ///   无 folder（0 字节）条目直接落地空文件；focus 所在 folder 提到
     ///   解码序最前（BTreeSet 升序底序，顺序读盘友好）
     /// - folder 解码：BlockDecoder 直达，回调内动态查 targets（UI 随时增删）；
-    ///   本 folder 目标解净即停（folder 内后续条目不解压）；非目标条目
-    ///   顺序消费丢弃（solid 流不可跳，错位必 CRC 失败）
+    ///   本 folder 目标解净且整会话无目标 → 批边界真暂停（驻留等新目标，
+    ///   解码位置停在条目边界）；本 folder 解净但其它 folder 仍有目标 →
+    ///   停 folder 转下一个；非目标条目顺序消费丢弃（solid 流不可跳，
+    ///   错位必 CRC 失败）
     /// - 漂移中断：focus 移到其它 folder 且仍待解 → Ok(false) 中断当前
     ///   folder 回外层重排（focus folder 最先）——被中断 folder 之后从头
     ///   重解（自愈，成本与"取消重启"旧路径持平）
     /// - 同 folder 回跳上游（目标在本趟已越过位置）：本趟解到尾不会命中，
     ///   下轮规划重排该 folder 从头重解补齐（自愈）
+    /// - 会话生命周期：真暂停后线程驻留不退出（规划期空目标同样驻留等待），
+    ///   退出只剩 cancel（切包）与出错两条路；UI 侧批完成由 pending 清空
+    ///   自行判定
     fn extract_session(
         &self,
         session: &SharedSession,
@@ -326,18 +364,32 @@ impl ArchiveVFS for SevenzVFS {
             .collect();
 
         loop {
+            // ---- 驻留等待（真暂停·规划期）：批解净后线程不退出，原地等
+            // UI 重定向写入新目标——顺序浏览续解、跳转续跑都不再付出
+            // "重新找 folder 起点 + 重解前缀"的代价（原空闲退出路径已被
+            // 驻留取代；会话退出只剩 cancel 切包与出错两条路，UI 侧"批
+            // 完成"由 pending 清空自行判定，不依赖线程退出）
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    super::session_exit(session);
+                    return Err(VfsError::Cancelled);
+                }
+                let empty = session.lock().unwrap().targets.is_empty();
+                if !empty {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             // ---- 规划：持锁快照目标集 → folder 分组 + focus 优先 ----
             let (folders, focus_folder, zero_streams, round_gen, focus_idx, tgt_idx) = {
-                // 判空/取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
+                // 取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
                 let mut st = session.lock().unwrap();
                 if cancel.load(Ordering::Relaxed) {
                     st.alive = false;
                     return Err(VfsError::Cancelled);
                 }
-                if st.targets.is_empty() {
-                    st.alive = false;
-                    return Ok(()); // 空闲收尾：UI 之后加目标会重新 spawn
-                }
+                // targets 判空退出已由上方驻留等待取代：进入规划即保证非空
+                // （UI 重定向的 clear+重写同锁原子，期间不会观察到空集）
                 // 本轮规划代数：UI 重定向在同一把锁内改 targets 并自增 gen，
                 // 两者快照同锁保证一致（gen 变了 ⟺ targets 换过）
                 let round_gen = st.gen;
@@ -464,10 +516,14 @@ impl ArchiveVFS for SevenzVFS {
             }
 
             // 轮级段游标（跨 folder 累计，条目相对 focus 分段，与解码序无关）
+            // mut：真暂停唤醒续解时清零（新批未经重规划，旧总量失效，UI 走
+            // 活动指示，待下一轮规划恢复定比）
             let (mut skip_cur, mut up_cur, mut down_cur) = (0u64, 0u64, 0u64);
-            let skip_total = totals[ExtractPhase::SkipUp as usize].1;
-            let up_total = totals[ExtractPhase::Upstream as usize].1;
-            let down_total = totals[ExtractPhase::Downstream as usize].1;
+            let (mut skip_total, mut up_total, mut down_total) = (
+                totals[ExtractPhase::SkipUp as usize].1,
+                totals[ExtractPhase::Upstream as usize].1,
+                totals[ExtractPhase::Downstream as usize].1,
+            );
 
             let mut interrupted = false;
             for &fi in &order {
@@ -554,11 +610,50 @@ impl ArchiveVFS for SevenzVFS {
                             file_done(idx, &dest); // 锁已释放
                             landed += 1;
                         }
-                        // 本 folder 目标解净：停止迭代（folder 内后续不解压）
-                        Ok(!folder_clear)
+                        // 本 folder 目标解净：若整会话也无目标 → 批边界真暂停
+                        // （驻留等新目标，解码位置停在当前条目）；唤醒续解时
+                        // 旧段总量/游标失效，清零走 UI 活动指示
+                        if folder_clear {
+                            match self.pause_at_batch_boundary(session, cancel, fi) {
+                                Ok(true) => {
+                                    skip_cur = 0;
+                                    up_cur = 0;
+                                    down_cur = 0;
+                                    skip_total = 0;
+                                    up_total = 0;
+                                    down_total = 0;
+                                    return Ok(true); // 新目标在本 folder：顺流续解
+                                }
+                                Ok(false) => {
+                                    interrupted = true;
+                                    return Ok(false); // 新目标在别的 folder：回外层重排
+                                }
+                                Err(_) => return Err(sevenz_rust::Error::other("cancelled")),
+                            }
+                        }
+                        Ok(true)
                     } else {
                         if folder_clear {
-                            return Ok(false);
+                            // 批边界真暂停（语义同 tgt 分支）：整会话解净时
+                            // 驻留等新目标而非停 folder——原有行为（停 folder
+                            // 回外层）会让线程空闲退出、下次点击重解 folder
+                            // 前缀；唤醒分流与新目标位置同 tgt 分支
+                            match self.pause_at_batch_boundary(session, cancel, fi) {
+                                Ok(true) => {
+                                    skip_cur = 0;
+                                    up_cur = 0;
+                                    down_cur = 0;
+                                    skip_total = 0;
+                                    up_total = 0;
+                                    down_total = 0;
+                                    // 新目标在本 folder：顺流续解，本条目按非目标消费
+                                }
+                                Ok(false) => {
+                                    interrupted = true;
+                                    return Ok(false);
+                                }
+                                Err(_) => return Err(sevenz_rust::Error::other("cancelled")),
+                            }
                         }
                         // 非目标条目顺序消费丢弃（solid 流不可跳，同 extract_batch），
                         // 按条目下标与 focus 相对位置分入 SkipUp/Downstream 段
@@ -1346,6 +1441,33 @@ mod tests {
         }))
     }
 
+    /// 驻留语义测试驱动：真暂停后线程不因"targets 解空"退出，同步调用
+    /// extract_session 会永久阻塞。此 helper 把会话放到后台线程跑，批解净
+    /// （targets 清空 = 全部 rename 落地）后置 cancel 让线程退出，返回线程
+    /// 最终 Result——cancel 路径为 Err(Cancelled)（同时 alive 被收尾置 false）。
+    /// 退出路径断言（alive=false）在新语义下由 cancel 收尾保证，语义等价
+    fn run_session_until_drained(
+        s: &SharedSession,
+        f: impl FnOnce(&SharedSession, &std::sync::atomic::AtomicBool) -> Result<(), VfsError>
+        + Send
+        + 'static,
+    ) -> Result<(), VfsError> {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c2 = cancel.clone();
+        let s2 = s.clone();
+        let handle = std::thread::spawn(move || f(&s2, &c2));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let empty = s.lock().unwrap().targets.is_empty();
+            if empty || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap()
+    }
+
     /// 建多 folder 测试包（每文件独立 folder，push_archive_entry）
     fn make_multi_folder_7z(dir: &Path, srcs: &[(String, Vec<u8>)]) -> PathBuf {
         let mut paths = Vec::new();
@@ -1431,22 +1553,27 @@ mod tests {
             st.focus = Some(0);
             st.alive = true;
         }
-        let target_reports = std::sync::Mutex::new(Vec::new());
-        let down_total = std::sync::Mutex::new(0u64);
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|ph, cur, total| {
-                if ph == ExtractPhase::Target {
-                    target_reports.lock().unwrap().push((cur, total));
-                }
-                if ph == ExtractPhase::Downstream {
-                    *down_total.lock().unwrap() = total;
-                }
-            },
-            &|_, _| {},
-        )
-        .unwrap();
+        let target_reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let down_total = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+        let tr = target_reports.clone();
+        let dt = down_total.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs.extract_session(
+                s,
+                cancel,
+                &|ph, cur, total| {
+                    if ph == ExtractPhase::Target {
+                        tr.lock().unwrap().push((cur, total));
+                    }
+                    if ph == ExtractPhase::Downstream {
+                        *dt.lock().unwrap() = total;
+                    }
+                },
+                &|_, _| {},
+            )
+        })
+        .err()
+        .expect("驻留会话由 cancel 收尾");
 
         // 旧实现：f1（idx 0 == focus 且不在 targets）被算进 Target 段 → 发
         // Target(0, 40_000) 骨架但回调走非目标分支永不写它 → 卡 0%。
@@ -1467,9 +1594,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 会话生命周期端到端：
-    /// 1) 目标解净 → Ok、targets 清空、alive=false、file_done 带 list 下标
-    /// 2) 空目标再入 = 空闲退出：立即 Ok，不触碰任何文件
+    /// 会话生命周期端到端（驻留语义）：
+    /// 1) 目标解净 → 批完成驻留（targets 清空、线程等待），由 cancel 收尾
+    /// 2) 空目标再入 = 驻留等待直至 cancel 收尾（Err(Cancelled)），不触碰任何文件
     /// 3) 会话复用：UI 重新加目标 + 置 alive，同一会话对象再跑；
     ///    focus folder 抢先解（file_done 顺序验证）
     /// 4) 目标不在包内：无进展保险报错防死循环（alive=false）
@@ -1484,7 +1611,8 @@ mod tests {
             ("f4.bin".into(), vec![4u8; 15_000]),
         ];
         let arch = make_multi_folder_7z(&dir, &srcs);
-        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        // Arc 包装：多个子步骤的后台会话闭包都要 move 一份
+        let vfs = std::sync::Arc::new(SevenzVFS::open(&arch, None).unwrap());
         assert_eq!(vfs.list().len(), 4);
 
         // 1) 基本解出：目标 f3（folder 直达，前置 folder 只 seek 不解压）
@@ -1496,17 +1624,23 @@ mod tests {
             st.focus = Some(2);
             st.alive = true;
         }
-        let done_idx = std::sync::atomic::AtomicU64::new(u64::MAX);
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_, _, _| {},
-            &|idx, path| {
-                done_idx.store(idx as u64, std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(path, d3.as_path(), "落地路径应为 f3 的目标路径");
-            },
-        )
-        .unwrap();
+        let done_idx = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let di = done_idx.clone();
+        let d3_expect = d3.clone();
+        let vfs1 = vfs.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs1.extract_session(
+                s,
+                cancel,
+                &|_, _, _| {},
+                &|idx, path| {
+                    di.store(idx as u64, std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(path, d3_expect.as_path(), "落地路径应为 f3 的目标路径");
+                },
+            )
+        })
+        .err()
+        .expect("驻留会话由 cancel 收尾");
         assert_eq!(
             done_idx.load(std::sync::atomic::Ordering::Relaxed),
             2,
@@ -1519,16 +1653,18 @@ mod tests {
             assert!(!st.alive, "Ok 返回后 alive 应为 false");
         }
 
-        // 2) 空目标 = 空闲退出：立即 Ok
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_, _, _| {},
-            &|_, _| {
-                panic!("空目标会话不应回调 file_done");
-            },
-        )
-        .unwrap();
+        // 2) 空目标再入：驻留等待直至 cancel 收尾（不再立即 Ok——空目标
+        // 即驻留是新的空闲语义），期间不触碰任何文件
+        let vfs2 = vfs.clone();
+        let err2 = run_session_until_drained(&s, move |s, cancel| {
+            vfs2.extract_session(s, cancel, &|_, _, _| {}, &|_, _| {})
+        })
+        .err()
+        .expect("空目标会话由 cancel 收尾");
+        assert!(
+            matches!(err2, VfsError::Cancelled),
+            "空目标驻留应由 cancel 收尾: {err2:?}"
+        );
 
         // 3) 会话复用 + focus 抢道：目标 f1 + f4，focus=f4 → f4 先落地
         {
@@ -1538,14 +1674,16 @@ mod tests {
             st.focus = Some(3);
             st.alive = true;
         }
-        let order = std::sync::Mutex::new(Vec::new());
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_, _, _| {},
-            &|idx, _| order.lock().unwrap().push(idx),
-        )
-        .unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let od = order.clone();
+        let vfs3 = vfs.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs3.extract_session(s, cancel, &|_, _, _| {}, &|idx, _| {
+                od.lock().unwrap().push(idx)
+            })
+        })
+        .err()
+        .expect("驻留会话由 cancel 收尾");
         assert_eq!(
             *order.lock().unwrap(),
             vec![3, 0],
@@ -1625,6 +1763,7 @@ mod tests {
         let s = new_session();
         let d0 = dir.join("out_n00.bin");
         let d64 = dir.join("out_n64.bin");
+        let d0_expect = d0.clone();
         {
             let mut st = s.lock().unwrap();
             st.targets.insert("n64.bin".into(), (64, d64.clone()));
@@ -1635,29 +1774,35 @@ mod tests {
         // n63 消费完、n64 未到——初始 (0, total) 骨架上报被 cur>0 过滤掉）
         // 时整体换目标——与 UI 重定向锁块同协议
         let redirected = std::sync::atomic::AtomicBool::new(false);
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|phase, cur, _total| {
-                if phase != ExtractPhase::SkipUp || cur == 0 {
-                    return;
-                }
-                if redirected.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                let mut st = s.lock().unwrap();
-                st.targets.clear();
-                st.targets.insert("n00.bin".into(), (0, d0.clone()));
-                st.focus = Some(0);
-                st.gen += 1;
-            },
-            &|idx, _| {
-                assert_eq!(idx, 0, "重定向后唯一应落地的目标是 n00");
-            },
-        )
-        .unwrap_or_else(|e| panic!("gen 救回应重新规划续跑而非误报: {e}"));
+        let redirected = std::sync::Arc::new(redirected);
+        let red = redirected.clone();
+        let s_ref = s.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs.extract_session(
+                s,
+                cancel,
+                &|phase, cur, _total| {
+                    if phase != ExtractPhase::SkipUp || cur == 0 {
+                        return;
+                    }
+                    if red.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut st = s_ref.lock().unwrap();
+                    st.targets.clear();
+                    st.targets.insert("n00.bin".into(), (0, d0.clone()));
+                    st.focus = Some(0);
+                    st.gen += 1;
+                },
+                &|idx, _| {
+                    assert_eq!(idx, 0, "重定向后唯一应落地的目标是 n00");
+                },
+            )
+        })
+        .err()
+        .expect("gen 救回应重新规划续跑且由 cancel 收尾");
         assert_eq!(
-            std::fs::read(&d0).unwrap(),
+            std::fs::read(&d0_expect).unwrap(),
             srcs[0].1,
             "重定向后 n00 应从头解出且内容正确"
         );
@@ -1689,30 +1834,31 @@ mod tests {
 
         let s = new_session();
         let dests: Vec<PathBuf> = (0..4).map(|i| dir.join(format!("chain_{i}.bin"))).collect();
+        let dests_in_thread = dests.clone();
         {
             let mut st = s.lock().unwrap();
             st.targets.insert("f1.bin".into(), (0, dests[0].clone()));
             st.focus = Some(0);
             st.alive = true;
         }
-        let done = std::sync::Mutex::new(Vec::new());
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_, _, _| {},
-            &|idx, _| {
-                done.lock().unwrap().push(idx);
+        let done = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dn = done.clone();
+        let s_ref = s.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs.extract_session(s, cancel, &|_, _, _| {}, &|idx, _| {
+                dn.lock().unwrap().push(idx);
                 // 落地即追加下一个目标（模拟 UI 组批）
                 if idx + 1 < 4 {
-                    let mut st = s.lock().unwrap();
+                    let mut st = s_ref.lock().unwrap();
                     st.targets.insert(
                         format!("f{}.bin", idx + 2),
-                        (idx + 1, dests[idx + 1].clone()),
+                        (idx + 1, dests_in_thread[idx + 1].clone()),
                     );
                 }
-            },
-        )
-        .unwrap();
+            })
+        })
+        .err()
+        .expect("驻留会话由 cancel 收尾");
         assert_eq!(
             *done.lock().unwrap(),
             vec![0, 1, 2, 3],
@@ -1803,20 +1949,20 @@ mod tests {
             st.focus = Some(g1);
             st.alive = true;
         }
-        let order = std::sync::Mutex::new(Vec::new());
-        vfs.extract_session(
-            &s,
-            &std::sync::atomic::AtomicBool::new(false),
-            &|_, _, _| {},
-            &|idx, _| {
-                order.lock().unwrap().push(idx);
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let od = order.clone();
+        let s_ref = s.clone();
+        run_session_until_drained(&s, move |s, cancel| {
+            vfs.extract_session(s, cancel, &|_, _, _| {}, &|idx, _| {
+                od.lock().unwrap().push(idx);
                 if idx == g1 {
                     // g1 刚落地：用户跳到另一 folder 的 h1 → 漂移
-                    s.lock().unwrap().focus = Some(h1);
+                    s_ref.lock().unwrap().focus = Some(h1);
                 }
-            },
-        )
-        .unwrap();
+            })
+        })
+        .err()
+        .expect("驻留会话由 cancel 收尾");
         assert_eq!(
             *order.lock().unwrap(),
             vec![g1, h1, g3],

@@ -244,6 +244,11 @@ struct ExtractJob {
     /// 快速解压全程不打扰播放，避免窗口闪烁。批内切换目标不重置
     /// （解压流本就在跑，切过去通常已在目标附近，立即显示进度是对的）
     started: std::time::Instant,
+    /// 批完成标志：本批 pending 已全部落地。7z 真暂停驻留后解码线程不再
+    /// 退出发 Done，任务对象保留待下一批重定向复用（rx/cancel 延续）；
+    /// UI 侧据 idle 关闭覆盖层/顶栏 bar 等"进行中"显示，并在 Done（RAR
+    /// 等旧格式仍会发）到达时防重兜底补播
+    idle: bool,
     /// 取消标志：仅切换压缩包时置位（终止解码线程，会话随旧包一起丢弃）。
     /// 批外跳转不取消——走会话重定向（session.targets 重写），解码流续跑
     /// 免重启（solid 包重启 = 重新顺序解前置数据）
@@ -1002,6 +1007,13 @@ impl eframe::App for App {
         probe!("poll_rating_probe");
         // 后台解压任务轮询（7z/RAR）
         self.poll_extract();
+        // 解压任务活跃时定时续帧：图片/静止画面 egui 无输入不重绘，通道里的
+        // Progress/FileDone 无人消费——顶栏进度冻结在最后一帧（下游条满、剩余
+        // N 项恒定，实测被当假死），批完成→驻留判定也不跑。视频常播时 mpv 持续
+        // 重绘掩盖了此问题，故此前未暴露。驻留（idle）/无任务时不续帧（零开销）
+        if self.extract.as_ref().is_some_and(|j| !j.idle) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         probe!("poll_extract");
         // 图片解码结果轮询（后台线程 → UI 线程上传纹理）
         self.poll_img();

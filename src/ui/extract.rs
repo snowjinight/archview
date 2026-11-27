@@ -451,7 +451,12 @@ impl App {
         if upstream_cap > 0 {
             if let Some(s) = arch.vfs.locate_start(entry_idx) {
                 let mut upstream_bytes: u64 = 0;
-                for i in s..entry_idx {
+                // 紧贴锚点向前收：从 entry_idx-1 逆序攒预算，落盘段 =
+                // [锚点-512MB, 锚点) 而非 folder 开头（folder 开头离锚点
+                // 最远，顺序浏览时最先被复用，预取价值最低）。解码顺序
+                // 不变（solid 从 folder 起点顺流）：skip 前缀 → 上游落盘
+                // → 锚点，进度条顺序因此与设计意图一致
+                for i in (s..entry_idx).rev() {
                     if upstream_bytes >= upstream_cap {
                         break;
                     }
@@ -534,22 +539,37 @@ impl App {
     pub(super) fn start_extract(&mut self, entry_idx: usize) {
         // 去重：该条目的解压线程已在跑（双击/重复点击会瞬时触发两次 play），
         // 不再起第二个线程——两个 unrar 抢写同一个临时文件会报 "Could not create file"。
+        // 批完成驻留（idle）任务不算"在跑"：其 entry_idx 停在上批锚点，同位
+        // 重点击（位图失真降级为未缓存等）须照常走组批重定向
         if self
             .extract
             .as_ref()
-            .is_some_and(|j| j.entry_idx == entry_idx)
+            .is_some_and(|j| !j.idle && j.entry_idx == entry_idx)
         {
             return;
         }
         // 只读规划段：借 archive 组批并产出 owned 数据。后续预检/重定向/
         // spawn 都要可变借用 self（方法调用借整个 self），须先结束 arch 借用
-        let (cached, was_pending, session, vfs, dir, dest, name, targets, batch_bytes) = {
+        let (cached, bitmap_miss, was_pending, session, vfs, dir, dest, name, targets, batch_bytes) = {
             let Some(arch) = &self.archive else { return };
             let entry = &arch.entries[entry_idx];
             let dir = cache::cache_dir(&self.cfg);
             let dest = cache::dest_path(&dir, arch.id, entry_idx, &entry.name);
-            // 缓存命中：查位图（open 时扫描 + FileDone 置位，尺寸已校验）
-            let cached = arch.cached.get(entry_idx).copied().unwrap_or(false);
+            // 缓存命中：查位图（open 时扫描 + FileDone 置位，尺寸已校验）。
+            // 位图失真兜底：位图说在而磁盘不在（跨包逐出漏清位等异常路径）→
+            // 降级为未缓存走解压路径；miss 记入 bitmap_miss，块外回写清位
+            // （本块是 &self.archive 只读借用），防后续批规划继续把该条目
+            // 当已缓存跳过
+            let mut bitmap_miss = false;
+            let cached = {
+                let hit = arch.cached.get(entry_idx).copied().unwrap_or(false);
+                if hit && !dest.exists() {
+                    bitmap_miss = true;
+                    false
+                } else {
+                    hit
+                }
+            };
             // 批内切换：新目标在当前批未完成清单里（覆盖层宽限期不清零的依据）
             let was_pending = self
                 .extract
@@ -586,6 +606,7 @@ impl App {
             };
             (
                 cached,
+                bitmap_miss,
                 was_pending,
                 arch.session.clone(),
                 arch.vfs.clone(),
@@ -596,6 +617,18 @@ impl App {
                 batch_bytes,
             )
         };
+        // 位图失真回写清位（只在规划块外做，块内是只读借用）：命中判定
+        // 已降级，不清位会让 compute_batch 继续跳过该条目
+        if bitmap_miss {
+            tracing::warn!(
+                "缓存位图失真: [{name}]（位图命中而磁盘缺失）→ 清位并走解压路径"
+            );
+            if let Some(a) = self.archive.as_mut() {
+                if entry_idx < a.cached.len() {
+                    a.cached[entry_idx] = false;
+                }
+            }
+        }
 
         // 回看 keep 判定：缓存命中 + 会话存活 + 点击项在抢道锚点
         // （focus，上次重定向写入、view 位在其上游）→ 完全不碰会话——
@@ -628,7 +661,9 @@ impl App {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                j.phases = [(0, 0); ExtractPhase::COUNT];
+                // phases 不清：进度属于后台解压批，与播放切换无关——清零会让
+                // 顶栏 Downstream mini bar 每次回看闪一下（消失一帧等下条
+                // Progress 消息恢复）
             }
             tracing::debug!(
                 "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项，窗口 {win}",
@@ -641,10 +676,10 @@ impl App {
             return;
         }
 
-        // 整窗已落地：无事可解，不重定向会话（空 targets 会让解码线程判空
-        // 退出）。也不动 focus 锚点——本就无事可解，锚点保持让后台按原
-        // 计划收尾；仅播放 + 切 j 字段——Done 兜底补播以 j.entry_idx 为
-        // 准，不切会在旧目标落地时把画面从当前条目拽走
+        // 整窗已落地：无事可解，不重定向会话——空 targets 写进去只会让 7z
+        // 驻留会话空转等待（RAR 则判空退出）。也不动 focus 锚点——本就无事
+        // 可解，锚点保持让后台按原计划收尾；仅播放 + 切 j 字段——Done 兜底
+        // 补播以 j.entry_idx 为准，不切会在旧目标落地时把画面从当前条目拽走
         if targets.is_empty() {
             debug_assert!(cached);
             let (_, win) = self.session_snapshot();
@@ -652,7 +687,7 @@ impl App {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                j.phases = [(0, 0); ExtractPhase::COUNT];
+                // phases 不清：同 keep 分支（进度属于后台批，清零闪 mini bar）
             }
             tracing::debug!(
                 "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
@@ -751,6 +786,9 @@ impl App {
                 j.phases = [(0, 0); ExtractPhase::COUNT];
                 j.pending = pending;
                 j.batch_len = batch_len;
+                // 新批开工：清除上批的批完成驻留标记（否则新批期间覆盖层
+                // 不显示、下个批完成也因 !j.idle 不成立而检测不到）
+                j.idle = false;
                 // started 仅批外新目标重置：批内切换/缓存命中沿用（覆盖层
                 // 宽限期不清零，立即显示进度是对的）
                 if !was_pending && !cached {
@@ -849,6 +887,7 @@ impl App {
             pending,
             batch_len,
             started: std::time::Instant::now(),
+            idle: false,
             cancel,
             rx,
         });
@@ -892,10 +931,22 @@ impl App {
                     // 供后续翻页命中），否则只记账。对比模式不自动播放——
                     // compare_tick 的落地检查按栏拾取（播放会劫持对比会话）
                     // 落地即置缓存命中位图（无论是否当前期望目标）：rename
-                    // 成功才会发 FileDone，位图可信；后续批扫描/命中判定零 IO
+                    // 成功才会发 FileDone，位图可信；后续批扫描/命中判定零 IO。
+                    // 但发送（解码线程 rename 完成）与消费（poll_extract 每帧
+                    // 才排空）之间有积压窗口，期间新批的 evict_if_needed 可能
+                    // 已删掉该文件——置位前 exists 复核，防滞留 FileDone 复活
+                    // 已逐出条目的位图（位图失真实测根因，DEVLOG §1.8）
                     if let Some(a) = self.archive.as_mut() {
                         if i < a.cached.len() {
-                            a.cached[i] = true;
+                            let dest = cache::dest_path(
+                                &cache::cache_dir(&self.cfg),
+                                a.id,
+                                i,
+                                &a.entries[i].name,
+                            );
+                            if dest.exists() {
+                                a.cached[i] = true;
+                            }
                         }
                     }
                     let mut play: Option<(PathBuf, usize)> = None;
@@ -927,6 +978,35 @@ impl App {
                     }
                     if let Some((d, i)) = play {
                         self.load_extracted(&d, i);
+                    }
+                    // 批完成（本批 pending 全部落地）：7z 真暂停驻留后解码
+                    // 线程不再退出发 Done，原 Done 兜底逻辑移至此处执行；
+                    // RAR 等旧格式 Done 仍会到达，由 idle 标志防重
+                    let batch_done = self
+                        .extract
+                        .as_ref()
+                        .is_some_and(|j| j.pending.is_empty() && !j.idle);
+                    if batch_done {
+                        if let Some(j) = self.extract.as_mut() {
+                            j.idle = true;
+                        }
+                        // 兜底补播（原 Done 逻辑）：目标理论上已由 FileDone
+                        // 播放（gen 匹配 = 期望未被后续重定向取代且未被批内
+                        // 切走）；文件在而没播过才补。回看提醒挂起时让位
+                        // （强切 = 把用户从回看内容拽回锚点）；对比模式不补播
+                        if !self.extract_ready
+                            && gen == self.next_gen
+                            && self.playing != Some(entry_idx)
+                            && self.compare.is_none()
+                            && std::fs::metadata(&dest).is_ok()
+                        {
+                            self.load_extracted(&dest, entry_idx);
+                        }
+                        let (focus, win) = self.session_snapshot();
+                        tracing::debug!(
+                            "批完成（会话驻留）: 最后目标 [{entry_name}]｜锚点 focus={focus:?}，当前窗口 {win}，playing={:?}",
+                            self.playing
+                        );
                     }
                 }
                 ExtMsg::Done => {
