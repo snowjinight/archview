@@ -20,6 +20,9 @@ mod iosched;
 mod logsink;
 mod meta;
 mod player;
+// 任务栏「最近」列表登记：打开成功后 SHAddToRecentDocs（拖入/SendTo/目录
+// 入口 Shell 不自动登记，见模块文档）
+mod recent_docs;
 // raw 裸数据媒体层：预设校验 / Bayer 探测 / 软解帧提取（mpv 播放与对比视图两路消费）
 mod rawdec;
 // 冒烟测试夹具定位（#[cfg(test)]）：require 系列，夹具缺失即 panic 禁止静默跳过
@@ -27,8 +30,8 @@ mod rawdec;
 mod smoke;
 // 高级搜索：语法引擎 + 搜索历史（AND/OR/NOT/短语/通配/分组）
 mod search;
-// 全局单实例：已有实例运行时把启动路径经 WM_COPYDATA 转发给它并退出
-// （第二实例拖任务栏图标/双击/SendTo → 旧实例直接替换当前打开内容）
+// 全局单实例：带可打开目标启动且已有实例运行时，把目标经 WM_COPYDATA
+// 转发给旧实例并退出（旧实例直接替换当前打开内容）；裸启动开新实例
 mod single_instance;
 mod ui;
 mod vartidy;
@@ -57,12 +60,6 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
 
-    // 全局单实例：已有实例运行时，把本次启动携带的路径转发给它（接收方
-    // 走与任务栏拖入相同的队列 → open_path 替换当前内容），前置旧实例
-    // 窗口后本进程退出；无实例则本进程持互斥体正常启动。须在 config
-    // 加载前做——第二实例秒退，不加载配置不初始化 mpv，无窗口闪烁
-    single_instance::forward_if_exists(&args);
-
     // config 需在 tracing 初始化前加载（日志级别来自配置）——此时日志管线
     // 尚未建立，失败信息走弹窗（windows 子系统下 eprintln/panic 不可见）
     let cfg = match config::Config::load_or_create() {
@@ -80,6 +77,14 @@ fn main() -> eframe::Result<()> {
     };
     // 初始打开目标在 config 之后解析（媒体文件判定用 config 扩展名列表）
     let initial = initial_archive(&args, &cfg);
+    // 半单实例转发：带可打开目标启动且已有实例运行时，把目标转发给旧
+    // 实例（接收方走与任务栏拖入相同的队列 → open_path 替换当前内容），
+    // 前置旧实例窗口后本进程退出；裸启动不参与单实例（保持开新窗口）。
+    // 放 mpv/日志初始化之前：转发实例秒退，无窗口闪烁
+    single_instance::forward_if_exists(initial.as_deref());
+    // 任务栏「最近」列表归属的 AppUserModelID：须在窗口创建前设置
+    //（winit 不设置 AUMID，缺了它最近项无法归入本应用的任务栏按钮）
+    recent_docs::init_app_id();
     // 日志级别优先级：RUST_LOG 环境变量 > config.toml log_level > 默认 info。
     // 均走 EnvFilter 解析：级别名单（info/debug/…）或按模块指令都接受；
     // 非法值回退 info

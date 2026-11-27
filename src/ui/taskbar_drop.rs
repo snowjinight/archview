@@ -1,12 +1,12 @@
-//! 任务栏驻留图标拖入通道（Windows 专用）：winit 的 OLE 拖放只注册在窗口
-//! 客户区，拖到任务栏驻留图标上不进 egui 的 dropped_files。这里用 Shell 层
-//! DragAcceptFiles 注册 + 子类化窗口过程接 WM_DROPFILES 兜底——任务栏对
-//! 运行中窗口的投递走该消息（窗口已注册 OLE 目标时客户区拖放仍走 winit
-//! 原路，两条通道互不重复）。路径进共享队列，UI 每帧排空第一条，与窗口
-//! 拖入同一条分流（open_path）。
+//! 任务栏拖入兜底 + 单实例转发接收（Windows 专用）。**实测（v1.3.3）：
+//! 现代系统（Win10 22H2 / Win11）任务栏不把 drop 转发给运行中窗口**——
+//! 未固定的运行中按钮直接红色拒绝，固定图标走"Shell 带参启动 exe"（见
+//! doc/架构设计/20_单实例与Shell集成.md §20.3），所以 WM_DROPFILES 通道
+//! 实际收不到任务栏投递，保留为防御性兜底。本模块存在的主要理由是
+//! WM_COPYDATA 接收端：single_instance 转发的路径落进 TASKBAR_DROPS
+//! 队列，UI 每帧排空第一条走 open_path，与窗口拖入同一条分流。
 //!
-//! 应用未运行时拖到驻留图标 = Shell 直接带文件参数启动 exe，不经此模块。
-//! 若此时已有实例运行，该启动参数由 single_instance 经 WM_COPYDATA 转发
+//! 若拖入时已有实例运行：该启动参数由 single_instance 经 WM_COPYDATA 转发
 //! 回旧实例的主窗口——同在本 wnd_proc 接收（SendMessage 直达子类过程），
 //! 与 WM_DROPFILES 走同一条队列 → open_path 替换当前内容。
 

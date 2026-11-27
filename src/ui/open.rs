@@ -289,6 +289,9 @@ impl App {
         entries: Vec<VirtualEntry>,
         pw: Option<String>,
     ) -> Option<usize> {
+        // 登记进任务栏「最近」列表：Shell 只自动登记文件关联启动，拖入/
+        // SendTo/目录入口一律漏掉——打开成功即补登（见 recent_docs 模块文档）
+        crate::recent_docs::add(&path);
         // 切换目录自动保存：旧目录还有待同步评级 → 立即启动同步 worker。
         // worker 持有的是排空后的 (PathBuf, 值) 列表，与新会话零耦合（异步
         // 落盘，新目录加载与写入并行）；dirty 只在目录模式产生（压缩包模式
