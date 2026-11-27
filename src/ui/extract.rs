@@ -390,10 +390,13 @@ impl App {
 
     /// 组批 = 会话窗口：目标 + view 顺序（显示顺序）下游条目
     /// （prefetch_downstream_mb 封顶）+ 定位免费区上游条目
-    /// （prefetch_upstream_mb 封顶）。已落地条目跳过
-    /// （无需解压、不占批额度；目标本身已缓存时窗口纯做预取）。返回
-    /// (窗口条目下标, 窗口总字节)。窗口随 focus 滑动：每次目标切换都重算
-    /// 对齐，连续观看跨过窗口尾界时无感续解，不必等整批重新解压
+    /// （prefetch_upstream_mb 封顶）。已落地条目跳过（无需解压）但**占预
+    /// 算字节**（R1）：窗口 = [锚点-预算, 锚点+预算] 随锚点整体滑动，缓存
+    /// 区不再免费穿过——窗口起点永不越过上一批已解区域滑向解码头身后
+    /// （身后未缓存项只能靠前缀重解取回，实测 8 项漏网曾触发 114 秒前缀
+    /// 重解）。返回 (窗口条目下标, 窗口总字节)。窗口随 focus 滑动：每次
+    /// 目标切换都重算对齐，连续观看跨过窗口尾界时无感续解，不必等整批
+    /// 重新解压
     pub(super) fn compute_batch(
         &self,
         arch: &ArchiveState,
@@ -409,7 +412,7 @@ impl App {
             .saturating_mul(1024 * 1024);
         let mut batch: Vec<usize> = Vec::new();
         let mut batch_bytes: u64 = 0;
-        // 目标自身：未落地才入批（已缓存时窗口纯做预取，不占额度）
+        // 目标自身：未落地才入批（调用方保证锚点未缓存才组批，R3）
         if !on_disk(entry_idx) {
             batch.push(entry_idx);
             batch_bytes = arch.entries[entry_idx].size;
@@ -424,12 +427,20 @@ impl App {
         // 与不预取完全等价，无额外代价——空间换时间，seek 代价大的 solid
         // 包上期望收益为正
         if cap > 0 {
+            // 额度游标与写入量分离：额度含已缓存项（R1），写入量只计
+            // 未缓存项（disk_short/evict 按实际落盘字节）。额度起点 =
+            // 目标自身字节（沿用原 batch_bytes 起步语义）
+            let mut cap_bytes = batch_bytes;
             for i in entry_idx + 1..arch.entries.len() {
-                if batch_bytes >= cap {
+                if cap_bytes >= cap {
                     break;
                 }
                 let e = &arch.entries[i];
-                if e.is_dir || on_disk(i) {
+                if e.is_dir {
+                    continue;
+                }
+                cap_bytes += e.size;
+                if on_disk(i) {
                     continue;
                 }
                 batch_bytes += e.size;
@@ -450,21 +461,27 @@ impl App {
             .saturating_mul(1024 * 1024);
         if upstream_cap > 0 {
             if let Some(s) = arch.vfs.locate_start(entry_idx) {
+                // 额度游标与写入量分离（同下游）：额度含已缓存项（R1），
+                // 缓存区不再免费穿过——窗口起点随锚点整体滑动且被已解
+                // 区域的缓存字节顶住，永不越过上一批起点收编解码头身后
+                // 的漏网项（顺带落盘的前提是解码流"将来还会流过"）
                 let mut upstream_bytes: u64 = 0;
                 // 紧贴锚点向前收：从 entry_idx-1 逆序攒预算，落盘段 =
-                // [锚点-512MB, 锚点) 而非 folder 开头（folder 开头离锚点
-                // 最远，顺序浏览时最先被复用，预取价值最低）。解码顺序
-                // 不变（solid 从 folder 起点顺流）：skip 前缀 → 上游落盘
+                // [锚点-预算, 锚点) 而非 folder 开头。解码顺序不变
+                // （solid 从 folder 起点顺流）：skip 前缀 → 上游落盘
                 // → 锚点，进度条顺序因此与设计意图一致
                 for i in (s..entry_idx).rev() {
                     if upstream_bytes >= upstream_cap {
                         break;
                     }
                     let e = &arch.entries[i];
-                    if e.is_dir || on_disk(i) {
+                    if e.is_dir {
                         continue;
                     }
                     upstream_bytes += e.size;
+                    if on_disk(i) {
+                        continue;
+                    }
                     batch_bytes += e.size;
                     batch.push(i);
                 }
@@ -527,15 +544,15 @@ impl App {
         (st.focus, win)
     }
 
-    /// 启动/重定向后台解压任务。缓存命中（同尺寸文件已在）直接播放：
-    /// 点击项在抢道锚点（focus，上次重定向目标）上游——即回看已看
-    /// 内容——走 keep 分支完全不碰会话，后台继续解原计划（锚点只向
-    /// 下游推进）；否则窗口照常重算——会话窗口以 focus 为中心（目标 +
-    /// 上/下游预取），每次向下游推进都重新对齐滑动：批内切换/下游缓存
-    /// 命中让窗口跟随用户推进，批外跳转则整体重算，共用同一条重定向
-    /// 路径（solid 包定位目标需顺序解压上游前置数据，一次解一批摊薄
-    /// 固定成本；上游条目定位时本就要被解掉丢弃，顺带写盘即"上游
-    /// 预取"——随机跳看后往回翻直接命中缓存）
+    /// 启动/重定向后台解压任务。R3 零动作守卫：锚点已缓存（位图命中且
+    /// 磁盘 exists 复核通过）→ 纯 UI 更新立即返回——不组批、不重定向、
+    /// 不起预取会话，预取全部变为"翻到未缓存项才触发"的搭车福利（停留
+    /// 已缓存区后台零活动，逐出回退也不会触发无谓重定向）。锚点未缓存
+    /// 才组批：窗口以 focus 为中心（目标 + 上/下游预取，预算含已缓存项
+    /// 字节、随锚点整体滑动），批内切换/批外跳转共用同一条重定向路径
+    /// （solid 包定位目标需顺序解压上游前置数据，一次解一批摊薄固定成
+    /// 本；上游条目定位时本就要被解掉丢弃，顺带写盘即"上游预取"——随机
+    /// 跳看后往回翻直接命中缓存）
     pub(super) fn start_extract(&mut self, entry_idx: usize) {
         // 去重：该条目的解压线程已在跑（双击/重复点击会瞬时触发两次 play），
         // 不再起第二个线程——两个 unrar 抢写同一个临时文件会报 "Could not create file"。
@@ -580,7 +597,11 @@ impl App {
             // （BlockDecoder 按 pack 偏移直达）。只解点击项 = 真随机访问，
             // 不组窗不预取（solid 包照旧 compute_batch 滑窗）
             let single = arch.vfs.access_mode() == AccessMode::SingleFile;
-            let (targets, batch_bytes) = if single {
+            // R3：锚点已缓存不组批——空 targets，块外零动作守卫统一处理
+            //（含 single 模式；原"缓存命中起预取会话"路径随之废除）
+            let (targets, batch_bytes) = if cached {
+                (Vec::new(), 0)
+            } else if single {
                 (
                     vec![(
                         entry.name.clone(),
@@ -630,67 +651,26 @@ impl App {
             }
         }
 
-        // 回看 keep 判定：缓存命中 + 会话存活 + 点击项在抢道锚点
-        // （focus，上次重定向写入、view 位在其上游）→ 完全不碰会话——
-        // 锚点只向下游推进不回退，后台继续按原计划解压锚点窗口（跳点
-        // 80 等解的同时回翻 1-30 缓存即此场景）。锚点与播放解耦：列表
+        // R3 零动作守卫：锚点已缓存 = 纯 UI 更新——不组批、不重定向会话、
+        // 不动 focus 锚点（原 keep 分支与"整窗已落地"分支在此统一，两者
+        // 前提均为锚点命中）。预取变为"翻到未缓存项才触发"的搭车福利：
+        // 停留已缓存区时后台零活动（会话驻留或按原计划继续解上一批），
+        // 逐出导致的位图回退（点已缓存锚点、窗口却含被逐出项）也不会
+        // 触发无谓重定向——用户原话"除非我点到了不在缓存里面的东西"。
+        // 仅切 UI 侧任务字段：Done 兜底补播以 j.entry_idx 为准；phases
+        // 不清（进度属于后台批，清零闪 mini bar）。锚点与播放解耦：列表
         // 高亮/滚动跟随 self.playing，focus 仅由解码线程消费（见
         // SessionState::focus）
-        let (sess_alive, sess_focus) = {
-            let st = session.lock().unwrap();
-            (st.alive, st.focus)
-        };
-        let (click_pos, focus_pos) = {
-            let pos_of = |i: usize| {
-                self.archive
-                    .as_ref()
-                    .and_then(|a| a.view.iter().position(|&v| v == i))
-            };
-            (pos_of(entry_idx), sess_focus.and_then(pos_of))
-        };
-        let upstream = matches!((click_pos, focus_pos), (Some(p), Some(f)) if p < f);
-        if cached && sess_alive && upstream {
-            // 仅切 UI 侧任务字段：Done 兜底补播以 j.entry_idx 为准，不切
-            // 会在旧目标落地时把画面从当前条目拽走。pending/batch_len/gen
-            // 都不动——顶栏"剩余 N 项"继续如实反映后台解压量；j.gen 与
-            // next_gen 不变，后台整批解完的 Done 兜底补播因 playing 已是
-            // 本条目而天然不触发
-            let pend = self.extract.as_ref().map(|j| j.pending.len()).unwrap_or(0);
+        let sess_focus = session.lock().unwrap().focus;
+        if cached {
             let (_, win) = self.session_snapshot();
             if let Some(j) = self.extract.as_mut() {
                 j.entry_idx = entry_idx;
                 j.dest = dest.clone();
                 j.entry_name = name.clone();
-                // phases 不清：进度属于后台解压批，与播放切换无关——清零会让
-                // 顶栏 Downstream mini bar 每次回看闪一下（消失一帧等下条
-                // Progress 消息恢复）
             }
             tracing::debug!(
-                "缓存命中（回看，会话保持）: {name}｜点击 view 位 {}，锚点 focus={}（view 位 {}），切换前 playing={:?}，后台待落地 {pend} 项，窗口 {win}",
-                click_pos.unwrap_or(usize::MAX),
-                sess_focus.unwrap_or(usize::MAX),
-                focus_pos.unwrap_or(usize::MAX),
-                self.playing
-            );
-            self.load_extracted(&dest, entry_idx);
-            return;
-        }
-
-        // 整窗已落地：无事可解，不重定向会话——空 targets 写进去只会让 7z
-        // 驻留会话空转等待（RAR 则判空退出）。也不动 focus 锚点——本就无事
-        // 可解，锚点保持让后台按原计划收尾；仅播放 + 切 j 字段——Done 兜底
-        // 补播以 j.entry_idx 为准，不切会在旧目标落地时把画面从当前条目拽走
-        if targets.is_empty() {
-            debug_assert!(cached);
-            let (_, win) = self.session_snapshot();
-            if let Some(j) = self.extract.as_mut() {
-                j.entry_idx = entry_idx;
-                j.dest = dest.clone();
-                j.entry_name = name.clone();
-                // phases 不清：同 keep 分支（进度属于后台批，清零闪 mini bar）
-            }
-            tracing::debug!(
-                "缓存命中（整窗已落地）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
+                "缓存命中（零动作）: {name}｜锚点 focus={:?}，playing={:?}，当前窗口 {win}",
                 sess_focus,
                 self.playing
             );
@@ -699,22 +679,13 @@ impl App {
         }
 
         // 磁盘余量预检（整批）：批外目标放不下直接报错，不发起到注定失败的
-        // 解压；缓存命中降级——播放不受影响，沿用旧窗口不滑动
+        // 解压（R3 守卫后此处锚点必未缓存，无降级旁路）
         if let Some(msg) = Self::disk_short(
             &dir,
             targets.len(),
             batch_bytes,
             self.cfg.cache.max_size_mb * 1024 * 1024,
         ) {
-            if cached {
-                tracing::warn!(
-                    "窗口滑动跳过（磁盘不足，播放不受影响）：{msg}｜锚点 focus={:?}，playing={:?}",
-                    sess_focus,
-                    self.playing
-                );
-                self.load_extracted(&dest, entry_idx);
-                return;
-            }
             self.set_err(msg);
             return;
         }
@@ -751,14 +722,12 @@ impl App {
                 st.targets.insert(n.clone(), (*i, d.clone()));
             }
             st.focus = Some(entry_idx);
-            // 「回到锚点」目标同步推进：仅目标未缓存（真正需要解压）时写。
-            // 缓存命中秒开只是回看/预取重定向，不算解压推进——否则会话
-            // 退出后翻看已缓存内容会把锚点污染掉，回不到真正的解压位置
-            if !cached {
-                self.last_focus = Some(entry_idx);
-                // 新解压开始：旧的"解压完成待消费"提醒作废
-                self.extract_ready = false;
-            }
+            // 「回到锚点」目标同步推进：锚点未缓存（真正需要解压）必写。
+            // 缓存命中秒开已在 R3 守卫提前返回，不会污染解压锚点——否则
+            // 会话退出后翻看已缓存内容会把锚点污染掉，回不到真正的解压位置
+            self.last_focus = Some(entry_idx);
+            // 新解压开始：旧的"解压完成待消费"提醒作废
+            self.extract_ready = false;
             // 重定向代数 +1：解码线程每轮规划快照 gen，零落地时据此区分
             // "UI 换了目标"与"目标不在解码流中"（后者才报错，见 vfs/mod.rs）
             st.gen += 1;
@@ -789,19 +758,12 @@ impl App {
                 // 新批开工：清除上批的批完成驻留标记（否则新批期间覆盖层
                 // 不显示、下个批完成也因 !j.idle 不成立而检测不到）
                 j.idle = false;
-                // started 仅批外新目标重置：批内切换/缓存命中沿用（覆盖层
-                // 宽限期不清零，立即显示进度是对的）
-                if !was_pending && !cached {
+                // started 仅批内切换沿用（覆盖层宽限期不清零，立即显示进度
+                // 是对的）；批外新目标重置
+                if !was_pending {
                     j.started = std::time::Instant::now();
                 }
-                if cached {
-                    tracing::debug!(
-                        "缓存命中: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
-                        sess_focus.unwrap_or(usize::MAX),
-                        self.playing
-                    );
-                    self.load_extracted(&dest, entry_idx);
-                } else if was_pending {
+                if was_pending {
                     tracing::debug!(
                         "批内切换目标: {name}（窗口滑动至 {win_summary}）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}",
                         sess_focus.unwrap_or(usize::MAX),
@@ -820,16 +782,8 @@ impl App {
         }
 
         // 解码线程已退出（空闲/出错/从未启动）：新线程 + 新通道消费会话。
-        // 缓存命中也照常起会话——窗口围绕已播目标继续预取，连续观看缓存
-        // 内容时跨出窗口同样无感滑动
-        if cached {
-            tracing::debug!(
-                "缓存命中（预取会话启动）: {name}｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，新窗 {win_summary}",
-                sess_focus.unwrap_or(usize::MAX),
-                self.playing
-            );
-            self.load_extracted(&dest, entry_idx);
-        }
+        // R3 守卫后此处锚点必未缓存（已缓存零动作提前返回），起会话即
+        // 真解压批；停留已缓存区不再起预取会话
         let (tx, rx) = mpsc::channel::<ExtMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = cancel.clone();
@@ -869,21 +823,20 @@ impl App {
             })
             .ok();
 
-        if !cached {
-            tracing::debug!(
-                "后台解压: {name} → {}（顺带预取 {} 项）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
-                dest.display(),
-                batch_len - 1,
-                sess_focus.unwrap_or(usize::MAX),
-                self.playing
-            );
-        }
+        tracing::debug!(
+            "后台解压: {name} → {}（顺带预取 {} 项）｜锚点 focus {}→{entry_idx}，切换前 playing={:?}，窗口 {win_summary}",
+            dest.display(),
+            batch_len - 1,
+            sess_focus.unwrap_or(usize::MAX),
+            self.playing
+        );
         self.extract = Some(ExtractJob {
             gen,
             entry_idx,
             dest,
             entry_name: name,
             phases: [(0, 0); ExtractPhase::COUNT],
+            active_phase: None,
             pending,
             batch_len,
             started: std::time::Instant::now(),
@@ -914,6 +867,9 @@ impl App {
             match msg {
                 ExtMsg::Progress(phase, done, total) => {
                 if let Some(j) = &mut self.extract {
+                    // 记录当前段（无比值期顶栏兜底显示用）；进度为覆盖
+                    // 语义，最近上报段即当前活动段
+                    j.active_phase = Some(phase);
                     // 按段直写 (当前, 总量)：总量>0 时字节封顶（上报侧
                     // min 已保证，双保险）；总量=0 的段走活动指示不写比值
                     let slot = &mut j.phases[phase as usize];

@@ -350,8 +350,8 @@ impl App {
                     // 解压五段顺序推进（跳前置→上游预取→目标→下游），只画
                     // Downstream 会在跳前置/上游预取阶段长时间停 0——用户误以
                     // 为卡死。倒序找第一个 cur>0 且 t>0 的段（后段开工说明前段
-                    // 完成）；全零（定位期/骨架期）不画条，文字标记已够。hover
-                    // 显精确字节进度
+                    // 完成）；无比值可画时兜底显最近上报段名 + spinner（见下），
+                    // hover 显精确字节进度
                     const PHASE_LABELS: [&str; ExtractPhase::COUNT] =
                         ["定位", "跳过", "上游", "目标", "下游"];
                     let mut active = None;
@@ -379,6 +379,18 @@ impl App {
                             c as f64 / 1048576.0,
                             t as f64 / 1048576.0
                         ));
+                    } else if let Some(p) = j.active_phase {
+                        // 无比值期（定位 Locate(0,0)、段骨架 (0,total)、真暂停
+                        // 唤醒续解段游标清零后 (cur,0)）画不了比值条——曾整段
+                        // 留白，实测被用户误读为"卡在定位"。兜底显最近上报段名
+                        // + spinner 活动指示（进度覆盖语义，最近段即当前段）
+                        ui.monospace(
+                            egui::RichText::new(PHASE_LABELS[p as usize])
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.add(egui::Spinner::new().size(10.0))
+                            .on_hover_text("该阶段暂无定比信息（定位/骨架/唤醒续解），转动 = 后台解压在推进");
                     }
                 }
             }

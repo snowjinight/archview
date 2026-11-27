@@ -39,6 +39,7 @@ fn done_fallback_yields_to_extract_ready() {
         dest: dest.clone(),
         entry_name: "anchor.jpg".into(),
         phases: [(0, 0); crate::vfs::ExtractPhase::COUNT],
+        active_phase: None,
         pending: std::collections::HashMap::new(),
         batch_len: 1,
         started: std::time::Instant::now(),
@@ -929,10 +930,10 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         "回看中锚点落地应置解压完成提醒（顶栏提醒的依据）"
     );
 
-    // ---- 步骤 5b：批完成驻留后按 last_focus 跳回锚点（会话复用重定向）----
-    // 驻留会话 alive=true：跳回锚点不再重 spawn，走重定向复用（新语义下
-    // 这正是"顺序/跳转零成本续解"的核心）。锚点 2 已落地 → 立即播放；
-    // 下游 5 尚未落地 → 重算预取窗口 [5]，解码线程从真暂停边界顺流补齐
+    // ---- 步骤 5b：批完成驻留后跳回锚点（R3 零动作 + 点未缓存项才组批）----
+    // 驻留会话 alive=true。锚点 2 已落地 → R3 零动作守卫：立即播放、
+    // 不组批、不重定向、gen 不自增（停留已缓存区后台零活动，预取全部
+    // 变为"翻到未缓存项才触发"的搭车福利）
     assert_eq!(
         app.last_focus,
         Some(2),
@@ -947,23 +948,36 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     let cancel2 = app
         .extract
         .as_ref()
-        .expect("5b 应保有驻留任务（重定向复用）")
+        .expect("5b 应保有驻留任务（零动作复用）")
         .cancel
         .clone();
     assert!(
         Arc::ptr_eq(&cancel2, &cancel1),
-        "驻留会话回锚点应复用解码线程（cancel 句柄不变）"
+        "回锚点零动作应复用解码线程（cancel 句柄不变）"
     );
     assert_eq!(app.playing, Some(2), "锚点已落地应立即播放");
     assert!(!app.extract_ready, "跳回锚点播放后提醒应清除");
-    assert_eq!(window(&app), vec![5], "锚点下游未落地项应进预取窗口");
-    assert_eq!(app.next_gen, 4, "重定向自增 gen");
+    assert!(
+        window(&app).is_empty(),
+        "锚点已缓存零动作：下游未落地项不再搭车预取"
+    );
+    assert_eq!(app.next_gen, 3, "零动作不自增 gen");
     {
         let st = app.archive.as_ref().unwrap().session.lock().unwrap();
         assert_eq!(st.focus, Some(2), "回到锚点不改锚点");
-        assert!(st.alive, "驻留会话应继续在跑");
+        assert!(st.alive, "驻留会话应继续待命");
     }
     assert_eq!(app.last_focus, Some(2), "回到锚点后 last_focus 保持");
+
+    // ---- 步骤 5b'：点到未缓存下游 5 → 组批重定向，驻留会话顺流续解 ----
+    // 这是 R3 新语义下预取的唯一触发路径：翻到未缓存项才组批
+    app.start_extract(5);
+    assert_eq!(window(&app), vec![5], "未缓存下游项应进预取窗口");
+    assert_eq!(app.next_gen, 4, "重定向自增 gen");
+    assert!(
+        Arc::ptr_eq(&app.extract.as_ref().unwrap().cancel, &cancel1),
+        "驻留会话重定向应复用解码线程（cancel 句柄不变）"
+    );
     // 等预取批（补解 5）收尾，还原"批完成驻留"前提给步骤 5c
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
@@ -986,21 +1000,22 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    // 预取会话补解的 5 应已落地（内容在终态统一比对）；playing 停在
-    // 锚点 2（FileDone 的 i=5 ≠ j.entry_idx=2，不切画面——正确）
+    // 预取批补解的 5 应已落地（内容在终态统一比对）；5 是当前期望目标
+    //（j.entry_idx=5，用户点击项），FileDone 落地即播——与旧"回看中预取
+    // 画面停在锚点"不同：R3 后点未缓存项组批，落地播放的就是点击项
     let dest5 = crate::cache::dest_path(&dir.join("cache"), 7, 5, &srcs[5].0);
     assert_eq!(
         std::fs::metadata(&dest5).unwrap().len(),
         srcs[5].1.len() as u64,
-        "预取会话应把下游 5 解压落地"
+        "预取批应把下游 5 解压落地"
     );
-    assert_eq!(app.playing, Some(2), "预取完成画面应停在锚点");
+    assert_eq!(app.playing, Some(5), "落地即播：画面切到点击项 5");
 
-    // ---- 步骤 5c：翻看已缓存项（缓存命中重定向，锚点不被污染）----
+    // ---- 步骤 5c：点已缓存项零动作（R3：逐出回退不触发无谓重定向）----
     // 删掉 5 的落地文件模拟"未落地的下游"，再点已缓存的 3：目标秒开 +
-    // 预取重定向补解 5。缓存命中不算解压推进 → last_focus 保持 2，
-    // "回到锚点"仍指向真正的解压位置。（驻留语义下走的是 alive 复用
-    // 重定向分支，不再 spawn 新线程）
+    // 零动作不补解——用户点的是已缓存项，不该为被逐出的下游项触发
+    // 重定向（用户原话"除非我点到了不在缓存里面的东西"）。last_focus
+    // 保持 2，"回到锚点"仍指向真正的解压位置
     // 真实流程里 5 变缺失只有 LRU 逐出/手动清缓存两条路，二者都会同步
     // 清命中位图（evict_if_needed 返回值/clean_all 后 fill(false)）——
     // 这里等价模拟逐出效果：删文件 + 清位
@@ -1008,14 +1023,22 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     app.archive.as_mut().unwrap().cached[5] = false;
     app.start_extract(3);
     assert_eq!(app.playing, Some(3), "已缓存目标应立即播放");
-    assert_eq!(window(&app), vec![5], "缺失的下游 5 应进预取窗口");
-    assert_eq!(app.next_gen, 5, "预取重定向自增 gen");
+    assert!(
+        window(&app).is_empty(),
+        "点已缓存项零动作：缺失的下游 5 不触发预取重定向"
+    );
+    assert_eq!(app.next_gen, 4, "零动作不自增 gen");
     assert_eq!(
         app.last_focus,
-        Some(2),
-        "缓存命中不应推进 last_focus（回看不污染锚点）"
+        Some(5),
+        "零动作不推进 last_focus（保持 5b' 未缓存组批推进的解压锚点）"
     );
     assert!(!app.extract_ready, "缓存命中不应置位提醒");
+    // 点到未缓存的 5 才补解（R3 后预取的唯一触发路径）；last_focus 保持 5
+    app.start_extract(5);
+    assert_eq!(window(&app), vec![5], "未缓存 5 应进预取窗口");
+    assert_eq!(app.next_gen, 5, "预取重定向自增 gen");
+    assert_eq!(app.last_focus, Some(5), "重复点击同项补解不改变锚点");
     // 等预取批（补解 5）收尾，还原全落地前提给步骤 7
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {

@@ -234,6 +234,10 @@ struct ExtractJob {
     /// 该段无定比分母（UI 走活动指示）；SkipUp/Upstream/Target 为覆盖层
     /// 三段，Downstream 为顶栏 mini bar（详见 ExtractPhase 语义）
     phases: [(u64, u64); ExtractPhase::COUNT],
+    /// 最近一次 Progress 上报的段（覆盖语义即当前段）：无比值期（定位
+    /// `Locate(0,0)`、段骨架 `(0,total)`、真暂停唤醒续解段游标清零后 `(cur,0)`）
+    /// 顶栏 mini bar 无比值可画，兜底显该段名 + spinner，避免无条期被误读为卡死
+    active_phase: Option<ExtractPhase>,
     /// 批内尚未解出的条目 → 目标路径（目标 + 预取）。条目落地（FileDone）
     /// 时移除；用户在批内切换目标时查此表决定"不取消只改期望"
     pending: std::collections::HashMap<usize, PathBuf>,
