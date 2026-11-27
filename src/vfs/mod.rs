@@ -71,14 +71,22 @@ pub(crate) fn password_candidates(pw: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// 解压临时文件路径：dest.xxx.part{pid}_{seq}（pid+序号）
+/// 解压临时文件路径：~tmp_{pid}_{seq}_{原名}（pid+序号防踩踏）。
 /// 写临时文件 + 原子改名，避免半截文件被当成有效缓存；
 /// pid：两个程序实例共享缓存目录时 dest 相同，pid 区分各自的临时文件；
 /// 序号：同进程内同一条目被并发解压时互不踩踏。
-/// 注意 cleanup_partial 按 "part" 前缀匹配，可清理 part* 全部形态。
+/// 前缀钉在文件名开头而非改写扩展名：条目本名可能就叫 xxx.part1（分卷
+/// 文件收进包内），旧版 with_extension("part…") 会把它的落地缓存
+/// {aid}_{idx}_xxx.part1 变成 "part" 扩展名形态——被 cleanup_partial
+/// 当残留删掉、scan_cached 拒收，缓存永不命中。dest_path 的安全名只含
+/// 字母数字 .-_，~ 前缀与其 {aid}_ 解析天然不冲突
 pub(crate) fn tmp_path(dest: &Path) -> PathBuf {
     let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    dest.with_extension(format!("part{}_{}", std::process::id(), n))
+    let fname = dest
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!("~tmp_{}_{}_{}", std::process::id(), n, fname))
 }
 
 /// 压缩包内单个条目（扁平列出，含完整路径信息）

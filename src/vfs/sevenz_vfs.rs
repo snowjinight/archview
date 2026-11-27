@@ -401,14 +401,23 @@ impl ArchiveVFS for SevenzVFS {
                             continue;
                         }
                         let size = self.entries[i].size;
-                        let ph = if i == focus_idx {
-                            ExtractPhase::Target
-                        } else if i < focus_idx {
-                            if tgt_idx.contains(&i) {
-                                ExtractPhase::Upstream
-                            } else {
-                                ExtractPhase::SkipUp
+                        // 归类必须与解码回调同源：先判是否目标（tgt_idx），再按
+                        // focus 分段。focus 指向的条目落地后已从 targets 移除而
+                        // UI 未重定向时（会话继续解下游预取的常态），focus 陈旧
+                        // 指向非目标条目——若按 i == focus_idx 先判 Target，
+                        // Target 段被发骨架却永远无写入（回调走非目标分支归
+                        // Downstream），bar 卡 0% 且 Downstream 串量。回调侧
+                        // （见下方 for_each_entries 闭包）目标按 ti 与 focus
+                        // 比较分段、非目标按 idx >= focus 归 Downstream，两侧
+                        // 逐条对应（RAR session_pass 同款先判目标的写法）
+                        let ph = if tgt_idx.contains(&i) {
+                            match i.cmp(&focus_idx) {
+                                std::cmp::Ordering::Equal => ExtractPhase::Target,
+                                std::cmp::Ordering::Less => ExtractPhase::Upstream,
+                                std::cmp::Ordering::Greater => ExtractPhase::Downstream,
                             }
+                        } else if i < focus_idx {
+                            ExtractPhase::SkipUp
                         } else {
                             ExtractPhase::Downstream
                         };
@@ -1357,6 +1366,105 @@ mod tests {
         }
         w.finish().unwrap();
         arch
+    }
+
+    /// focus 陈旧指向已落地条目（targets 已 remove、UI 未重定向，会话继续
+    /// 解下游预取）时分段总量必须与解码回调同源：非目标条目（含陈旧 focus）
+    /// 按回调归 Downstream，不得发 Target 段骨架——旧实现按 i == focus_idx
+    /// 先判 Target，Target bar 卡 0% 且 Downstream 串量。
+    /// 场景：solid 包 3 条目，f1 预先落好（缓存命中后已 remove），targets
+    /// 只剩 f2/f3，focus 残留指向 f1 的下标 0
+    #[test]
+    fn solid_7z_session_stale_focus_no_target_skeleton() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_stale_focus_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = vec![
+            ("f1.bin".into(), vec![1u8; 40_000]),
+            ("f2.bin".into(), vec![2u8; 30_000]),
+            ("f3.bin".into(), vec![3u8; 20_000]),
+        ];
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("solid3.7z");
+        let mut w = SevenZWriter::create(&arch).unwrap();
+        let entries: Vec<SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                SevenZArchiveEntry::from_path(p, p.file_name().unwrap().to_string_lossy().into_owned())
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+
+        // f1 已落地（缓存命中后的常态）：内容正确
+        let d1 = dir.join("out_f1.bin");
+        vfs.extract_entry(
+            &vfs.list()[0],
+            &d1,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&d1).unwrap(), srcs[0].1);
+
+        // targets 只剩 f2/f3（f1 已 remove），focus 残留指向 f1（idx 0）
+        let s = new_session();
+        let d2 = dir.join("out_f2.bin");
+        let d3 = dir.join("out_f3.bin");
+        {
+            let mut st = s.lock().unwrap();
+            st.targets.insert("f2.bin".into(), (1, d2.clone()));
+            st.targets.insert("f3.bin".into(), (2, d3.clone()));
+            st.focus = Some(0);
+            st.alive = true;
+        }
+        let target_reports = std::sync::Mutex::new(Vec::new());
+        let down_total = std::sync::Mutex::new(0u64);
+        vfs.extract_session(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &|ph, cur, total| {
+                if ph == ExtractPhase::Target {
+                    target_reports.lock().unwrap().push((cur, total));
+                }
+                if ph == ExtractPhase::Downstream {
+                    *down_total.lock().unwrap() = total;
+                }
+            },
+            &|_, _| {},
+        )
+        .unwrap();
+
+        // 旧实现：f1（idx 0 == focus 且不在 targets）被算进 Target 段 → 发
+        // Target(0, 40_000) 骨架但回调走非目标分支永不写它 → 卡 0%。
+        // 新实现：Target 段总量 0，全程不出现非零 Target 上报
+        assert!(
+            target_reports.lock().unwrap().iter().all(|&(_, t)| t == 0),
+            "陈旧 focus 不在 targets 时不得发非零 Target 段: {:?}",
+            target_reports.lock().unwrap()
+        );
+        // f1 与回调同源归入 Downstream：总量 = 三条目之和（旧实现只有 50_000）
+        assert_eq!(
+            *down_total.lock().unwrap(),
+            90_000,
+            "Downstream 总量应含陈旧 focus 条目"
+        );
+        assert_eq!(std::fs::read(&d2).unwrap(), srcs[1].1, "f2 内容错误");
+        assert_eq!(std::fs::read(&d3).unwrap(), srcs[2].1, "f3 内容错误");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 会话生命周期端到端：

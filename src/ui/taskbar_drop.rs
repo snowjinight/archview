@@ -5,8 +5,10 @@
 //! 原路，两条通道互不重复）。路径进共享队列，UI 每帧排空第一条，与窗口
 //! 拖入同一条分流（open_path）。
 //!
-//! 应用未运行时拖到驻留图标 = Shell 直接带文件参数启动 exe，不经此模块
-//! （走 main.rs 的 initial_open 命令行链路）。
+//! 应用未运行时拖到驻留图标 = Shell 直接带文件参数启动 exe，不经此模块。
+//! 若此时已有实例运行，该启动参数由 single_instance 经 WM_COPYDATA 转发
+//! 回旧实例的主窗口——同在本 wnd_proc 接收（SendMessage 直达子类过程），
+//! 与 WM_DROPFILES 走同一条队列 → open_path 替换当前内容。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -14,9 +16,11 @@ use std::sync::{Mutex, OnceLock};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC, WM_DROPFILES, WNDPROC,
+    CallWindowProcW, DefWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC, WM_COPYDATA, WM_DROPFILES,
+    WNDPROC,
 };
 
 /// 任务栏拖入路径队列：WM_DROPFILES 在 UI 线程触发，本就与排空方同线程，
@@ -62,6 +66,25 @@ pub fn drain() -> Vec<PathBuf> {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_COPYDATA {
+        // single_instance 转发的启动路径（dwData 0 = 本应用约定）：
+        // UTF-16 + NUL 结尾，cbData 为字节数
+        let cds = &*(lparam as *const COPYDATASTRUCT);
+        if cds.dwData == 0 && !cds.lpData.is_null() && cds.cbData >= 2 {
+            let chars = std::slice::from_raw_parts(cds.lpData.cast::<u16>(), cds.cbData as usize / 2);
+            let path = String::from_utf16_lossy(chars);
+            let path = path.trim_end_matches('\0');
+            if !path.is_empty() {
+                if let Ok(mut q) = TASKBAR_DROPS.lock() {
+                    q.push(PathBuf::from(path));
+                }
+                if let Some(ctx) = EGUI_CTX.get() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+        return 1; // TRUE = 已处理，不再向原过程传递
+    }
     if msg == WM_DROPFILES {
         let hdrop = wparam as windows_sys::Win32::UI::Shell::HDROP;
         // index -1（u32::MAX）= 查询拖入总数；逐项先查路径长度再取宽字符

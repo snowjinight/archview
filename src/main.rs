@@ -27,6 +27,9 @@ mod rawdec;
 mod smoke;
 // 高级搜索：语法引擎 + 搜索历史（AND/OR/NOT/短语/通配/分组）
 mod search;
+// 全局单实例：已有实例运行时把启动路径经 WM_COPYDATA 转发给它并退出
+// （第二实例拖任务栏图标/双击/SendTo → 旧实例直接替换当前打开内容）
+mod single_instance;
 mod ui;
 mod vartidy;
 mod vfs;
@@ -53,6 +56,12 @@ fn main() -> eframe::Result<()> {
         let code = encode::cli::cli_main(&args[1..]);
         std::process::exit(code);
     }
+
+    // 全局单实例：已有实例运行时，把本次启动携带的路径转发给它（接收方
+    // 走与任务栏拖入相同的队列 → open_path 替换当前内容），前置旧实例
+    // 窗口后本进程退出；无实例则本进程持互斥体正常启动。须在 config
+    // 加载前做——第二实例秒退，不加载配置不初始化 mpv，无窗口闪烁
+    single_instance::forward_if_exists(&args);
 
     // config 需在 tracing 初始化前加载（日志级别来自配置）——此时日志管线
     // 尚未建立，失败信息走弹窗（windows 子系统下 eprintln/panic 不可见）

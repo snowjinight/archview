@@ -108,7 +108,10 @@ fn parse_cache_name(path: &Path) -> Option<(u64, usize)> {
 /// 打开包时调用一次，此后批扫描/命中判定查位图——万级条目批扫描从
 /// N 次 per-file metadata 系统调用降到 0 次；read_dir 附带的
 /// DirEntry::metadata 零额外打开（NTFS/网络盘都远快于逐文件 metadata）。
-/// 尺寸与条目一致才置位（防半截/残留错位文件）；.part* 临时文件排除
+/// 尺寸与条目一致才置位（防半截/残留错位文件）。不按扩展名排除临时文件：
+/// tmp_path 的 ~tmp_ 前缀与其 {aid}_ 解析天然不冲突；条目本名叫 xxx.part1
+/// 的落地缓存扩展名就是 part1，是合法缓存必须收下（启动时残留已由
+/// cleanup_partial 清掉，扫描时不会遇到临时文件）
 pub fn scan_cached(dir: &Path, archive_id: u64, entries: &[VirtualEntry]) -> Vec<bool> {
     let prefix = format!("{archive_id}_");
     let mut out = vec![false; entries.len()];
@@ -116,13 +119,6 @@ pub fn scan_cached(dir: &Path, archive_id: u64, entries: &[VirtualEntry]) -> Vec
         return out;
     };
     for e in rd.flatten() {
-        // .part 半截临时文件（cleanup_partial 的清理对象）不算缓存
-        if e.path()
-            .extension()
-            .is_some_and(|x| x.to_string_lossy().starts_with("part"))
-        {
-            continue;
-        }
         let fname = e.file_name();
         let Some(name) = fname.to_str() else {
             continue;
@@ -162,17 +158,19 @@ pub fn dest_path(dir: &Path, archive_id: u64, entry_idx: usize, entry_name: &str
     dir.join(format!("{archive_id}_{entry_idx}_{safe}"))
 }
 
-/// 启动时清理 .part / .partN 半截临时文件（上次解压中断/并发失败的残留）
+/// 启动时清理解压半截临时文件（上次解压中断/并发失败的残留）：
+/// ~tmp_ 前缀形态。不能按扩展名一刀切——条目本名可能就叫 xxx.part1
+/// （分卷文件），其落地缓存扩展名就是 part1，是合法缓存不是残留
 pub fn cleanup_partial(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
         let p = e.path();
-        let is_tmp = p
-            .extension()
-            .map(|x| x.to_string_lossy().starts_with("part"))
-            .unwrap_or(false);
+        let is_tmp = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("~tmp_"));
         if is_tmp {
             std::fs::remove_file(&p).ok();
         }
@@ -220,4 +218,48 @@ pub fn clean_archive(dir: &Path, archive_id: u64) -> u64 {
         }
     }
     freed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, size: u64) -> VirtualEntry {
+        VirtualEntry {
+            name: name.into(),
+            size,
+            is_dir: false,
+            encrypted: false,
+            crc: None,
+        }
+    }
+
+    /// 条目本名叫 xxx.part1（分卷文件）的落地缓存不得被当临时文件：
+    /// cleanup_partial 启动清理必须保留它、scan_cached 必须收下；
+    /// ~tmp_ 前缀临时文件则应清掉
+    #[test]
+    fn part_named_entry_cache_survives_cleanup_and_scans() {
+        let dir = std::env::temp_dir().join(format!("archview_cache_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![entry("movie.part1", 10)];
+        let dest = dest_path(&dir, 7, 0, "movie.part1");
+        std::fs::write(&dest, vec![9u8; 10]).unwrap();
+
+        let tmp = crate::vfs::tmp_path(&dest);
+        assert_eq!(
+            tmp.file_name().unwrap().to_str().unwrap().split_once('_').unwrap().0,
+            "~tmp",
+            "临时文件前缀形态"
+        );
+        std::fs::write(&tmp, b"half").unwrap();
+
+        cleanup_partial(&dir);
+        assert!(!tmp.exists(), "~tmp_ 前缀临时文件应被清理");
+        assert!(dest.exists(), "xxx.part1 条目的落地缓存是合法缓存，不得清理");
+
+        let bitmap = scan_cached(&dir, 7, &entries);
+        assert!(bitmap[0], "part 命名条目的落地缓存应命中位图");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
