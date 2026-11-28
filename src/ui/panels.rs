@@ -334,6 +334,32 @@ impl App {
             // 这里只留一个短标记（无长文本不会截断），且常显——keep 回看上游
             // 缓存、等待新文件等所有场景下后台剩余量都可见；与媒体区覆盖层
             // 信息重复无妨，视频正被观看绝不能遮挡
+            // 打开中短标记（与解压标记同理常显）：边看图/视频边开新包时，
+            // 媒体区居中文案会被画面纹理/PaintCallback 盖住——顶栏槽位恒
+            // 可见（ISO/目录打开全程 + 排序进度均在）。长包名截断，全文
+            // 悬停气泡
+            if let Some(j) = &self.open_job {
+                let name = j
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let text = match &self.open_progress {
+                    Some((Some(f), stage)) => format!(
+                        "{stage} {:.0}% — {name}…",
+                        (f.clamp(0.0, 1.0) * 100.0).round()
+                    ),
+                    Some((None, stage)) => format!("{stage} — {name}…"),
+                    None => format!("正在打开 {name}…"),
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(text).color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate()
+                    .selectable(false),
+                );
+            }
             if let Some(j) = &self.extract {
                 // 批完成驻留（idle）：会话活着但没有在解的批——不显示"进行
                 // 中"标记，否则批解完后顶栏永远挂着"剩余 0 项"
@@ -1470,34 +1496,38 @@ impl App {
                         }
                     });
                 });
-            } else {
-                let text = if let Some(j) = &self.open_job {
-                    let name = j
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    match &self.open_progress {
-                        Some((Some(f), stage)) => {
-                            format!(
-                                "{stage} {:.0}% — {name}",
-                                (f.clamp(0.0, 1.0) * 100.0).round()
-                            )
-                        }
-                        Some((None, stage)) => format!("{stage} — {name}…"),
-                        None => format!("正在打开 {name}…"),
-                    }
-                } else if self.archive.is_some() {
-                    "点击左侧列表中的视频/图片开始播放".to_string()
-                } else {
-                    // 宽度受 put 矩形（400px）约束，文案需保持单行可容纳
-                    "先打开压缩包（ZIP / 7Z / RAR）或媒体目录".to_string()
-                };
-                ui.put(
-                    egui::Rect::from_center_size(video.center(), egui::vec2(400.0, 30.0)),
-                    egui::Label::new(egui::RichText::new(text).weak()).selectable(false),
-                );
             }
+        } else {
+            // 打开中/无画面占位文案。注意归属：此 else 必须配对外层
+            // `if overlay_job`（曾误挂在 `if let Some(j) = &self.extract` 上
+            // 成为死分支——overlay_job 为 true 蕴含 extract 是 Some，else 永不
+            // 执行，媒体区在启动/打开期/无画面态全程白屏无文案，实测截图实锤）
+            let text = if let Some(j) = &self.open_job {
+                let name = j
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match &self.open_progress {
+                    Some((Some(f), stage)) => {
+                        format!(
+                            "{stage} {:.0}% — {name}",
+                            (f.clamp(0.0, 1.0) * 100.0).round()
+                        )
+                    }
+                    Some((None, stage)) => format!("{stage} — {name}…"),
+                    None => format!("正在打开 {name}…"),
+                }
+            } else if self.archive.is_some() {
+                "点击左侧列表中的视频/图片开始播放".to_string()
+            } else {
+                // 宽度受 put 矩形（400px）约束，文案需保持单行可容纳
+                "先打开压缩包（ZIP / 7Z / RAR）或媒体目录".to_string()
+            };
+            ui.put(
+                egui::Rect::from_center_size(video.center(), egui::vec2(400.0, 30.0)),
+                egui::Label::new(egui::RichText::new(text).weak()).selectable(false),
+            );
         }
         // mpv render API 纹理渲染（doc/架构设计/13_渲染架构迁移.md，照搬开源参考实现的
         // PaintCallback 模式）：离屏 FBO ← mpv 绘制 → blit 到 egui 画布。

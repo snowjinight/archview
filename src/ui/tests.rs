@@ -122,6 +122,7 @@ fn dir_mode_open_pipeline() {
                 id,
                 entries,
                 pw,
+                ..
             }) => break (vfs, entries, id, pw),
             Ok(super::OpenMsg::NeedPw { .. }) => panic!("目录打开不应要求密码"),
             Ok(super::OpenMsg::Failed(e)) => panic!("目录打开失败: {e}"),
@@ -140,7 +141,7 @@ fn dir_mode_open_pipeline() {
 
     // 2) 状态迁移：stream=true（FastSeek → 流式快路径）、视图含全部媒体
     assert_eq!(
-        app.apply_open_done(root.clone(), None, vfs, id, entries, None),
+        app.apply_open_done(root.clone(), None, vfs, id, entries, None, None, false),
         None
     );
     let a = app.archive.as_ref().unwrap();
@@ -155,7 +156,7 @@ fn dir_mode_open_pipeline() {
     let vfs2: std::sync::Arc<dyn super::ArchiveVFS> =
         std::sync::Arc::new(super::DirVFS::open(&empty, media_pred(), 0).unwrap());
     let entries2 = vfs2.list();
-    app.apply_open_done(empty, None, vfs2, 7, entries2, None);
+    app.apply_open_done(empty, None, vfs2, 7, entries2, None, None, false);
     assert_eq!(app.notice.as_deref(), Some("没有可播放的视频/图片"));
 
     let _ = std::fs::remove_dir_all(&root);
@@ -250,7 +251,7 @@ fn archive_switch_clears_selection() {
     // 预置旧包的选择状态后切包
     app.selected = [1, 2, 4].into_iter().collect();
     app.select_anchor = Some(2);
-    app.apply_open_done(root.clone(), None, vfs, 7, entries, None);
+    app.apply_open_done(root.clone(), None, vfs, 7, entries, None, None, false);
     assert!(app.selected.is_empty(), "切包必须清空多选（下标错位引用）");
     assert_eq!(app.select_anchor, None, "范围锚点一并清除");
 
@@ -298,6 +299,7 @@ fn media_file_entry_focus_jump() {
                 id,
                 entries,
                 pw,
+                ..
             }) => break (vfs, entries, id, pw),
             Ok(super::OpenMsg::NeedPw { .. }) => panic!("目录打开不应要求密码"),
             Ok(super::OpenMsg::Failed(e)) => panic!("目录打开失败: {e}"),
@@ -315,7 +317,7 @@ fn media_file_entry_focus_jump() {
         .position(|e| e.name.eq_ignore_ascii_case("x.mp4"))
         .unwrap();
     assert_eq!(
-        app.apply_open_done(media.clone(), None, vfs, id, entries, pw),
+        app.apply_open_done(media.clone(), None, vfs, id, entries, pw, None, false),
         Some(idx_v)
     );
     assert_eq!(app.pending_focus, None, "焦点消费后应清零");
@@ -331,7 +333,7 @@ fn media_file_entry_focus_jump() {
         .unwrap();
     app.pending_focus = Some("A.JPG".into()); // 模拟分流置位（写法与收集名不同）
     assert_eq!(
-        app.apply_open_done(media.clone(), None, vfs2, 9, entries2, None),
+        app.apply_open_done(media.clone(), None, vfs2, 9, entries2, None, None, false),
         Some(idx_i),
         "大小写不同写法应命中同名条目"
     );
@@ -345,7 +347,7 @@ fn media_file_entry_focus_jump() {
     let entries3 = vfs3.list();
     app.pending_focus = Some("nope.mp4".into());
     assert_eq!(
-        app.apply_open_done(media.clone(), None, vfs3, 10, entries3, None),
+        app.apply_open_done(media.clone(), None, vfs3, 10, entries3, None, None, false),
         None,
         "找不到目标应静默不播"
     );
@@ -359,7 +361,7 @@ fn media_file_entry_focus_jump() {
     let entries4 = vfs4.list();
     app.pending_focus = Some("a.jpg".into());
     assert_eq!(
-        app.apply_open_done(media.join("X.MP4"), None, vfs4, 11, entries4, None),
+        app.apply_open_done(media.join("X.MP4"), None, vfs4, 11, entries4, None, None, false),
         None,
         "非目录路径不应消费焦点"
     );
@@ -417,6 +419,104 @@ fn natural_sort_pipeline_semantics() {
             "第10话/1.jpg",
         ]
     );
+}
+
+/// 后台预排序基序语义（排序已移入打开后台线程，rebuild_view 按基序过滤、
+/// UI 线程零排序）：
+/// 1) Done 携带自然序基序 → view 严格按基序遍历，而非 entries 物理序
+/// 2) 失配兜底（补排序）：基序为恒等序但当前需求要自然序（stream 强制）→
+///    rebuild_view 就地补排序并置位 disp_is_natural（热重载罕见路径）
+/// 3) 失配兜底（重置）：基序为自然序但当前需求是物理序（stream=false 且
+///    sort_files=false）→ 重置恒等序，显示恢复 entries 物理序
+#[test]
+fn disp_order_background_presort_semantics() {
+    use crate::vfs::dir_vfs::DirVFS;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 独立空目录仅作 vfs 句柄（rebuild_view 只消费 archive 字段，不读盘）
+    let root = std::env::temp_dir().join(format!("ui_disp_order_{}_{}", std::process::id(), uniq));
+    std::fs::create_dir_all(&root).unwrap();
+    let vfs: std::sync::Arc<dyn super::ArchiveVFS> =
+        std::sync::Arc::new(DirVFS::open(&root, |_| false, 0).unwrap());
+    // 物理序 10/2/1，自然序应为 1/2/10（基序 = [2, 0, 1]）
+    let mk_entries = || {
+        ["10.jpg", "2.jpg", "1.jpg"]
+            .iter()
+            .map(|n| crate::vfs::VirtualEntry {
+                name: n.to_string(),
+                size: 1,
+                is_dir: false,
+                encrypted: false,
+                crc: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mk_app = |stream: bool, disp: (Option<Vec<usize>>, bool)| -> App {
+        let mut cfg = crate::config::Config::default();
+        cfg.cache.dir = root.join("cache").to_string_lossy().into_owned();
+        let mut app = App::new_for_test(cfg);
+        let disp_order = disp.0.unwrap_or_else(|| (0..3).collect());
+        app.archive = Some(super::ArchiveState {
+            id: 7,
+            name: "pkg".into(),
+            path: root.clone(),
+            password: None,
+            entries: mk_entries(),
+            view: Vec::new(),
+            vfs: vfs.clone(),
+            stream,
+            session: std::sync::Arc::new(std::sync::Mutex::new(super::SessionState {
+                targets: Default::default(),
+                focus: None,
+                alive: false,
+                gen: 0,
+                skip_note: None,
+                resume: false,
+            })),
+            ratings: std::collections::HashMap::new(),
+            deleted: std::collections::HashSet::new(),
+            cached: vec![false; 3],
+            dir_mode: false,
+            disp_order,
+            disp_is_natural: disp.1,
+        });
+        app
+    };
+    let view_names = |app: &App| -> Vec<String> {
+        let a = app.archive.as_ref().unwrap();
+        a.view.iter().map(|&i| a.entries[i].name.clone()).collect()
+    };
+
+    // 1) 打开后台线程预排序产物：view 严格按基序（物理序 10/2/1 → 自然序 1/2/10）
+    let mut app = mk_app(true, (Some(vec![2, 1, 0]), true));
+    app.rebuild_view();
+    assert_eq!(
+        view_names(&app),
+        vec!["1.jpg", "2.jpg", "10.jpg"],
+        "view 应按预排序基序输出自然序"
+    );
+
+    // 2) 失配兜底（补排序）：恒等基序 + stream 强制自然序 → 就地补排序置位
+    let mut app = mk_app(true, (None, false));
+    app.rebuild_view();
+    let a = app.archive.as_ref().unwrap();
+    assert!(a.disp_is_natural, "兜底应置位 disp_is_natural");
+    assert_eq!(a.disp_order, vec![2, 1, 0], "兜底应重建自然序基序");
+    assert_eq!(view_names(&app), vec!["1.jpg", "2.jpg", "10.jpg"]);
+
+    // 3) 失配兜底（重置）：自然序基序 + 需求物理序（stream=false，sort_files
+    // 默认关）→ 重置恒等序，显示恢复 entries 物理序
+    let mut app = mk_app(false, (Some(vec![2, 1, 0]), true));
+    app.rebuild_view();
+    let a = app.archive.as_ref().unwrap();
+    assert!(!a.disp_is_natural, "兜底应复位 disp_is_natural");
+    assert_eq!(a.disp_order, vec![0, 1, 2], "兜底应重置恒等基序");
+    assert_eq!(
+        view_names(&app),
+        vec!["10.jpg", "2.jpg", "1.jpg"],
+        "物理序显示 = entries 原样（固态包下游预取命中前提不可破坏）"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// 虚拟化列表（show_viewport 手动行范围）关键行为的回归测试。
@@ -777,6 +877,8 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         deleted: std::collections::HashSet::new(),
         cached,
         dir_mode: false,
+        disp_order: (0..6).collect(),
+        disp_is_natural: false,
     });
 
     // 会话当前窗口（下标升序）
@@ -1412,7 +1514,7 @@ fn play_clears_top_messages() {
         std::sync::Arc::new(super::DirVFS::open(&root, media_pred(), 0).unwrap());
     let entries = vfs.list();
     assert_eq!(entries.len(), 1);
-    app.apply_open_done(root.clone(), None, vfs, 3, entries, None);
+    app.apply_open_done(root.clone(), None, vfs, 3, entries, None, None, false);
     assert!(
         app.archive.as_ref().is_some_and(|a| a.stream),
         "目录集合应走流式路径（图片路由前提）"
@@ -1498,7 +1600,7 @@ fn open_done_clears_messages_and_keeps_empty_hint() {
         std::sync::Arc::new(super::DirVFS::open(&empty, media_pred(), 0).unwrap());
     let entries = vfs.list();
     assert!(entries.is_empty());
-    app.apply_open_done(empty.clone(), None, vfs, 5, entries, None);
+    app.apply_open_done(empty.clone(), None, vfs, 5, entries, None, None, false);
     assert!(app.error.is_none(), "切换内容源应清掉旧包红色错误");
     assert_eq!(
         app.notice.as_deref(),
@@ -1628,6 +1730,8 @@ fn png_archive(
         deleted: std::collections::HashSet::new(),
         cached: vec![false; n], // 目录模式直读文件，缓存位图不参与
         dir_mode: true,
+        disp_order: (0..n).collect(),
+        disp_is_natural: false,
     });
     vfs
 }

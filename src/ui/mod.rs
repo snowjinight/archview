@@ -102,6 +102,17 @@ struct ArchiveState {
     /// LRU 逐出/清空缓存清位——批扫描与命中判定查此表，替代逐条目
     /// metadata 系统调用（万级条目 × 网络盘上代价显著）
     cached: Vec<bool>,
+    /// 显示基序（entry 下标的显示顺序）：打开后台线程一次性预计算——排序
+    /// 必须等全部条目收集完才能开始（需要完整 name 域），因此放在
+    /// spawn_open 的后台线程里紧跟收集串行执行（藏在打开耗时阶段），
+    /// rebuild_view 只按此基序过滤、不再排序（70 万条实测排序 1.3s，
+    /// UI 线程同步排序曾冻结窗口）。FastSeek 包强制自然序或
+    /// ui.sort_files=true 时为自然序基序，否则恒等序（= 包内物理序，
+    /// 固态包下游预取批恰好物理相邻，不可破坏 entries 本身的物理序）
+    disp_order: Vec<usize>,
+    /// disp_order 是否为自然序基序：config 热重载切换 sort_files 时，
+    /// rebuild_view 据此检测基序与当前需求失配并就地修正（罕见路径）
+    disp_is_natural: bool,
 }
 
 /// 密码输入弹窗：加密头（打开阶段）或内容加密（播放阶段）触发
@@ -289,6 +300,12 @@ enum OpenMsg {
         id: u64,
         entries: Vec<VirtualEntry>,
         pw: Option<String>,
+        /// 显示基序（打开后台线程预排序产物）：Some = 自然序基序（FastSeek
+        /// 强制 / ui.sort_files），None = 恒等序（=物理序，apply_open_done
+        /// 补齐 0..n），rebuild_view 直接按基序过滤
+        disp_order: Option<Vec<usize>>,
+        /// disp_order 是否为自然序基序（热重载失配检测用）
+        disp_natural: bool,
     },
     /// 加密头或密码错误：需要（重新）弹密码框
     NeedPw {

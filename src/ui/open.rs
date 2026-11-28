@@ -127,6 +127,9 @@ impl App {
         // 名在收集层即可见（旧「扩展名白名单」旁路曾把预设命中文件在扫描
         // 阶段丢弃，目录模式下列表里根本不出现）；压缩包等其它文件天然排除
         let cfg_t = self.cfg.clone();
+        // 排序开关快照（后台预排序判据，与 rebuild_view 同源：FastSeek 强制
+        // 自然序 ∨ ui.sort_files）；布尔拷贝避免 cfg_t 被 is_media 闭包 move
+        let sort_files = self.cfg.ui.sort_files;
         let is_media = move |name: &str| cfg_t.is_video_ext(name) || cfg_t.is_image_ext(name);
         // 单媒体文件入口（pending_focus 置位）对所在目录的收集深度取配置
         // （默认 1 = 只收集目标文件同级，防盘根/超大目录全盘扫描）；
@@ -181,11 +184,57 @@ impl App {
                                     // 开销可忽略
                                     egui_ctx.request_repaint();
                                 });
+                            // 后台预排序：排序必须等全部条目收集完才能开始
+                            // （需要完整 name 域），紧跟收集串行执行——藏在打开
+                            // 耗时阶段里，UI rebuild_view 只按基序过滤零排序
+                            // （70 万条实测 1.3s，同步排序曾冻结 UI 线程）。
+                            // 固态包关闭排序时走恒等序（=物理序），只建索引
+                            // 不动 entries，下游预取批/上游预取相位行为不变
+                            let natural =
+                                arc.access_mode() == AccessMode::FastSeek || sort_files;
+                            let (disp_order, disp_natural) = if natural {
+                                // 排序中状态：大包排序秒级可见（70 万条 1.3s），
+                                // 进度区从"正在读取压缩包目录 100%"切换为排序文案
+                                let _ = tx.send(OpenMsg::Progress {
+                                    fraction: None,
+                                    stage: "正在排序文件列表".into(),
+                                });
+                                egui_ctx.request_repaint();
+                                let t = std::time::Instant::now();
+                                // 分块排序 + 进度回报：键生成/块排序/多路归并
+                                // 各阶段持续上报 fraction，大包排序全程有
+                                // 进度可见而非黑箱转圈
+                                let order = natural_order_with_progress(&entries, &|f| {
+                                    let _ = tx.send(OpenMsg::Progress {
+                                        fraction: Some(f.clamp(0.0, 1.0) as f32),
+                                        stage: "正在排序文件列表".into(),
+                                    });
+                                    egui_ctx.request_repaint();
+                                });
+                                // 排序完成状态：随后 Done 到达、下一帧列表出现
+                                // 即自然消失（无人工延时）
+                                let _ = tx.send(OpenMsg::Progress {
+                                    fraction: None,
+                                    stage: "排序完成".into(),
+                                });
+                                egui_ctx.request_repaint();
+                                // debug 级排序耗时探针（大包排序成本观测用）
+                                tracing::debug!(
+                                    "自然序预排序 {} 条耗时 {:?}",
+                                    entries.len(),
+                                    t.elapsed()
+                                );
+                                (Some(order), true)
+                            } else {
+                                (None, false) // 恒等序由 apply_open_done 补齐
+                            };
                             OpenMsg::Done {
                                 vfs: arc,
                                 id,
                                 entries,
                                 pw: locked,
+                                disp_order,
+                                disp_natural,
                             }
                         }
                         Err(VfsError::Password) => OpenMsg::NeedPw {
@@ -252,9 +301,19 @@ impl App {
                     id,
                     entries,
                     pw,
+                    disp_order,
+                    disp_natural,
                 } => {
-                    let to_play =
-                        self.apply_open_done(job.path, job.retry_play, vfs, id, entries, pw);
+                    let to_play = self.apply_open_done(
+                        job.path,
+                        job.retry_play,
+                        vfs,
+                        id,
+                        entries,
+                        pw,
+                        disp_order,
+                        disp_natural,
+                    );
                     // 密码重试场景：恢复播放提交密码时想看的条目
                     if let Some(entry_idx) = to_play {
                         self.play(entry_idx);
@@ -288,6 +347,10 @@ impl App {
         id: u64,
         entries: Vec<VirtualEntry>,
         pw: Option<String>,
+        // Some = 自然序基序（后台线程预排序产物）；None = 恒等序（测试
+        // 旁路/物理序，此处补齐 0..n）
+        disp_order: Option<Vec<usize>>,
+        disp_natural: bool,
     ) -> Option<usize> {
         // 登记进任务栏「最近」列表：Shell 只自动登记文件关联启动，拖入/
         // SendTo/目录入口一律漏掉——打开成功即补登（见 recent_docs 模块文档）
@@ -322,6 +385,8 @@ impl App {
         // 缓存命中位图建图：一次 readdir 替代此后批扫描的全部逐条目 metadata
         // （本包上次会话遗留的落地文件，按 {id}_{idx}_ 前缀解析 + 尺寸校验）
         let cached = cache::scan_cached(&cache::cache_dir(&self.cfg), id, &entries);
+        // 恒等序补齐（None = 物理序原样，一次性 0..n 构造代价可忽略）
+        let disp_order = disp_order.unwrap_or_else(|| (0..entries.len()).collect());
         self.archive = Some(ArchiveState {
             id,
             name,
@@ -347,6 +412,8 @@ impl App {
             // 目录模式判定一次性缓存（每帧 stat 在网络盘上是 ~70ms 级往返，
             // 见 ArchiveState.dir_mode 注释）
             dir_mode: path.is_dir(),
+            disp_order,
+            disp_is_natural: disp_natural,
         });
         // 新包旧选择无意义：清多选与范围锚点（entry 下标对新包是错位引用）
         self.selected.clear();
@@ -609,9 +676,9 @@ impl App {
 
     /// 重新计算过滤视图：搜索框高级语法匹配（search_engine：空格 AND、| OR、
     /// ! 排除、"精确短语"、* ? 通配、<分组>，语法说明见根目录 serach.md）
-    /// + 只显示媒体文件（视频/图片按 config 分类），
-    /// 按文件名自然序排序（数字段按数值比较：1/2/10，而非字典序的 1/10/2；
-    /// 保证序号/上一个下一个顺序稳定，与归档内部顺序无关）。
+    /// + 只显示媒体文件（视频/图片按 config 分类），按打开后台线程预排序的
+    /// 显示基序遍历（disp_order：自然序或恒等物理序，排序成本已藏在打开
+    /// 阶段，此处零排序；基序失配兜底见下）。
     /// 同时重建列表行缓存（虚拟化渲染的显示数据）：只在触发条件变化时执行
     /// （打开/搜索过滤/切标签/配置重载改排序或扩展名分类/评级筛选），
     /// 不再每帧重算——万级条目时每帧 clone/format 是 UI 卡顿的主因
@@ -637,11 +704,44 @@ impl App {
         let filter_active = self.rating_submitted == self.rating_done
             && self.rating_filter.is_some();
         let rating_filter = self.rating_filter;
-        let mut classified: Vec<(usize, bool)> = a
-            .entries
+        // 基序失配兜底（config 热重载切换 sort_files 的罕见路径）：打开后台
+        // 线程预排序用的开关快照与当前配置不符时就地修正 disp_order——
+        // 补排序/重置恒等序一次，此后 disp_order 与当前需求重新对齐。
+        // 正常路径（打开后未改配置）两个分支都不命中，零开销直取基序
+        let needed = a.stream || self.cfg.ui.sort_files;
+        if needed && !a.disp_is_natural {
+            let t = std::time::Instant::now();
+            let mut keyed: Vec<(usize, String)> = a
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.name.to_lowercase()))
+                .collect();
+            keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.1, &y.1));
+            a.disp_order = keyed.into_iter().map(|(i, _)| i).collect();
+            a.disp_is_natural = true;
+            tracing::debug!("热重载补排序 {} 条耗时 {:?}", a.entries.len(), t.elapsed());
+        } else if !needed && a.disp_is_natural {
+            a.disp_order = (0..a.entries.len()).collect();
+            a.disp_is_natural = false;
+        }
+        // 按基序遍历收集（打开后台线程已预排序；恒等序时 = 物理序原样）。
+        // 排序语义与判据同 spawn_open：排序键 = 完整相对路径（name 含子目录
+        // 路径）：同前缀子目录的条目天然连成一片（原则 1），目录名与夹内
+        // 文件名的数字段都按数值排（原则 2，第1话/1.jpg → 第1话/2.jpg →
+        // 第2话/1.jpg → 第10话/1.jpg）。FastSeek 包（ZIP/ISO/目录集合，
+        // stream=true）**强制**自然序：无解压会话，图片预取走 Stream 源随机
+        // 读、视频走 mpv stream_cb 随机 seek，物理序零收益，排序纯观感；
+        // 解压包（7z/RAR，solid 与 single-file 皆同）按 config: ui.sort_files
+        // （默认关 = 保持压缩包内部顺序：固态包下内部顺序 == 物理码流顺序，
+        // 下游预取批恰好是物理相邻的后续文件，翻页直接命中缓存，性能最优）。
+        // 注意 7-Zip 工具打的包内部本来就是字典序（实验验证：无视添加顺序
+        // 强制重排），关闭排序对这类包的显示无变化，属正常现象
+        let classified: Vec<(usize, bool)> = a
+            .disp_order
             .iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
+            .filter_map(|&i| {
+                let e = &a.entries[i];
                 if e.is_dir || !query.matches(&e.name) || a.deleted.contains(&i) {
                     return None;
                 }
@@ -656,30 +756,6 @@ impl App {
                 (is_video || self.cfg.is_image_ext(&e.name)).then_some((i, is_video))
             })
             .collect();
-        // 排序：自然序（alphanumeric-sort），数字段按数值比较（1/2/10），
-        // 非数字段不区分大小写——看漫画/图集时编号文件按人类预期排列。
-        // 排序键 = 完整相对路径（name 含子目录路径）：同前缀子目录的条目
-        // 天然连成一片（原则 1），目录名与夹内文件名的数字段都按数值排
-        // （原则 2，第1话/1.jpg → 第1话/2.jpg → 第2话/1.jpg → 第10话/1.jpg）。
-        // FastSeek 包（ZIP/ISO/目录集合，stream=true）**强制**自然序：无解压
-        // 会话，图片预取走 Stream 源随机读、视频走 mpv stream_cb 随机 seek，
-        // 物理序零收益，排序纯观感；解压包（7z/RAR，solid 与 single-file 皆
-        // 同）按 config: ui.sort_files（默认关 = 保持压缩包内部顺序：固态包
-        // 下内部顺序 == 物理码流顺序，下游预取批恰好是物理相邻的后续文件，
-        // 翻页直接命中缓存，性能最优）。
-        // 注意 7-Zip 工具打的包内部本来就是字典序（实验验证：无视添加顺序
-        // 强制重排），关闭排序对这类包的显示无变化，属正常现象。
-        if a.stream || self.cfg.ui.sort_files {
-            // 预生成小写键（每条一次分配），比较器内不再重复 to_lowercase
-            // （旧比较器每次比较做 2 次 to_lowercase，万级条目 ≈ 34 万次分配）。
-            // 键与 (idx, 分类) 绑定排序再取回：排序中不会错位
-            let mut keyed: Vec<(usize, bool, String)> = classified
-                .iter()
-                .map(|&(i, v)| (i, v, a.entries[i].name.to_lowercase()))
-                .collect();
-            keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.2, &y.2));
-            classified = keyed.into_iter().map(|(i, v, _)| (i, v)).collect();
-        }
         let (view, kinds): (Vec<usize>, Vec<bool>) = classified.into_iter().unzip();
         a.view = view;
 
@@ -749,9 +825,141 @@ impl App {
     }
 }
 
+/// 自然序预排序（分块 + 进度回报）：排序必须等全部条目收集完才能开始
+/// （需要完整 name 域），在打开后台线程执行。三阶段——分块键生成 / 分块
+/// 内部排序 / 多路归并——各自回报进度（fraction 0~1）。结果等价于整体
+/// 稳定排序：键相同（仅大小写差异）时按原始下标序，与 `sort_by` 稳定
+/// 语义一致。大包（70 万条实测 1.6s）排序全程有进度而非黑箱。
+fn natural_order_with_progress(
+    entries: &[crate::vfs::VirtualEntry],
+    report: &dyn Fn(f64),
+) -> Vec<usize> {
+    use std::cmp::{Ordering, Reverse};
+    use std::collections::BinaryHeap;
+
+    const CHUNK: usize = 65536;
+    let n = entries.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // 阶段 1：小写键预生成（每条一次字符串分配，成本大头之一）
+    let mut keyed: Vec<(usize, String)> = Vec::with_capacity(n);
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        keyed.extend(
+            entries[start..end]
+                .iter()
+                .enumerate()
+                .map(|(k, e)| (start + k, e.name.to_lowercase())),
+        );
+        report(end as f64 / n as f64);
+    }
+    // 阶段 2：分块内部稳定排序（就地，chunk i 占 keyed[i*CHUNK..]）
+    for (ci, chunk) in keyed.chunks_mut(CHUNK).enumerate() {
+        chunk.sort_by(|x, y| alphanumeric_sort::compare_str(&x.1, &y.1));
+        report(((ci + 1) * CHUNK).min(n) as f64 / n as f64);
+    }
+    // 阶段 3：k 路归并。BinaryHeap 是最大堆，Reverse 一层即按键升序弹出；
+    // 键相等按原始下标序（= 整体稳定排序）。节点持有键副本（自持数据，
+    // 归并中只读 keyed，无借用冲突）
+    struct HeapNode {
+        key: String,
+        idx: usize,
+        chunk: usize,
+        pos: usize,
+    }
+    impl Ord for HeapNode {
+        fn cmp(&self, other: &Self) -> Ordering {
+            let c = alphanumeric_sort::compare_str(&self.key, &other.key);
+            if c == Ordering::Equal {
+                self.idx.cmp(&other.idx)
+            } else {
+                c
+            }
+        }
+    }
+    impl PartialOrd for HeapNode {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Eq for HeapNode {}
+    impl PartialEq for HeapNode {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == Ordering::Equal
+        }
+    }
+    let mut heap: BinaryHeap<Reverse<HeapNode>> = (0..keyed.len().div_ceil(CHUNK))
+        .map(|ci| {
+            let (idx, key) = &keyed[ci * CHUNK];
+            Reverse(HeapNode {
+                key: key.clone(),
+                idx: *idx,
+                chunk: ci,
+                pos: 0,
+            })
+        })
+        .collect();
+    let mut order = Vec::with_capacity(n);
+    let mut merged = 0usize;
+    while let Some(Reverse(mut node)) = heap.pop() {
+        order.push(node.idx);
+        node.pos += 1;
+        merged += 1;
+        if merged % CHUNK == 0 {
+            report(merged as f64 / n as f64);
+        }
+        // 同 chunk 的下一元素：chunk 起点闭区间内且不越过 keyed 末尾
+        //（尾 chunk 可能不满），否则该 chunk 已耗尽不入堆
+        let global = node.chunk * CHUNK + node.pos;
+        if node.pos < CHUNK && global < n {
+            let (idx, key) = &keyed[global];
+            node.key = key.clone();
+            node.idx = *idx;
+            heap.push(Reverse(node));
+        }
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分块排序+归并与整体稳定排序逐位等价：构造跨 chunk 边界（>65536 条）
+    /// 且含大量大小写重复键的数据集（相邻两条 lowercase 相同），验证键相同
+    /// 时按原始下标序（稳定语义），并有多次进度回报
+    #[test]
+    fn natural_order_chunked_equivalent_to_full_stable_sort() {
+        let n = 70_003usize; // 65536 + 尾 chunk 非满（跨块边界验证）
+        let entries: Vec<crate::vfs::VirtualEntry> = (0..n)
+            .map(|i| {
+                // 相邻两条共享同一 lowercase 键（IMG_5/same.jpg 与 img_5/same.jpg）
+                let case = if i % 2 == 0 { "IMG" } else { "img" };
+                crate::vfs::VirtualEntry {
+                    name: format!("{case}_{}/same.jpg", i / 2),
+                    size: i as u64,
+                    is_dir: false,
+                    encrypted: false,
+                    crc: None,
+                }
+            })
+            .collect();
+        let progress_calls = std::cell::Cell::new(0usize);
+        let got = natural_order_with_progress(&entries, &|_| {
+            progress_calls.set(progress_calls.get() + 1)
+        });
+        // 参照实现：整体稳定排序（旧单次 sort_by 语义）
+        let mut keyed: Vec<(usize, String)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.name.to_lowercase()))
+            .collect();
+        keyed.sort_by(|x, y| alphanumeric_sort::compare_str(&x.1, &y.1));
+        let want: Vec<usize> = keyed.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(got, want, "分块排序+归并与整体稳定排序不等价");
+        assert!(progress_calls.get() > 1, "跨 chunk 数据集应有多次进度回报");
+    }
 
     /// 评级读取矩阵分流（meta::read_rating，worker 逐条直读）：嵌入式
     /// （jpg 签名 + 属性式 Rating）命中 / sidecar（bmp + .xmp）命中 /
