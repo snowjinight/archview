@@ -215,6 +215,11 @@ pub struct SessionState {
     /// 清空。UI 定位转圈期（五段无比值）读它显示"正在跳过 <名>（<大小>）"
     /// ——solid 流跳过大视频也是真解码，是定位耗时的主力，让转圈期可见
     pub skip_note: Option<(usize, String, u64)>,
+    /// 当前解码轮次是否为驻留唤醒顺流续解（true=接着上次解码位置继续，
+    /// 无前缀重解；false=规划（重）开工，BlockDecoder 从 folder 起点直达
+    /// 顺序解）。解码线程每轮规划置 false、唤醒续解臂置 true；UI 覆盖层
+    /// 据此切换标题文案，让"秒级续解"与"前缀重解"在视觉上可区分
+    pub resume: bool,
 }
 
 /// 会话共享句柄

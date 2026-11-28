@@ -221,7 +221,10 @@ impl SevenzVFS {
         folder: usize,
         cur_idx: usize,
     ) -> (usize, [(u64, u64); ExtractPhase::COUNT]) {
-        let st = session.lock().unwrap();
+        let mut st = session.lock().unwrap();
+        // 本轮解码 = 驻留唤醒顺流续解（解码器未重启，接着上次位置流）：
+        // UI 覆盖层标题据此区分"续解（无前缀重解）"与"folder 直达重解"
+        st.resume = true;
         let fresh_focus = st
             .focus
             .unwrap_or_else(|| st.targets.values().map(|(i, _)| *i).min().unwrap_or(0));
@@ -487,6 +490,9 @@ impl ArchiveVFS for SevenzVFS {
                     st.alive = false;
                     return Err(VfsError::Cancelled);
                 }
+                // 规划（重）开工 = BlockDecoder 从 folder 起点直达顺序解：
+                // 续解标志复位（唤醒续解臂会再置 true，UI 据此切换标题文案）
+                st.resume = false;
                 // targets 判空退出已由上方驻留等待取代：进入规划即保证非空
                 // （UI 重定向的 clear+重写同锁原子，期间不会观察到空集）
                 // 本轮规划代数：UI 重定向在同一把锁内改 targets 并自增 gen，
@@ -1619,6 +1625,7 @@ mod tests {
             alive: false,
             gen: 0,
             skip_note: None,
+            resume: false,
         }))
     }
 
@@ -2367,6 +2374,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
+        // 规划开工置 false（冷启动/重排 = folder 直达重解）
+        assert!(!s.lock().unwrap().resume, "规划开工后 resume 应为 false");
 
         // 模拟 UI 重定向：新批 n1（锚点，focus 推进）+ n2（下游）。写入后
         // 唤醒判定 ahead_in_folder=true → 顺流续解，唤醒臂应发新骨架
@@ -2397,6 +2406,8 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // 唤醒续解置 true（UI 标题切"续解中"的依据）
+        assert!(s.lock().unwrap().resume, "唤醒续解后 resume 应为 true");
         // 骨架纯上报口径，不影响推进：n1（改判落地）与 n2 顺流照常
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !landed.lock().unwrap().contains(&2) {

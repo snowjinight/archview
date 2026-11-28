@@ -342,9 +342,20 @@ impl App {
                     ui.colored_label(ui.visuals().weak_text_color(), "解压会话驻留中");
                 } else {
                     let left = j.pending.len();
+                    // 续解标志（解码线程每轮规划置 false/唤醒续解臂置 true）：
+                    // 与媒体区覆盖层标题同口径，区分两种推进方式
+                    let resume = self
+                        .archive
+                        .as_ref()
+                        .and_then(|a| a.session.lock().ok().map(|st| st.resume))
+                        .unwrap_or(false);
                     ui.colored_label(
                         ui.visuals().weak_text_color(),
-                        format!("后台解压中…（剩余 {left} 项）"),
+                        if resume {
+                            format!("续解中…（剩余 {left} 项）")
+                        } else {
+                            format!("后台解压中…（剩余 {left} 项）")
+                        },
                     );
                     // 当前活动段 mini bar：固定槽位 140×6 + 2 字段名前缀。
                     // 解压五段顺序推进（跳前置→上游预取→目标→下游），只画
@@ -1321,9 +1332,21 @@ impl App {
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.vertical_centered(|ui| {
+                        // 续解标志（解码线程每轮规划置 false / 唤醒续解臂置
+                        // true）：区分"接着上次解码位置续解"与"folder 直达
+                        // 从起点顺序解（前缀重解）"
+                        let resume = self
+                            .archive
+                            .as_ref()
+                            .and_then(|a| a.session.lock().ok().map(|st| st.resume))
+                            .unwrap_or(false);
                         ui.label(
-                            egui::RichText::new("正在后台解压（固态包需顺序解压到目标位置）")
-                                .color(ui.visuals().warn_fg_color),
+                            egui::RichText::new(if resume {
+                                "续解中（接着上次解码位置继续，不重解前缀）"
+                            } else {
+                                "正在后台解压（固态包需顺序解压到目标位置）"
+                            })
+                            .color(ui.visuals().warn_fg_color),
                         );
                         ui.add_space(6.0);
                         // 完整文件名（自动换行，不截断）
@@ -1364,6 +1387,13 @@ impl App {
                                                note: Option<&(usize, String, u64)>,
                                                amber: egui::Color32| {
                             if let Some((_, name, _)) = note {
+                                // 意图前缀：裸路径用户不知道显示意图，先声明
+                                // "跳过此文件"（弱色），再跟目录蓝/文件名琥珀
+                                ui.label(
+                                    egui::RichText::new("跳过此文件：")
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
                                 let (dir, file) = match name.rsplit_once('/') {
                                     Some((d, f)) => (Some(format!("{d}/")), f),
                                     None => (None, name.as_str()),

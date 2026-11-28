@@ -741,6 +741,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
         alive: false,
         gen: 0,
         skip_note: None,
+        resume: false,
     }));
     // 独立缓存目录尚无落地文件：位图全空（真实流程由 FileDone 逐个置位）
     let cached = vec![false; entries.len()];
@@ -1593,6 +1594,7 @@ fn png_archive(
         alive: false,
         gen: 0,
         skip_note: None,
+        resume: false,
     }));
     app.archive = Some(super::ArchiveState {
         id,
