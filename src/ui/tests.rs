@@ -1208,6 +1208,147 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 位图失真当批生效（4fe8221 审查 #2 回归）：位图命中而磁盘缺失时，
+/// 清位必须发生在 compute_batch 之前——否则组批仍按旧位图把锚点当
+/// 已缓存跳过，锚点不入批不落地不播放（首次点击无反馈），第二次
+/// 点击才自愈。修复后：清位前置 → 锚点入当批 → 首次点击即解压即播放。
+/// 触发面 = 外部删缓存文件 / 双实例共目录（应用内逐出与 FileDone 积压
+/// 竞态已由 evict 回写清位 + FileDone exists 复核堵死）
+#[test]
+fn bitmap_miss_anchor_enters_batch_on_first_click() {
+    use crate::vfs::sevenz_vfs::SevenzVFS;
+    use crate::vfs::{ArchiveVFS, SessionState};
+    use std::sync::Arc;
+
+    // xorshift64 伪随机数据：落地后逐字节比对可捕获错位
+    fn prng_vec(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut v = Vec::with_capacity(len);
+        while v.len() < len {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v.truncate(len);
+        v
+    }
+
+    let dir = std::env::temp_dir().join(format!("ui_bitmap_miss_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let srcs: Vec<(String, Vec<u8>)> = (0..3)
+        .map(|i| {
+            (
+                format!("p{i:02}.jpg"),
+                prng_vec(i as u64 + 0x9E37, 1024 * 1024),
+            )
+        })
+        .collect();
+
+    // solid 7z：全部条目同一 folder（组批滑窗主战场）
+    let arch = dir.join("miss.7z");
+    {
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let mut w = sevenz_rust::SevenZWriter::create(&arch).unwrap();
+        let entries: Vec<sevenz_rust::SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                sevenz_rust::SevenZArchiveEntry::from_path(
+                    p,
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    cfg.cache.max_size_mb = 4096;
+    cfg.extract.prefetch_downstream_mb = 3;
+    cfg.extract.prefetch_upstream_max_mb = 0;
+    let mut app = super::App::new_for_test(cfg);
+
+    let vfs: Arc<dyn ArchiveVFS> = Arc::new(SevenzVFS::open(&arch, None).unwrap());
+    let entries = vfs.list();
+    assert_eq!(entries.len(), 3);
+    let session: crate::vfs::SharedSession = Arc::new(std::sync::Mutex::new(SessionState {
+        targets: Default::default(),
+        focus: None,
+        alive: false,
+        gen: 0,
+        skip_note: None,
+        resume: false,
+    }));
+    // 位图污染：p00 标记已缓存，但缓存目录没有任何落地文件（模拟外部
+    // 删缓存文件 / 双实例共目录后的陈旧位图）
+    let cached = vec![true, false, false];
+    app.archive = Some(super::ArchiveState {
+        id: 8,
+        name: "miss.7z".into(),
+        path: arch.clone(),
+        password: None,
+        entries,
+        view: (0..3).collect(),
+        vfs,
+        stream: false,
+        session,
+        ratings: std::collections::HashMap::new(),
+        deleted: std::collections::HashSet::new(),
+        cached,
+        dir_mode: false,
+        disp_order: (0..3).collect(),
+        disp_is_natural: false,
+    });
+
+    let window = |app: &super::App| -> Vec<usize> {
+        let st = app.archive.as_ref().unwrap().session.lock().unwrap();
+        let mut v: Vec<usize> = st.targets.values().map(|(i, _)| *i).collect();
+        v.sort_unstable();
+        v
+    };
+
+    // 首次点击锚点 0：位图说在、磁盘说不在 → 清位前置，锚点入当批
+    app.start_extract(0);
+    assert!(
+        !app.archive.as_ref().unwrap().cached[0],
+        "失真位图应已清位"
+    );
+    assert_eq!(
+        window(&app),
+        vec![0, 1, 2],
+        "锚点必须入当批窗口（旧时序 compute_batch 先跑，窗口只剩 [1,2]）"
+    );
+
+    // 首次点击即落地即播放（旧 bug：锚点不入批 → FileDone(0) 永不到来）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.playing != Some(0) {
+        assert!(std::time::Instant::now() < deadline, "锚点 0 首次点击未播放");
+        assert!(app.error.is_none(), "解压过程不应有错误");
+        app.poll_extract();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let data = std::fs::read(crate::cache::dest_path(&dir.join("cache"), 8, 0, &srcs[0].0))
+        .expect("锚点应落地");
+    assert_eq!(data, srcs[0].1, "锚点内容错位");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// raw dump 预设校验（方案 §4.5/§8）：raw_demux_opts 的五类拦截文案与
 /// 通过拼参（含 bit_shift 流层参数带出）。校验必须在 loadfile 之前——
 /// rawvideo demuxer 对尾部零头字节不报错、画面错位难排查，故报错均

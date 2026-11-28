@@ -587,28 +587,46 @@ impl App {
         {
             return;
         }
+        // 位图失真预检（先于组批）：位图命中而磁盘不在（外部删缓存文件、
+        // 双实例共目录等应用外路径；应用内逐出与 FileDone 积压竞态已由
+        // evict 回写清位 + FileDone exists 复核堵死）→ 立即清位。清位必须
+        // 在 compute_batch 之前：组批按位图跳过"已缓存"条目，旧时序（清位
+        // 回写放在规划块之后）会让 compute_batch 把锚点当已缓存跳过——
+        // 锚点不入批不落地不播放，第二次点击才自愈
+        let bitmap_miss = {
+            let Some(arch) = self.archive.as_ref() else { return };
+            let hit = arch.cached.get(entry_idx).copied().unwrap_or(false);
+            let miss_dest = cache::dest_path(
+                &cache::cache_dir(&self.cfg),
+                arch.id,
+                entry_idx,
+                &arch.entries[entry_idx].name,
+            );
+            hit && !miss_dest.exists()
+        };
+        if bitmap_miss {
+            let miss_name = self
+                .archive
+                .as_ref()
+                .map(|a| a.entries[entry_idx].name.clone())
+                .unwrap_or_default();
+            tracing::warn!("缓存位图失真: [{miss_name}]（位图命中而磁盘缺失）→ 清位并走解压路径");
+            if let Some(a) = self.archive.as_mut() {
+                if entry_idx < a.cached.len() {
+                    a.cached[entry_idx] = false;
+                }
+            }
+        }
         // 只读规划段：借 archive 组批并产出 owned 数据。后续预检/重定向/
         // spawn 都要可变借用 self（方法调用借整个 self），须先结束 arch 借用
-        let (cached, bitmap_miss, was_pending, session, vfs, dir, dest, name, targets, batch_bytes) = {
+        let (cached, was_pending, session, vfs, dir, dest, name, targets, batch_bytes) = {
             let Some(arch) = &self.archive else { return };
             let entry = &arch.entries[entry_idx];
             let dir = cache::cache_dir(&self.cfg);
             let dest = cache::dest_path(&dir, arch.id, entry_idx, &entry.name);
             // 缓存命中：查位图（open 时扫描 + FileDone 置位，尺寸已校验）。
-            // 位图失真兜底：位图说在而磁盘不在（跨包逐出漏清位等异常路径）→
-            // 降级为未缓存走解压路径；miss 记入 bitmap_miss，块外回写清位
-            // （本块是 &self.archive 只读借用），防后续批规划继续把该条目
-            // 当已缓存跳过
-            let mut bitmap_miss = false;
-            let cached = {
-                let hit = arch.cached.get(entry_idx).copied().unwrap_or(false);
-                if hit && !dest.exists() {
-                    bitmap_miss = true;
-                    false
-                } else {
-                    hit
-                }
-            };
+            // 失真预检已在上方完成并清位，此处读到 false 即正常走解压路径
+            let cached = arch.cached.get(entry_idx).copied().unwrap_or(false);
             // 批内切换：新目标在当前批未完成清单里（覆盖层宽限期不清零的依据）
             let was_pending = self
                 .extract
@@ -649,7 +667,6 @@ impl App {
             };
             (
                 cached,
-                bitmap_miss,
                 was_pending,
                 arch.session.clone(),
                 arch.vfs.clone(),
@@ -660,19 +677,6 @@ impl App {
                 batch_bytes,
             )
         };
-        // 位图失真回写清位（只在规划块外做，块内是只读借用）：命中判定
-        // 已降级，不清位会让 compute_batch 继续跳过该条目
-        if bitmap_miss {
-            tracing::warn!(
-                "缓存位图失真: [{name}]（位图命中而磁盘缺失）→ 清位并走解压路径"
-            );
-            if let Some(a) = self.archive.as_mut() {
-                if entry_idx < a.cached.len() {
-                    a.cached[entry_idx] = false;
-                }
-            }
-        }
-
         // R3 零动作守卫：锚点已缓存 = 纯 UI 更新——不组批、不重定向会话、
         // 不动 focus 锚点（原 keep 分支与"整窗已落地"分支在此统一，两者
         // 前提均为锚点命中）。预取变为"翻到未缓存项才触发"的搭车福利：
