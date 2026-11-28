@@ -275,18 +275,7 @@ impl RarVFS {
             }
             (focus, t)
         };
-        progress(ExtractPhase::Locate, 0, 0);
-        for p in [
-            ExtractPhase::SkipUp,
-            ExtractPhase::Upstream,
-            ExtractPhase::Target,
-            ExtractPhase::Downstream,
-        ] {
-            let (c, t) = phase_totals[p as usize];
-            if t > 0 {
-                progress(p, c, t);
-            }
-        }
+        super::emit_phase_skeleton(&phase_totals, progress);
         let mut landed = 0; // 本遍落地数
         let mut skipped: usize = 0;
         let mut skip_cur: u64 = 0;
@@ -319,7 +308,7 @@ impl RarVFS {
             let parked = session.lock().unwrap().targets.is_empty();
             if parked {
                 // 驻留等待无消费动作，跳过提示过期（对齐 7z 驻留清空）
-                session.lock().unwrap().skip_note = None;
+                super::set_skip_note(session, None);
                 tracing::debug!(
                     "[会话] 条目[{name}]（idx {cur_idx:?}）目标清空 → RAR 条目边界驻留等待"
                 );
@@ -328,18 +317,15 @@ impl RarVFS {
                 // 重睡，无法回到条目循环头（那会 drop head 丢掉 open）
                 let cur = cur_idx.unwrap_or(usize::MAX);
                 let min_tgt = loop {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err(VfsError::Cancelled);
-                    }
-                    let still_empty = session.lock().unwrap().targets.is_empty();
-                    if still_empty {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                    let m = {
-                        let st = session.lock().unwrap();
-                        st.targets.values().map(|(i, _)| *i).min()
-                    };
+                    // 驻留睡眠（公共体 park_until_wake）：targets 非空或 cancel 返回
+                    super::park_until_wake(session, cancel)?;
+                    let m = session
+                        .lock()
+                        .unwrap()
+                        .targets
+                        .values()
+                        .map(|(i, _)| *i)
+                        .min();
                     // 醒来瞬间目标又被换空（UI 重定向 clear+写同锁原子，
                     // 理论不可见；防御性兜底）：原地重睡
                     let Some(m) = m else {
@@ -361,18 +347,10 @@ impl RarVFS {
                 }
                 // 唤醒臂：新鲜 focus/targets 重算段骨架（分母从当前条目起，
                 // 身前条目已流过解码流不进分母）+ resume 置位（UI 标题切
-                // "续解中"）+ 段游标清零（分母口径已换）。求和无锁依赖先放锁，
-                // 防 2021 edition 守卫临时值跨块重入自死锁（教训见 7z 改判分支）
-                let (fresh_focus, wake_tgt) = {
-                    let mut st = session.lock().unwrap();
-                    st.resume = true;
-                    let fresh_focus = st.focus.unwrap_or_else(|| {
-                        st.targets.values().map(|(i, _)| *i).min().unwrap_or(0)
-                    });
-                    let wake_tgt: std::collections::HashSet<usize> =
-                        st.targets.values().map(|(i, _)| *i).collect();
-                    (fresh_focus, wake_tgt)
-                };
+                // "续解中"）+ 段游标清零（分母口径已换）。wake_snapshot 同锁
+                // 取齐后放锁，求和无锁依赖（防 2021 edition 守卫临时值跨块
+                // 重入自死锁，教训见 7z 改判分支）
+                let (fresh_focus, wake_tgt) = super::wake_snapshot(session);
                 focus_idx = fresh_focus;
                 let last = wake_tgt.iter().copied().max().unwrap_or(0);
                 let mut t = [(0u64, 0u64); ExtractPhase::COUNT];
@@ -407,18 +385,7 @@ impl RarVFS {
                 up_cur = 0;
                 down_cur = 0;
                 // 开工协议同款：Locate(0,0) + 各非零段 (0,total)
-                progress(ExtractPhase::Locate, 0, 0);
-                for p in [
-                    ExtractPhase::SkipUp,
-                    ExtractPhase::Upstream,
-                    ExtractPhase::Target,
-                    ExtractPhase::Downstream,
-                ] {
-                    let (_, tot) = phase_totals[p as usize];
-                    if tot > 0 {
-                        progress(p, 0, tot);
-                    }
-                }
+                super::emit_phase_skeleton(&phase_totals, progress);
             }
             // 持锁快照：本条目目标 / focus 是否漂移到当前遍历位置的上游
             let (tgt, upstream) = {
@@ -438,8 +405,10 @@ impl RarVFS {
                 // （整段流进度的一部分，计入推进防止夹缝处 bar 停滞）。
                 // 跳过提示：消费边界短锁刷新（solid RAR 逐条 skip 是真解码，
                 // 长视频跳过期让 UI 转圈可见在干什么）
-                session.lock().unwrap().skip_note =
-                    Some((cur_idx.unwrap_or(usize::MAX), name.clone(), size));
+                super::set_skip_note(
+                    session,
+                    Some((cur_idx.unwrap_or(usize::MAX), name.clone(), size)),
+                );
                 let is_up = cur_idx.is_some_and(|c| c < focus_idx);
                 open = head.skip().map_err(|e| {
                     VfsError::Archive(format!("RAR 跳过条目 [{}] 失败（正在定位目标）: {e}", name))
@@ -485,11 +454,8 @@ impl RarVFS {
                         progress(ExtractPhase::Target, t, t);
                     }
                 }
-                let hit = {
-                    let mut st = session.lock().unwrap();
-                    st.skip_note = None; // 幂等落地，跳过提示过期
-                    st.targets.remove(&name).is_some()
-                };
+                // 幂等落地，跳过提示过期
+                let hit = super::land_target(session, &name);
                 if hit {
                     file_done(ti, &dest); // 锁已释放
                     landed += 1;
@@ -541,11 +507,8 @@ impl RarVFS {
                     dest.display()
                 ))
             })?;
-            let hit = {
-                let mut st = session.lock().unwrap();
-                st.skip_note = None; // 目标落地，跳过提示过期
-                st.targets.remove(&name).is_some()
-            };
+            // 目标落地，跳过提示过期
+            let hit = super::land_target(session, &name);
             if hit {
                 file_done(ti, &dest); // 锁已释放
                 landed += 1;
@@ -718,22 +681,14 @@ impl ArchiveVFS for RarVFS {
             .collect();
         let mut stagnant = 0; // 连续零落地轮数（无进展保险）
         loop {
-            // 持锁预检：取消 / 规划代数快照（判空与置 alive=false 同锁，协议见
-            // mod.rs）。顺带快照本轮 gen——UI 重定向同锁自增，零落地轮末
-            // 比对可知"没进展"是否因中途换了目标
-            let round_gen = {
-                let mut st = session.lock().unwrap();
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    st.alive = false;
-                    return Err(VfsError::Cancelled);
-                }
-                // targets 判空退出已由 pass 内条目边界驻留取代（预检空目标
-                // 照常进入 pass：首个条目边界驻留等新目标，cancel 唯一硬退出）。
-                // 规划（重）开工 = 从头遍历重解前缀（非续解）：续解标志复位
-                // （驻留唤醒臂再置 true，UI 据此切换标题文案）
-                st.resume = false;
-                st.gen
-            };
+            // 持锁预检（session_prelude）：取消 / 规划代数快照（判空与置
+            // alive=false 同锁，协议见 mod.rs）。顺带快照本轮 gen——UI 重定
+            // 向同锁自增，零落地轮末比对可知"没进展"是否因中途换了目标
+            // targets 判空退出已由 pass 内条目边界驻留取代（预检空目标
+            // 照常进入 pass：首个条目边界驻留等新目标，cancel 唯一硬退出）。
+            // 规划（重）开工 = 从头遍历重解前缀（非续解）：续解标志复位
+            //（驻留唤醒臂再置 true，UI 据此切换标题文案）
+            let (round_gen, ()) = super::session_prelude(session, cancel, |_| ())?;
             let mut landed = 0;
             // 候选轮内重启次数：漂移抢道 Restart 与驻留唤醒上游回跳 Restart
             // 合并计数（上限 64 防 UI 抖动/连点上游死循环误报）

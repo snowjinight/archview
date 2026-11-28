@@ -230,6 +230,105 @@ pub(crate) fn session_exit(session: &SharedSession) {
     session.lock().unwrap().alive = false;
 }
 
+// ---- 固态会话编排协议函数（7z / RAR 两 VFS 共用，纯收编不改行为）----
+// 两边 loop 形态各自保留（folder 直达 vs 顺序遍历），可独立命名的共性收编
+// 为自由函数：驻留睡眠 / 规划预检 / 唤醒快照 / 开工骨架 / skip_note 与落地
+// 幂等。均遵守会话线程纪律：睡眠不持锁，醒来重读共享状态禁用旧快照。
+
+/// 驻留睡眠循环（批边界/规划期真暂停的公共体）：targets 解净时原地睡眠等
+/// 新目标，50ms 分片检查 cancel（硬退出）。返回 Ok = 已有新目标；醒来后
+/// 必须重新持锁重读 targets/focus 决策，禁止沿用睡眠前快照
+pub(crate) fn park_until_wake(
+    session: &SharedSession,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), VfsError> {
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(VfsError::Cancelled);
+        }
+        if !session.lock().unwrap().targets.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 规划预检（每轮规划起始）：取消 → 置 alive=false 报 Cancelled（与 UI 加
+/// 目标同锁互斥，不会"UI 判存活却随即线程退出丢目标"）；resume 复位（本轮
+/// 为规划重开工，驻留唤醒臂再置 true，UI 据此切换标题文案）；快照本轮规划
+/// 代数 gen。其余规划快照经 `plan` 在同一把锁内完成——gen 与 targets 快照
+/// 同锁保证一致（gen 变了 ⟺ targets 换过；UI 重定向的 clear+重写同锁原子，
+/// 期间不会观察到空集）。plan 内禁止再锁 session（守卫已持锁）
+pub(crate) fn session_prelude<R>(
+    session: &SharedSession,
+    cancel: &std::sync::atomic::AtomicBool,
+    plan: impl FnOnce(&mut SessionState) -> R,
+) -> Result<(u64, R), VfsError> {
+    let mut st = session.lock().unwrap();
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        st.alive = false;
+        return Err(VfsError::Cancelled);
+    }
+    st.resume = false;
+    let gen = st.gen;
+    let planned = plan(&mut st);
+    drop(st); // 显式放锁：2021 edition 守卫临时值教训，返回值使用不跨守卫
+    Ok((gen, planned))
+}
+
+/// 唤醒臂快照（醒来重读纪律：暂停前快照的 focus/targets 禁沿用）：resume
+/// 置位（本轮解码 = 驻留唤醒顺流续解，UI 覆盖层标题据此区分"续解"与
+/// "重解"）+ 新鲜 focus（无 focus = 最小目标下标）+ 目标下标集合。同锁
+/// 取齐后放锁返回，求和/发骨架均无锁依赖
+pub(crate) fn wake_snapshot(
+    session: &SharedSession,
+) -> (usize, std::collections::HashSet<usize>) {
+    let mut st = session.lock().unwrap();
+    st.resume = true;
+    let fresh_focus = st
+        .focus
+        .unwrap_or_else(|| st.targets.values().map(|(i, _)| *i).min().unwrap_or(0));
+    let wake_tgt: std::collections::HashSet<usize> =
+        st.targets.values().map(|(i, _)| *i).collect();
+    (fresh_focus, wake_tgt)
+}
+
+/// 开工/骨架协议（规划开工与驻留唤醒臂同源同款）：Locate(0,0)（总量 0 →
+/// UI 显示定位 spinner）+ 各非零段 (0, total)（UI 画空 bar 骨架，条立即
+/// 出现不空窗）
+pub(crate) fn emit_phase_skeleton(
+    totals: &[(u64, u64); ExtractPhase::COUNT],
+    progress: &dyn Fn(ExtractPhase, u64, u64),
+) {
+    progress(ExtractPhase::Locate, 0, 0);
+    for ph in [
+        ExtractPhase::SkipUp,
+        ExtractPhase::Upstream,
+        ExtractPhase::Target,
+        ExtractPhase::Downstream,
+    ] {
+        let t = totals[ph as usize].1;
+        if t > 0 {
+            progress(ph, 0, t);
+        }
+    }
+}
+
+/// 跳过提示写协议：消费边界短锁刷新（写完即放，绝不跨 io::copy 持锁）。
+/// None = 目标落地/驻留等待，提示过期清空
+pub(crate) fn set_skip_note(session: &SharedSession, note: Option<(usize, String, u64)>) {
+    session.lock().unwrap().skip_note = note;
+}
+
+/// 落地幂等协议：持锁清 skip_note（跳过提示过期）+ 从 targets 移除；移除
+/// 成功才算落地（返回 true → 调用方**锁外**回调 file_done——file_done 必须
+/// 锁外调用）。移除失败 = 重复落地（候选重试/唤醒改判竞态），不回调，幂等
+pub(crate) fn land_target(session: &SharedSession, name: &str) -> bool {
+    let mut st = session.lock().unwrap();
+    st.skip_note = None;
+    st.targets.remove(name).is_some()
+}
+
 /// 统一三种压缩包格式的读取接口（注册进全局注册表，跨线程共享）
 pub trait ArchiveVFS: Send + Sync {
     /// 列出所有 entry

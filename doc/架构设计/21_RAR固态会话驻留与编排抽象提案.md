@@ -1,6 +1,6 @@
 # 21. RAR 固态会话驻留与编排抽象提案
 
-> 状态：**Phase A/B 已实施（2026-11-28）**。背景：7z 固态会话已完成"驻留暂停 + 唤醒续解 +
+> 状态：**Phase A/B/C 已实施（2026-11-28）**。背景：7z 固态会话已完成"驻留暂停 + 唤醒续解 +
 > 唤醒段骨架 + 续解标志"全套（§11.4）；RAR 固态包原是"批解净即退出线程、
 > 下次点击从头遍历重解前缀"的旧模型（§11.2 会话化最初形态）。本节记录
 > RAR 移植路径、与 7z 的模型差异对照、编排层抽象的取舍评估与分阶段计划。
@@ -175,9 +175,20 @@ file_done、无进展保险、驻留睡眠循环、wake_skeleton 重发。差异
   Downstream 骨架 30000 + resume=true 证伪误重启）/
   `rar_session_wake_upstream_restarts`（判据=f0 只能经 Restart 落地 +
   resume 保持 false）；全量 259 测试通过。
-- **Phase C — 编排层方案 B 收编**（待办）：提取 `session_prelude` /
-  `park_until_wake` / wake 骨架闭包化，两边 loop 改调共享函数；
-  完成后复评是否值得升级方案 A。
+- **Phase C — 编排层方案 B 收编** ✅（2026-11-28 落地，纯重构行为等价）：
+  6 个会话协议自由函数收编进 [vfs/mod.rs](../../src/vfs/mod.rs)（紧邻
+  `session_exit`，SessionState 协议同址）——`park_until_wake`（驻留睡眠
+  循环公共体，7z 批边界/规划期 + RAR 唤醒等待三处共用）、`session_prelude`
+  （预检 cancel/alive + resume 复位 + gen 快照，闭包 `plan` 承载各自规划
+  快照同锁完成，保住"gen 变了 ⟺ targets 换过"同锁不变量）、
+  `wake_snapshot`（唤醒臂 resume=true + 新鲜 focus + 目标集合，同锁取齐
+  放锁返回）、`emit_phase_skeleton`（Locate + 各非零段 (0,total) 开工
+  协议，两边共 5 处调用点统一）、`set_skip_note` / `land_target`
+  （skip_note 写协议与落地幂等协议，file_done 锁外调用纪律写入函数注释）。
+  两边 loop 形态各自保留；全量 259 测试零失败。
+  **复评结论：不升级方案 A（trait）**——收编后 loop 骨架仍非镜像（7z
+  folder 解码序 + 回调内分流 vs RAR 候选×Restart 双层循环），trait 四钩子
+  会被两边少数服从多数地拉扯，自由函数已覆盖全部可命名共性，YAGNI。
 - **Phase D — 文档与状态同步**（进行中）：本节状态已改"已实施"；
   §11.4 补 RAR 驻留描述、落地开发 01/04 叙事与排查、README 推荐阅读
   路径补 RAR 待续。
