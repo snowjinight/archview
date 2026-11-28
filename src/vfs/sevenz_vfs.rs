@@ -152,6 +152,89 @@ impl SevenzVFS {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+
+    /// 纯元数据段总量求和（entries×folder_of×targets/focus，无 IO、无副作用、
+    /// 不触碰 targets/收集窗口/解码流）：规划分母与唤醒臂骨架同源同款。
+    /// 只计 folders 内 [from_idx, 该 folder 最后一个目标]（解码实际停止点，
+    /// 之后与之前的条目不会流经/已流经）；归类必须与解码回调同源——先判
+    /// 是否目标（tgt_idx），再按 focus 分段（focus 指向的条目落地后已从
+    /// targets 移除而 UI 未重定向时，focus 陈旧指向非目标条目——若按
+    /// i == focus_idx 先判 Target，Target 段被发骨架却永远无写入，bar 卡
+    /// 0% 且 Downstream 串量；先判目标则两侧逐条对应）
+    fn segment_totals(
+        &self,
+        folders: &std::collections::BTreeSet<usize>,
+        focus_idx: usize,
+        tgt_idx: &std::collections::HashSet<usize>,
+        from_idx: usize,
+    ) -> [(u64, u64); ExtractPhase::COUNT] {
+        let mut totals = [(0u64, 0u64); ExtractPhase::COUNT];
+        let Some(&last) = tgt_idx.iter().max() else {
+            return totals;
+        };
+        // folder → 该 folder 内最后一个目标下标（解码的实际停止点）
+        let mut stop: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &i in tgt_idx {
+            if let Some(Some(f)) = self.folder_of.get(i) {
+                stop.entry(*f)
+                    .and_modify(|s| *s = (*s).max(i))
+                    .or_insert(i);
+            }
+        }
+        for i in from_idx..=last {
+            if let Some(Some(f)) = self.folder_of.get(i).copied() {
+                if !folders.contains(&f) {
+                    continue;
+                }
+                let Some(&s) = stop.get(&f) else {
+                    continue;
+                };
+                if i > s {
+                    continue;
+                }
+                let size = self.entries[i].size;
+                let ph = if tgt_idx.contains(&i) {
+                    match i.cmp(&focus_idx) {
+                        std::cmp::Ordering::Equal => ExtractPhase::Target,
+                        std::cmp::Ordering::Less => ExtractPhase::Upstream,
+                        std::cmp::Ordering::Greater => ExtractPhase::Downstream,
+                    }
+                } else if i < focus_idx {
+                    ExtractPhase::SkipUp
+                } else {
+                    ExtractPhase::Downstream
+                };
+                totals[ph as usize].1 += size;
+            }
+        }
+        totals
+    }
+
+    /// 唤醒臂骨架（批边界驻留被新批唤醒、顺流续解前调用）：醒来重读纪律——
+    /// 暂停前快照的 focus/targets 禁沿用。新鲜 focus/targets 纯元数据求和
+    /// （segment_totals，规划同源同款；不动收集窗口/targets/解码流，仅上报
+    /// 口径），from=cur_idx+1（唤醒点条目正在消费，不进分母）。返回
+    /// (新鲜 focus, 各段总量)，调用方换 focus_idx + 发开工骨架
+    fn wake_skeleton(
+        &self,
+        session: &SharedSession,
+        folder: usize,
+        cur_idx: usize,
+    ) -> (usize, [(u64, u64); ExtractPhase::COUNT]) {
+        let st = session.lock().unwrap();
+        let fresh_focus = st
+            .focus
+            .unwrap_or_else(|| st.targets.values().map(|(i, _)| *i).min().unwrap_or(0));
+        let wake_tgt: std::collections::HashSet<usize> =
+            st.targets.values().map(|(i, _)| *i).collect();
+        drop(st); // 求和无锁依赖，先放锁
+        let mut folders = std::collections::BTreeSet::new();
+        folders.insert(folder);
+        (
+            fresh_focus,
+            self.segment_totals(&folders, fresh_focus, &wake_tgt, cur_idx + 1),
+        )
+    }
 }
 
 impl ArchiveVFS for SevenzVFS {
@@ -396,7 +479,8 @@ impl ArchiveVFS for SevenzVFS {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             // ---- 规划：持锁快照目标集 → folder 分组 + focus 优先 ----
-            let (folders, focus_folder, zero_streams, round_gen, focus_idx, tgt_idx) = {
+            // mut：驻留唤醒顺流续解时按新批 focus 重置（唤醒臂 wake_skeleton）
+                let (folders, focus_folder, zero_streams, round_gen, mut focus_idx, tgt_idx) = {
                 // 取消与置 alive=false 同一次持锁（协议：与 UI 加目标互斥）
                 let mut st = session.lock().unwrap();
                 if cancel.load(Ordering::Relaxed) {
@@ -437,61 +521,9 @@ impl ArchiveVFS for SevenzVFS {
                     st.targets.values().map(|(i, _)| *i).collect();
                 (folders, focus_folder, zero, round_gen, focus_idx, tgt_idx)
             };
-            // 锁外统计本轮各段定比总量（entries/folder_of 为 open 缓存，无 IO）。
-            // 只计"本轮解码 folder 内 [folder 首条目, 该 folder 最后一个目标]"的
-            // 条目——folder 解码到目标解净即停，其后的条目不会流经，计入会
-            // 令分母虚大、bar 永远到不了 100%。focus 之前的目标计入 Upstream
-            // （预取落地）、非目标计入 SkipUp（穿过丢弃）；focus 本体 Target；
-            // focus 之后到批末整段流计入 Downstream（目标落地与段内非目标
-            // 跳过都算——搜索过滤/标签页隐藏/缓存命中条目会夹在批内目标之间）
-            let mut totals = [(0u64, 0u64); ExtractPhase::COUNT];
-            if let Some(&last) = tgt_idx.iter().max() {
-                // folder → 该 folder 内最后一个目标下标（解码的实际停止点）
-                let mut stop: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::new();
-                for &i in &tgt_idx {
-                    if let Some(Some(f)) = self.folder_of.get(i) {
-                        stop.entry(*f)
-                            .and_modify(|s| *s = (*s).max(i))
-                            .or_insert(i);
-                    }
-                }
-                for i in 0..=last {
-                    if let Some(Some(f)) = self.folder_of.get(i).copied() {
-                        if !folders.contains(&f) {
-                            continue;
-                        }
-                        let Some(&s) = stop.get(&f) else {
-                            continue;
-                        };
-                        if i > s {
-                            continue;
-                        }
-                        let size = self.entries[i].size;
-                        // 归类必须与解码回调同源：先判是否目标（tgt_idx），再按
-                        // focus 分段。focus 指向的条目落地后已从 targets 移除而
-                        // UI 未重定向时（会话继续解下游预取的常态），focus 陈旧
-                        // 指向非目标条目——若按 i == focus_idx 先判 Target，
-                        // Target 段被发骨架却永远无写入（回调走非目标分支归
-                        // Downstream），bar 卡 0% 且 Downstream 串量。回调侧
-                        // （见下方 for_each_entries 闭包）目标按 ti 与 focus
-                        // 比较分段、非目标按 idx >= focus 归 Downstream，两侧
-                        // 逐条对应（RAR session_pass 同款先判目标的写法）
-                        let ph = if tgt_idx.contains(&i) {
-                            match i.cmp(&focus_idx) {
-                                std::cmp::Ordering::Equal => ExtractPhase::Target,
-                                std::cmp::Ordering::Less => ExtractPhase::Upstream,
-                                std::cmp::Ordering::Greater => ExtractPhase::Downstream,
-                            }
-                        } else if i < focus_idx {
-                            ExtractPhase::SkipUp
-                        } else {
-                            ExtractPhase::Downstream
-                        };
-                        totals[ph as usize].1 += size;
-                    }
-                }
-            }
+            // 锁外统计本轮各段定比总量（entries/folder_of 为 open 缓存，无 IO）：
+            // 规划分母与唤醒臂骨架同源同款（纯元数据求和，见 segment_totals）
+            let totals = self.segment_totals(&folders, focus_idx, &tgt_idx, 0);
             // 开工协议：发 Locate(0,0)（总量 0 → UI 显示定位 spinner）+
             // 各非零段 (0, total)（UI 画空 bar 骨架）
             progress(ExtractPhase::Locate, 0, 0);
@@ -634,8 +666,8 @@ impl ArchiveVFS for SevenzVFS {
                             landed += 1;
                         }
                         // 本 folder 目标解净：若整会话也无目标 → 批边界真暂停
-                        // （驻留等新目标，解码位置停在当前条目）；唤醒续解时
-                        // 旧段总量/游标失效，清零走 UI 活动指示
+                        // （驻留等新目标，解码位置停在当前条目）；唤醒续解时按
+                        // 新批 focus/targets 重算段骨架（唤醒臂 wake_skeleton）
                         if folder_clear {
                             tracing::debug!(
                                 "[会话] 条目[{ename}]（idx {idx}）目标落地后 folder{fi} 清 → 批边界驻留等待"
@@ -645,12 +677,32 @@ impl ArchiveVFS for SevenzVFS {
                                     tracing::debug!(
                                         "[会话] 驻留唤醒（顺流）：当前条目[{ename}] 已作为目标落地，继续解后续条目"
                                     );
+                                    // 醒来重读纪律：新鲜 focus/targets 重算段骨架
+                                    // （wake_skeleton，纯元数据求和，规划同源同款；
+                                    // 不动收集窗口/targets/解码流，仅上报口径），
+                                    // 后续归段也换新鲜 focus
+                                    let (fresh_focus, wake_totals) =
+                                        self.wake_skeleton(session, fi, idx);
+                                    focus_idx = fresh_focus;
                                     skip_cur = 0;
                                     up_cur = 0;
                                     down_cur = 0;
-                                    skip_total = 0;
-                                    up_total = 0;
-                                    down_total = 0;
+                                    skip_total = wake_totals[ExtractPhase::SkipUp as usize].1;
+                                    up_total = wake_totals[ExtractPhase::Upstream as usize].1;
+                                    down_total = wake_totals[ExtractPhase::Downstream as usize].1;
+                                    // 开工协议同款：Locate(0,0) + 各非零段 (0,total)
+                                    progress(ExtractPhase::Locate, 0, 0);
+                                    for ph in [
+                                        ExtractPhase::SkipUp,
+                                        ExtractPhase::Upstream,
+                                        ExtractPhase::Target,
+                                        ExtractPhase::Downstream,
+                                    ] {
+                                        let t = wake_totals[ph as usize].1;
+                                        if t > 0 {
+                                            progress(ph, 0, t);
+                                        }
+                                    }
                                     return Ok(true); // 新目标在本 folder：顺流续解
                                 }
                                 Ok(false) => {
@@ -675,23 +727,36 @@ impl ArchiveVFS for SevenzVFS {
                             // 前缀；唤醒分流与新目标位置同 tgt 分支
                             match self.pause_at_batch_boundary(session, cancel, fi, self_idx) {
                                 Ok(true) => {
+                                    // 醒来重读纪律：新鲜 focus/targets 重算段骨架
+                                    // （wake_skeleton，纯元数据求和，规划同源同款；
+                                    // 不动收集窗口/targets/解码流，仅上报口径），
+                                    // 后续归段也换新鲜 focus
+                                    let (fresh_focus, wake_totals) =
+                                        self.wake_skeleton(session, fi, self_idx);
+                                    focus_idx = fresh_focus;
                                     skip_cur = 0;
                                     up_cur = 0;
                                     down_cur = 0;
-                                    skip_total = 0;
-                                    up_total = 0;
-                                    down_total = 0;
+                                    skip_total = wake_totals[ExtractPhase::SkipUp as usize].1;
+                                    up_total = wake_totals[ExtractPhase::Upstream as usize].1;
+                                    down_total = wake_totals[ExtractPhase::Downstream as usize].1;
+                                    progress(ExtractPhase::Locate, 0, 0);
+                                    for ph in [
+                                        ExtractPhase::SkipUp,
+                                        ExtractPhase::Upstream,
+                                        ExtractPhase::Target,
+                                        ExtractPhase::Downstream,
+                                    ] {
+                                        let t = wake_totals[ph as usize].1;
+                                        if t > 0 {
+                                            progress(ph, 0, t);
+                                        }
+                                    }
                                     // 唤醒点条目可能已被重定向收为新目标：本条目
                                     // 数据未消费，改判目标当场落地。若仍按非目标
                                     // 丢弃，它挂在 targets 里够不着 → folder 解完
                                     // 触发自愈前缀重解（实测一项挂起 106 秒转圈，
                                     // 2026-11-28 日志 ⚠ 桩实锤后修复）
-                                    // 禁止把 session.lock() 直接写进 if let
-                                    // scrutinee：2021 edition 下守卫临时值
-                                    // 存活到整个 if-let 块结束，块内
-                                    // targets.remove 再次加锁 = 同线程
-                                    // Mutex 自死锁（实测：改判落地文件
-                                    // 完成后线程冻结、零日志零自愈）
                                     // 禁止把 session.lock() 直接写进 if let
                                     // scrutinee：2021 edition 下守卫临时值
                                     // 存活到整个 if-let 块结束，块内
@@ -705,9 +770,8 @@ impl ArchiveVFS for SevenzVFS {
                                         .get(e.name.as_str())
                                         .cloned();
                                     if let Some((idx, dest)) = wake_tgt {
-                                        // 归段按本轮规划 focus 的相对位置；段游标
-                                        // 刚清零 → (0,0) 走 UI 活动指示，下一轮
-                                        // 规划恢复定比
+                                        // 归段按新鲜 focus 的相对位置（唤醒臂已换
+                                        // focus 并重算段骨架，与规划侧同源）
                                         let (phase, base, seg_total) = if idx == focus_idx {
                                             (ExtractPhase::Target, 0u64, e.size)
                                         } else if idx < focus_idx {
@@ -2217,6 +2281,134 @@ mod tests {
             "驻留会话应由 cancel 收尾: {r:?}"
         );
         assert!(!s.lock().unwrap().alive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 唤醒臂段骨架回归：批边界驻留被新批唤醒、顺流续解时必须按新批
+    /// focus/targets 重算段骨架（wake_skeleton）。旧实现把段总量清零走
+    /// (x,0) 活动指示 → 唤醒后续解全程无进度条分母（转圈黑箱，上游落盘/
+    /// 下游预取都看不见进度）。判据 = 唤醒后 Downstream 段出现 total==单
+    /// 条目大小的上报（骨架 (0,total)，旧实现全程 total==0）
+    #[test]
+    fn session_wake_skeleton_reports_new_totals() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_wake_skel_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|i| (format!("n{i}.bin"), vec![i as u8; 40_000]))
+            .collect();
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("solid5.7z");
+        let mut w = SevenZWriter::create(&arch).unwrap();
+        let entries: Vec<SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                SevenZArchiveEntry::from_path(
+                    p,
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        let s = new_session();
+        let landed: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = Default::default();
+        {
+            let mut st = s.lock().unwrap();
+            st.targets
+                .insert("n0.bin".into(), (0, dir.join("out_n0.bin")));
+            st.focus = Some(0);
+            st.alive = true;
+        }
+        let reports: std::sync::Arc<
+            std::sync::Mutex<Vec<(crate::vfs::ExtractPhase, u64, u64)>>,
+        > = Default::default();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s2, cancel2, landed2, rep, s3) = (
+            s.clone(),
+            cancel.clone(),
+            landed.clone(),
+            reports.clone(),
+            s.clone(), // file_done 闭包专用克隆（&s2 实参借用冲突）
+        );
+        let handle = std::thread::spawn(move || {
+            vfs.extract_session(
+                &s2,
+                &cancel2,
+                &move |ph, cur, total| {
+                    rep.lock().unwrap().push((ph, cur, total));
+                },
+                &move |idx, _path| {
+                    landed2.lock().unwrap().push(idx);
+                    if idx == 0 {
+                        // n0 落地即清空 targets：n1 非目标且 folder 清 → 批边界驻留
+                        s3.lock().unwrap().targets.clear();
+                    }
+                },
+            )
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !landed.lock().unwrap().contains(&0) {
+            assert!(std::time::Instant::now() < deadline, "n0 落地超时");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // 模拟 UI 重定向：新批 n1（锚点，focus 推进）+ n2（下游）。写入后
+        // 唤醒判定 ahead_in_folder=true → 顺流续解，唤醒臂应发新骨架
+        {
+            let mut st = s.lock().unwrap();
+            st.targets
+                .insert("n1.bin".into(), (1, dir.join("out_n1.bin")));
+            st.targets
+                .insert("n2.bin".into(), (2, dir.join("out_n2.bin")));
+            st.focus = Some(1);
+        }
+
+        // 判据：Downstream 段出现 total==40_000（骨架 (0,40_000) 或落地报
+        // 满）；旧实现唤醒清零 → 全程 total==0，10s 未达即判回归
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let hit = reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(ph, _, t)| ph == crate::vfs::ExtractPhase::Downstream && t == 40_000);
+            if hit {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "唤醒后未见 Downstream 非零骨架：段总量重算回归（旧实现清零）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 骨架纯上报口径，不影响推进：n1（改判落地）与 n2 顺流照常
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !landed.lock().unwrap().contains(&2) {
+            assert!(std::time::Instant::now() < deadline, "n2 顺流落地超时");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(*landed.lock().unwrap(), vec![0, 1, 2], "落地顺序错误");
+
+        // 收尾：folder 解净 → 批边界驻留，cancel 退出
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = handle.join().unwrap();
+        assert!(matches!(r, Err(VfsError::Cancelled)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

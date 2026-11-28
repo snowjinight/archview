@@ -1346,19 +1346,41 @@ impl App {
                             j.phases[ExtractPhase::Downstream as usize],
                         );
                         let sum_total = skip.1 + up.1 + tgt.1 + down.1;
+                        // 跳过提示：读会话跳过注记——solid 流跳过大视频也是真
+                        // 解码（每目录末尾的视频是定位耗时主力）。无比值期与
+                        // 转圈文案同排；有分母期画在分段行下（目标落地时注记
+                        // 被解码线程清空，自动消失）。路径目录/文件名拆行着色
+                        // （目录主题蓝 / 文件名主题琥珀）+ 自动换行，长路径
+                        // 完整可见
+                        let note = self.archive.as_ref().and_then(|a| {
+                            a.session.lock().ok().and_then(|st| st.skip_note.clone())
+                        });
+                        let amber = if ui.visuals().dark_mode {
+                            AMBER_DARK
+                        } else {
+                            AMBER_LIGHT
+                        };
+                        let skip_note_lines = |ui: &mut egui::Ui,
+                                               note: Option<&(usize, String, u64)>,
+                                               amber: egui::Color32| {
+                            if let Some((_, name, _)) = note {
+                                let (dir, file) = match name.rsplit_once('/') {
+                                    Some((d, f)) => (Some(format!("{d}/")), f),
+                                    None => (None, name.as_str()),
+                                };
+                                if let Some(d) = dir {
+                                    egui::Label::new(
+                                        egui::RichText::new(d).small().color(ACCENT),
+                                    )
+                                    .wrap()
+                                    .ui(ui);
+                                }
+                                egui::Label::new(egui::RichText::new(file).small().color(amber))
+                                    .wrap()
+                                    .ui(ui);
+                            }
+                        };
                         if sum_total == 0 {
-                            // 跳过提示：无比值期（定位/骨架/唤醒续解）转圈时读会话
-                            // 跳过注记——solid 流跳过大视频也是真解码（每目录末尾的
-                            // 视频是定位耗时主力）。路径目录/文件名拆行着色（目录
-                            // 主题蓝 / 文件名主题琥珀）+ 自动换行，长路径完整可见
-                            let note = self.archive.as_ref().and_then(|a| {
-                                a.session.lock().ok().and_then(|st| st.skip_note.clone())
-                            });
-                            let amber = if ui.visuals().dark_mode {
-                                AMBER_DARK
-                            } else {
-                                AMBER_LIGHT
-                            };
                             ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new());
                                 match &note {
@@ -1368,20 +1390,7 @@ impl App {
                                     None => ui.label("正在定位目标…"),
                                 };
                             });
-                            if let Some((_, name, _)) = note {
-                                let (dir, file) = match name.rsplit_once('/') {
-                                    Some((d, f)) => (Some(format!("{d}/")), f),
-                                    None => (None, name.as_str()),
-                                };
-                                if let Some(d) = dir {
-                                    egui::Label::new(egui::RichText::new(d).small().color(ACCENT))
-                                        .wrap()
-                                        .ui(ui);
-                                }
-                                egui::Label::new(egui::RichText::new(file).small().color(amber))
-                                    .wrap()
-                                    .ui(ui);
-                            }
+                            skip_note_lines(ui, note.as_ref(), amber);
                         } else {
                             let sum_done = skip.0 + up.0 + tgt.0 + down.0;
                             ui.add(
@@ -1415,6 +1424,8 @@ impl App {
                             row(ui, "上游预取落地", up);
                             row(ui, "目标写入", tgt);
                             let _ = down; // Downstream 在顶栏 mini bar 展示
+                            // 跳过中的条目名（目标落地注记即清空，只显在跳过期）
+                            skip_note_lines(ui, note.as_ref(), amber);
                         }
                         if j.batch_len > 1 {
                             ui.add_space(6.0);
