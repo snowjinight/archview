@@ -33,6 +33,7 @@
 | [§16 图片高清档密度重构专项](16_图片高清档密度重构专项.md) | full 档密度 ×ppp×2→×3 + 预算制（12288/100MP）/ orig-lru 免二次解码（单槽起步，后 LRU 化见 §12）/ fast_image_resize SIMD / 锐化默认关+前移 / 观感增强链 YUV 域重构 + Y·增强量 dump；预算 clamp 取整 floor 教训 | [ARCHITECTURE §13.4 / §6.3](../架构设计/13_渲染架构迁移.md) |
 | [§17 图片元数据方向与评星专项](17_图片元数据方向与评星专项.md) | EXIF 方向矫正 + R 旋转（little_exif 写，旋转不重写像素只改 tag）；2026-11-23 评级重构（17.7 取代 17.6 兼容开关）：**分格式真相矩阵**（jpg/png/webp 嵌入式 XMP img-parts 容器手术 + XMP 文本三件套；tif/RAW/bmp/gif sidecar `.xmp`；EXIF 18246 评级链彻底删除）+ **延迟批量写**（dirty 内存集 + 右键同步/退出自动保存 CancelClose 状态机 + 写失败拦截不发 Close err 常驻清单）+ 删除文件跳过语义（exists 检查不碰残留 sidecar）/ **按需评级探测**（17.8：视口惰性 ≈3×视口窗口 + mark-at-enqueue 位图去重 + 拖动穿越 debounce + 筛选补扫 inflight 门控，取代一次性全量扫描）/ 星级筛选 + trash 删除（**deleted 标记集不物理移除 entries**）；手拼 RIFF WebP 夹具三连坑、PNG eXIf 库读写不对称坑 | [ARCHITECTURE §6.7](../架构设计/06_图片预览模块.md) |
 | [§18 IO调度层接入专项](18_IO调度层接入专项.md) | 统一 IO 发牌调度器接入（优先级占槽模型：解码 > 预取 > 评级，`[io]` 配置热重载）：三处手工守卫删除（extract 单在途 early-return / compare window_busy 闸门）→ 规则涌现 / 类随消息走 + fail-open 记账口径 / 评级并入发牌（`IoClass::Rating` 占槽 + App 侧派发闸门 + 文件粒度抢占，worker 阻塞收单条命令零轮询）/ 卡死排查（幂等去重优先于发牌 + PowerShell 管道缓冲掩盖进度）/ 并行编辑冲突复发教训 / 调度关键日志分级（info=排队/放行转折含等待时长，debug=开工细节） | [ARCHITECTURE §17](../架构设计/17_IO调度层.md) |
+| [§19 ISO镜像支持专项](19_ISO镜像支持专项.md) | ISO 镜像 VFS 落地（ISO9660/Joliet + 纯 UDF 2.50 蓝光）：crate 调研否决记录 / type2 元数据分区映射偏移 40（规范记忆不可靠，真盘 hex dump 为准）/ BDAV 192B 节奏 0x47@+4 / bridge 与纯 UDF 双形态 / BD 菜单流 mpv 内容层限制 / L1 扩展名（老 config 不自动补项）/ ProgID Archview.Iso + 专属图标索引 4 + ps1 ASCII-only / 真盘诊断测试与排查对照表 | [ARCHITECTURE §4.3](../架构设计/04_VFS层.md) |
 
 ## 维护约定（强制）
 

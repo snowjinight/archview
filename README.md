@@ -1,7 +1,7 @@
-# Archview — 压缩包媒体播放器
+# Archview — 压缩包 / 光盘镜像媒体播放器
 
-直接预览播放压缩包内媒体的桌面工具：无需完整解压，打开 ZIP / 7Z / RAR 压缩包即可浏览和播放其中的视频与图片，支持加密压缩包（打开阶段自动探测密码 + 会话内记忆）。
-新版本支持非压缩包，直接拖入目录，自动列出全部媒体列表，点击播放即可。
+把压缩包当文件夹用、不解压直接看片看图的桌面工具：ZIP / 7Z / RAR（含分卷、加密包）拖进窗口，里面的视频和图片立刻成列、点击即播；ISO / UDF 光盘镜像同样直接打开——蓝光原盘（BDMV/M2TS）、DVD（VOB）不用挂载、不用虚拟光驱，像打开一个普通文件夹一样浏览播放。
+不止压缩包和镜像：普通文件夹拖入即用；固态压缩包随机跳看秒开（后台解码会话常驻，翻到哪解到哪）；相机 RAW、无封装的裸数据流（yuv / nv12 dump）也能直接播放；多图分栏对比、raw 序列帧一键编码成视频（encode）、var 资源包增量整理（tidy）——从素材到成片，一个工具全包。
 
 文档按「通用 → 播放器 → Encode → VarTidy」组织：播放器是主功能（标准媒体 + 非标裸数据播放），Encode 与 VarTidy 是复用同一内核的两个子功能（GUI 右键 + CLI 子命令）；各项配置不集中罗列，分散到对应功能的章节里随功能介绍。
 
@@ -9,7 +9,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 压缩格式 | ZIP（含 deflate/store）、7Z、RAR（含分卷 RAR） |
+| 压缩格式 | ZIP（含 deflate/store）、7Z、RAR（含分卷 RAR）；光盘镜像 ISO（ISO9660 + Joliet + 纯 UDF 2.50，蓝光 BDMV/M2TS 与 DVD-VOB 原盘直读） |
 | 加密支持 | 打开阶段自动探测密码（无密码 → config 密码列表），耗尽才弹密码框；多编码候选兼容汉字密码；会话内密码记忆（切换包后切回不用重输） |
 | 文件列表 | 视频 / 图片两个标签页，序号 `[当前/总数]` 显示，高级搜索过滤（见「播放器 → 高级搜索」），多级子目录平铺展示；单击 = 纯播放（与选区解耦），多选 = Ctrl / Shift / Ctrl+A（见「播放器 → 多选操作」） |
 | 流式播放 | ZIP 直接边读边播（zvf:// 自定义流协议），不用先解压 |
@@ -48,9 +48,10 @@
 - **Archview tidy**：右键压缩包（可多选）→ 发送 → 按 config.toml 的 `vartidy.repo_dir` 增量整理（见下文「VarTidy」）。
 - **Archview encode**：右键帧文件/目录/压缩包（可多选）→ 发送 → 按 CLI encode 语义编码为视频（见下文「Encode」；多选帧文件即精确模式）。
 
-**2. 文件关联**：按「压缩包 / 视频 / 图片」注册三个 ProgID（`Archview.Archive` / `Archview.Video` / `Archview.Image`，`shell\open\command` 指向 exe `"%1"`），再把全部受支持扩展名以 `OpenWithProgids` 写入对应键——**只进右键「打开方式」推荐列表，不抢系统默认**。覆盖范围与 config 内置清单一致：
+**2. 文件关联**：按「压缩包 / 光盘镜像 / 视频 / 图片」注册四个 ProgID（`Archview.Archive` / `Archview.Iso` / `Archview.Video` / `Archview.Image`，`shell\open\command` 指向 exe `"%1"`；每个 ProgID 各自的 DefaultIcon 指向 exe 内嵌的对应类型图标），再把全部受支持扩展名以 `OpenWithProgids` 写入对应键——**只进右键「打开方式」推荐列表，不抢系统默认**。覆盖范围与 config 内置清单一致：
 
 - 压缩包：`zip` `7z` `rar`；
+- 光盘镜像：`iso`（ISO9660 / Joliet / 纯 UDF 2.50，蓝光 BDMV 与 DVD 原盘直读）；
 - 视频：`mp4` `mkv` `avi` `mov` `flv` `ts` `webm` `wmv` `m4v`，加非标 raw dump 三后缀 `nv12` `yuv400` `raw`（`[[raw.demux]]` 默认预设；raw 走 `is_video_ext` 的 raw 预设命中，双击即打开父目录媒体集合并跳转该文件）；
 - 图片：`jpg` `jpeg` `png` `gif` `webp` `bmp` `tif` `tiff`，加相机 RAW `arw` `nef` `nrw` `srf` `sr2` `arq`。
 

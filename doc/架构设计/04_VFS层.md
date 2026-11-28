@@ -3,15 +3,15 @@
 ## 4. 核心抽象：VFS 层
 
 ```rust
-/// 统一三种压缩包格式的读取接口
+/// 统一全部数据源（zip / 7z / RAR / 目录 / ISO 镜像 / 单文件）的读取接口
 trait ArchiveVFS {
     fn open(path: &Path, password: Option<&str>) -> Result<Self>;
     /// 递归列出所有 entry（扁平 + 路径信息）
     fn list(&self) -> Vec<VirtualEntry>;
     /// 打开单个文件，返回可读可 seek 的虚拟文件
     fn open_entry(&self, entry: &VirtualEntry) -> Result<Box<dyn VirtualFile>>;
-    /// 决定播放策略的关键能力声明
-    fn access_mode(&self) -> AccessMode; // FastSeek | Solid(需缓存回退)
+    /// 决定播放策略的关键能力声明（三档分级判据见 §2.3）
+    fn access_mode(&self) -> AccessMode; // FastSeek | SingleFile(单文件按需) | Solid(需缓存回退)
 }
 
 /// mpv stream_cb 回调直接对接此 trait；图片查看器同样消费此 trait
@@ -29,6 +29,24 @@ trait VirtualFile: Read + Seek {
 - cookie **双重装箱**：`Box<dyn VirtualFile>` 是胖指针（数据指针 + vtable），直接
   `as *mut c_void` 会丢 vtable 导致回调内崩溃——须先 `Box::new(vfile)` 再
   `Box::into_raw`，close 回调按同原型回收。
+
+### 4.0 六种 VFS 实现总览
+
+同一 trait 契约下六个实现（`src/vfs/`），`access_mode` 三档分流（分级决策详见
+§2.3；FastSeek 类全部走 mpv `zvf://` stream_cb 快路径，播放器对格式无感知）：
+
+| 实现 | access_mode | 数据通路 | 一句话 | 详读 |
+|---|---|---|---|---|
+| ZipVFS | FastSeek | `zvf://` 流式按需 | deflate seek = 下游续解丢弃 / 上游重开丢弃到目标 | §4.1（编码）、§5 |
+| SevenzVFS | Solid ∨ SingleFile | solid=后台解压会话；独立 folder=单文件按需 | sevenz-rust 只支持顺序解压，`open_entry` 不走 stream_cb | §11 |
+| RarVFS | Solid ∨ SingleFile | 同 7z 分档（unrar 无流式读 API） | solid 走会话 + 条目边界驻留 | §11、§21 |
+| DirVFS | FastSeek | `zvf://` | 目录 = 媒体集合（本地文件随机访问 O(1)） | §4.2 |
+| IsoVFS | FastSeek | `zvf://` | ISO9660/Joliet + 纯 UDF 2.50 extent 直读 | §4.3 |
+| SingleFileVFS | FastSeek | `zvf://` | 单个落盘文件包装成单条目 VFS（raw bit_shift 桥梁） | §4.5 |
+
+7z/RAR 的解压会话、批边界唤醒、滑窗预取、驻留等慢路径机制不在本节展开——
+见 §11（机制总设计）与 §21（RAR 驻留移植）；本节（§4.4）只记两个实现接入
+trait 的接口行为。
 
 ### 4.1 zip 老包文件名编码（GBK 等）
 
@@ -111,8 +129,10 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
   Joliet（UCS-2BE，原大小写/中文/长名）；否则基础名（大写 8.3，剥 `;版本`
   与尾部 `.`）
 - **UDF 2.50 指针链（蓝光 BDMV）**：AVDP → VDS(PD+LVD) → 元数据分区映射
-  （type2 map 偏移 62 的 Metadata File Location）→ 元数据文件 FE 的数据
-  extent = 元数据分区内容 → FSD(tag 256, 根 ICB long_ad 偏移 400) → FID 树。
+  （type2 map 长 64 字节：**偏移 40..44 = Metadata File Location**，物理分区
+  相对裸 u32——真盘实测布局，非规范记忆的 62；为 0 时退化试物理分区 lba 0，
+  兼容 libfreemkv 的硬编码形态）→ 元数据文件 FE 的数据 extent = 元数据分区
+  内容 → FSD(tag 256, 根 ICB long_ad 偏移 400) → FID 树。
   分区语义：ICB/FID/目录数据在元数据分区，**文件数据 short_ad 永远落在物理
   分区**（元数据分区只装结构）——两者换算镜像绝对字节偏移后与 ISO9660 共用
   同一条 extent 通道，`IsoFile` 适配器零改动复用。AD 连续链（extent type 3）
@@ -126,7 +146,15 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
   镜像语义是"媒体集合"而非"包"；VarTidy 的包过滤独立维持 zip/7z/rar 不变
 - 测试：程序化构造最小合法镜像全链路验证——ISO9660（PVD/SVD/终止符 + 目录
   扇区 + 跨扇区文件数据）与 UDF 2.50（VDS/元数据分区/FSD/FE+261/266 双分支/
-  双 extent 跨界 seek/UTF-16BE 名字）各一组
+  双 extent 跨界 seek/UTF-16BE 名字）各一组（UDF fixture 参数化跑两个
+  metadata file lbn 分支）；另有 `#[ignore]` 真盘诊断测试
+  （`ARCHVIEW_ISO_TEST` 环境变量门控，指向真实 ISO 路径：列目录树 + 对全部
+  .m2ts 按头部/中部 192B 节奏校验 0x47@+4）
+- **L1 已实施**（逐文件播放）：`vob` `m2ts` `mts` 已入 `video_extensions`
+  默认表——DVD-VOB / 蓝光-M2TS 直接进列表点击播放；老 config.toml 已有
+  `[media]` 段的不会自动获得新项（TOML 键级合并语义），需手动加或删段重建。
+  `iso` 扩展名已入 install.bat 关联列表（独立 ProgID `Archview.Iso` +
+  exe 内嵌专用图标 DefaultIcon 索引 4，与压缩包图标区分）
 - **L2 规划（完整光盘体验，未实施）**：VOB/M2TS 已入媒体列表（逐文件播正片，
   音视频字幕本就是复用容器无需特殊处理）；跨 clip 无缝拼接/章节/菜单属 L2——
   走 mpv 的 `dvdnav://`/`bluray://` 协议（libdvdnav/libbluray 自己解析 IFO/MPLS，
@@ -134,3 +162,27 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
   单个影片条目）+ 交路径。架构坎：这两个协议要**真实文件路径**不走 stream_cb，
   包中包场景需先把镜像整体落缓存；ISO 直接磁盘打开零解压直通。待办前置：
   实测 bundled mpv 是否带 libdvdnav/libbluray
+
+### 4.4 SevenzVFS / RarVFS：慢路径会话的 trait 接入
+
+7z（sevenz-rust）与 RAR（unrar crate 内嵌编译 UnRAR 源码，RAR4/5、分卷）都无法
+提供条目级随机 seek 的读接口——7z 只支持顺序解压（solid 块内 seek 需从块头重解），
+unrar 无流式读 API——因此两个实现的 `open_entry` 不走 stream_cb，播放走
+「后台解压到缓存目录 → 本地文件装载」。`access_mode` 按包头结构分流（§2.3 判据）：
+
+- **solid 形态**（RAR 主头 ROADF_SOLID 标志；7z 无全局标志，按 folder 结构判定
+  ——任一 folder 含 ≥2 条目 = solid）：`AccessMode::Solid`。解压会话/批边界
+  真暂停/滑窗预取/唤醒分流机制见 §11，RAR 条目边界驻留见 §21
+- **非 solid 形态**（rar 默认 `-s-`；`7z a -ms=off` 产出的全独立 folder 包）：
+  `AccessMode::SingleFile`——每文件独立压缩/独立 folder，定位 = 廉价头跳转 /
+  folder 直达，只解点击项（批 = 1），不付滑窗/预取/重定向成本。上游预取免费区
+  仅 solid 有意义：非 solid 的定位是廉价 skip，顺带落盘零增量，返回 None
+
+### 4.5 SingleFileVFS：单文件桥梁（file_vfs.rs）
+
+慢路径解压的缓存文件是忠实拷贝（raw bit_shift 位移不落盘、不进缓存键）；需要
+bit_shift 修正播放时，把单个落盘文件包装成**单条目 FastSeek VFS**注册进
+stream_cb 注册表，经 `zvf://` 装载——mpv 的 read/seek 回调走 open_cb →
+open_entry → 本地文件直读，`s=N` 时在流层包 ShiftReader（与 zip 快路径同源
+实现）。本质是 DirVFS「目录集合」先例缩成「一个文件」的特例：让慢路径落盘
+产物复用与快路径完全相同的流式装载通道。

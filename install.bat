@@ -40,14 +40,19 @@ rem ==== 2. File associations ============================================
 rem ProgID: who we are + how to open. OpenWithProgids: add us to each
 rem extension's "Open with" list without touching the default app.
 rem DefaultIcon "exe",N: N is a ZERO-BASED index over the exe's icon
-rem resources in resource-ID order (build.rs ids 1..4):
-rem   index 0 = app, 1 = image, 2 = video, 3 = archive
+rem resources in resource-ID order (build.rs ids 1..5):
+rem   index 0 = app, 1 = image, 2 = video, 3 = archive, 4 = iso
 rem (verified by ExtractIconEx on the built exe; ",N" inside quotes is
 rem legacy notation, "exe",N outside quotes is the canonical form)
 
 reg add "HKCU\Software\Classes\Archview.Archive" /ve /d "Archview Archive" /f >nul
 reg add "HKCU\Software\Classes\Archview.Archive\DefaultIcon" /ve /d "\"%EXE_PATH%\",3" /f >nul
 reg add "HKCU\Software\Classes\Archview.Archive\shell\open\command" /ve /d "\"%EXE_PATH%\" \"%%1\"" /f >nul
+
+rem ISO gets its own ProgID so the disc image shows the dedicated ISO icon
+reg add "HKCU\Software\Classes\Archview.Iso" /ve /d "Archview Disc Image" /f >nul
+reg add "HKCU\Software\Classes\Archview.Iso\DefaultIcon" /ve /d "\"%EXE_PATH%\",4" /f >nul
+reg add "HKCU\Software\Classes\Archview.Iso\shell\open\command" /ve /d "\"%EXE_PATH%\" \"%%1\"" /f >nul
 
 reg add "HKCU\Software\Classes\Archview.Video" /ve /d "Archview Video" /f >nul
 reg add "HKCU\Software\Classes\Archview.Video\DefaultIcon" /ve /d "\"%EXE_PATH%\",2" /f >nul
@@ -59,6 +64,8 @@ reg add "HKCU\Software\Classes\Archview.Image\shell\open\command" /ve /d "\"%EXE
 
 rem Archives: zip / 7z / rar (VFS supported set)
 for %%e in (zip 7z rar) do call :assocext ".%%e" "Archview.Archive"
+rem Disc images: iso (ISO9660 / Joliet / UDF 2.50, Blu-ray BDMV inside)
+for %%e in (iso) do call :assocext ".%%e" "Archview.Iso"
 rem Videos: standard containers + raw dump presets ([[raw.demux]] defaults:
 rem nv12 = NV12 8bit, yuv400 = gray 8bit, raw = bayer_auto16le dump)
 for %%e in (mp4 mkv avi mov flv ts webm wmv m4v nv12 yuv400 raw) do call :assocext ".%%e" "Archview.Video"
@@ -83,6 +90,7 @@ echo   Archview encode  -^> "%EXE_PATH%" encode
 echo.
 echo Registered in "Open with" (right-click a file - Open with):
 echo   Archview Archive : zip 7z rar
+echo   Archview Iso     : iso (ISO9660 / UDF disc image, Blu-ray BDMV)
 echo   Archview Video   : mp4 mkv avi mov flv ts webm wmv m4v + raw dump (nv12 yuv400 raw)
 echo   Archview Image   : jpg jpeg png gif webp bmp tif tiff + camera RAW (arw nef nrw srf sr2 arq)
 echo.
