@@ -399,6 +399,24 @@ fn natural_sort_pipeline_semantics() {
     );
     // 同值前导零 tie-break：2.jpg 在 02.jpg 前（少零在前，结果稳定）
     assert_eq!(sort(vec!["02.jpg", "2.jpg"]), vec!["2.jpg", "02.jpg"]);
+    // 完整相对路径为排序键的两原则：同子目录条目连成一片（前缀先比较），
+    // 目录名与夹内文件名的数字段都按数值排
+    assert_eq!(
+        sort(vec![
+            "第2话/10.jpg",
+            "第10话/1.jpg",
+            "第2话/1.jpg",
+            "第1话/1.jpg",
+            "第2话/2.jpg",
+        ]),
+        vec![
+            "第1话/1.jpg",
+            "第2话/1.jpg",
+            "第2话/2.jpg",
+            "第2话/10.jpg",
+            "第10话/1.jpg",
+        ]
+    );
 }
 
 /// 虚拟化列表（show_viewport 手动行范围）关键行为的回归测试。

@@ -100,7 +100,8 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
 
 - `list()` 递归 walk，条目名 = root 下相对路径（`/` 分隔，与压缩包条目形态一致）；
   **按路径字典序排序**——目录集合没有"包内物理顺序"，`read_dir` 顺序又不可预期，
-  字典序是 `ui.sort_files=false` 默认行为下最确定的顺序
+  字典序是最确定的确定序兜底；显示层 `rebuild_view` 会对 FastSeek 集合强制
+  自然序重排（见 §11.2），故此兜底序仅 VFS 层可见
 - 符号链接 / junction 一律跳过（防环且语义可预期）；子目录不可读静默跳过
   （部分可读的树照常收集）；根目录不可读定性打开失败
 - `open_entry()` = `std::fs::File` 套 `VirtualFile` 适配器（size 打开时缓存一次）
