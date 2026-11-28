@@ -1,7 +1,7 @@
 # 21. RAR 固态会话驻留与编排抽象提案
 
-> 状态：**提案（待实施）**。背景：7z 固态会话已完成"驻留暂停 + 唤醒续解 +
-> 唤醒段骨架 + 续解标志"全套（§11.4）；RAR 固态包仍是"批解净即退出线程、
+> 状态：**Phase A/B 已实施（2026-11-28）**。背景：7z 固态会话已完成"驻留暂停 + 唤醒续解 +
+> 唤醒段骨架 + 续解标志"全套（§11.4）；RAR 固态包原是"批解净即退出线程、
 > 下次点击从头遍历重解前缀"的旧模型（§11.2 会话化最初形态）。本节记录
 > RAR 移植路径、与 7z 的模型差异对照、编排层抽象的取舍评估与分阶段计划。
 
@@ -143,35 +143,43 @@ file_done、无进展保险、驻留睡眠循环、wake_skeleton 重发。差异
 
 ## 21.5 风险点
 
-1. **unrar Open 长时间闲置安全性（Phase A 必须先证）**：睡眠数分钟后
-   read_header/skip/extract_to 是否正常、解出数据 CRC 是否完整、线程
-   是否真睡眠（不占 CPU）。unrar 是解压器不是服务器，理论上静态持有
-   无害，但 C++ 内部缓冲/句柄行为需实测。若不安全 → 退路：遍历尽即
-   退出线程 + 保留现有模型，仅做编排层共享函数提取（收益缩水但零风险）。
+1. **unrar Open 长时间闲置安全性（Phase A 已实证通过，2026-11-28）**：
+   spike（解 f0 → read_header f1 后持有 Open 睡 35s → skip/extract f2）：
+   逐条内容校验通过；闲置期进程 CPU 增量 0ms（真睡眠零空转）。
+   unrar 是解压器不是服务器，Open 静态持有无害——结论成立。
 2. **驻留资源占用**：56G 包的 Open 状态（句柄/映射/解码缓冲）常驻。
    7z 驻留持有 BlockDecoder 同量级，预期可接受；实测确认。
-3. **Restart 与驻留交互**：上游目标触发 Restart 时已驻留落盘的条目
-   幂等跳过（现有机制），但 Restart 上限 64 的计数语义需把"驻留唤醒
-   导致的 Restart"与"漂移抢道 Restart"合并计数，防 UI 连续上游点击
-   打满上限误报错。
-4. **skip_note/resume 协议一致性**：驻留睡眠期间 skip_note 应保持最后
-   状态还是清空（7z 驻留清空）——对齐 7z：驻留即清空。
+3. **Restart 与驻留交互（已实现合并计数）**：驻留唤醒导致的 Restart 与
+   漂移抢道 Restart 共用外层同一 `restarts` 计数器（上限 64），防 UI 连续
+   上游点击打满上限误报。
+4. **skip_note/resume 协议一致性（已对齐）**：驻留即清空 skip_note；
+   唤醒臂置 resume=true，Restart 臂/外层规划复位 false，UI 标题区分
+   "续解中 / 顺序解压"与 7z 完全同款。
 
 ## 21.6 分阶段实施计划
 
-- **Phase A — 安全性验证 spike**（先行，不进主干）：测试内构造 rar
-  固态包 fixture（现有 rar 测试资产复用；unrar 无法压缩，需固定
-  fixture 或 rar 工具生成脚本），open → 解几条 → 条目边界睡眠 30s+ →
-  继续解完 → 逐条 CRC 校验 + 线程 CPU 占用断言。**通过才进 Phase B。**
-- **Phase B — RAR 驻留最小实现**：按 §21.3 改 session_pass 分流 +
-  外层预检；wake 臂（骨架重算 + resume=true）；驻留清 skip_note；
-  Restart 计数合并。回归测试镜像 7z 组：`rar_session_parks_at_entry_boundary`、
-  `rar_session_wake_downstream_resumes`（判据=唤醒后无 Restart、
-  Downstream 骨架非零）、`rar_session_wake_upstream_restarts`。
-- **Phase C — 编排层方案 B 收编**：提取 `session_prelude` /
+- **Phase A — 安全性验证 spike** ✅（2026-11-28 通过，未进主干）：solid.rar
+  夹具（f0/f1/f2 各 30000 字节）实测：解 f0 → read_header f1 后持有 Open
+  睡 35s → skip/extract f2，逐条内容校验通过；闲置期进程 CPU 增量 0ms。
+  spike 测试验证后已删除，结论沉淀于本节 §21.5-1 与 rar_vfs.rs 驻留注释。
+- **Phase B — RAR 驻留最小实现** ✅（2026-11-28 落地）：§21.3 全量实现——
+  session_pass 条目边界驻留分流（单点接管：pass 入口空目标与批解净后的
+  边界统一走同一驻留分支）+ 唤醒分流（min(targets) < cur → Restart /
+  min ≥ cur → 零前缀续跑）+ 唤醒臂（骨架重算分母从当前条目起 + resume
+  置位 + 段游标清零 + Locate/各段开工协议）+ 外层预检空目标不再退出
+  （pass 内驻留接管）+ 包尾（遍历尽且 targets 空）不驻留正常退出 +
+  Restart 计数合并。实现要点：read_header(self) 拿走 open 所有权、head
+  持有解码状态——醒来兜底重睡不能回条目循环头（会 drop head 丢 open）。
+  回归测试 `rar_session_parks_at_entry_boundary` /
+  `rar_session_wake_downstream_resumes`（判据=唤醒点条目改判落地 +
+  Downstream 骨架 30000 + resume=true 证伪误重启）/
+  `rar_session_wake_upstream_restarts`（判据=f0 只能经 Restart 落地 +
+  resume 保持 false）；全量 259 测试通过。
+- **Phase C — 编排层方案 B 收编**（待办）：提取 `session_prelude` /
   `park_until_wake` / wake 骨架闭包化，两边 loop 改调共享函数；
   完成后复评是否值得升级方案 A。
-- **Phase D — 文档与状态同步**：本节状态改"已实施"；§11.4 补 RAR 驻留
-  描述；落地开发 01/04 同步叙事与排查；README 推荐阅读路径补 RAR。
+- **Phase D — 文档与状态同步**（进行中）：本节状态已改"已实施"；
+  §11.4 补 RAR 驻留描述、落地开发 01/04 叙事与排查、README 推荐阅读
+  路径补 RAR 待续。
 
 依赖顺序 A → B → C → D，B 可独立发版（C 纯重构不改行为）。
