@@ -3,6 +3,7 @@
 
 pub mod dir_vfs;
 pub mod file_vfs;
+pub mod iso_vfs;
 pub mod rar_vfs;
 pub mod sevenz_vfs;
 pub mod zip_vfs;
@@ -519,6 +520,8 @@ pub fn open_archive(path: &Path, password: Option<&str>) -> Result<Box<dyn Archi
             sevenz_vfs::SevenzVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>)
         }
         "rar" => rar_vfs::RarVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>),
+        // ISO9660+Joliet 只读镜像：FastSeek 快路径（无加密概念，密码恒忽略）
+        "iso" => iso_vfs::IsoVFS::open(path, password).map(|v| Box::new(v) as Box<dyn ArchiveVFS>),
         _ => Err(VfsError::Unsupported(format!("暂不支持的格式: .{ext}"))),
     }
 }
@@ -603,7 +606,8 @@ pub(crate) fn split_rar_family(name: &str) -> Option<String> {
     Some(prefix.to_string())
 }
 
-/// 目录内所有压缩包（zip/7z/rar，与 open_archive 支持集一致），按文件名升序。
+/// 目录内所有压缩包（zip/7z/rar，与 open_archive 支持集一致，ISO 镜像除外——
+/// 目录内连续看包语义只针对压缩包），按文件名升序。
 /// 分卷 RAR（`X.partN.rar`）每族只保留排序最前的一卷（通常为 part1）作为可打开条目，
 /// 避免列表里出现同一包的多卷。目录不可读返回空。
 pub fn archives_in(dir: &Path) -> Vec<PathBuf> {

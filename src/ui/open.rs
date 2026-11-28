@@ -7,7 +7,7 @@ impl App {
 
     pub(super) fn open_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Archives", &["zip", "7z", "rar"])
+            .add_filter("Archives", &["zip", "7z", "rar", "iso"])
             .pick_file()
         else {
             return;

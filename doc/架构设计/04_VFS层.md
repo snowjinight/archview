@@ -90,3 +90,29 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
 
 行为边界：目录集合模式下没有「同目录下一个压缩包」概念（末尾翻页提示改为一次性
 说明）；「目录内连续看包」N 键语义仅在打开压缩包文件时保留。
+
+### 4.3 ISO 镜像（ISO9660 + Joliet，IsoVFS）
+
+第四种 FastSeek 格式（`iso_vfs.rs`）：ISO9660 是未压缩、未加密的只读文件系统，
+每个文件在目录记录里直接登记数据区位置（extent LBA）与长度，随机访问 = 打开镜像
+`File` + seek 到 `lba*2048 + offset`，O(1)——与 DirVFS/zip Stored 同构，走 mpv
+`zvf://` 流式快路径，**解压会话/滑窗/上游预取/密码探测等慢路径机制零触碰**
+（条目全部 `encrypted=false`、`crc=None`、`locate_start=None` 默认即正确）。
+
+- **不引入外部库**：VFS 的核心产出物是「文件名 → extent 表」（`VirtualFile`
+  适配器的本质），现成 crate（hadris-iso / cdfs / hivepack::iso）都抽象成
+  "按路径读流"，extent 藏在抽象内部且各有坑（hadris 的 Joliet+RR root
+  评分选择可能隐藏 Unicode 名、hivepack 顺序流式不适配随机 seek）；
+  ISO9660+Joliet 只读解析是同类最简单的二进制格式之一，手写约 400 行全权控制
+- **名字空间二选一**：PVD（LBA16）+ 可选 Joliet SVD（转义序列 `%/@` `%/C`
+  `%/E`），有 Joliet 用 Joliet（UCS-2BE，原大小写/中文/长名）；否则基础名
+  （大写 8.3，剥 `;版本` 与尾部 `.`）。纯 UDF 镜像（蓝光 BDMV）一期明确
+  不支持：卷识别序列只有 BEA01/NSR02/NSR03 且无 CD001 时报 Unsupported
+  定性（蓝光 = UDF 2.50 metadata partition，二期规划）
+- **多 extent 合并**：ISO9660 的 4GB 上限会把大文件切成连续同名目录记录
+  （首条 flags bit7 置位），合并为一个文件的连续 extent 表；`IsoFile`
+  适配器做逻辑位置 → 镜像物理偏移映射（段内起点 = 前序 extent 长度累计）
+- **不参与"同目录下一个压缩包"**：`archives_in`（N 键连续看包）不收 ISO——
+  镜像语义是"媒体集合"而非"包"；VarTidy 的包过滤独立维持 zip/7z/rar 不变
+- 测试：程序化构造最小合法镜像（PVD/SVD/终止符 + 目录扇区 + 跨扇区文件数据）
+  全链路验证列表/读取/seek/导出/分发/UDF 定性拒绝

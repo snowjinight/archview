@@ -174,7 +174,7 @@ fn initial_archive(args: &[String], cfg: &config::Config) -> Option<std::path::P
         p.extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
-            .is_some_and(|e| matches!(e.as_str(), "zip" | "7z" | "rar"))
+            .is_some_and(|e| matches!(e.as_str(), "zip" | "7z" | "rar" | "iso"))
     };
     for a in args {
         let p = std::path::Path::new(a);
