@@ -1347,10 +1347,41 @@ impl App {
                         );
                         let sum_total = skip.1 + up.1 + tgt.1 + down.1;
                         if sum_total == 0 {
+                            // 跳过提示：无比值期（定位/骨架/唤醒续解）转圈时读会话
+                            // 跳过注记——solid 流跳过大视频也是真解码（每目录末尾的
+                            // 视频是定位耗时主力）。路径目录/文件名拆行着色（目录
+                            // 主题蓝 / 文件名主题琥珀）+ 自动换行，长路径完整可见
+                            let note = self.archive.as_ref().and_then(|a| {
+                                a.session.lock().ok().and_then(|st| st.skip_note.clone())
+                            });
+                            let amber = if ui.visuals().dark_mode {
+                                AMBER_DARK
+                            } else {
+                                AMBER_LIGHT
+                            };
                             ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new());
-                                ui.label("正在定位目标…");
+                                match &note {
+                                    Some((_, _, size)) => {
+                                        ui.label(format!("正在定位…跳过（{}）", human(*size)))
+                                    }
+                                    None => ui.label("正在定位目标…"),
+                                };
                             });
+                            if let Some((_, name, _)) = note {
+                                let (dir, file) = match name.rsplit_once('/') {
+                                    Some((d, f)) => (Some(format!("{d}/")), f),
+                                    None => (None, name.as_str()),
+                                };
+                                if let Some(d) = dir {
+                                    egui::Label::new(egui::RichText::new(d).small().color(ACCENT))
+                                        .wrap()
+                                        .ui(ui);
+                                }
+                                egui::Label::new(egui::RichText::new(file).small().color(amber))
+                                    .wrap()
+                                    .ui(ui);
+                            }
                         } else {
                             let sum_done = skip.0 + up.0 + tgt.0 + down.0;
                             ui.add(

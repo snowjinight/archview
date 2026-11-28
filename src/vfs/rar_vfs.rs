@@ -322,7 +322,11 @@ impl RarVFS {
             }
             let Some((ti, dest)) = tgt else {
                 // 非目标条目：focus 之前 = 跳过段（解码丢弃），之后 = 下游段
-                // （整段流进度的一部分，计入推进防止夹缝处 bar 停滞）
+                // （整段流进度的一部分，计入推进防止夹缝处 bar 停滞）。
+                // 跳过提示：消费边界短锁刷新（solid RAR 逐条 skip 是真解码，
+                // 长视频跳过期让 UI 转圈可见在干什么）
+                session.lock().unwrap().skip_note =
+                    Some((cur_idx.unwrap_or(usize::MAX), name.clone(), size));
                 let is_up = cur_idx.is_some_and(|c| c < focus_idx);
                 open = head.skip().map_err(|e| {
                     VfsError::Archive(format!("RAR 跳过条目 [{}] 失败（正在定位目标）: {e}", name))
@@ -368,7 +372,12 @@ impl RarVFS {
                         progress(ExtractPhase::Target, t, t);
                     }
                 }
-                if session.lock().unwrap().targets.remove(&name).is_some() {
+                let hit = {
+                    let mut st = session.lock().unwrap();
+                    st.skip_note = None; // 幂等落地，跳过提示过期
+                    st.targets.remove(&name).is_some()
+                };
+                if hit {
                     file_done(ti, &dest); // 锁已释放
                     landed += 1;
                 }
@@ -419,7 +428,12 @@ impl RarVFS {
                     dest.display()
                 ))
             })?;
-            if session.lock().unwrap().targets.remove(&name).is_some() {
+            let hit = {
+                let mut st = session.lock().unwrap();
+                st.skip_note = None; // 目标落地，跳过提示过期
+                st.targets.remove(&name).is_some()
+            };
+            if hit {
                 file_done(ti, &dest); // 锁已释放
                 landed += 1;
             }

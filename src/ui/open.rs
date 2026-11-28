@@ -338,6 +338,7 @@ impl App {
                 focus: None,
                 alive: false,
                 gen: 0,
+                skip_note: None,
             })),
             ratings: std::collections::HashMap::new(),
             deleted: std::collections::HashSet::new(),

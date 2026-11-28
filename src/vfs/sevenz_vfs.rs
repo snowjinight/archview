@@ -623,12 +623,11 @@ impl ArchiveVFS for SevenzVFS {
                             }
                             _ => {} // Target 由 write_entry_data 报满
                         }
-                        let hit = session
-                            .lock()
-                            .unwrap()
-                            .targets
-                            .remove(e.name.as_str())
-                            .is_some();
+                        let hit = {
+                            let mut st = session.lock().unwrap();
+                            st.skip_note = None; // 目标落地，跳过提示过期
+                            st.targets.remove(e.name.as_str()).is_some()
+                        };
                         if hit {
                             tracing::debug!("[会话] 落地 [{ename}]（idx {idx}）");
                             file_done(idx, &dest); // 锁已释放
@@ -665,6 +664,8 @@ impl ArchiveVFS for SevenzVFS {
                     } else {
                         let self_idx = idx_of.get(e.name.as_str()).copied().unwrap_or(usize::MAX);
                         if folder_clear {
+                            // 驻留等待 = 无消费动作，跳过提示过期清空
+                            session.lock().unwrap().skip_note = None;
                             tracing::debug!(
                                 "[会话] 条目[{ename}]（idx {self_idx}）非目标且 folder{fi} 目标清 → 批边界驻留等待"
                             );
@@ -734,12 +735,11 @@ impl ArchiveVFS for SevenzVFS {
                                             }
                                             _ => {}
                                         }
-                                        let hit = session
-                                            .lock()
-                                            .unwrap()
-                                            .targets
-                                            .remove(e.name.as_str())
-                                            .is_some();
+                                        let hit = {
+                                            let mut st = session.lock().unwrap();
+                                            st.skip_note = None; // 〔唤醒改判〕落地，跳过提示过期
+                                            st.targets.remove(e.name.as_str()).is_some()
+                                        };
                                         if hit {
                                             tracing::debug!(
                                                 "[会话] 落地 [{ename}]（idx {idx}）〔唤醒改判〕"
@@ -761,6 +761,11 @@ impl ArchiveVFS for SevenzVFS {
                                 Err(_) => return Err(sevenz_rust::Error::other("cancelled")),
                             }
                         }
+                        // 跳过提示：消费边界短锁刷新（写完即放，绝不跨
+                        // io::copy 持锁）——UI 定位转圈期显示正在跳过的条目
+                        // （大视频跳过 = 真解码，是定位耗时的主力）
+                        session.lock().unwrap().skip_note =
+                            Some((self_idx, e.name.clone(), e.size));
                         // 非目标条目顺序消费丢弃（solid 流不可跳，同 extract_batch），
                         // 按条目下标与 focus 相对位置分入 SkipUp/Downstream 段
                         let is_down = idx_of
@@ -1549,6 +1554,7 @@ mod tests {
             focus: None,
             alive: false,
             gen: 0,
+            skip_note: None,
         }))
     }
 
@@ -2211,6 +2217,102 @@ mod tests {
             "驻留会话应由 cancel 收尾: {r:?}"
         );
         assert!(!s.lock().unwrap().alive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跳过提示（skip_note）生命周期回归：非目标条目消费边界必须刷新注记
+    /// （定位转圈期 UI 显示"正在跳过 <名>（<大小>）"），批边界驻留必须清空。
+    /// 观察点取 Target 段写盘中的 progress 上报——此刻前一个非目标（n1）的
+    /// 注记必然还在（清空点在写完 rename 后的 targets.remove），无竞态
+    #[test]
+    fn session_skip_note_lifecycle() {
+        use sevenz_rust::{SevenZArchiveEntry, SevenZWriter};
+
+        let dir = std::env::temp_dir().join(format!("sevenz_skip_note_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srcs: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|i| (format!("n{i}.bin"), vec![i as u8; 40_000]))
+            .collect();
+        let mut paths = Vec::new();
+        for (name, data) in &srcs {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            paths.push(p);
+        }
+        let arch = dir.join("solid5.7z");
+        let mut w = SevenZWriter::create(&arch).unwrap();
+        let entries: Vec<SevenZArchiveEntry> = paths
+            .iter()
+            .map(|p| {
+                SevenZArchiveEntry::from_path(
+                    p,
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let readers: Vec<sevenz_rust::SourceReader<std::fs::File>> = paths
+            .iter()
+            .map(|p| sevenz_rust::SourceReader::new(std::fs::File::open(p).unwrap()))
+            .collect();
+        w.push_archive_entries(entries, sevenz_rust::SeqReader::new(readers))
+            .unwrap();
+        w.finish().unwrap();
+
+        let vfs = SevenzVFS::open(&arch, None).unwrap();
+        let s = new_session();
+        {
+            let mut st = s.lock().unwrap();
+            st.targets
+                .insert("n2.bin".into(), (2, dir.join("out_n2.bin")));
+            st.focus = Some(2);
+            st.alive = true;
+        }
+        // Target 段写盘期间 skip_note 快照（n1 刚被跳过、n2 尚未落地清空）
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<Option<(usize, String, u64)>>>> =
+            Default::default();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s2, ob, cancel2) = (s.clone(), observed.clone(), cancel.clone());
+        let s3 = s.clone(); // 传给会话线程的独立克隆（主线程 s 留作断言）
+        let handle = std::thread::spawn(move || {
+            vfs.extract_session(
+                &s3,
+                &cancel2,
+                &move |phase, _cur, total| {
+                    if phase == crate::vfs::ExtractPhase::Target && total == 40_000 {
+                        ob.lock().unwrap().push(s2.lock().unwrap().skip_note.clone());
+                    }
+                },
+                &|_, _| {},
+            )
+        });
+
+        // n2 落地判据：out 文件在场
+        let out = dir.join("out_n2.bin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::metadata(&out).is_err() {
+            assert!(std::time::Instant::now() < deadline, "n2 落地超时");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let ob_snap = observed.lock().unwrap().clone();
+        assert!(
+            ob_snap.iter().any(|n| n
+                .as_ref()
+                .is_some_and(|(i, name, size)| *i == 1 && name == "n1.bin" && *size == 40_000)),
+            "Target 写盘期间应有 n1 的跳过注记: {ob_snap:?}"
+        );
+        // n2 落地后 folder 清 → 批边界驻留，注记必须清空（驻留期无消费动作）
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            s.lock().unwrap().skip_note.is_none(),
+            "驻留期跳过注记应清空"
+        );
+
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = handle.join().unwrap();
+        assert!(
+            matches!(r, Err(VfsError::Cancelled)),
+            "驻留会话应由 cancel 收尾: {r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
