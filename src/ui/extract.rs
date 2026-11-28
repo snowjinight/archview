@@ -389,8 +389,9 @@ impl App {
     }
 
     /// 组批 = 会话窗口：目标 + view 顺序（显示顺序）下游条目
-    /// （prefetch_downstream_mb 封顶）+ 定位免费区上游条目
-    /// （prefetch_upstream_mb 封顶）。已落地条目跳过（无需解压）但**占预
+    /// （prefetch_downstream_mb 封顶）+ 定位免费区上游顺带落盘条目
+    /// （prefetch_upstream_max_mb 封顶——上游是伴随量，max 只是上限非目标）。
+    /// 已落地条目跳过（无需解压）但**占预
     /// 算字节**（R1）：窗口 = [锚点-预算, 锚点+预算] 随锚点整体滑动，缓存
     /// 区不再免费穿过——窗口起点永不越过上一批已解区域滑向解码头身后
     /// （身后未缓存项只能靠前缀重解取回，实测 8 项漏网曾触发 114 秒前缀
@@ -450,14 +451,15 @@ impl App {
 
         // 上游预取：免费区 = 定位目标时必然被顺序解掉丢弃的上游条目
         // （locate_start 起点由格式决定——7z 目标所在 folder 起点、不跨 folder；
-        // RAR 整个前缀），顺带写盘零解码增量。预算 prefetch_upstream_mb
-        // 独立封顶，实取可能小于预算（folder 前缀不足时全取，不越界补齐）。
+        // RAR 整个前缀），顺带写盘零解码增量。上限 prefetch_upstream_max_mb
+        // 只封顶不凑满（伴随量非配额），实取可能小于上限（folder 前缀不足时
+        // 全取，不越界补齐）。
         // 同下游：全量落地不看 view。与下游批天然不重叠（下游从
         // entry_idx+1 起物理序、上游止于 entry_idx），无需去重
         let upstream_cap = self
             .cfg
             .extract
-            .prefetch_upstream_mb
+            .prefetch_upstream_max_mb
             .saturating_mul(1024 * 1024);
         if upstream_cap > 0 {
             if let Some(s) = arch.vfs.locate_start(entry_idx) {

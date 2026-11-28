@@ -729,7 +729,7 @@ fn sliding_window_smoke_in_batch_back_and_forth() {
     cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
     cfg.cache.max_size_mb = 4096;
     cfg.extract.prefetch_downstream_mb = 3;
-    cfg.extract.prefetch_upstream_mb = 0;
+    cfg.extract.prefetch_upstream_max_mb = 0;
     let mut app = super::App::new_for_test(cfg);
 
     let vfs: Arc<dyn ArchiveVFS> = Arc::new(SevenzVFS::open(&arch, None).unwrap());

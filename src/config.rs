@@ -104,21 +104,22 @@ pub struct ExtractConfig {
     /// 后续文件（下标更大的方向 = 列表向下 = 解码流推进方向）的总大小上限。
     /// 一次顺序解压流解出一批文件，翻页时直接命中缓存，摊薄"定位目标需
     /// 顺序解压前置数据"的固定成本
-    #[serde(alias = "prefetch_mb")]
     pub prefetch_downstream_mb: u64,
-    /// 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置
+    /// 上游顺带落盘最大上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置
     /// 条目（下标更小的方向 = 列表向上；7z 限于目标所在 folder 内、RAR
     /// 为整个前缀）顺带写盘，随机跳看后回看直接命中缓存。
-    /// 解码零增量，仅占磁盘写入量
-    #[serde(alias = "prefetch_prev_mb")]
-    pub prefetch_upstream_mb: u64,
+    /// 解码零增量，仅占磁盘写入量。
+    /// 语义与下游不对称：下游 prefetch_downstream_mb 是目标窗口量（尽量取满），
+    /// 本键只是上限（max）——实取多少取决于免费区（folder 前缀）大小与已缓存
+    /// 分布，通常小于该值，绝不回头补解凑满
+    pub prefetch_upstream_max_mb: u64,
 }
 
 impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
             prefetch_downstream_mb: 512,
-            prefetch_upstream_mb: 512,
+            prefetch_upstream_max_mb: 512,
         }
     }
 }
@@ -1527,11 +1528,12 @@ image_full_sharpen_dump_enhance = false
 # 翻页直接命中，摊薄固态包定位成本
 prefetch_downstream_mb = 512
 
-# 上游预取上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
+# 上游顺带落盘最大上限（MB），0 = 关闭：定位目标时必然被顺序解掉丢弃的前置条目
 # （下标更小 = 列表向上；7z 限于目标所在 folder 内、RAR 为整个前缀）顺带
-# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量
-# （旧键名 prefetch_mb / prefetch_prev_mb 仍可读取）
-prefetch_upstream_mb = 512
+# 写盘，随机跳看后回看直接命中缓存。解码零增量，仅占磁盘写入量。
+# 语义与下游不对称：下游 prefetch_downstream_mb 尽量取满，本键只是上限（max）
+# ——实取多少取决于免费区（folder 前缀）大小与已缓存分布，通常小于该值
+prefetch_upstream_max_mb = 512
 
 # ============ VarTidy 整理器 ============
 [vartidy]
@@ -1601,20 +1603,6 @@ mod tests {
         let text = toml::to_string_pretty(&Config::default()).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, Config::default());
-    }
-
-    /// 旧键名兼容：prefetch_mb / prefetch_prev_mb（上游/下游正名前）经
-    /// serde alias 仍可解析，老用户的 config.toml 不失效
-    #[test]
-    fn extract_prefetch_legacy_keys() {
-        let cfg: Config = toml::from_str(
-            "[extract]
-prefetch_mb = 7
-prefetch_prev_mb = 9",
-        )
-        .unwrap();
-        assert_eq!(cfg.extract.prefetch_downstream_mb, 7);
-        assert_eq!(cfg.extract.prefetch_upstream_mb, 9);
     }
 
     /// UI 重绘频率三键：自定义值可解析；pacing_ms 越界钳制 5~240fps

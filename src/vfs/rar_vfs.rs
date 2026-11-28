@@ -500,7 +500,8 @@ impl ArchiveVFS for RarVFS {
     /// 上游预取免费区 = 整个前缀 [0, 目标)：**仅 solid RAR 有意义**——unrar
     /// 定位目标需逐条 skip，solid 前缀是真解码，把顺带解出的条目写盘零增量。
     /// 非 solid RAR 返回 None：skip 是廉价头跳转，上游预取等于白白解码
-    /// 前置文件。预算由 config `extract.prefetch_upstream_mb` 封顶
+    /// 前置文件。上限由 config `extract.prefetch_upstream_max_mb` 封顶（伴随量
+    /// 非配额，实取以整个前缀大小为准）
     fn locate_start(&self, _entry_idx: usize) -> Option<usize> {
         if self.solid {
             Some(0)

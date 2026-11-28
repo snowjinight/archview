@@ -365,7 +365,7 @@ pub trait ArchiveVFS: Send + Sync {
     /// 定位该条目时顺序解压流的起始条目下标（list 顺序；None = 定位无前置解码）。
     /// `[start, entry_idx)` 即"上游预取免费区"：这些条目在定位目标时必然被
     /// 顺序解掉丢弃，顺带写盘零解码增量——UI 据此做上游预取
-    /// （config `extract.prefetch_upstream_mb`，随机跳看时往回翻直接命中缓存）。
+    /// （config `extract.prefetch_upstream_max_mb`，随机跳看时往回翻直接命中缓存）。
     /// - 7z：目标所在 folder 的首个条目（跨 folder 只 seek 不解压，
     ///   上游预取不得超出 folder 边界）
     /// - RAR：0（unrar 无 folder 直达，逐条 skip 定位，整个前缀都被顺序消费；
