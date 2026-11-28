@@ -149,6 +149,9 @@ impl App {
         self.error = None;
         self.notice = None;
         let Some((key, source, name)) = self.archive.as_ref().map(|a| {
+            // 本函数只服务流式包（play() 按 stream && wants_texture 门控）：
+            // solid 图片走 start_extract → FileDone → load_extracted（File 源）。
+            // 所有 ImageSource 发起入口同规则：按包形态选源（02 坑 12）
             (
                 (a.id, entry_idx),
                 ImageSource::Stream(a.vfs.clone(), a.entries[entry_idx].clone()),
@@ -274,7 +277,24 @@ impl App {
             return;
         };
         let e = &arch.entries[key.1];
-        let src = ImageSource::Stream(arch.vfs.clone(), e.clone());
+        // 解码源按包形态分流（02 坑 12）：流式包（zip/DirVFS/FileVFS）Stream；
+        // 7z/RAR（stream=false，solid 与否皆同）一律落盘 File 源——open_entry
+        // 恒 Unsupported（流式读只有 zip/目录有实现），非 solid 同样走
+        // start_extract → 缓存 → load_extracted，发 Stream = 注定失败 →
+        // 负缓存 → mpv 回退。落盘文件缺失（已被逐出且未重新解出）跳过补发：
+        // 不发注定失败的请求污染负缓存；用户重新点击走 start_extract 正常
+        // 链路重解。与 prefetch_images / compare / panels 的选源规则同源，
+        // heal 是最后一个补齐的入口
+        let src = if arch.stream {
+            ImageSource::Stream(arch.vfs.clone(), e.clone())
+        } else {
+            let dir = cache::cache_dir(&self.cfg);
+            let dest = cache::dest_path(&dir, arch.id, key.1, &e.name);
+            match std::fs::metadata(&dest) {
+                Ok(m) if m.len() == e.size => ImageSource::File(dest),
+                _ => return,
+            }
+        };
         let name = e.name.clone();
         let max_dim = self.cfg.image.image_max_dim;
         tracing::warn!("当前图不在缓存且无在途解码，补发请求: {name}");

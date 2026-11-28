@@ -1628,6 +1628,38 @@ fn wait_texture(app: &mut App, key: super::ImgKey, what: &str) {
     }
 }
 
+/// heal 补发按包形态选源（落地开发 02 坑 12 回归）：非流式包（solid 同型）
+/// 补发一律走落盘 File 源（size 校验一致才发）；落盘缺失跳过不发——
+/// 绝不发注定失败的 Stream（solid open_entry 必失败 → 负缓存 → mpv 回退）
+#[test]
+fn heal_solid_package_uses_file_source_and_skips_when_missing() {
+    let dir = make_png_dir("heal", &["photo.png"]);
+    let mut cfg = crate::config::Config::default();
+    cfg.cache.dir = dir.join("cache").to_string_lossy().into_owned();
+    let mut app = App::new_for_test(cfg);
+
+    let _vfs = png_archive(&mut app, 10, &dir, 1);
+    // 改成非流式包形态（solid 7z/RAR 同型）：heal 必须走落盘 File 源
+    app.archive.as_mut().unwrap().stream = false;
+    app.playing = Some(0);
+    let key: super::ImgKey = (10, 0);
+
+    // 落盘缺失：跳过补发，不发起任何解码请求（旧实现发 Stream → 必失败）
+    app.poll_img();
+    assert!(
+        !app.img.is_pending(key) && !app.img.has(key),
+        "落盘缺失不应补发解码请求"
+    );
+
+    // 落盘在场且 size 一致：补发 File 源，解码进入在途并成功出纹理
+    let dest = crate::cache::dest_path(&dir.join("cache"), 10, 0, "photo.png");
+    std::fs::copy(dir.join("photo.png"), &dest).unwrap();
+    let size = app.archive.as_ref().unwrap().entries[0].size;
+    assert_eq!(std::fs::metadata(&dest).unwrap().len(), size, "缓存副本与条目 size 应一致");
+    app.poll_img();
+    wait_texture(&mut app, key, "heal 补发");
+}
+
 /// 重播链路冒烟（纹理图路径，控制栏「重播」按钮与配置重载共用
 /// replay_current）：解码就绪 → 记 per-file 亮度 → 深放大发起高清升级
 /// （full worker 在途）→ 立即重播。钉死三点（对应"高清放大中改锐化
