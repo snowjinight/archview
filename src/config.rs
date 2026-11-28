@@ -216,6 +216,10 @@ impl Default for MediaConfig {
         Self {
             video_extensions: [
                 "mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v",
+                // 光盘容器：VOB = DVD-Video 复用流（音视频字幕同文件，MPEG-PS）；
+                // m2ts/mts = 蓝光 BDMV / AVCHD 复用流（MPEG-TS）。逐文件播正片；
+                // 跨 clip 无缝拼接/菜单属 L2 规划（dvdnav:// 与 bluray://，见 §4.3）
+                "vob", "m2ts", "mts",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -1191,7 +1195,9 @@ clean_on_switch = false
 [media]
 
 # 视频 / 图片的文件扩展名识别列表（不区分大小写）
-video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v"]
+# vob = DVD-Video 复用流；m2ts/mts = 蓝光 BDMV / AVCHD 复用流（逐文件播正片）
+video_extensions = ["mp4", "mkv", "avi", "mov", "flv", "ts", "webm", "wmv", "m4v",
+                    "vob", "m2ts", "mts"]
 
 # 相机 RAW（内嵌预览直读）：Sony ARW 家族 + Nikon NEF 家族
 image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff",

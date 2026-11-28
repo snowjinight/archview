@@ -91,28 +91,46 @@ is_image_ext(name)`，与列表过滤 `rebuild_view` 同源）：标准扩展名
 行为边界：目录集合模式下没有「同目录下一个压缩包」概念（末尾翻页提示改为一次性
 说明）；「目录内连续看包」N 键语义仅在打开压缩包文件时保留。
 
-### 4.3 ISO 镜像（ISO9660 + Joliet，IsoVFS）
+### 4.3 ISO / UDF 镜像（ISO9660+Joliet 与纯 UDF 2.50，IsoVFS）
 
-第四种 FastSeek 格式（`iso_vfs.rs`）：ISO9660 是未压缩、未加密的只读文件系统，
-每个文件在目录记录里直接登记数据区位置（extent LBA）与长度，随机访问 = 打开镜像
-`File` + seek 到 `lba*2048 + offset`，O(1)——与 DirVFS/zip Stored 同构，走 mpv
-`zvf://` 流式快路径，**解压会话/滑窗/上游预取/密码探测等慢路径机制零触碰**
+第四种 FastSeek 格式（`iso_vfs.rs`）：ISO9660 与 UDF 都是未压缩、未加密的只读
+文件系统，每个文件在描述符里直接登记数据区位置（extent LBA）与长度，随机访问 =
+打开镜像 `File` + seek 到 `lba*2048 + offset`，O(1)——与 DirVFS/zip Stored 同构，
+走 mpv `zvf://` 流式快路径，**解压会话/滑窗/上游预取/密码探测等慢路径机制零触碰**
 （条目全部 `encrypted=false`、`crc=None`、`locate_start=None` 默认即正确）。
 
 - **不引入外部库**：VFS 的核心产出物是「文件名 → extent 表」（`VirtualFile`
-  适配器的本质），现成 crate（hadris-iso / cdfs / hivepack::iso）都抽象成
-  "按路径读流"，extent 藏在抽象内部且各有坑（hadris 的 Joliet+RR root
-  评分选择可能隐藏 Unicode 名、hivepack 顺序流式不适配随机 seek）；
-  ISO9660+Joliet 只读解析是同类最简单的二进制格式之一，手写约 400 行全权控制
-- **名字空间二选一**：PVD（LBA16）+ 可选 Joliet SVD（转义序列 `%/@` `%/C`
-  `%/E`），有 Joliet 用 Joliet（UCS-2BE，原大小写/中文/长名）；否则基础名
-  （大写 8.3，剥 `;版本` 与尾部 `.`）。纯 UDF 镜像（蓝光 BDMV）一期明确
-  不支持：卷识别序列只有 BEA01/NSR02/NSR03 且无 CD001 时报 Unsupported
-  定性（蓝光 = UDF 2.50 metadata partition，二期规划）
-- **多 extent 合并**：ISO9660 的 4GB 上限会把大文件切成连续同名目录记录
-  （首条 flags bit7 置位），合并为一个文件的连续 extent 表；`IsoFile`
-  适配器做逻辑位置 → 镜像物理偏移映射（段内起点 = 前序 extent 长度累计）
+  适配器的本质），现成 crate（hadris-iso / cdfs / hivepack::iso / hadris-udf）
+  都抽象成"按路径读流"，extent 藏在抽象内部且各有坑（hadris 的 Joliet+RR root
+  评分选择可能隐藏 Unicode 名、hivepack 顺序流式不适配随机 seek、hadris-udf
+  明确拒绝 metadata partition 读不了蓝光）；只读解析手写全权控制（ISO9660 层
+  几百行；UDF 布局参照 libfreemkv/udf.rs——对真 BD-ROM 实测过的指针链）
+- **双形态识别**：卷描述符扫描（LBA16 起）见 CD001 主卷 → ISO9660 模式
+  （bridge 双结构盘走 ISO 侧）；无 CD001 且 AVDP(扇区256) tag=2 → UDF 模式
+- **ISO9660 名字空间二选一**：有 Joliet SVD（转义序列 `%/@` `%/C` `%/E`）用
+  Joliet（UCS-2BE，原大小写/中文/长名）；否则基础名（大写 8.3，剥 `;版本`
+  与尾部 `.`）
+- **UDF 2.50 指针链（蓝光 BDMV）**：AVDP → VDS(PD+LVD) → 元数据分区映射
+  （type2 map 偏移 62 的 Metadata File Location）→ 元数据文件 FE 的数据
+  extent = 元数据分区内容 → FSD(tag 256, 根 ICB long_ad 偏移 400) → FID 树。
+  分区语义：ICB/FID/目录数据在元数据分区，**文件数据 short_ad 永远落在物理
+  分区**（元数据分区只装结构）——两者换算镜像绝对字节偏移后与 ISO9660 共用
+  同一条 extent 通道，`IsoFile` 适配器零改动复用。AD 连续链（extent type 3）
+  读指向区域续解（超大 m2ts 的保险）；内嵌数据形态（ICB flags bit3-5 = 3）
+  无外部 extent，条目可见但不可播
+- **多 extent 合并**（ISO9660）：4GB 上限把大文件切成连续同名目录记录（首条
+  flags bit7 置位），合并为一个文件的连续 extent 表；UDF 侧 FE/EFE 的多条
+  short_ad 天然多 extent。`IsoFile` 做逻辑位置 → 物理偏移映射（段内起点 =
+  前序 extent 长度累计），稀疏/空洞段按 gap→EOF 兜底
 - **不参与"同目录下一个压缩包"**：`archives_in`（N 键连续看包）不收 ISO——
   镜像语义是"媒体集合"而非"包"；VarTidy 的包过滤独立维持 zip/7z/rar 不变
-- 测试：程序化构造最小合法镜像（PVD/SVD/终止符 + 目录扇区 + 跨扇区文件数据）
-  全链路验证列表/读取/seek/导出/分发/UDF 定性拒绝
+- 测试：程序化构造最小合法镜像全链路验证——ISO9660（PVD/SVD/终止符 + 目录
+  扇区 + 跨扇区文件数据）与 UDF 2.50（VDS/元数据分区/FSD/FE+261/266 双分支/
+  双 extent 跨界 seek/UTF-16BE 名字）各一组
+- **L2 规划（完整光盘体验，未实施）**：VOB/M2TS 已入媒体列表（逐文件播正片，
+  音视频字幕本就是复用容器无需特殊处理）；跨 clip 无缝拼接/章节/菜单属 L2——
+  走 mpv 的 `dvdnav://`/`bluray://` 协议（libdvdnav/libbluray 自己解析 IFO/MPLS，
+  不自研），app 侧只需识别（镜像含 `VIDEO_TS.IFO` / `BDMV/index.bdmv` → 呈现为
+  单个影片条目）+ 交路径。架构坎：这两个协议要**真实文件路径**不走 stream_cb，
+  包中包场景需先把镜像整体落缓存；ISO 直接磁盘打开零解压直通。待办前置：
+  实测 bundled mpv 是否带 libdvdnav/libbluray
