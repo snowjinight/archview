@@ -9,8 +9,9 @@
 //!   player_e2e/  libmpv-2.dll + clip.mp4 + test.zip（两 entry Deflated）
 //!                —— src/player/mod.rs e2e 系列（make_test_zip 同参数）
 //!   encode_e2e/  libmpv-2.dll —— src/encode/mod.rs e2e（dump 帧纯 Rust 构造）
-//!   rar/         test.rar + plain.rar + solid.rar
-//!                —— src/vfs/rar_vfs.rs list_and_extract / non_solid / solid
+//!   rar/         test.rar + plain.rar + solid.rar + enc.rar + enchead.rar
+//!                —— src/vfs/rar_vfs.rs list_and_extract / non_solid / solid /
+//!                encrypted_rar_password_probe
 //!   img/         anim2.webp —— src/imgview.rs decode_动画webp逐帧
 //!   diag/        641.webp + 1000.webp —— src/player/mod.rs diag_webp_load_latency
 //!   vartidy/     pack1-6 + var_repo —— run_tests.bat 第 3 段 VarTidy CLI 冒烟
@@ -309,7 +310,10 @@ fn gen_player(root: &Path, ffmpeg: &Path, mpv_dll: &Path, rng: &mut Rng) {
     println!("[player_e2e] clip.mp4 + test.zip + libmpv-2.dll 就绪");
 }
 
-/// rar 族三包（payload 与 rar_vfs 测试断言逐字节一致）
+/// rar 族五包（payload 与 rar_vfs 测试断言逐字节一致）：
+/// test/plain/solid 未加密 + enc（-p 内容加密）/enchead（-hp 加密头），
+/// 密码统一 smoke-pw-123（ASCII，编码候选无歧义）——rar_vfs 密码探测链
+/// 回归测试用（enc 即 §1.10「skip 加密条目报密码错被包装降级」的场景）
 fn gen_rar(root: &Path, rar: &Path) {
     let dir = root.join("rar");
     std::fs::create_dir_all(&dir).unwrap();
@@ -334,9 +338,25 @@ fn gen_rar(root: &Path, rar: &Path) {
     let refs: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
     run_rar(rar, &dir.join("plain.rar"), &["-ep"], &refs, &payload);
     run_rar(rar, &dir.join("solid.rar"), &["-ep", "-s"], &refs, &payload);
+    // enc.rar：内容加密（文件名明文，探测走 verify_one 逐头定位）
+    run_rar(
+        rar,
+        &dir.join("enc.rar"),
+        &["-ep", "-psmoke-pw-123"],
+        &refs,
+        &payload,
+    );
+    // enchead.rar：加密头（open 阶段 try_list 即验）
+    run_rar(
+        rar,
+        &dir.join("enchead.rar"),
+        &["-ep", "-hpsmoke-pw-123"],
+        &refs,
+        &payload,
+    );
 
     let _ = std::fs::remove_dir_all(&payload);
-    println!("[rar] test.rar + plain.rar + solid.rar 就绪");
+    println!("[rar] test/plain/solid/enc/enchead.rar 就绪");
 }
 
 fn run_rar(rar: &Path, arch: &Path, flags: &[&str], files: &[&Path], cwd: &Path) {

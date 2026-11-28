@@ -1,4 +1,4 @@
-﻿//! SevenzVFS：7z 格式（solid 走慢路径会话，全独立 folder 走单文件按需）。
+//! SevenzVFS：7z 格式（solid 走慢路径会话，全独立 folder 走单文件按需）。
 //! sevenz-rust 只支持顺序解压（固态块内 seek 需从块头重解），因此 open_entry 不支持，
 //! 播放走后台解压到缓存目录 → 播放本地文件。
 
@@ -1546,6 +1546,49 @@ mod tests {
         let data = std::fs::read(&dest).unwrap();
         assert_eq!(data.len(), 60_000);
         assert!(data.iter().all(|&b| b == 5));
+        // 5) open 阶段密码探测链（UI 弹窗的关键路径）：无候选 → Err(Password)
+        //（弹密码框）；正确候选 → 锁定密码打开成功
+        let probe = crate::vfs::open_with_password_probe(&arch, &[]);
+        assert!(
+            matches!(&probe, Err(VfsError::Password)),
+            "无候选探测应报 Password（弹窗分支）"
+        );
+        let probe = crate::vfs::open_with_password_probe(&arch, &["pw123".to_string()]).unwrap();
+        assert_eq!(probe.1.as_deref(), Some("pw123"), "候选命中应锁定密码");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多条目 solid folder 的探测（探测目标=最小加密条目，未必是 folder 首条）：
+    /// 无候选 → Password（弹窗），正确候选 → 锁定成功——覆盖空密码解码报错在
+    /// folder 中间条目位置的形态
+    #[test]
+    fn encrypted_7z_probe_multi_entry_folder() {
+        let dir = std::env::temp_dir().join(format!("sevenz_enc_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = dir.join("enc_solid.7z");
+        let mut w = sevenz_rust::SevenZWriter::create(&arch).unwrap();
+        w.set_encrypt_header(false);
+        w.set_content_methods(vec![sevenz_rust::AesEncoderOptions::new(Password::from(
+            "pw123",
+        ))
+        .into()]);
+        // 三个条目压进同一 folder（solid），最小条目夹在中间
+        for (name, size) in [("a.bin", 50_000usize), ("b.bin", 1_000), ("c.bin", 70_000)] {
+            let p = dir.join(name);
+            std::fs::write(&p, vec![7u8; size]).unwrap();
+            let e = sevenz_rust::SevenZArchiveEntry::from_path(&p, name.into());
+            w.push_archive_entry(e, Some(std::fs::File::open(&p).unwrap())).unwrap();
+            std::fs::remove_file(&p).unwrap();
+        }
+        w.finish().unwrap();
+
+        let probe = crate::vfs::open_with_password_probe(&arch, &[]);
+        assert!(
+            matches!(&probe, Err(VfsError::Password)),
+            "solid folder 中间条目探测应报 Password（弹窗分支）"
+        );
+        let probe = crate::vfs::open_with_password_probe(&arch, &["pw123".to_string()]).unwrap();
+        assert_eq!(probe.1.as_deref(), Some("pw123"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

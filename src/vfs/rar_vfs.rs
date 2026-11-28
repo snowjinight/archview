@@ -637,8 +637,9 @@ impl ArchiveVFS for RarVFS {
             match self.try_batch(pw.as_deref(), targets, cancel, progress, file_done) {
                 Ok(()) => return Ok(()),
                 // 密码/编码不匹配（RAR4 无密码哈希，错密码可能只报 CRC 失败）：换下一候选。
-                // 已解出的目标已落地（try_batch 幂等跳过），重试只补漏
-                Err(e) if is_pwd_or_crc(&e) => last_err = e,
+                // 已解出的目标已落地（try_batch 幂等跳过），重试只补漏。
+                // 归一化为 Password：skip 加密条目的密码错误以包装文案形态到达
+                Err(e) if is_pwd_or_crc(&e) => last_err = VfsError::Password,
                 Err(e) => return Err(e),
             }
         }
@@ -729,9 +730,10 @@ impl ArchiveVFS for RarVFS {
                             }
                         }
                         // 密码/编码不匹配：跳出 Restart 重试换下一候选
-                        // （已落地的幂等跳过，重试只补漏）
+                        // （已落地的幂等跳过，重试只补漏）。归一化为 Password
+                        //（skip 加密条目的密码错误以包装文案形态到达）
                         Err(e) if is_pwd_or_crc(&e) => {
-                            last_err = e;
+                            last_err = VfsError::Password;
                             break;
                         }
                         Err(e) => {
@@ -799,7 +801,10 @@ impl ArchiveVFS for RarVFS {
         for c in &candidates {
             match self.verify_one(entry, c.as_deref()) {
                 Ok(()) => return Ok(()),
-                Err(e) if is_pwd_or_crc(&e) => last = e,
+                // 密码相关（含 CRC 误判形态）统一归一化为 Password：
+                // 包装文案（Archive 类型但含 "password" 字样）若原样返回，
+                // open_with_password_probe 按非密码错误定性，弹窗分支被绕过
+                Err(e) if is_pwd_or_crc(&e) => last = VfsError::Password,
                 Err(e) => return Err(e),
             }
         }
@@ -868,7 +873,15 @@ impl RarVFS {
                         return r.map(|_| ());
                     }
                     open = head.skip().map_err(|e| {
-                        VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
+                        // skip 路过加密条目时 unrar 同样要求密码
+                        //（"Password for encrypted archive not specified"）：
+                        // 保持 Password 类型，否则 open 阶段探测会把加密包
+                        // 定性为硬错误直接 Failed，UI 永远弹不出密码框
+                        if is_password_err(&e) {
+                            VfsError::Password
+                        } else {
+                            VfsError::Archive(format!("RAR 跳过条目 [{}] 失败: {e}", name))
+                        }
                     })?;
                 }
                 None => return Err(VfsError::Archive(format!("entry 不存在: {}", entry.name))),
@@ -986,6 +999,40 @@ mod tests {
             assert!(data.iter().all(|&b| b == fill), "解出应为本条目内容");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 加密 RAR 密码探测链（open_with_password_probe = UI 弹窗的关键路径，
+    /// 夹具见 smoke_setup gen_rar；密码统一 smoke-pw-123）：
+    /// - enc.rar（-p 内容加密、文件名明文）：无候选 → Err(Password)（弹窗分支）；
+    ///   正确候选 → 锁定成功且条目 encrypted=true。这是 §1.10「verify_one skip
+    ///   加密条目报密码错被包装成 Archive 降级硬失败」的回归测试
+    /// - enchead.rar（-hp 加密头）：无候选 → Err(Password)；正确候选 → 锁定
+    #[test]
+    fn encrypted_rar_password_probe() {
+        // ---- 内容加密：探测走 verify_password（skip 加密条目 + extract 目标）----
+        let arch = crate::smoke::require("rar/enc.rar");
+        let vfs = RarVFS::open(&arch, None).unwrap();
+        assert!(
+            vfs.list().iter().any(|e| e.encrypted),
+            "内容加密包 encrypted 标志应可靠（探测目标选择的前提）"
+        );
+        let probe = crate::vfs::open_with_password_probe(&arch, &[]);
+        assert!(
+            matches!(&probe, Err(VfsError::Password)),
+            "内容加密无候选探测应报 Password（弹窗分支），不得包装降级为硬错误"
+        );
+        let probe = crate::vfs::open_with_password_probe(&arch, &["smoke-pw-123".into()]).unwrap();
+        assert_eq!(probe.1.as_deref(), Some("smoke-pw-123"), "候选命中应锁定密码");
+
+        // ---- 加密头：open(None) 即失败，候选重开链 ----
+        let arch = crate::smoke::require("rar/enchead.rar");
+        let probe = crate::vfs::open_with_password_probe(&arch, &[]);
+        assert!(
+            matches!(&probe, Err(VfsError::Password)),
+            "加密头无候选探测应报 Password（弹窗分支）"
+        );
+        let probe = crate::vfs::open_with_password_probe(&arch, &["smoke-pw-123".into()]).unwrap();
+        assert_eq!(probe.1.as_deref(), Some("smoke-pw-123"));
     }
 
     // ---- extract_session 驻留语义测试（镜像 7z 组，协议见 sevenz_vfs.rs）----
